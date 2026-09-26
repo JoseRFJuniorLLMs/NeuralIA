@@ -114,6 +114,54 @@ fn cmp_rules_reject_selectors_never_name_accept() {
     }
 }
 
+/// Gate (critico, script injetado; SPEC-0114 «as definicoes de cookies do
+/// rodape ficam»): nenhum `banner` de `CMP_RULES` nomeia um anfitriao que o
+/// CMP deixa na pagina e reusa para as definicoes que o utilizador abre
+/// depois (`PERSISTENT_CMP_HOSTS`). Escondido no carregamento, ele deixava
+/// essas definicoes invisiveis para sempre.
+///
+/// Sabotagem: o `#didomi-host` de volta ao `banner` do Didomi -> vermelho.
+#[test]
+fn cmp_banners_never_name_a_persistent_host() {
+    let mut named = 0;
+    for rule in CMP_RULES {
+        let detect_and_reject = format!("{} {}", rule.detect, rule.reject.unwrap_or_default());
+        named += PERSISTENT_CMP_HOSTS
+            .iter()
+            .filter(|host| detect_and_reject.contains(*host))
+            .count();
+        let Some(banner) = rule.banner else {
+            continue;
+        };
+        for part in banner.split(',').map(str::trim) {
+            assert!(!part.is_empty(), "{}: seletor vazio", rule.id);
+            for host in PERSISTENT_CMP_HOSTS {
+                assert!(
+                    !part.contains(host),
+                    "{}: o banner {part:?} esconde o anfitriao persistente {host}",
+                    rule.id
+                );
+            }
+        }
+        // A recusa tambem nunca vive so dentro do centro de preferencias.
+        if let Some(reject) = rule.reject {
+            assert!(
+                !reject.contains("#onetrust-pc-sdk"),
+                "{}: {reject}",
+                rule.id
+            );
+        }
+    }
+    // O controlo: os anfitrioes da lista sao os destas regras.
+    assert!(named >= 3, "{named}");
+    let usercentrics = CMP_RULES
+        .iter()
+        .find(|rule| rule.id == "usercentrics")
+        .expect("usercentrics");
+    assert_eq!(usercentrics.banner, None);
+    assert!(usercentrics.reject.is_some());
+}
+
 /// Gate: as listas estao na forma em que o script compara (normalizadas),
 /// nenhuma frase de recusa traz uma palavra de aceitar (nunca seria
 /// clicada) e cada lingua do plano tem recusa e aceitar.
@@ -384,9 +432,14 @@ fn the_script_config_carries_the_registry_and_the_lists() {
     assert_eq!(config["accept"], json!(ACCEPT_WORDS));
     assert_eq!(config["stickyMin"], json!(STICKY_MIN_RATIO));
     assert_eq!(config["budgetMs"], json!(FRAME_BUDGET_MS));
+    assert_eq!(config["cmpMs"], json!(CMP_PASS_EVERY_MS));
+    assert_eq!(config["frameWall"], json!(FRAME_WALL_RATIO));
     assert_eq!(config["idleMs"], json!(IDLE_STOP_MS));
     assert_eq!(config["userMs"], json!(USER_OPENED_MS));
     let selector = config["paywallSel"].as_str().expect("paywallSel");
-    assert!(selector.contains(r#"[class*="tp-modal"]"#), "{selector}");
-    assert!(selector.contains(r#"[id*="paywall"]"#), "{selector}");
+    // Sem olhar a maiusculas: `PaywallModal` tambem e um paywall.
+    assert!(selector.contains(r#"[class*="tp-modal" i]"#), "{selector}");
+    assert!(selector.contains(r#"[id*="paywall" i]"#), "{selector}");
+    assert!(!selector.contains(r#"paywall"]"#), "{selector}");
+    assert!(!NEWSLETTER_MARKERS.contains(&"boletim"));
 }

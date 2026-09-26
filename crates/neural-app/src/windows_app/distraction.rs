@@ -31,18 +31,34 @@ use neural_core::distraction::{
 //   primitiva que usa (querySelectorAll, click, getComputedStyle,
 //   MutationObserver, as strings...): uma pagina que as troque depois nao
 //   muda o que ele ve nem o que ele faz;
-// - so CLICA num CMP conhecido, quando o seletor de recusa casa E o texto
-//   visivel do botao tem uma frase de recusa E nenhuma palavra de aceitar;
-//   de resto so esconde (`display: none`). Uma moldura de outra origem
-//   (Sourcepoint, TrustArc) e so escondida;
-// - esconde avisos de cookies, janelas de newsletter e barras fixas que
-//   ocupam pelo menos 25% da altura da janela; um marcador de paywall
-//   deixa o que o tem intocado, e o que aparece ate 1,5 s depois de um
-//   clique ou de uma tecla do utilizador (ele e que o abriu) ou tem um
-//   campo de senha tambem;
+// - num CMP conhecido so age com o aviso VISIVEL agora (um centro de
+//   preferencias escondido, de quem ja respondeu, nao e um aviso) e so
+//   esconde o aviso, nunca o anfitriao que o CMP reusa para as definicoes
+//   do rodape; so CLICA num botao visivel, quando o seletor de recusa casa
+//   E o texto dele tem uma frase de recusa E nenhuma palavra de aceitar;
+//   de resto so esconde (`display: none`);
+// - uma moldura de outra origem (Sourcepoint, TrustArc) nunca e clicada
+//   nem lida: a que tapa a pagina (metade da altura ou mais) pode ser um
+//   "pague ou aceite" e fica, e com ela a rolagem e os fundos ficam como a
+//   pagina os pos; a pequena fica numa pagina presa e, numa pagina que
+//   rola, sai sem mexer na rolagem nem nos fundos;
+// - esconde avisos de cookies, janelas de newsletter (no id/class; pelo
+//   texto so um dialogo cujo unico campo e um e-mail) e barras fixas na
+//   janela, encostadas ao topo ou ao fundo, com pelo menos 25% da altura
+//   dela; o que aparece ate 1,5 s depois de um clique ou de uma tecla do
+//   utilizador (ele e que o abriu) ou tem um campo de senha fica;
+// - um paywall (marcador no id/class ou no texto de um candidato ou de um
+//   aviso) fica, e depois de o ver o script nunca mais devolve a rolagem
+//   nem esconde um fundo nessa pagina (e desfaz a rolagem que ja tinha
+//   devolvido);
 // - devolve a rolagem so quando escondeu a causa e o documento rola mesmo;
-// - trabalha no maximo 8 ms de cada vez e para de observar a pagina
-//   depois de 30 s sem mudancas;
+//   um fundo vazio de ecra inteiro so sai ao lado do que escondeu (nunca
+//   uma moldura, canvas ou video da pagina);
+// - o exame dos elementos cede a vez depois de 8 ms; a procura dos CMPs
+//   (umas consultas ao documento inteiro) corre no maximo a cada 250 ms;
+//   de cada elemento acrescentado olha no maximo 60 descendentes; para de
+//   observar a pagina depois de 30 s sem mudancas (uma pagina que nunca
+//   para de mudar e observada enquanto estiver aberta);
 // - nunca usa o `postMessage` e nunca recebe a capability do canal.
 //
 // A ligacao a WebView: o `AddScriptToExecuteOnDocumentCreated` do COM (e
@@ -91,6 +107,9 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
   var getAttr = uncurry(ElP.getAttribute);
   var tagOf = getter(ElP, 'localName');
   var nodeTypeOf = getter(NodeP, 'nodeType');
+  var parentOf = getter(NodeP, 'parentNode');
+  var firstChildOf = getter(ElP, 'firstElementChild');
+  var nextOf = getter(ElP, 'nextElementSibling');
   var containsNode = uncurry(NodeP.contains);
   var docElOf = getter(DocP, 'documentElement');
   var bodyOf = getter(DocP, 'body');
@@ -104,8 +123,11 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
   var rTop = getter(RectP, 'top'), rBottom = getter(RectP, 'bottom');
   var rWidth = getter(RectP, 'width'), rHeight = getter(RectP, 'height');
   var clickEl = uncurry(HtmlP.click);
-  var setProp = uncurry(W.CSSStyleDeclaration.prototype.setProperty);
-  var getProp = uncurry(W.CSSStyleDeclaration.prototype.getPropertyValue);
+  var CssP = W.CSSStyleDeclaration.prototype;
+  var setProp = uncurry(CssP.setProperty);
+  var getProp = uncurry(CssP.getPropertyValue);
+  var getPri = uncurry(CssP.getPropertyPriority);
+  var removeProp = uncurry(CssP.removeProperty);
   var computed = uncurry(W.getComputedStyle);
   var listen = uncurry(W.EventTarget.prototype.addEventListener);
   var MO = W.MutationObserver;
@@ -240,10 +262,37 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
     var de = docElOf(D);
     return de ? [clientWOf(de), clientHOf(de)] : [0, 0];
   }
+  // Mostrado agora: com caixa, e nem ele nem um antepassado escondido.
+  function visible(el) {
+    try {
+      var style = computed(W, el);
+      if (getProp(style, 'display') === 'none' || getProp(style, 'visibility') === 'hidden') return false;
+      var rect = rectOf(el);
+      return rWidth(rect) > 0 && rHeight(rect) > 0;
+    } catch (e) { return false; }
+  }
+  function scrollLocked() {
+    var targets = [docElOf(D), bodyOf(D)];
+    for (var t = 0; t < 2; t++) {
+      if (!targets[t]) continue;
+      var overflow = getProp(computed(W, targets[t]), 'overflow-y');
+      if (overflow === 'hidden' || overflow === 'clip') return true;
+    }
+    return false;
+  }
+  // Uma camada da propria pagina (a app numa moldura, um canvas, um video).
+  function media(tag) {
+    return tag === 'iframe' || tag === 'canvas' || tag === 'video' || tag === 'img' ||
+      tag === 'picture' || tag === 'svg' || tag === 'object' || tag === 'embed';
+  }
 
   var clicked = create(null);
-  var hidCause = false, restored = false;
-  var backdrops = buffer();
+  // hidCause: escondemos o que prende a pagina (um aviso, uma janela).
+  // walled: a pagina tem um paywall, ou uma moldura que nao se le e a
+  // tapa; a partir dai a rolagem e os fundos ficam como a pagina os pos.
+  var hidCause = false, restored = false, walled = false;
+  var causes = buffer(), backdrops = buffer(), saved = buffer();
+  function cause(el) { hidCause = true; add(causes, el); }
 
   // O que aparece logo depois de um clique ou de uma tecla do utilizador
   // foi ele que abriu (as definicoes de cookies do rodape, uma pesquisa, um
@@ -261,37 +310,88 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
     return true;
   }
 
-  // Os CMPs conhecidos: recusa (so com o texto certo), depois esconder.
+  // Uma moldura de outra origem (Sourcepoint, TrustArc): nunca se le o
+  // que ela diz. A que tapa a pagina pode ser um "pague ou aceite": fica,
+  // e a pagina passa a ter um muro. A pequena fica numa pagina presa (sem
+  // ela nao havia como sair); numa pagina que rola sai -- sem contar como
+  // causa (nem rolagem, nem fundos).
+  function frameOnly(shown) {
+    var vh = viewport()[1], wall = !(vh > 0);
+    for (var i = 0; i < shown.n && !wall; i++) {
+      if (rHeight(rectOf(shown[i])) >= vh * C.frameWall) wall = true;
+    }
+    if (wall) {
+      walled = true;
+      for (var j = 0; j < shown.n; j++) wsAdd(seen, shown[j]);
+      return;
+    }
+    if (scrollLocked()) return;
+    for (var k = 0; k < shown.n; k++) hide(shown[k]);
+  }
+
+  // Os CMPs conhecidos, so com um aviso visivel agora: recusa (so num
+  // botao visivel com o texto certo), depois esconder o aviso. Sem aviso
+  // visivel (ja respondido, ou so o centro de preferencias escondido),
+  // nada: nem clique, nem esconder.
   function runCmps() {
     for (var i = 0; i < C.cmp.length; i++) {
       var cmp = C.cmp[i];
       if (!query(D, cmp.detect).n) continue;
-      var banners = cmp.banner ? query(D, cmp.banner) : buffer();
-      var walled = false, mine = false;
-      for (var b = 0; b < banners.n; b++) {
-        if (paywallish(banners[b])) walled = true;
-        if (openedByUser(banners[b])) mine = true;
+      var root = D;
+      if (cmp.shadow) {
+        var hosts = query(D, cmp.shadow);
+        root = null;
+        try { root = hosts.n ? shadowOf(hosts[0]) : null; } catch (e) { root = null; }
       }
-      if (walled || mine) continue;
-      if (cmp.reject && cmp.frame !== true && clicked[cmp.id] !== true) {
-        var root = D;
-        if (cmp.shadow) {
-          var hosts = query(D, cmp.shadow);
-          root = null;
-          try { root = hosts.n ? shadowOf(hosts[0]) : null; } catch (e) { root = null; }
-        }
-        if (root) {
-          var buttons = query(root, cmp.reject);
-          for (var j = 0; j < buttons.n; j++) {
-            if (!safeReject(labelOf(buttons[j]))) continue;
-            clicked[cmp.id] = true;
-            try { clickEl(buttons[j]); } catch (e) {}
-            break;
-          }
+      var buttons = cmp.reject && root && cmp.frame !== true ? query(root, cmp.reject) : buffer();
+      // Sem `banner` (consent.google.com, Usercentrics): o sinal e o botao.
+      var candidates = cmp.banner ? query(D, cmp.banner) : buttons;
+      var shown = buffer();
+      for (var c = 0; c < candidates.n; c++) {
+        if (!wsHas(hidden, candidates[c]) && visible(candidates[c])) add(shown, candidates[c]);
+      }
+      if (!shown.n) continue;
+      var paid = false, mine = false;
+      for (var b = 0; b < shown.n; b++) {
+        if (paywallish(shown[b])) paid = true;
+        if (openedByUser(shown[b])) mine = true;
+      }
+      if (paid) { walled = true; continue; }
+      if (mine) continue;
+      if (cmp.frame === true) { frameOnly(shown); continue; }
+      if (clicked[cmp.id] !== true) {
+        for (var j = 0; j < buttons.n; j++) {
+          if (!visible(buttons[j]) || !safeReject(labelOf(buttons[j]))) continue;
+          clicked[cmp.id] = true;
+          try { clickEl(buttons[j]); } catch (e) {}
+          break;
         }
       }
-      for (var k = 0; k < banners.n; k++) if (hide(banners[k])) hidCause = true;
+      if (!cmp.banner) continue;
+      for (var k = 0; k < shown.n; k++) if (hide(shown[k])) cause(shown[k]);
     }
+  }
+
+  // Um dialogo que so fala de newsletter no texto so sai quando o unico
+  // campo dele e um e-mail (um checkout com a caixa «receber a newsletter»
+  // tem outros campos, e fica).
+  function emailOnly(el) {
+    var fields = query(el, 'input, select, textarea');
+    var email = false;
+    for (var i = 0; i < fields.n; i++) {
+      var field = fields[i];
+      if (tagOf(field) !== 'input') return false;
+      var type = lower('' + (getAttr(field, 'type') || 'text'));
+      if (type === 'hidden' || type === 'submit' || type === 'button' || type === 'image') continue;
+      if (type === 'email') { email = true; continue; }
+      if (type === 'text') {
+        var hint = norm((getAttr(field, 'name') || '') + ' ' + (getAttr(field, 'id') || '') + ' ' +
+          (getAttr(field, 'autocomplete') || '') + ' ' + (getAttr(field, 'placeholder') || ''), 200);
+        if (indexOf(hint, 'mail') >= 0) { email = true; continue; }
+      }
+      return false;
+    }
+    return email;
   }
 
   // Um candidato: aviso de cookies sem CMP conhecido, janela de newsletter,
@@ -309,23 +409,27 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
       getAttr(el, 'aria-modal') === 'true';
     if (!fixed && !modal) return;
     if (getProp(style, 'display') === 'none' || getProp(style, 'visibility') === 'hidden') return;
+    // Um paywall (marcador no id/class ou no texto) fica, e a pagina passa
+    // a ter um muro: a rolagem e os fundos ficam como ela os pos.
+    var names = idClass(el);
+    var text = norm(labelOf(el), 4000);
+    if (hasMarker(names, C.paywall) || hasMarker(text, C.paywall) || query(el, C.paywallSel).n) {
+      walled = true;
+      return;
+    }
     var active = activeOf(D);
     if (active && active !== bodyOf(D) && containsNode(el, active)) return;
     if (justOpened()) { wsAdd(userOpened, el); return; }
     // Um login ou um registo (tem um campo de senha) nunca sai.
     if (query(el, 'input[type="password"]').n) return;
-    var names = idClass(el);
-    if (hasMarker(names, C.paywall) || query(el, C.paywallSel).n) return;
-    var text = norm(labelOf(el), 4000);
-    if (hasMarker(text, C.paywall)) return;
     if (fixed && (indexOf(names, 'cookie') >= 0 || indexOf(names, 'consent') >= 0 ||
         indexOf(names, 'gdpr') >= 0)) {
-      if (hide(el)) hidCause = true;
+      if (hide(el)) cause(el);
       return;
     }
-    if ((fixed && hasMarker(names, C.newsletter)) ||
-        (modal && (hasMarker(names, C.newsletter) || hasMarker(text, C.newsletter)))) {
-      if (hide(el)) hidCause = true;
+    if (hasMarker(names, C.newsletter) ||
+        (modal && hasMarker(text, C.newsletter) && emailOnly(el))) {
+      if (hide(el)) cause(el);
       return;
     }
     if (!fixed) return;
@@ -334,23 +438,67 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
     var rect = rectOf(el);
     var top = rTop(rect), bottom = rBottom(rect), width = rWidth(rect), height = rHeight(rect);
     if (width >= vw * 0.9 && height >= vh * 0.9) {
+      // So um fundo vazio (nem texto, nem filhos, nem uma moldura, canvas
+      // ou video da pagina); sai so ao lado do que escondemos (`settle`).
       var z = getProp(style, 'z-index');
-      if (text.length < 2 && z !== 'auto' && +z > 0) add(backdrops, el);
+      if (text.length < 2 && z !== 'auto' && +z > 0 && !media(tag) && !firstChildOf(el)) {
+        add(backdrops, el);
+      }
       return;
     }
+    // Uma barra NA janela, encostada ao topo ou ao fundo: nem uma seccao
+    // presa mais abaixo na pagina, nem um menu arrumado fora do ecra.
     if (width >= vw * 0.5 && height >= vh * C.stickyMin && height < vh * C.stickyMax &&
-        (top <= 1 || bottom >= vh - 1)) {
+        top < vh && bottom > 0 &&
+        ((top >= -1 && top <= 1) || (bottom >= vh - 1 && bottom <= vh + 1))) {
       hide(el);
     }
   }
 
-  function settle() {
-    if (hidCause) {
-      for (var i = 0; i < backdrops.n; i++) hide(backdrops[i]);
-      backdrops = buffer();
+  // O fundo e irmao do que escondemos, ou do embrulho dele.
+  function nextToCause(el) {
+    var parent = parentOf(el);
+    if (!parent) return false;
+    for (var i = 0; i < causes.n; i++) {
+      var up = parentOf(causes[i]);
+      if (up === parent || (up && parentOf(up) === parent)) return true;
     }
-    if (!hidCause || restored) return;
-    if (query(D, C.paywallSel).n) return;
+    return false;
+  }
+  function unrestore() {
+    for (var i = 0; i < saved.n; i++) {
+      var record = saved[i];
+      try {
+        if (record[1]) setProp(record[0], 'overflow-y', record[1], record[2]);
+        else removeProp(record[0], 'overflow-y');
+      } catch (e) {}
+    }
+    saved = buffer();
+  }
+
+  // Um marcador de paywall no id/class de algum elemento do documento: 2 se
+  // um deles esta visivel (um muro), 1 se so ha escondidos (um molde).
+  function paywallOnPage() {
+    var found = query(D, C.paywallSel);
+    for (var i = 0; i < found.n && i < 20; i++) if (visible(found[i])) return 2;
+    return found.n ? 1 : 0;
+  }
+
+  function settle() {
+    var pay = walled || !hidCause ? 0 : paywallOnPage();
+    if (pay === 2) walled = true;
+    // Com um muro na pagina: nada de fundos, e a rolagem que devolvemos
+    // antes de ele chegar volta a ser a da pagina.
+    if (walled) { unrestore(); backdrops = buffer(); return; }
+    if (!hidCause) return;
+    var keep = buffer();
+    for (var i = 0; i < backdrops.n; i++) {
+      if (nextToCause(backdrops[i])) hide(backdrops[i]);
+      else add(keep, backdrops[i]);
+    }
+    backdrops = keep;
+    // Um paywall escondido no documento tambem segura a rolagem.
+    if (restored || pay) return;
     var de = docElOf(D), body = bodyOf(D);
     if (!de || !body) return;
     var viewH = clientHOf(de);
@@ -359,15 +507,19 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
     for (var t = 0; t < 2; t++) {
       var overflow = getProp(computed(W, targets[t]), 'overflow-y');
       if (overflow === 'hidden' || overflow === 'clip') {
-        setProp(styleOf(targets[t]), 'overflow-y', 'auto', 'important');
+        var inline = styleOf(targets[t]);
+        add(saved, [inline, getProp(inline, 'overflow-y'), getPri(inline, 'overflow-y')]);
+        setProp(inline, 'overflow-y', 'auto', 'important');
         restored = true;
       }
     }
   }
 
-  // ---- o ritmo: 8 ms de cada vez; para depois de 30 s sem mudancas ----
+  // ---- o ritmo: o exame cede a vez depois de 8 ms; os CMPs no maximo a
+  // cada 250 ms; para depois de 30 s sem mudancas ----
   var queue = buffer(), head = 0;
   var scheduled = false, stopped = false, idleArmed = false, lastChange = 0, observer = null;
+  var lastCmps = -1e12, cmpsDue = false;
   function now() { return perfNow(perf); }
   function schedule(ms) {
     if (scheduled || stopped) return;
@@ -377,11 +529,36 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
   function enqueue(list) {
     for (var i = 0; i < list.n; i++) add(queue, list[i]);
   }
+  // Um elemento acrescentado e ate 60 descendentes dele, sem copiar a
+  // arvore inteira.
+  function enqueueTree(node) {
+    add(queue, node);
+    var count = 0, cur = firstChildOf(node);
+    while (cur && count < 60) {
+      add(queue, cur);
+      count = count + 1;
+      var next = firstChildOf(cur);
+      while (!next && cur) {
+        next = nextOf(cur);
+        if (!next) {
+          cur = parentOf(cur);
+          if (cur === node) cur = null;
+        }
+      }
+      cur = next;
+    }
+  }
   function pump() {
     scheduled = false;
     if (stopped) return;
     var start = now();
-    try { runCmps(); } catch (e) {}
+    if (start - lastCmps >= C.cmpMs) {
+      lastCmps = start;
+      cmpsDue = false;
+      try { runCmps(); } catch (e) {}
+    } else {
+      cmpsDue = true;
+    }
     while (head < queue.n) {
       if (now() - start > C.budgetMs) { schedule(16); return; }
       var el = queue[head];
@@ -391,6 +568,9 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
     }
     queue = buffer();
     head = 0;
+    // `settle` so logo depois de uma procura dos CMPs: nunca devolve a
+    // rolagem sem ter visto o aviso (ou o muro) que chegou entretanto.
+    if (cmpsDue) { schedule(lastCmps + C.cmpMs - now()); return; }
     try { settle(); } catch (e) {}
     armIdle();
   }
@@ -421,9 +601,7 @@ pub(in crate::windows_app) const NEURALIA_DISTRACTION_SCRIPT: &str = r##"(functi
       for (var j = 0; j < count; j++) {
         var node = nlItem(added, j);
         if (!node || nodeTypeOf(node) !== 1) continue;
-        add(queue, node);
-        var inside = query(node, '*');
-        for (var k = 0; k < inside.n && k < 60; k++) add(queue, inside[k]);
+        enqueueTree(node);
       }
     }
     schedule(50);

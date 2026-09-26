@@ -40,12 +40,23 @@ use crate::search::{ProviderId, is_ai_provider_host, is_login_host, login_hosts}
 /// - `reject`: o botao de recusa, procurado no documento ou, com
 ///   `shadow_host`, dentro da shadow root aberta desse anfitriao. `None`:
 ///   nunca se clica neste CMP.
-/// - `banner`: o que se esconde (sempre no documento: esconder o anfitriao
-///   esconde tudo o que esta na shadow root dele). `None`: nunca se
-///   esconde nada -- a pagina `consent.google.com` E o aviso.
+/// - `banner`: o que se esconde (sempre no documento), e so o proprio
+///   aviso: nunca um anfitriao que fica na pagina e mostra tambem as
+///   definicoes que o utilizador abre depois pelo rodape
+///   (`PERSISTENT_CMP_HOSTS`: o centro de preferencias do OneTrust, o
+///   `#didomi-host`, a raiz do Usercentrics). O script so age quando um
+///   deles esta visivel. `None`: nunca se esconde nada -- a pagina
+///   `consent.google.com` E o aviso, e o Usercentrics vive todo na shadow
+///   root de um anfitriao persistente; ai o sinal de que ha um aviso e o
+///   botao de recusa visivel.
 /// - `frame_only`: o aviso vive numa moldura de outra origem (Sourcepoint,
-///   TrustArc), onde o script da pagina de topo nao entra: so se esconde a
-///   moldura, nunca se clica.
+///   TrustArc), onde o script da pagina de topo nao entra nem le -- nem um
+///   "pague ou aceite" (pur abo, contentpass). Nunca se clica; so se
+///   esconde a moldura pequena (menos de `FRAME_WALL_RATIO` da altura da
+///   janela) numa pagina que rola, e esconde-la nunca devolve a rolagem nem
+///   tira fundos. A que tapa a pagina fica, e com ela na pagina o script
+///   deixa a rolagem e os fundos como estao; a pequena numa pagina com a
+///   rolagem presa tambem fica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CmpRule {
     pub id: &'static str,
@@ -73,8 +84,12 @@ pub const CMP_RULES: &[CmpRule] = &[
     CmpRule {
         id: "onetrust",
         detect: "#onetrust-consent-sdk, #onetrust-banner-sdk",
-        reject: Some("#onetrust-reject-all-handler, #onetrust-pc-sdk .ot-pc-refuse-all-handler"),
-        banner: Some("#onetrust-banner-sdk, #onetrust-pc-sdk, .onetrust-pc-dark-filter"),
+        // So o aviso: o centro de preferencias (`#onetrust-pc-sdk`) e o
+        // fundo `.onetrust-pc-dark-filter` ficam na pagina para as
+        // definicoes do rodape (o fundo ao lado do aviso escondido sai pela
+        // regra dos fundos do script).
+        reject: Some("#onetrust-reject-all-handler"),
+        banner: Some("#onetrust-banner-sdk"),
         shadow_host: None,
         frame_only: false,
     },
@@ -92,7 +107,8 @@ pub const CMP_RULES: &[CmpRule] = &[
         id: "didomi",
         detect: "#didomi-host, #didomi-notice",
         reject: Some("#didomi-notice-disagree-button"),
-        banner: Some("#didomi-host, .didomi-popup-backdrop"),
+        // O `#didomi-host` fica: e onde o Didomi mostra as preferencias.
+        banner: Some("#didomi-notice, .didomi-popup-backdrop"),
         shadow_host: None,
         frame_only: false,
     },
@@ -100,7 +116,9 @@ pub const CMP_RULES: &[CmpRule] = &[
         id: "usercentrics",
         detect: "#usercentrics-root, #usercentrics-cmp-ui",
         reject: Some(r#"[data-testid="uc-deny-all-button"]"#),
-        banner: Some("#usercentrics-root, #usercentrics-cmp-ui"),
+        // O anfitriao e persistente (mostra tambem as definicoes): nunca se
+        // esconde; so a recusa com o texto certo.
+        banner: None,
         shadow_host: Some("#usercentrics-root, #usercentrics-cmp-ui"),
         frame_only: false,
     },
@@ -171,7 +189,9 @@ pub const CMP_RULES: &[CmpRule] = &[
         shadow_host: None,
         frame_only: false,
     },
-    // Molduras de outra origem: so esconder.
+    // Molduras de outra origem: nunca clicar; so esconder a pequena (ver
+    // `frame_only`). O "pague ou aceite" destes CMPs vive dentro da
+    // moldura, onde o script nao le.
     CmpRule {
         id: "sourcepoint",
         detect: r#"[id^="sp_message_container_"], iframe[id^="sp_message_iframe_"]"#,
@@ -298,9 +318,12 @@ pub const ACCEPT_WORDS: &[&str] = &[
     "acconsent",
 ];
 
-/// Marcadores de paywall (texto ou `id`/`class`, normalizados): um
-/// candidato com um deles fica intocado, e com um deles no documento o
-/// script nunca devolve a rolagem.
+/// Marcadores de paywall (texto ou `id`/`class`, normalizados; no
+/// documento, `id`/`class` sem olhar a maiusculas): um candidato com um
+/// deles fica intocado, e depois de o script ver um (num candidato, num
+/// aviso de CMP ou no documento) nunca mais devolve a rolagem nem esconde
+/// um fundo nessa pagina -- e a rolagem que ja tinha devolvido volta a ser
+/// a da pagina.
 pub const PAYWALL_MARKERS: &[&str] = &[
     "paywall",
     "regwall",
@@ -327,11 +350,13 @@ pub const PAYWALL_MARKERS: &[&str] = &[
     "riservato agli abbonati",
 ];
 
-/// Marcadores de uma janela de newsletter (texto ou `id`/`class`,
-/// normalizados).
+/// Marcadores de uma janela de newsletter (normalizados). No `id`/`class`
+/// de uma janela ou barra fixa bastam; no TEXTO de um dialogo so contam
+/// quando o unico campo dele e um e-mail (um checkout com a caixa «receber
+/// a newsletter» fica). Sem o «boletim» do pt: e tambem o boletim de
+/// ocorrencia, o escolar, o de voto.
 pub const NEWSLETTER_MARKERS: &[&str] = &[
     "newsletter",
-    "boletim",
     "boletín",
     "boletin",
     "infolettre",
@@ -341,13 +366,34 @@ pub const NEWSLETTER_MARKERS: &[&str] = &[
     "signup popup",
 ];
 
-/// Uma barra fixa (ou presa) encostada ao topo ou ao fundo so e escondida
-/// com pelo menos esta fracao da altura da janela.
+/// Os anfitrioes que um CMP deixa na pagina e reusa para as definicoes
+/// que o utilizador abre depois (o rodape «Definicoes de cookies»): nenhum
+/// `banner` de `CMP_RULES` os nomeia (gate
+/// `cmp_banners_never_name_a_persistent_host`).
+pub const PERSISTENT_CMP_HOSTS: &[&str] = &[
+    "#onetrust-consent-sdk",
+    "#onetrust-pc-sdk",
+    ".onetrust-pc-dark-filter",
+    "#didomi-host",
+    "#usercentrics-root",
+    "#usercentrics-cmp-ui",
+];
+
+/// Uma barra fixa (ou presa) na janela, encostada ao topo ou ao fundo, so
+/// e escondida com pelo menos esta fracao da altura da janela.
 pub const STICKY_MIN_RATIO: f64 = 0.25;
 /// Acima desta fracao ja nao e uma barra: e a pagina (um layout fixo).
 pub const STICKY_MAX_RATIO: f64 = 0.9;
-/// O trabalho de cada passagem do script, em ms, antes de ceder a vez.
+/// Uma moldura de outra origem (`frame_only`) com pelo menos esta fracao
+/// da altura da janela tapa a pagina: pode ser um "pague ou aceite" que o
+/// script nao le, e fica.
+pub const FRAME_WALL_RATIO: f64 = 0.5;
+/// O exame dos elementos de cada passagem, em ms, antes de ceder a vez.
 pub const FRAME_BUDGET_MS: u32 = 8;
+/// A procura dos CMPs conhecidos (umas consultas ao documento inteiro)
+/// corre no maximo uma vez neste intervalo, em ms, numa pagina que muda
+/// sem parar.
+pub const CMP_PASS_EVERY_MS: u32 = 250;
 /// O script para de observar a pagina depois disto sem mudancas.
 pub const IDLE_STOP_MS: u32 = 30_000;
 /// O que aparece ate este tempo depois de um clique ou de uma tecla do
@@ -609,13 +655,13 @@ pub fn distraction_config(
 }
 
 /// Um seletor que acha um elemento com um destes marcadores no `id` ou na
-/// `class` (os espacos viram `-`).
+/// `class`, sem olhar a maiusculas (`PaywallModal`); os espacos viram `-`.
 fn marker_selector(markers: &[&str]) -> String {
     let mut parts = Vec::new();
     for marker in markers {
         let marker = marker.replace(' ', "-");
-        parts.push(format!(r#"[class*="{marker}"]"#));
-        parts.push(format!(r#"[id*="{marker}"]"#));
+        parts.push(format!(r#"[class*="{marker}" i]"#));
+        parts.push(format!(r#"[id*="{marker}" i]"#));
     }
     parts.join(", ")
 }
@@ -661,7 +707,9 @@ pub fn script_config(policy: &DistractionPolicy) -> Value {
         "newsletter": NEWSLETTER_MARKERS,
         "stickyMin": STICKY_MIN_RATIO,
         "stickyMax": STICKY_MAX_RATIO,
+        "frameWall": FRAME_WALL_RATIO,
         "budgetMs": FRAME_BUDGET_MS,
+        "cmpMs": CMP_PASS_EVERY_MS,
         "idleMs": IDLE_STOP_MS,
         "userMs": USER_OPENED_MS,
         "maxLabel": MAX_LABEL_CHARS,

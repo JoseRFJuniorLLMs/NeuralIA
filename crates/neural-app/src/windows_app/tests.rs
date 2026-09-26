@@ -29660,8 +29660,9 @@ function MOCK() {
   var $String = String;
   var $assign = Object.assign;
   var $stringify = JSON.stringify;
-  var log = { clicks: [], pageClicks: [], posted: [], errors: [], network: [], timersRun: 0, maxSpent: 0 };
-  var state = { clock: 0, styleCost: 0, timers: [], observers: [] };
+  var log = { clicks: [], pageClicks: [], posted: [], errors: [], network: [], timersRun: 0, maxSpent: 0,
+    maxMutation: 0, docQueries: 0 };
+  var state = { clock: 0, styleCost: 0, qsaCost: 0, timers: [], observers: [] };
   g.__log = log;
   g.__state = state;
   g.__push = $push;
@@ -29694,7 +29695,18 @@ function MOCK() {
           var rest = $slice(body, k + op.length);
           var quote = rest[0];
           attr.op = op;
-          attr.value = (quote === '"' || quote === "'") ? $slice(rest, 1, rest.length - 1) : rest;
+          if (quote === '"' || quote === "'") {
+            // `[a*="v" i]`: sem olhar a maiusculas.
+            var close = $indexOf(rest, quote, 1);
+            attr.value = $slice(rest, 1, close);
+            var flag = $slice(rest, close + 1), f = 0;
+            while (f < flag.length && isSpace(flag[f])) f++;
+            flag = $slice(flag, f);
+            if (flag === 'i') attr.i = true;
+            else if (flag.length) throw new SyntaxError('flag: ' + text);
+          } else {
+            attr.value = rest;
+          }
         }
         $push(c.attrs, attr);
         i = end + 1;
@@ -29771,22 +29783,23 @@ function MOCK() {
     var cls = attrOf(el, 'class');
     for (i = 0; i < c.classes.length; i++) if (cls === null || !hasClass(cls, c.classes[i])) return false;
     for (i = 0; i < c.attrs.length; i++) {
-      var a = c.attrs[i], v = attrOf(el, a.name);
+      var a = c.attrs[i], v = attrOf(el, a.name), want = a.value;
       if (v === null) return false;
-      if (a.op === '=' && v !== a.value) return false;
-      if (a.op === '^=' && !(a.value.length && $indexOf(v, a.value) === 0)) return false;
-      if (a.op === '*=' && !(a.value.length && $indexOf(v, a.value) >= 0)) return false;
-      if (a.op === '$=' && !(a.value.length && v.length >= a.value.length &&
-          $slice(v, v.length - a.value.length) === a.value)) return false;
+      if (a.i) { v = $lower(v); want = $lower(want); }
+      if (a.op === '=' && v !== want) return false;
+      if (a.op === '^=' && !(want.length && $indexOf(v, want) === 0)) return false;
+      if (a.op === '*=' && !(want.length && $indexOf(v, want) >= 0)) return false;
+      if (a.op === '$=' && !(want.length && v.length >= want.length &&
+          $slice(v, v.length - want.length) === want)) return false;
     }
     return true;
   }
   function matchSeq(el, seq, index) {
     if (!matchCompound(el, seq[index].c)) return false;
     if (index === 0) return true;
-    var parent = el.parentNode;
+    var parent = el.__parent;
     if (seq[index].comb === '>') return !!parent && parent.__type === 1 && matchSeq(parent, seq, index - 1);
-    for (var a = parent; a && a.__type === 1; a = a.parentNode) if (matchSeq(a, seq, index - 1)) return true;
+    for (var a = parent; a && a.__type === 1; a = a.__parent) if (matchSeq(a, seq, index - 1)) return true;
     return false;
   }
   function qsa(root, selector) {
@@ -29796,6 +29809,7 @@ function MOCK() {
       for (var i = 0; i < node.childNodes.length; i++) {
         var child = node.childNodes[i];
         if (child.__type !== 1) continue;
+        state.clock += state.qsaCost;
         for (var s = 0; s < seqs.length; s++) {
           if (matchSeq(child, seqs[s], seqs[s].length - 1)) { $push(items, child); break; }
         }
@@ -29834,7 +29848,7 @@ function MOCK() {
       for (var t = 0; t < obs.__targets.length; t++) {
         var target = obs.__targets[t], hit = target.target === parent;
         if (!hit && target.subtree) {
-          for (var a = parent; a; a = a.parentNode) if (a === target.target) { hit = true; break; }
+          for (var a = parent; a; a = a.__parent) if (a === target.target) { hit = true; break; }
         }
         if (hit) { $push(obs.__pending, new g.MutationRecord(parent, [child])); break; }
       }
@@ -29849,14 +29863,15 @@ function MOCK() {
     removeEventListener() {}
   };
   g.Node = class Node extends g.EventTarget {
-    constructor() { super(); this.parentNode = null; this.childNodes = []; }
+    constructor() { super(); this.__parent = null; this.childNodes = []; }
     get nodeType() { return this.__type; }
+    get parentNode() { return this.__parent; }
     contains(other) {
-      for (var n = other; n; n = n.parentNode) if (n === this) return true;
+      for (var n = other; n; n = n.__parent) if (n === this) return true;
       return false;
     }
     appendChild(child) {
-      child.parentNode = this;
+      child.__parent = this;
       $push(this.childNodes, child);
       mutated(this, child);
       return child;
@@ -29883,8 +29898,28 @@ function MOCK() {
     get localName() { return this.__tag; }
     getAttribute(name) { return attrOf(this, $String(name)); }
     querySelectorAll(selector) { return qsa(this, selector); }
+    get firstElementChild() {
+      for (var i = 0; i < this.childNodes.length; i++) if (this.childNodes[i].__type === 1) return this.childNodes[i];
+      return null;
+    }
+    get nextElementSibling() {
+      var parent = this.__parent, after = false;
+      if (!parent) return null;
+      for (var i = 0; i < parent.childNodes.length; i++) {
+        var node = parent.childNodes[i];
+        if (after && node.__type === 1) return node;
+        if (node === this) after = true;
+      }
+      return null;
+    }
+    // Como o navegador: sem caixa quando ele ou um antepassado (tambem
+    // pelo anfitriao de uma shadow root) tem `display: none`; sem `rect`
+    // na fixture, uma caixa pequena no topo.
     getBoundingClientRect() {
-      var r = this.__rect || [0, 0, 0, 0];
+      for (var a = this; a; a = a.__type === 11 ? a.host : a.__parent) {
+        if (a.__type === 1 && computedValue(a, 'display') === 'none') return new g.DOMRect(0, 0, 0, 0);
+      }
+      var r = this.__rect || [0, 0, 100, 20];
       return new g.DOMRect(r[0], r[1], r[2], r[3]);
     }
     get shadowRoot() { return this.__shadow && this.__shadow.__open ? this.__shadow : null; }
@@ -29913,6 +29948,18 @@ function MOCK() {
       state.clock += state.styleCost;
       return computedValue(this.__el, name);
     }
+    getPropertyPriority(name) {
+      name = $String(name);
+      return this.__isInline && $hasOwn(this.__el.__priority, name) ? this.__el.__priority[name] : '';
+    }
+    removeProperty(name) {
+      if (!this.__isInline) throw new Error('estilo computado e so leitura');
+      name = $String(name);
+      var old = $hasOwn(this.__el.__inline, name) ? this.__el.__inline[name] : '';
+      delete this.__el.__inline[name];
+      delete this.__el.__priority[name];
+      return old;
+    }
   };
   g.DocumentFragment = class DocumentFragment extends g.Node {
     querySelectorAll(selector) { return qsa(this, selector); }
@@ -29934,7 +29981,7 @@ function MOCK() {
     }
     get readyState() { return this.__ready; }
     get activeElement() { return this.__active || this.body; }
-    querySelectorAll(selector) { return qsa(this, selector); }
+    querySelectorAll(selector) { log.docQueries++; return qsa(this, selector); }
   };
   g.NodeList = class NodeList {
     constructor(items) { this.__items = items; }
@@ -29992,7 +30039,7 @@ function MOCK() {
     var kids = spec.children || [];
     for (var i = 0; i < kids.length; i++) {
       var child = build(kids[i]);
-      child.parentNode = el;
+      child.__parent = el;
       $push(el.childNodes, child);
     }
     if (spec.shadow) {
@@ -30000,7 +30047,7 @@ function MOCK() {
       var inner = spec.shadow.children || [];
       for (var j = 0; j < inner.length; j++) {
         var node = build(inner[j]);
-        node.parentNode = root;
+        node.__parent = root;
         $push(root.childNodes, node);
       }
       el.__shadow = root;
@@ -30022,7 +30069,7 @@ function MOCK() {
     html.__clientWidth = viewport[0];
     html.__clientHeight = viewport[1];
     html.__scrollHeight = scrollHeight;
-    html.parentNode = g.document;
+    html.__parent = g.document;
     $push(g.document.childNodes, html);
     var body = g.document.body;
     if (body) body.__scrollHeight = scrollHeight;
@@ -30056,7 +30103,9 @@ function MOCK() {
       if (!obs.__pending.length) continue;
       var records = obs.__pending;
       obs.__pending = [];
+      var before = state.clock;
       timed(obs.__cb, obs, records);
+      if (state.clock - before > log.maxMutation) log.maxMutation = state.clock - before;
     }
   };
   g.__runUntil = function (until) {
@@ -30096,6 +30145,7 @@ function MOCK() {
     return $stringify({
       clicks: log.clicks, pageClicks: log.pageClicks, posted: log.posted, errors: log.errors,
       network: log.network, hidden: hidden, timersRun: log.timersRun, maxSpent: log.maxSpent,
+      maxMutation: log.maxMutation, docQueries: log.docQueries,
       listeners: (g.document.__listeners || []).length + (g.__listeners || []).length,
       observers: state.observers.length, observing: observing,
       htmlOverflow: overflow(de), bodyOverflow: overflow(body)
@@ -30121,11 +30171,16 @@ function POISON() {
   g.Element.prototype.getAttribute = function () { return 'aceitar'; };
   Object.defineProperty(g.Element.prototype, 'shadowRoot', { configurable: true, get: function () { return null; } });
   Object.defineProperty(g.Element.prototype, 'clientHeight', { configurable: true, get: function () { return 0; } });
-  ['top', 'bottom', 'width', 'height'].forEach(function (name) {
+  Object.defineProperty(g.Node.prototype, 'parentNode', { configurable: true, get: function () { return null; } });
+  Object.defineProperty(g.Element.prototype, 'firstElementChild', { configurable: true, get: function () { return null; } });
+  Object.defineProperty(g.Element.prototype, 'nextElementSibling', { configurable: true, get: boom });
+  ['top', 'bottom', 'left', 'right', 'width', 'height'].forEach(function (name) {
     Object.defineProperty(g.DOMRectReadOnly.prototype, name, { configurable: true, get: function () { return 0; } });
   });
   g.CSSStyleDeclaration.prototype.setProperty = function () {};
   g.CSSStyleDeclaration.prototype.getPropertyValue = function () { return 'static'; };
+  g.CSSStyleDeclaration.prototype.getPropertyPriority = boom;
+  g.CSSStyleDeclaration.prototype.removeProperty = boom;
   g.getComputedStyle = boom;
   g.Node.prototype.contains = function () { return true; };
   Object.defineProperty(g.MutationRecord.prototype, 'addedNodes', { configurable: true, get: empty });
@@ -30158,6 +30213,7 @@ for (const c of INPUT.cases) {
   vm.runInContext('location = __loc;', context);
   if (c.child) vm.runInContext('top = {};', context);
   context.__state.styleCost = c.styleCost || 0;
+  context.__state.qsaCost = c.qsaCost || 0;
   const errors = [];
   try {
     vm.runInContext(c.script, context, { filename: 'distraction.js' });
@@ -30179,6 +30235,14 @@ for (const c of INPUT.cases) {
     } else if (step.advance) {
       context.__ms = step.advance;
       vm.runInContext('__runUntil(__state.clock + __ms);', context);
+    } else if (step.burst) {
+      // Uma pagina que nao para: `count` elementos pequenos, um a cada `every` ms.
+      context.__parent = step.burst[0];
+      context.__ms = step.burst[2];
+      for (let b = 0; b < step.burst[1]; b++) {
+        context.__node = { tag: 'span', children: ['x'] };
+        vm.runInContext('__add(__parent, __node); __flush(); __runUntil(__state.clock + __ms);', context);
+      }
     } else if (step.input) {
       context.__type = step.input;
       vm.runInContext('__fireWindow(__type);', context);
@@ -30257,7 +30321,7 @@ process.stdout.write(JSON.stringify(results));
                     button(json!({ "id": "onetrust-accept-btn-handler", "data-fixture": "accept" }), "Aceitar todos os cookies"),
                     button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), reject)
                 ] },
-                { "tag": "div", "attrs": { "class": "onetrust-pc-dark-filter", "data-fixture": "banner" },
+                { "tag": "div", "attrs": { "class": "onetrust-pc-dark-filter", "data-fixture": "backdrop" },
                   "css": { "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800] }
             ] }),
                 ],
@@ -30275,8 +30339,8 @@ process.stdout.write(JSON.stringify(results));
             "didomi" => (
                 NEWS,
                 vec![
-                    json!({ "tag": "div", "attrs": { "id": "didomi-host", "data-fixture": "banner" }, "children": [
-                { "tag": "div", "attrs": { "id": "didomi-notice" }, "css": { "position": "fixed" }, "rect": [0, 700, 1200, 100], "children": [
+                    json!({ "tag": "div", "attrs": { "id": "didomi-host" }, "children": [
+                { "tag": "div", "attrs": { "id": "didomi-notice", "data-fixture": "banner" }, "css": { "position": "fixed" }, "rect": [0, 700, 1200, 100], "children": [
                     button(json!({ "id": "didomi-notice-agree-button", "data-fixture": "accept" }), "Concordar e fechar"),
                     button(json!({ "id": "didomi-notice-disagree-button", "data-fixture": "reject" }), reject)
                 ] }
@@ -30286,7 +30350,7 @@ process.stdout.write(JSON.stringify(results));
             "usercentrics" => (
                 NEWS,
                 vec![
-                    json!({ "tag": "div", "attrs": { "id": "usercentrics-root", "data-fixture": "banner" },
+                    json!({ "tag": "div", "attrs": { "id": "usercentrics-root" },
                 "shadow": { "open": true, "children": [
                     { "tag": "div", "attrs": { "class": "sc-dialog" }, "children": [
                         button(json!({ "data-testid": "uc-accept-all-button", "data-fixture": "accept" }), "Aceitar todos"),
@@ -30383,7 +30447,7 @@ process.stdout.write(JSON.stringify(results));
                 NEWS,
                 vec![
                     json!({ "tag": "div", "attrs": { "id": "sp_message_container_1234", "data-fixture": "banner" },
-                "css": { "position": "fixed", "z-index": "2147483647" }, "rect": [0, 0, 1200, 800], "children": [
+                "css": { "position": "fixed", "z-index": "2147483647" }, "rect": [0, 650, 1200, 150], "children": [
                     { "tag": "iframe", "attrs": { "id": "sp_message_iframe_1234", "src": "https://cdn.privacy-mgmt.com/index.html" } }
                 ] }),
                 ],
@@ -30413,6 +30477,35 @@ process.stdout.write(JSON.stringify(results));
             }
             Value::Array(items) => items.iter().map(banner_count).sum(),
             _ => 0,
+        }
+    }
+
+    /// Os `data-fixture` da fixture que estao em `wanted`, pela ordem do
+    /// documento (a do `__collect`: o elemento, os filhos, a shadow root).
+    fn fixture_names(value: &Value, wanted: &[&str], out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(name) = map
+                    .get("attrs")
+                    .and_then(|attrs| attrs.get("data-fixture"))
+                    .and_then(Value::as_str)
+                    .filter(|name| wanted.contains(name))
+                {
+                    out.push(name.to_string());
+                }
+                if let Some(children) = map.get("children") {
+                    fixture_names(children, wanted, out);
+                }
+                if let Some(shadow) = map.get("shadow") {
+                    fixture_names(shadow, wanted, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    fixture_names(item, wanted, out);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -30461,6 +30554,9 @@ process.stdout.write(JSON.stringify(results));
                     "{}: a fixture e a regra discordam do que se esconde",
                     rule.id
                 );
+                // O aviso e, ao lado dele, o fundo vazio (o do OneTrust).
+                let mut hides = Vec::new();
+                fixture_names(&json!(body), &["banner", "backdrop"], &mut hides);
                 cases.push(case(
                     &format!("{} / {label}", rule.id),
                     href,
@@ -30468,11 +30564,11 @@ process.stdout.write(JSON.stringify(results));
                     page(body),
                 ));
                 let clicks = clicks && rule.reject.is_some() && !rule.frame_only;
-                expected.push((clicks, banners));
+                expected.push((clicks, hides));
             }
         }
         let results = run_distraction(&cases);
-        for (result, (clicks, banners)) in results.iter().zip(expected) {
+        for (result, (clicks, hides)) in results.iter().zip(expected) {
             let name = result["name"].as_str().unwrap_or_default();
             assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
             assert_eq!(
@@ -30486,7 +30582,7 @@ process.stdout.write(JSON.stringify(results));
             );
             assert_eq!(
                 strings(&result["hidden"]),
-                vec!["banner".to_string(); banners],
+                hides,
                 "{name}: o que se escondeu"
             );
             assert_eq!(strings(&result["posted"]), Vec::<String>::new(), "{name}");
@@ -30582,15 +30678,44 @@ process.stdout.write(JSON.stringify(results));
         assert!(acted_on >= 7, "{acted_on}");
     }
 
-    /// Gate (critico, script injetado): um paywall fica intocado. Um
-    /// modal do Piano que tambem fala de newsletter, uma barra de paywall
-    /// com 30% da altura e um aviso de CMP com um marcador de "pague ou
-    /// aceite" (contentpass): nada se esconde, nada se clica, a rolagem
-    /// presa fica presa. O controlo: o mesmo modal sem o marcador
-    /// (newsletter) sai, com o fundo, e a rolagem volta.
+    /// Um aviso de cookies generico (fixo, `cookie` na classe), no fundo.
+    fn cookie_bar() -> Value {
+        json!({ "tag": "div", "attrs": { "class": "cookie-bar", "data-fixture": "cookie" },
+            "css": { "position": "fixed" }, "rect": [0, 740, 1200, 60], "children": ["Usamos cookies."] })
+    }
+
+    /// Uma moldura do Sourcepoint que tapa a janela: o "pague ou aceite"
+    /// (pur abo, contentpass) vive dentro dela, onde o script nao le.
+    fn sourcepoint_wall() -> Value {
+        json!({ "tag": "div", "attrs": { "id": "sp_message_container_999", "data-fixture": "sp-wall" },
+            "css": { "position": "fixed", "z-index": "2147483647" }, "rect": [0, 0, 1200, 800], "children": [
+                { "tag": "iframe", "attrs": { "id": "sp_message_iframe_999", "src": "https://cdn.privacy-mgmt.com/index.html" } }
+            ] })
+    }
+
+    /// Gate (critico, script injetado): um paywall fica intocado, e com um
+    /// na pagina a rolagem e os fundos ficam como a pagina os pos.
     ///
-    /// Sabotagem: o `hasMarker(..., C.paywall)` a devolver sempre `false`
-    /// -> vermelho.
+    /// Intocados (nada escondido, nada clicado, a rolagem presa fica presa):
+    /// um modal do Piano que tambem fala de newsletter, uma barra de paywall
+    /// com 30% da altura, um aviso de CMP com um marcador de "pague ou
+    /// aceite" (contentpass), as molduras do Sourcepoint e do TrustArc que
+    /// tapam a janela, presa ou nao (o "pague ou aceite" esta dentro delas,
+    /// onde o script nao le -- F1), e a pequena numa pagina presa.
+    ///
+    /// Com o aviso de cookies escondido ao lado de um paywall (F2): um
+    /// paywall so pelo texto («Assine para continuar»), um `PaywallModal`
+    /// (maiusculas), o fundo sem marcador de um paywall do Piano, e a
+    /// moldura do Sourcepoint com uma newsletter: sai so o aviso (ou a
+    /// newsletter), o paywall e o fundo ficam, e a rolagem nunca volta. Um
+    /// paywall que chega DEPOIS de a rolagem ter voltado desfaz a volta.
+    ///
+    /// O controlo: o mesmo modal sem o marcador (newsletter) sai, com o
+    /// fundo, e a rolagem volta.
+    ///
+    /// Sabotagens: o `hasMarker(..., C.paywall)` a devolver sempre `false`;
+    /// a `frameOnly` a esconder tambem a moldura que tapa; o `walled = true`
+    /// do `examine` retirado -> vermelho.
     #[test]
     fn paywall_overlays_are_never_touched() {
         let script = distraction_script(&DistractionPolicy::default());
@@ -30609,16 +30734,34 @@ process.stdout.write(JSON.stringify(results));
                 button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), "Rejeitar tudo")
             ] }
         ] });
-        let newsletter = json!({ "tag": "div", "attrs": { "class": "newsletter-modal", "role": "dialog", "data-fixture": "newsletter" },
+        let trustarc_wall = json!({ "tag": "div", "attrs": { "class": "truste_box_overlay", "data-fixture": "ta-wall" },
+            "css": { "position": "fixed", "z-index": "1000" }, "rect": [0, 0, 1200, 800], "children": [
+                { "tag": "iframe", "attrs": { "src": "https://consent-pref.trustarc.com/?type=x" } }
+            ] });
+        let newsletter = || {
+            json!({ "tag": "div", "attrs": { "class": "newsletter-modal", "role": "dialog", "data-fixture": "newsletter" },
             "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
                 "Receba a nossa newsletter toda semana."
+            ] })
+        };
+        let text_sheet = json!({ "tag": "div", "attrs": { "data-fixture": "paywall" },
+            "css": { "position": "fixed", "z-index": "50" }, "rect": [0, 400, 1200, 400], "children": [
+                "Assine para continuar lendo esta matéria."
             ] });
-        let cases = [
+        let camel = json!({ "tag": "div", "attrs": { "class": "PaywallModal", "role": "dialog", "data-fixture": "paywall" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Leia sem limites por R$ 1,90."
+            ] });
+        let untouched = [
             case(
                 "piano",
                 NEWS,
                 &script,
-                page_with(json!({}), locked.clone(), vec![piano, backdrop.clone()]),
+                page_with(
+                    json!({}),
+                    locked.clone(),
+                    vec![piano.clone(), backdrop.clone()],
+                ),
             ),
             case(
                 "barra",
@@ -30633,29 +30776,175 @@ process.stdout.write(JSON.stringify(results));
                 page_with(json!({}), locked.clone(), vec![pay_or_ok]),
             ),
             case(
-                "newsletter",
+                "sourcepoint pague ou aceite",
                 NEWS,
                 &script,
-                page_with(json!({}), locked, vec![newsletter, backdrop]),
+                page_with(json!({}), locked.clone(), vec![sourcepoint_wall()]),
+            ),
+            case(
+                "trustarc que tapa",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![trustarc_wall]),
+            ),
+            // A que tapa sem prender a rolagem tambem fica: o tamanho basta.
+            case(
+                "sourcepoint que tapa sem prender",
+                NEWS,
+                &script,
+                page(vec![sourcepoint_wall()]),
+            ),
+            // A pequena numa pagina presa fica (escondida, nao havia saida).
+            case(
+                "sourcepoint pequena numa pagina presa",
+                NEWS,
+                &script,
+                page_with(
+                    json!({}),
+                    locked.clone(),
+                    cmp_fixture("sourcepoint", "x").expect("sourcepoint").1,
+                ),
             ),
         ];
+        // O aviso sai; o paywall, o fundo dele e a rolagem presa ficam.
+        let beside = [
+            (
+                case(
+                    "paywall pelo texto",
+                    NEWS,
+                    &script,
+                    page_with(json!({}), locked.clone(), vec![text_sheet, cookie_bar()]),
+                ),
+                vec!["cookie"],
+            ),
+            (
+                case(
+                    "PaywallModal",
+                    NEWS,
+                    &script,
+                    page_with(json!({}), locked.clone(), vec![camel, cookie_bar()]),
+                ),
+                vec!["cookie"],
+            ),
+            (
+                case(
+                    "fundo do paywall",
+                    NEWS,
+                    &script,
+                    page_with(
+                        json!({}),
+                        locked.clone(),
+                        vec![piano, backdrop.clone(), cookie_bar()],
+                    ),
+                ),
+                vec!["cookie"],
+            ),
+            (
+                case(
+                    "sourcepoint e newsletter",
+                    NEWS,
+                    &script,
+                    page_with(
+                        json!({}),
+                        locked.clone(),
+                        vec![sourcepoint_wall(), newsletter(), backdrop.clone()],
+                    ),
+                ),
+                vec!["newsletter"],
+            ),
+        ];
+        let mut late = case(
+            "paywall tardio",
+            NEWS,
+            &script,
+            page_with(json!({}), locked.clone(), vec![cookie_bar()]),
+        );
+        late["steps"] = json!([
+            { "advance": 2000 },
+            { "add": ["body", { "tag": "div", "attrs": { "class": "paywall-modal", "role": "dialog", "data-fixture": "paywall" },
+                "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400],
+                "children": ["Leia sem limites"] }] }
+        ]);
+        let mut restored_before = late.clone();
+        restored_before["steps"] = json!([{ "advance": 2000 }]);
+        // Um molde de paywall escondido no documento (de quem ja assina):
+        // a newsletter e o fundo dela saem, mas a rolagem fica presa.
+        let template = case(
+            "molde escondido",
+            NEWS,
+            &script,
+            page_with(
+                json!({}),
+                locked.clone(),
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "paywall-template" }, "css": { "display": "none" },
+                        "children": ["Assine para continuar"] }),
+                    newsletter(),
+                    backdrop.clone(),
+                ],
+            ),
+        );
+        let control = case(
+            "newsletter",
+            NEWS,
+            &script,
+            page_with(json!({}), locked, vec![newsletter(), backdrop]),
+        );
+
+        let mut cases: Vec<Value> = untouched.to_vec();
+        cases.extend(beside.iter().map(|(case, _)| case.clone()));
+        cases.extend([late, restored_before, template, control]);
         let results = run_distraction(&cases);
-        for result in &results[..3] {
+        for result in &results {
             let name = result["name"].as_str().unwrap_or_default();
             assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{name}");
+        }
+        let (untouched_results, rest) = results.split_at(untouched.len());
+        for result in untouched_results {
+            let name = result["name"].as_str().unwrap_or_default();
             assert_eq!(
                 strings(&result["hidden"]),
                 Vec::<String>::new(),
-                "{name}: tocou no paywall"
+                "{name}: tocou no paywall: {result}"
             );
-            assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{name}");
             assert_eq!(
                 result["bodyOverflow"],
                 Value::Null,
                 "{name}: devolveu a rolagem"
             );
         }
-        let control = &results[3];
+        let (beside_results, rest) = rest.split_at(beside.len());
+        for (result, (_, hidden)) in beside_results.iter().zip(&beside) {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(
+                strings(&result["hidden"]),
+                *hidden,
+                "{name}: o paywall ou o fundo dele saiu: {result}"
+            );
+            assert_eq!(
+                result["bodyOverflow"],
+                Value::Null,
+                "{name}: devolveu a rolagem com um paywall na pagina: {result}"
+            );
+        }
+        let (late, restored_before, template, control) = (&rest[0], &rest[1], &rest[2], &rest[3]);
+        assert_eq!(
+            strings(&template["hidden"]),
+            ["newsletter", "backdrop"],
+            "{template}"
+        );
+        assert_eq!(template["bodyOverflow"], Value::Null, "{template}");
+        assert_eq!(strings(&late["hidden"]), ["cookie"], "{late}");
+        assert_eq!(
+            late["bodyOverflow"],
+            Value::Null,
+            "a rolagem devolvida antes do paywall ficou: {late}"
+        );
+        assert_eq!(
+            restored_before["bodyOverflow"], "auto",
+            "o controlo do paywall tardio: {restored_before}"
+        );
         assert_eq!(
             strings(&control["hidden"]),
             ["newsletter", "backdrop"],
@@ -30968,16 +31257,18 @@ process.stdout.write(JSON.stringify(results));
         assert_eq!(results[0]["htmlOverflow"], "auto", "{}", results[0]);
         assert_eq!(results[0]["bodyOverflow"], "auto", "{}", results[0]);
         assert_eq!(results[1]["bodyOverflow"], Value::Null, "{}", results[1]);
-        assert_eq!(strings(&results[1]["hidden"]), ["banner", "banner"]);
+        assert_eq!(strings(&results[1]["hidden"]), ["banner", "backdrop"]);
         assert_eq!(strings(&results[2]["hidden"]), Vec::<String>::new());
         assert_eq!(results[2]["bodyOverflow"], Value::Null, "{}", results[2]);
     }
 
-    /// Gate (amostrado): o limiar das barras fixas. Encostada ao topo ou ao
-    /// fundo, com pelo menos metade da largura: 20% da altura fica, 25% e
-    /// 30% saem; um layout fixo da pagina inteira fica; uma barra estreita
-    /// ou no meio da janela fica; a que tem o foco (o utilizador escreve
-    /// nela) fica.
+    /// Gate (amostrado): o limiar das barras fixas. Na janela, encostada ao
+    /// topo ou ao fundo, com pelo menos metade da largura: 20% da altura
+    /// fica, 25% e 30% saem; um layout fixo da pagina inteira fica; uma
+    /// barra estreita ou no meio da janela fica; a que tem o foco (o
+    /// utilizador escreve nela) fica; fora da janela -- uma seccao presa
+    /// mais abaixo, um menu arrumado abaixo do fundo ou acima do topo --
+    /// fica (F5).
     ///
     /// Sabotagem (amostra da tarefa): `stickyMin` a 0.1 -> a barra de 20%
     /// sai -> vermelho.
@@ -30995,6 +31286,12 @@ process.stdout.write(JSON.stringify(results));
             bar("layout", "fixed", [0, 0, 1200, 800]),
             bar("narrow", "fixed", [0, 0, 400, 400]),
             bar("middle", "fixed", [0, 200, 1200, 300]),
+            // Fora da janela (F5): uma seccao presa mais abaixo na pagina, um
+            // menu arrumado logo abaixo do fundo e outro acima do topo.
+            bar("section-below", "sticky", [0, 2400, 1200, 400]),
+            bar("parked-sheet", "fixed", [0, 800, 1200, 480]),
+            json!({ "tag": "div", "attrs": { "data-fixture": "parked-above" }, "css": { "position": "fixed" },
+                "rect": [0, -600, 1200, 300], "children": ["menu"] }),
             json!({ "tag": "div", "attrs": { "data-fixture": "chat" }, "css": { "position": "fixed" },
                 "rect": [0, 500, 1200, 300], "children": [
                     { "tag": "textarea", "attrs": { "data-fixture": "typing" } }
@@ -31013,10 +31310,11 @@ process.stdout.write(JSON.stringify(results));
     }
 
     /// Gate (amostrado): o ritmo. Com cada leitura de estilo a custar 1 ms
-    /// (relogio virtual), o script cede a vez depois de 8 ms e acaba o
+    /// (relogio virtual), o exame cede a vez depois de 8 ms e acaba o
     /// trabalho em varias vezes; depois de 30 s sem mudancas deixa de
     /// observar a pagina (um aviso que chega depois fica), antes disso
-    /// ainda o apanha.
+    /// ainda o apanha. Uma insercao de 3000 elementos nao e copiada pelo
+    /// observador, e a procura dos CMPs corre no maximo a cada 250 ms.
     #[test]
     fn the_script_yields_after_8_ms_and_stops_after_30_s_idle() {
         let script = distraction_script(&DistractionPolicy::default());
@@ -31040,7 +31338,18 @@ process.stdout.write(JSON.stringify(results));
         idle["steps"] = json!([{ "advance": 31000 }, { "add": ["body", late("too-late")] }]);
         let mut busy = case("a tempo", NEWS, &script, page(vec![]));
         busy["steps"] = json!([{ "advance": 20000 }, { "add": ["body", late("in-time")] }]);
-        let results = run_distraction(&[slow, idle, busy]);
+        // F7: uma insercao grande nao e copiada inteira (cada no visitado
+        // por uma consulta custa 0,01 ms), e numa pagina que muda a cada
+        // 40 ms durante 3 s a procura dos CMPs corre no maximo a cada 250 ms.
+        let spans: Vec<Value> = (0..3000)
+            .map(|_| json!({ "tag": "span", "children": ["x"] }))
+            .collect();
+        let mut big = case("arvore grande", NEWS, &script, page(vec![]));
+        big["qsaCost"] = json!(0.01);
+        big["steps"] = json!([{ "add": ["body", { "tag": "div", "children": spans }] }]);
+        let mut restless = case("sem parar", NEWS, &script, page(vec![]));
+        restless["steps"] = json!([{ "burst": ["body", 75, 40] }]);
+        let results = run_distraction(&[slow, idle, busy, big, restless]);
         let slow = &results[0];
         assert_eq!(strings(&slow["hidden"]), ["last-bar"], "{slow}");
         assert!(slow["timersRun"].as_u64().unwrap_or(0) >= 5, "{slow}");
@@ -31057,6 +31366,20 @@ process.stdout.write(JSON.stringify(results));
             ["in-time"],
             "{}",
             results[2]
+        );
+        let big = &results[3];
+        assert_eq!(strings(&big["errors"]), Vec::<String>::new(), "{big}");
+        assert!(
+            big["maxMutation"].as_f64().unwrap_or(99.0) < 1.0,
+            "o observador copiou a insercao inteira: {big}"
+        );
+        // Uma procura = uma consulta ao documento por regra; mais a do
+        // inicio. 3 s a cada 250 ms: 12 procuras, e a do inicio.
+        let restless = &results[4];
+        let searches = restless["docQueries"].as_u64().unwrap_or(u64::MAX) / CMP_RULES.len() as u64;
+        assert!(
+            (3..=15).contains(&searches),
+            "{searches} procuras dos CMPs em 3 s: {restless}"
         );
     }
 
@@ -31167,5 +31490,227 @@ process.stdout.write(JSON.stringify(results));
         assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{result}");
         assert_eq!(strings(&result["hidden"]), ["later-bar"], "{result}");
         assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{result}");
+    }
+
+    /// Gate (critico, script injetado; F3, SPEC-0114 «as definicoes de
+    /// cookies do rodape ficam»): um CMP sem aviso visivel -- de quem ja
+    /// respondeu -- nao recebe clique nem fica escondido. O OneTrust com o
+    /// aviso e o centro de preferencias escondidos (com «Rejeitar tudo» la
+    /// dentro), o Cookiebot escondido e o Usercentrics com o aviso fechado
+    /// na shadow root: zero cliques, nada escondido. O `#didomi-host`
+    /// (vazio, depois da resposta) nunca sai, e as preferencias que o
+    /// utilizador abre nele ficam visiveis.
+    ///
+    /// Sabotagem: o `visible(...)` dos candidatos do `runCmps` a devolver
+    /// sempre `true` -> vermelho.
+    #[test]
+    fn cmp_settings_the_user_opens_stay() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let gone = json!({ "display": "none" });
+        let onetrust = json!({ "tag": "div", "attrs": { "id": "onetrust-consent-sdk" }, "children": [
+            { "tag": "div", "attrs": { "id": "onetrust-banner-sdk" }, "css": gone.clone(), "children": [
+                button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), "Rejeitar tudo")
+            ] },
+            { "tag": "div", "attrs": { "id": "onetrust-pc-sdk" }, "css": gone.clone(), "children": [
+                button(json!({ "class": "ot-pc-refuse-all-handler", "data-fixture": "pc-reject" }), "Rejeitar tudo")
+            ] },
+            { "tag": "div", "attrs": { "class": "onetrust-pc-dark-filter" },
+              "css": { "display": "none", "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800] }
+        ] });
+        let cookiebot = json!({ "tag": "div", "attrs": { "id": "CybotCookiebotDialog" }, "css": gone.clone(),
+            "rect": [0, 680, 1200, 120], "children": [
+                button(json!({ "id": "CybotCookiebotDialogBodyButtonDecline", "data-fixture": "cb-reject" }), "Recusar")
+            ] });
+        let usercentrics = json!({ "tag": "div", "attrs": { "id": "usercentrics-root" },
+            "shadow": { "open": true, "children": [
+                { "tag": "div", "attrs": { "class": "sc-dialog" }, "css": gone, "children": [
+                    button(json!({ "data-testid": "uc-deny-all-button", "data-fixture": "uc-reject" }), "Rejeitar")
+                ] }
+            ] } });
+        let mut didomi = case(
+            "didomi respondido",
+            NEWS,
+            &script,
+            page(vec![
+                json!({ "tag": "div", "attrs": { "id": "didomi-host" } }),
+            ]),
+        );
+        didomi["steps"] = json!([
+            { "advance": 5000 },
+            { "input": "pointerdown" },
+            { "add": ["didomi-host", { "tag": "div", "attrs": { "class": "didomi-popup-backdrop", "data-fixture": "preferences" },
+                "css": { "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800], "children": [
+                    "Preferências de privacidade",
+                    button(json!({ "id": "didomi-notice-disagree-button" }), "Rejeitar tudo")
+                ] }] }
+        ]);
+        let results = run_distraction(&[
+            case("onetrust respondido", NEWS, &script, page(vec![onetrust])),
+            case("cookiebot respondido", NEWS, &script, page(vec![cookiebot])),
+            case(
+                "usercentrics fechado",
+                NEWS,
+                &script,
+                page(vec![usercentrics]),
+            ),
+            didomi,
+        ]);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(
+                strings(&result["clicks"]),
+                Vec::<String>::new(),
+                "{name}: clicou sem aviso visivel: {result}"
+            );
+            assert_eq!(
+                strings(&result["hidden"]),
+                Vec::<String>::new(),
+                "{name}: escondeu o que o utilizador abre depois: {result}"
+            );
+        }
+    }
+
+    /// Gate (amostrado; F4): um fundo de ecra inteiro so sai quando esta
+    /// vazio e ao lado do que escondemos. A app da pagina numa moldura de
+    /// ecra inteiro, um canvas e um video fixos, um fundo vazio longe do
+    /// aviso e uma camada com filhos ficam quando o aviso de cookies sai;
+    /// o fundo vazio irmao do aviso sai com ele.
+    ///
+    /// Sabotagem (amostra da tarefa): o `nextToCause` a devolver sempre
+    /// `true` -> vermelho.
+    #[test]
+    fn only_an_empty_backdrop_next_to_what_we_hid_goes() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let layer = |tag: &str, name: &str, z: &str| {
+            json!({ "tag": tag, "attrs": { "data-fixture": name },
+                "css": { "position": "fixed", "z-index": z }, "rect": [0, 0, 1200, 800] })
+        };
+        let far = json!({ "tag": "div", "attrs": { "id": "wrap" }, "children": [
+            { "tag": "div", "attrs": { "id": "inner" }, "children": [layer("div", "far-layer", "5")] }
+        ] });
+        let busy_layer = json!({ "tag": "div", "attrs": { "data-fixture": "with-children" },
+            "css": { "position": "fixed", "z-index": "5" }, "rect": [0, 0, 1200, 800],
+            "children": [{ "tag": "div", "attrs": { "class": "spinner" } }] });
+        let results = run_distraction(&[
+            case(
+                "a app numa moldura",
+                NEWS,
+                &script,
+                page(vec![layer("iframe", "app-iframe", "1"), cookie_bar()]),
+            ),
+            case(
+                "canvas e video",
+                NEWS,
+                &script,
+                page(vec![
+                    layer("canvas", "canvas", "1"),
+                    layer("video", "video", "2"),
+                    cookie_bar(),
+                ]),
+            ),
+            case(
+                "longe",
+                NEWS,
+                &script,
+                page(vec![far, busy_layer, cookie_bar()]),
+            ),
+            case(
+                "ao lado",
+                NEWS,
+                &script,
+                page(vec![layer("div", "backdrop", "5"), cookie_bar()]),
+            ),
+        ]);
+        for result in &results[..3] {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(strings(&result["hidden"]), ["cookie"], "{name}: {result}");
+        }
+        assert_eq!(
+            strings(&results[3]["hidden"]),
+            ["backdrop", "cookie"],
+            "{}",
+            results[3]
+        );
+    }
+
+    /// Gate (amostrado; F6): um dialogo que so FALA de newsletter fica,
+    /// salvo quando o unico campo dele e um e-mail. Um checkout que abre 2 s
+    /// depois do clique com a caixa «Quero receber a newsletter» (com ou sem
+    /// outros campos) e o dialogo do boletim de ocorrencia ficam; a janela
+    /// de newsletter so com o e-mail sai.
+    #[test]
+    fn a_dialog_that_only_mentions_a_newsletter_stays() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let dialog = |name: &str, children: Value| {
+            json!({ "tag": "div", "attrs": { "role": "dialog", "data-fixture": name },
+                "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 150, 600, 500],
+                "children": children })
+        };
+        let input = |kind: &str, field: &str| json!({ "tag": "input", "attrs": { "type": kind, "name": field } });
+        let checkout = dialog(
+            "checkout",
+            json!([
+                "Finalizar compra",
+                input("text", "nome"),
+                input("email", "email"),
+                input("checkbox", "optin"),
+                "Quero receber a newsletter"
+            ]),
+        );
+        let guest = dialog(
+            "guest-checkout",
+            json!([
+                "Continuar como convidado",
+                input("email", "email"),
+                input("checkbox", "optin"),
+                "Assinar a newsletter"
+            ]),
+        );
+        let police = dialog(
+            "boletim",
+            json!([
+                "Registre o seu boletim de ocorrência online",
+                input("text", "protocolo")
+            ]),
+        );
+        let signup = dialog(
+            "signup",
+            json!([
+                "Assine a nossa newsletter e receba as novidades",
+                input("email", "email"),
+                input("submit", "ok")
+            ]),
+        );
+        let mut late = case("checkout tardio", NEWS, &script, page(vec![]));
+        late["steps"] = json!([
+            { "input": "pointerdown" },
+            { "advance": 2000 },
+            { "add": ["body", checkout] },
+            { "add": ["body", guest] }
+        ]);
+        let results = run_distraction(&[
+            late,
+            case("boletim", NEWS, &script, page(vec![police])),
+            case("newsletter", NEWS, &script, page(vec![signup])),
+        ]);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+        }
+        assert_eq!(
+            strings(&results[0]["hidden"]),
+            Vec::<String>::new(),
+            "{}",
+            results[0]
+        );
+        assert_eq!(
+            strings(&results[1]["hidden"]),
+            Vec::<String>::new(),
+            "{}",
+            results[1]
+        );
+        assert_eq!(strings(&results[2]["hidden"]), ["signup"], "{}", results[2]);
     }
 }
