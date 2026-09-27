@@ -39,7 +39,7 @@ fn io_error(error: impl std::fmt::Display) -> io::Error {
 }
 
 fn schema_hash() -> String {
-    format!("{:x}", Sha256::digest(SCHEMA_V01.as_bytes()))
+    Sha256::digest(SCHEMA_V01.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>()
 }
 
 pub(super) fn remove_sqlite_sidecars(path: &Path) {
