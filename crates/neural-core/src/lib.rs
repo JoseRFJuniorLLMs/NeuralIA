@@ -56,9 +56,10 @@ pub use library::{BookEntry, Bookmark, Library, LibraryError, Position};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::reader_html;
 pub use search::{
-    ProviderId, ProviderInfo, all_self_names, chatgpt_search_url, claude_search_url,
-    copilot_search_url, deepseek_search_url, gemini_search_url, google_ai_url, grok_search_url,
-    is_ai_provider_host, is_login_host, login_hosts, mistral_search_url, perplexity_search_url,
+    AnswerReadSelector, ProviderId, ProviderInfo, SelectorGrounding, all_self_names,
+    chatgpt_search_url, claude_search_url, copilot_search_url, deepseek_search_url,
+    gemini_search_url, google_ai_url, grok_search_url, is_ai_provider_host, is_login_host,
+    login_hosts, mistral_search_url, perplexity_search_url,
 };
 pub use security::{
     Locality, is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
@@ -80,7 +81,9 @@ pub use memory::{
 };
 pub use pomodoro::{Phase, Pomodoro, PomodoroEvent, PomodoroSettings, PomodoroSettingsError};
 pub use research::{
-    ComparisonFact, ResearchItem, ResearchItemKind, ResearchSession, SynthesisSnapshot,
+    AttemptStatus, ComparisonFact, ConsensusSnapshot, MAX_CONSENSUS_SNAPSHOTS, ProviderAttempt,
+    ResearchItem, ResearchItemKind, ResearchSession, ResearchTurn, SnapshotAnswer,
+    SynthesisSnapshot, TurnOrigin, operation_key,
 };
 
 pub use agent_protocol::{AgentAction, AgentElement, AgentRuntimeConfig, ObservedPage};

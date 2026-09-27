@@ -859,6 +859,172 @@ jobs:
                   &self.registry
               }
           '@
+            },
+            @{
+              Label = "answer-read-skips-the-host-check"
+              Test = "answer_read_refuses_a_host_mismatch"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if expected.is_empty() || host != expected {
+                  return Err(AnswerReadError::HostMismatch {
+          '@
+              New = @'
+              if false {
+                  return Err(AnswerReadError::HostMismatch {
+          '@
+            },
+            @{
+              Label = "answer-read-cap-after-serde"
+              Test = "answer_read_parse_caps_raw_and_requires_exact_keys"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if raw.len() > ANSWER_READ_MAX_RAW_BYTES {
+                  return Err(AnswerReadError::OverCap { bytes: raw.len() });
+              }
+              let value: serde_json::Value =
+                  serde_json::from_str(raw).map_err(|_| AnswerReadError::NotJson)?;
+          '@
+              New = @'
+              let value: serde_json::Value =
+                  serde_json::from_str(raw).map_err(|_| AnswerReadError::NotJson)?;
+              if raw.len() > ANSWER_READ_MAX_RAW_BYTES {
+                  return Err(AnswerReadError::OverCap { bytes: raw.len() });
+              }
+          '@
+            },
+            @{
+              Label = "answer-read-refuses-for-one-link"
+              Test = "answer_read_drops_only_the_invalid_link"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                      Err(_) => kept.push(None),
+          '@
+              New = @'
+                      Err(_) => return Err(AnswerReadError::Type("links")),
+          '@
+            },
+            @{
+              Label = "answer-read-keeps-page-markers"
+              Test = "answer_read_script_neutralizes_page_markers_and_long_links"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                if (mark0) value = value.split(mark0).join('\uFFFD');
+                if (mark1) value = value.split(mark1).join('\uFFFD');
+          '@
+              New = @'
+                if (mark0) value = value.split(mark0).join(mark0);
+                if (mark1) value = value.split(mark1).join(mark1);
+          '@
+            },
+            @{
+              Label = "answer-read-script-skips-the-link-cap"
+              Test = "answer_read_script_neutralizes_page_markers_and_long_links"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                  links.push(overCap(href) ? '' : href);
+          '@
+              New = @'
+                  links.push(href);
+          '@
+            },
+            @{
+              Label = "consensus-reads-the-split"
+              Test = "consensus_reads_only_the_columns_never_the_split"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              matches!(host, WebViewHost::Column(index) if index < COMPARATOR_COLUMNS)
+          '@
+              New = @'
+              matches!(host, WebViewHost::Column(index) | WebViewHost::Split(index) if index < COMPARATOR_COLUMNS)
+          '@
+            },
+            @{
+              Label = "consensus-compares-a-translated-column"
+              Test = "consensus_never_compares_a_translated_column"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if translated || column.pending.is_some() {
+                  return PollAction::Wait;
+              }
+          '@
+              New = @'
+              if column.pending.is_some() {
+                  return PollAction::Wait;
+              }
+          '@
+            },
+            @{
+              Label = "consensus-reads-a-foreign-page"
+              Test = "consensus_reads_only_the_columns_provider_page"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if !on_provider_page || host.is_empty() || is_login_host(&host) {
+          '@
+              New = @'
+              if host.is_empty() {
+          '@
+            },
+            @{
+              Label = "consensus-writes-into-another-session"
+              Test = "consensus_run_never_writes_into_another_session"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if session.id != run.session {
+                  return None;
+              }
+          '@
+              New = @'
+              if session.id.is_empty() {
+                  return None;
+              }
+          '@
+            },
+            @{
+              Label = "consensus-run-survives-a-new-turn"
+              Test = "a_new_turn_supersedes_the_running_read"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                      .is_some_and(|run| run.session != session || run.turn != turn);
+          '@
+              New = @'
+                      .is_some_and(|run| run.session != session);
+          '@
+            },
+            @{
+              Label = "consensus-turn-key-without-anchor"
+              Test = "consensus_turn_key_is_anchored_to_the_latest_turn"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                  Some(turn) => format!("{base}@{}", turn.ordinal),
+          '@
+              New = @'
+                  Some(_) => format!("{base}@0"),
+          '@
+            },
+            @{
+              Label = "consensus-reads-columns-outside-the-turn"
+              Test = "consensus_reads_only_the_providers_of_the_latest_turn"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                  .filter(|index| {
+                      column_provider(*index).is_some_and(|provider| turn.asked(provider.display_name()))
+                  })
+          '@
+              New = @'
+                  .filter(|index| column_provider(*index).is_some())
+          '@
+            },
+            @{
+              Label = "research-answer-overwrites-a-turn-answer"
+              Test = "research_answer_push_never_overwrites_a_turn_answer"
+              SourcePath = "crates/neural-core/src/research.rs"
+              Old = @'
+                      item.kind == ResearchItemKind::ProviderAnswer
+                          && item.turn.is_none()
+          '@
+              New = @'
+                      item.kind == ResearchItemKind::ProviderAnswer
+          '@
             }
           )
 
