@@ -1400,4 +1400,32 @@ mod recovery_regression_tests {
             "pending"
         );
     }
+    /// Gate critico: recovery_only tem uma unica tentativa. Depois de um
+    /// segundo crash ele nao aparece como historico e nao conserva o caminho
+    /// escondido para sempre.
+    #[test]
+    fn exhausted_hidden_recovery_is_purged_after_its_single_retry() {
+        let log = DownloadLog {
+            entries: vec![neural_core::downloads::DownloadRecord {
+                name: "segredo.pdf".to_string(),
+                path: Some(PathBuf::from(r"C:\Baixados\segredo.pdf")),
+                host: Some("example.com".to_string()),
+                bytes: Some(42),
+                recovery_only: true,
+                outcome: neural_core::downloads::RecordOutcome::Pending {
+                    confirmed_program: false,
+                    resumed: true,
+                },
+                at: 1,
+            }],
+        };
+        let mut manager = DownloadManager::new(DownloadSettings::default(), log);
+        assert_eq!(
+            manager.resume_pending(|| DownloadId(99)),
+            vec![DownloadEffect::Persist]
+        );
+        assert!(manager.log().entries.is_empty());
+        assert_eq!(manager.entries().count(), 0);
+    }
+
 }
