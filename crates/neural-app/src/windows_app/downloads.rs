@@ -1283,12 +1283,7 @@ mod recovery_regression_tests {
         (state, events, stores)
     }
 
-    fn start_and_finish(
-        state: &mut DownloadsState,
-        private_mode: bool,
-        id: u64,
-        path: &Path,
-    ) {
+    fn start_and_finish(state: &mut DownloadsState, private_mode: bool, id: u64, path: &Path) {
         state.run(
             private_mode,
             DownloadEvent::Starting(DownloadStart {
@@ -1314,8 +1309,8 @@ mod recovery_regression_tests {
     }
 
     fn log_json(dir: &Path) -> serde_json::Value {
-        let text = std::fs::read_to_string(dir.join(DOWNLOADS_LOG_STORE.name))
-            .expect("downloads.json");
+        let text =
+            std::fs::read_to_string(dir.join(DOWNLOADS_LOG_STORE.name)).expect("downloads.json");
         serde_json::from_str(&text).expect("json")
     }
 
@@ -1387,8 +1382,7 @@ mod recovery_regression_tests {
 
         let committed = log_json(&dir.0);
         assert_eq!(
-            committed["data"]["entries"][0]["outcome"]["kind"],
-            "completed",
+            committed["data"]["entries"][0]["outcome"]["kind"], "completed",
             "{committed}"
         );
         assert_ne!(
