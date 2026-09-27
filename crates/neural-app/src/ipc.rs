@@ -973,7 +973,7 @@ mod tests {
     /// ou sai uma acao: o gate abaixo exige um exemplo aceite por acao e que
     /// a SPEC-0005 (lista e contagem), a SPEC-0108 (lista e contagem) e a
     /// SPEC-0015 (contagem) digam exatamente isto.
-    const PUBLISHED_ACTION_COUNT: usize = 31;
+    const PUBLISHED_ACTION_COUNT: usize = 32;
 
     /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
     /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
@@ -1008,6 +1008,7 @@ mod tests {
             IpcAction::Palette { .. } => "palette",
             IpcAction::GmailState { .. } => "gmail-state",
             IpcAction::ResearchAnswer { .. } => "research-answer",
+            IpcAction::PdfPageText { .. } => "pdf-page-text",
             IpcAction::AgentObservation { .. } => "agent-observation",
             IpcAction::Hint { .. } => "hint",
             IpcAction::Note { .. } => "note",
@@ -1093,6 +1094,10 @@ mod tests {
             message(
                 "research-answer",
                 json!({"col":0,"text":"texto suficiente"}),
+            ),
+            message(
+                "pdf-page-text",
+                json!({"page":1,"text":"texto da pagina"}),
             ),
             message(
                 "agent-observation",
