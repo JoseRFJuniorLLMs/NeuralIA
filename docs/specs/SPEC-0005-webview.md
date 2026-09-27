@@ -575,9 +575,13 @@ before NeuralIA leaves; one still running at the deadline stays pending.
 `App::exiting` needs the window and has none.
 
 Finished downloads are recorded in `downloads.json` (at most 200, name,
-folder, host, size and outcome, never the full URL), an `Automatic` store.
-The record is written when the download ends, as `pending` with the file's
-path, and the verdict replaces it with the outcome. If NeuralIA stops
+folder, host, size and outcome, never the full URL), a
+`GuardedAutomatic` store. The manager is the privacy guard for this
+specific store: private downloads are excluded before persistence, while a
+normal download may still commit its late verification verdict if the
+global store mode becomes private after the file ended. The record is
+written when the download ends, as `pending` with the file's path, and the
+verdict replaces it with the outcome. If NeuralIA stops
 before the verdict (it crashes, or the exit's wait runs out), the next
 start (`DownloadsState::open`, `DownloadManager::resume_pending`) verifies
 that file again once, in a new row «Verificando o arquivo…», with
@@ -595,16 +599,22 @@ its verification), while the store registry is in private mode
 (`StoreMode::Private`, which no product command turns on yet) is recorded
 either, not even as `pending`, and not when the mode is back to normal
 before its verdict: it never reaches the file. A download that ended in
-normal mode keeps its record when its verdict arrives in private mode; the
-store writes nothing in that mode, and the next save in normal mode writes
-the outcome. A private download cut short before its verdict leaves no
-record to resume. `run_download_event`, the
-app's whole `UserEvent::Download` arm, sets the manager's private mode from
-the registry before every event. Ctrl+Shift+Delete (`DownloadEvent::ClearLog`,
-effect `EraseLog`) removes `downloads.json`, its `.bak` copy and an
-interrupted write's temporary file from disk directly, in any mode and even
-when the store is read-only (a future-version or corrupt file), and leaves
-the downloaded files. Gates: `the_start_decision_table`,
+normal mode keeps its record when its verdict arrives in private mode, and
+that verdict replaces `pending` immediately: this is the only
+`GuardedAutomatic` store, pinned by `guarded_automatic_is_downloads_only`.
+A private download cut short before its verdict leaves no record to resume.
+`run_download_event`, the app's whole `UserEvent::Download` arm, sets the
+manager's private mode from the registry before every event.
+
+Ctrl+Shift+Delete (`DownloadEvent::ClearLog`) removes completed download
+history. With no verification in progress it erases `downloads.json`, its
+`.bak` copy and an interrupted write's temporary file. If a file is
+already in `Finalizing`, clearing history instead persists only that
+pending record marked `recovery_only`: the panel filters it out, the
+session entry becomes history-invisible, a crash can still resume the
+verification, and the eventual verdict removes the recovery record without
+restoring a history row. The downloaded file itself is never deleted merely
+by clearing history. Gates: `the_start_decision_table`,
 `the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
 `private_downloads_are_never_recorded`,
 `nothing_made_in_private_mode_is_ever_recorded`,
@@ -619,7 +629,8 @@ header is read, and 1 MiB or GiB per entry cost the same reads),
 `corrupt_zip64_and_overlap_zips_are_not_inspected`,
 `zip_mutation_harness_never_panics_and_never_comes_out_clean`,
 `browse_lite_listing_fails_for_the_named_reason`,
-`a_verification_is_never_cancelled_and_leaves_a_pending_record`
+`a_verification_is_never_cancelled_and_leaves_a_pending_record`,
+`clear_history_during_verification_keeps_only_hidden_recovery`
 (neural-core) and
 `downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
 `download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
@@ -637,7 +648,9 @@ shows the real outcome),
 `a_lost_finalize_worker_falls_back_to_the_ui_thread`,
 `exit_during_verification_finishes_the_verdict_before_leaving`,
 `a_verification_cut_short_is_resumed_at_the_next_start`,
-`allow_programs_is_read_when_the_verdict_is_committed`, with
+`allow_programs_is_read_when_the_verdict_is_committed`,
+`clear_history_during_verification_preserves_recovery_without_restoring_history`,
+`normal_download_verdict_persists_even_if_global_mode_turns_private`, with
 `every_webview_gets_the_hooks` requiring the manager on every `Managed` host
 and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
 tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
