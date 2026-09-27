@@ -1946,8 +1946,8 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   // WRY/WebView2 injeta initialization scripts em child frames no Windows:
   // o rail e o CSS que esconde as barras so pertencem ao documento principal.
   if (window.top !== window) return;
-document.addEventListener('DOMContentLoaded', () => {
-  if (document.getElementById('neuralia-split-scroll-rail')) return;
+  function mountTimeline() {
+    if (document.getElementById('neuralia-split-scroll-rail')) return;
 
   const style = document.createElement('style');
   style.id = 'neuralia-split-scroll-style';
@@ -2202,7 +2202,13 @@ document.addEventListener('DOMContentLoaded', () => {
     childList:true, subtree:true
   });
   syncTicks();
-});
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mountTimeline, { once:true });
+  } else {
+    mountTimeline();
+  }
 })();
 "#;
 

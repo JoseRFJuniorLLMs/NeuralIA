@@ -31,19 +31,16 @@ only one channel is a bug, not a limitation.
 - Backspace / Alt+Left / Alt+Right walk the page history.
 - Ctrl+R and F5 reload; Ctrl + / - / 0 zoom on Chrome's ladder; Ctrl+F opens an
   in-page find bar; Ctrl+P prints; F12 opens DevTools; Ctrl+U shows the source.
-- Ctrl + mouse wheel, and the precision-touchpad pinch that Chromium delivers as
-  ctrl+wheel, step the same zoom ladder through the same `zoomin`/`zoomout`
-  actions (one notch = one step; small pinch deltas add up to one). A page that
-  handles the gesture itself (`preventDefault`) keeps it. WebView2's own zoom
-  controls stay off, so nothing zooms twice. Gate:
-  `ctrl_wheel_and_touchpad_pinch_zoom_through_the_app_steps` (runs the shipped
-  keymap under Node). The pinch path was not exercised on touchpad hardware.
-- Over an iframe (an artifact preview, an embedded video or map) Ctrl+wheel
-  does not zoom: the gesture stays with the frame. Forwarding it to the top
-  document with `postMessage` was tried and removed before 2.1.8, because any
-  frame of the page could then step the app zoom without a user gesture. Gate:
-  `a_page_message_never_zooms_the_app_and_frames_forward_nothing` (runs the
-  shipped keymap as a child frame and as the top frame under Node).
+- Ctrl + mouse wheel keeps using NeuralIA's existing zoom ladder, so the
+  shared app zoom state and new pages stay in sync. A precision-touchpad
+  two-finger pinch uses WebView2 Page Scale instead: every built WebView passes
+  through the common post-build hook, which enables
+  `ICoreWebView2Settings5::SetIsPinchZoomEnabled(true)`. The native browser
+  zoom control stays disabled, so pinch does not duplicate Ctrl+wheel. The
+  pinch scales the page as a page — text, images, video and layout together —
+  including service panels such as YouTube. Older WebView2 runtimes degrade
+  gracefully to the existing keyboard/mouse zoom. CI compiles and gates the
+  wiring; physical touchpad hardware is not emulated by the runner.
 - F11 toggles fullscreen for the current comparator column; F8 toggles auto-scroll;
   1/2/3 expand a column and 0 restores.
 - Backspace and the digits are ignored while typing in a field.

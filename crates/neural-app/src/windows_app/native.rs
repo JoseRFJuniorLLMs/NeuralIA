@@ -333,12 +333,14 @@ pub(in crate::windows_app) unsafe extern "system" fn panel_handle_subclass(
                     DeleteObject(bg as _);
                     let center = (client.right - client.left) / 2;
                     let line = RECT {
-                        left: center,
+                        left: center - 1,
                         top: 0,
                         right: center + 1,
                         bottom: client.bottom,
                     };
-                    let brush = CreateSolidBrush(rgb3(theme.surface_line));
+                    // Dois pixels e a cor de destaque: a pega continua
+                    // discreta, mas nunca se confunde com a borda da WebView.
+                    let brush = CreateSolidBrush(rgb3(theme.accent));
                     FillRect(hdc, &line, brush);
                     DeleteObject(brush as _);
                 }

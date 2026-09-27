@@ -272,6 +272,34 @@ fn spec_0103_product_gate_targets_the_shipped_javascript_timeline() {
 }
 
 #[test]
+fn every_neuralia_webview_keeps_app_mouse_zoom_and_enables_native_pinch() {
+    assert!(APP.contains("enable_native_pinch_zoom(webview)"));
+    assert!(APP.contains("ICoreWebView2Settings5"));
+    assert!(APP.contains("SetIsPinchZoomEnabled(true)"));
+    assert!(
+        !APP.contains("SetIsZoomControlEnabled(true)"),
+        "native browser zoom would duplicate NeuralIA mouse zoom"
+    );
+    assert!(
+        APP.contains("function wheelZoomAction("),
+        "Ctrl+wheel must keep updating NeuralIA shared zoom ladder"
+    );
+    assert!(APP.contains("install_service_visual_script(webview, host)"));
+    assert!(APP.contains("AddScriptToExecuteOnDocumentCreated"));
+}
+
+#[test]
+fn docked_panel_resize_handle_is_forced_visible_above_service_webviews() {
+    let panels = include_str!("../src/windows_app/app/panels.rs");
+    let native = include_str!("../src/windows_app/native.rs");
+
+    assert!(panels.contains("HWND_TOP"));
+    assert!(panels.contains("SetWindowPos("));
+    assert!(panels.contains("SWP_NOACTIVATE | SWP_SHOWWINDOW"));
+    assert!(native.contains("CreateSolidBrush(rgb3(theme.accent))"));
+}
+
+#[test]
 fn spec_0104_product_agent_reaches_the_native_permission_policy() {
     let start = between(APP, "fn start_browser_agent", "fn handle_agent_observation");
     assert!(start.contains("is_local_network_target(&valid)"));

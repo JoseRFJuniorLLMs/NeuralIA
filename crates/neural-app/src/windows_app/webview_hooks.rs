@@ -1056,6 +1056,61 @@ fn register_webview_accelerators(
 
 // ===================== a metade depois do build =====================
 
+/// Ativa somente o Page Scale por pinça do WebView2. O zoom de Ctrl+roda e
+/// Ctrl +/- continua no mecanismo do NeuralIA, que guarda `self.zoom`.
+fn enable_native_pinch_zoom(webview: &WebView) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+    use windows_core::Interface;
+    use wry::WebViewExtWindows;
+
+    let settings = unsafe { webview.webview().Settings() }
+        .map_err(|error| format!("Settings indisponível: {error}"))?;
+    let settings = settings
+        .cast::<ICoreWebView2Settings5>()
+        .map_err(|error| format!("ICoreWebView2Settings5 indisponível: {error}"))?;
+    unsafe { settings.SetIsPinchZoomEnabled(true) }
+        .map_err(|error| format!("SetIsPinchZoomEnabled falhou: {error}"))
+}
+
+/// O painel do YouTube recebe apenas a timeline visual do NeuralIA. O script
+/// não contém capability nem canal IPC e os demais serviços continuam sem
+/// script de página.
+pub(in crate::windows_app) fn service_visual_script(host: WebViewHost) -> Option<&'static str> {
+    match host {
+        WebViewHost::Service(Service::YouTube) => Some(SPLIT_SCROLL_RAIL_SCRIPT),
+        _ => None,
+    }
+}
+
+/// Registra a timeline pelo COM depois do build, sem mudar o builder dos
+/// serviços. A avaliação imediata cobre o documento que já começou a carregar;
+/// o registro no document-created cobre as próximas navegações/SPA documents.
+fn install_service_visual_script(webview: &WebView, host: WebViewHost) -> Result<(), String> {
+    let Some(script) = service_visual_script(host) else {
+        return Ok(());
+    };
+
+    use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
+    use windows_core::HSTRING;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |result, _id| {
+            if let Err(error) = result {
+                debug_log(format_args!(
+                    "service visual: timeline não registrada ({error})"
+                ));
+            }
+            Ok(())
+        },
+    ));
+    unsafe { core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script), &handler) }
+        .map_err(|error| format!("AddScriptToExecuteOnDocumentCreated: {error}"))?;
+    let _ = webview.evaluate_script(script);
+    Ok(())
+}
+
 /// Quem regista no WebView2 o que a tabela manda para uma WebView acabada de
 /// construir. O produto passa o COM (`ComHookRegistrar`); o gate passa um
 /// registo que anota o que foi pedido para cada hospedeiro.
@@ -1387,6 +1442,18 @@ impl App {
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
     /// gancho e fica no log.
     fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {
+        if let Err(error) = enable_native_pinch_zoom(webview) {
+            debug_log(format_args!(
+                "pinch zoom: {} sem gesto nativo ({error})",
+                host.describe()
+            ));
+        }
+        if let Err(error) = install_service_visual_script(webview, host) {
+            debug_log(format_args!(
+                "service visual: {} sem timeline ({error})",
+                host.describe()
+            ));
+        }
         let mut registrar = ComHookRegistrar {
             webview,
             auto_scroll: self.auto_scroll.clone(),
@@ -1420,5 +1487,38 @@ impl App {
         self.translation_page_loaded(page);
         self.bookmarks_page_loaded(page, &url);
         self.adblock_page_loaded(page);
+    }
+}
+
+#[cfg(test)]
+mod service_visual_tests {
+    use super::*;
+
+    #[test]
+    fn only_youtube_gets_the_shared_neuralia_timeline() {
+        assert_eq!(
+            service_visual_script(WebViewHost::Service(Service::YouTube)),
+            Some(SPLIT_SCROLL_RAIL_SCRIPT)
+        );
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::Gmail,
+            Service::Breath,
+        ] {
+            assert_eq!(
+                service_visual_script(WebViewHost::Service(service)),
+                None,
+                "{service:?} received the YouTube timeline"
+            );
+        }
+
+        let script = service_visual_script(WebViewHost::Service(Service::YouTube))
+            .expect("YouTube timeline");
+        assert!(script.contains("neuralia-split-scroll-rail"));
+        assert!(script.contains("*::-webkit-scrollbar{width:0!important"));
+        assert!(script.contains("function semanticAnchors()"));
+        assert!(!script.contains("chrome.webview.postMessage"));
+        assert!(!script.contains("__NEURALIA_CAP__"));
     }
 }
