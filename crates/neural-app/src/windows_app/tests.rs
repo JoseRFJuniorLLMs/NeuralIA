@@ -25445,7 +25445,7 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
         (
             "neural-app/src/agents/store.rs",
-            9,
+            3,
             "agents/ (Automatic): conversas e state.json ficam sob o caminho do StoreGrant e obedecem writes_allowed",
         ),
         (
