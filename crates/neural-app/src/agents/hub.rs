@@ -257,6 +257,10 @@ struct Question {
     view: QuestionView,
     connection: ConnectionId,
     state: QuestionState,
+    /// O desfecho ainda pertence ao historico persistente. O
+    /// Ctrl+Shift+Delete desliga isto para perguntas que continuam vivas em
+    /// memoria, para a resposta/timeout posterior nao recriar a conversa.
+    persist_outcome: bool,
 }
 
 struct HubState {
@@ -438,6 +442,7 @@ impl AgentHub {
                         events,
                         &question.view,
                         QuestionOutcome::Closed(CloseReason::Cancelled),
+                        question.persist_outcome,
                     );
                 }
             }
@@ -529,6 +534,7 @@ impl AgentHub {
                             view: view.clone(),
                             connection,
                             state: QuestionState::Pending,
+                            persist_outcome: true,
                         },
                     );
                     events.push(AgentEvent::Question(view));
@@ -588,12 +594,14 @@ impl AgentHub {
             }
             if matches!(question.state, QuestionState::Pending) && now >= question.view.deadline {
                 let view = question.view.clone();
+                let persist_outcome = question.persist_outcome;
                 close_question(
                     &mut state,
                     &store,
                     &mut events,
                     &view,
                     QuestionOutcome::Closed(CloseReason::TimedOut),
+                    persist_outcome,
                 );
                 if let Some(question) = state.questions.get_mut(&question_id) {
                     question.state =
@@ -644,6 +652,7 @@ impl AgentHub {
                     events,
                     &question.view,
                     QuestionOutcome::Closed(CloseReason::Cancelled),
+                    question.persist_outcome,
                 );
             }
         });
@@ -689,8 +698,16 @@ impl AgentHub {
                 }
             };
             let view = question.view.clone();
+            let persist_outcome = question.persist_outcome;
             let outcome = QuestionOutcome::Answered { answer: text, via };
-            close_question(state, &store, events, &view, outcome.clone());
+            close_question(
+                state,
+                &store,
+                events,
+                &view,
+                outcome.clone(),
+                persist_outcome,
+            );
             if let Some(question) = state.questions.get_mut(&question_id) {
                 question.state = QuestionState::Done(outcome);
             }
@@ -702,14 +719,21 @@ impl AgentHub {
     pub(crate) fn dismiss_question(&self, question_id: u64) -> Result<(), String> {
         let store = self.inner.store.clone();
         self.with_state(|state, events| {
-            let view = state
+            let (view, persist_outcome) = state
                 .questions
                 .get(&question_id)
                 .filter(|q| matches!(q.state, QuestionState::Pending))
-                .map(|q| q.view.clone())
+                .map(|q| (q.view.clone(), q.persist_outcome))
                 .ok_or_else(|| "Esta pergunta já não está à espera de resposta.".to_string())?;
             let outcome = QuestionOutcome::Closed(CloseReason::Dismissed);
-            close_question(state, &store, events, &view, outcome.clone());
+            close_question(
+                state,
+                &store,
+                events,
+                &view,
+                outcome.clone(),
+                persist_outcome,
+            );
             if let Some(question) = state.questions.get_mut(&question_id) {
                 question.state = QuestionState::Done(outcome);
             }
@@ -846,15 +870,22 @@ impl AgentHub {
         let now = self.now();
         let store = self.inner.store.clone();
         self.with_state(|state, events| {
-            let expired: Vec<QuestionView> = state
+            let expired: Vec<(QuestionView, bool)> = state
                 .questions
                 .values()
                 .filter(|q| matches!(q.state, QuestionState::Pending) && now >= q.view.deadline)
-                .map(|q| q.view.clone())
+                .map(|q| (q.view.clone(), q.persist_outcome))
                 .collect();
-            for view in expired {
+            for (view, persist_outcome) in expired {
                 let outcome = QuestionOutcome::Closed(CloseReason::TimedOut);
-                close_question(state, &store, events, &view, outcome.clone());
+                close_question(
+                    state,
+                    &store,
+                    events,
+                    &view,
+                    outcome.clone(),
+                    persist_outcome,
+                );
                 if let Some(question) = state.questions.get_mut(&view.id) {
                     question.state = QuestionState::Done(outcome);
                 }
@@ -865,7 +896,8 @@ impl AgentHub {
     /// Ctrl+Shift+Delete: apaga as conversas do disco e da memoria, debaixo
     /// do lock (uma ponte que escreva entretanto nao ressuscita o ficheiro
     /// a meio). As perguntas pendentes continuam (o agente esta a espera
-    /// delas).
+    /// delas), mas o desfecho delas passa a ser so de memoria: responder,
+    /// cancelar ou expirar depois do clear nao recria a conversa apagada.
     pub(crate) fn clear_conversations(&self) -> Result<(), String> {
         let store = self.inner.store.clone();
         let mut result = Ok(());
@@ -876,6 +908,11 @@ impl AgentHub {
                 entry.marks.next_id = entry.marks.next_id.max(last + 1);
                 entry.marks.read_up_to = entry.marks.next_id.saturating_sub(1);
                 entry.conversation = Conversation::default();
+            }
+            for question in state.questions.values_mut() {
+                if matches!(question.state, QuestionState::Pending) {
+                    question.persist_outcome = false;
+                }
             }
             if result.is_ok() {
                 state.store_error = None;
@@ -931,6 +968,7 @@ fn close_question(
     events: &mut Vec<AgentEvent>,
     view: &QuestionView,
     outcome: QuestionOutcome,
+    persist_outcome: bool,
 ) {
     let body = match &outcome {
         QuestionOutcome::Answered { answer, via } => RecordBody::UserAnswer {
@@ -943,7 +981,9 @@ fn close_question(
             reason: *reason,
         },
     };
-    if let Some(entry) = state.agents.get_mut(&view.agent) {
+    if persist_outcome
+        && let Some(entry) = state.agents.get_mut(&view.agent)
+    {
         let record = AgentRecord {
             id: entry.next_id(),
             ts_ms: now_ms(),
