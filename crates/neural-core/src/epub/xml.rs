@@ -144,23 +144,15 @@ pub(crate) fn parse(text: &str) -> Result<Dom, XmlFault> {
                 }
             }
             Event::Text(text) => {
-                let text = text
-                    .xml10_content()
-                    .map_err(|error| XmlFault::Syntax(error.to_string()))?;
+                let text = text.xml10_content();
                 dom.push_text(top, &text);
             }
             Event::CData(data) => {
-                let text = data
-                    .decode()
-                    .map_err(|error| XmlFault::Syntax(error.to_string()))?;
-                dom.push_text(top, &text);
+                dom.push_text(top, data.as_ref());
             }
             Event::GeneralRef(reference) => dom.push_text(top, &resolve_reference(&reference)),
             Event::DocType(doctype) => {
-                let doctype = doctype
-                    .decode()
-                    .map_err(|error| XmlFault::Syntax(error.to_string()))?;
-                if declares_entities(&doctype) {
+                if declares_entities(doctype.as_ref()) {
                     return Err(XmlFault::Unsafe(
                         "o DOCTYPE declara entidades (possível bomba de entidades ou XXE)".into(),
                     ));
@@ -178,9 +170,7 @@ fn declares_entities(doctype: &str) -> bool {
 }
 
 fn resolve_reference(reference: &BytesRef<'_>) -> String {
-    let Ok(name) = reference.decode() else {
-        return String::new();
-    };
+    let name = reference.as_ref();
     if reference.is_char_ref() {
         return match reference.resolve_char_ref() {
             Ok(Some(ch)) => ch.to_string(),
@@ -283,16 +273,16 @@ impl Dom {
                 MAX_XML_NODES as u64,
             ));
         }
-        let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+        let name = start.name().as_ref().to_owned();
         let mut attrs = Vec::new();
         for attr in start.attributes().with_checks(false) {
             let Ok(attr) = attr else { continue };
-            let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+            let key = attr.key.as_ref().to_owned();
             let value = match attr.normalized_value_with(XmlVersion::Implicit1_0, 1, resolve_entity)
             {
                 Ok(value) => value.into_owned(),
                 // Entidade desconhecida no atributo: o valor cru, sem expandir.
-                Err(_) => String::from_utf8_lossy(&attr.value).into_owned(),
+                Err(_) => attr.value.into_owned(),
             };
             attrs.push((key, value));
         }
