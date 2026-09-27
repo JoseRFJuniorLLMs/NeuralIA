@@ -1088,6 +1088,18 @@ jobs:
           '@
             },
             @{
+              Label = "agents-marks-newer-failure-blocks-older-snapshot"
+              Test = "marks_writer_never_accepts_an_older_snapshot_after_a_newer_write_failed"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                  if snapshot.generation < self.latest_generation_seen
+                      || snapshot.generation <= self.persisted_generation
+          '@
+              New = @'
+                  if snapshot.generation <= self.persisted_generation
+          '@
+            },
+            @{
               Label = "agents-marks-recovery-must-clear-error"
               Test = "a_failed_mark_read_save_is_retried_even_when_the_ram_mark_is_unchanged"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
