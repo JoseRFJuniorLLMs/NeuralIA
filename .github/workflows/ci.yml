@@ -1305,6 +1305,10 @@ jobs:
         shell: pwsh
         timeout-minutes: 5
         run: ./scripts/test-private-mode.ps1 -ExePath ci-tested/NeuralIA.exe
+      - name: Agents MCP bridge E2E on the tested exe
+        shell: pwsh
+        timeout-minutes: 5
+        run: node ./scripts/test-agents-mcp.mjs ./ci-tested/NeuralIA.exe
       # Release contract of the CI-only accelerator spike (infra-accel-spike):
       # the exact bytes that release.yml packages were built without the spike
       # feature, so the spike marker is not in them. The spike itself runs in
