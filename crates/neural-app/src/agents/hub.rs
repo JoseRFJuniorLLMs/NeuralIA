@@ -1833,10 +1833,12 @@ pub(crate) mod tests {
     fn clearing_history_with_a_pending_question_never_recreates_the_conversation() {
         let f = fixture("clear-pending");
         let claude = f.hub.connect("claude").unwrap();
+        let drop_connection = f.hub.connect("claude").unwrap();
         let answered = ask(&f.hub, claude, 600).unwrap();
         let dismissed = ask(&f.hub, claude, 600).unwrap();
         let cancelled = ask(&f.hub, claude, 600).unwrap();
         let timed_out = ask(&f.hub, claude, ASK_TIMEOUT_MIN_SECS).unwrap();
+        let disconnected = ask(&f.hub, drop_connection, 600).unwrap();
 
         let agents_dir = f.dir.0.join("agents");
         let conversation = agents_dir.join("claude.jsonl");
@@ -1846,7 +1848,7 @@ pub(crate) mod tests {
         f.hub.clear_conversations().unwrap();
         assert!(!conversation.exists());
         assert!(!state_file.exists());
-        assert_eq!(f.hub.pending_questions().len(), 4);
+        assert_eq!(f.hub.pending_questions().len(), 5);
 
         let still_cleared = || {
             assert!(f.hub.conversation("claude").is_empty());
@@ -1896,6 +1898,15 @@ pub(crate) mod tests {
                 .wait_question(claude, timed_out, Duration::from_millis(1))
                 .unwrap(),
             json!({"state":"timed_out"})
+        );
+        still_cleared();
+
+        f.hub.disconnect(drop_connection);
+        assert!(
+            f.hub
+                .pending_questions()
+                .iter()
+                .all(|question| question.id != disconnected)
         );
         still_cleared();
         assert!(f.hub.pending_questions().is_empty());
