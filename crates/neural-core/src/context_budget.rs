@@ -18,7 +18,9 @@
 //!    (`ContextError::PrivateContent`).
 //! 2. **partir em trechos** de ~`chunk_tokens` (160 por omissao) em
 //!    fronteiras de frase: `Dr. Silva` e `3.5 GHz` ficam inteiros
-//!    (abreviaturas, iniciais e decimais nao fecham frase).
+//!    (abreviaturas, iniciais e decimais nao fecham frase), e os terminais
+//!    do CJK (`。！？`) fecham sem espaco a seguir. O corte de cada trecho
+//!    acha-se por busca exponencial e bissecao: O(n log n) bytes medidos.
 //! 3. **deduplicar**, pela ordem da pontuacao, para a copia que fica ser a
 //!    mais pontuada (numa igualdade, a primeira): o SHA-256 do texto
 //!    normalizado apanha as copias exactas; o SimHash das janelas
@@ -51,9 +53,10 @@
 //! maximo.
 //!
 //! O `ContextPack` que sai tem campos privados: le-se (`rendered`,
-//! `est_tokens`, `sources` com as posicoes em bytes, `duplicates`,
-//! `dropped`) e nao se monta nem se altera de fora -- o unico caminho para
-//! um pacote e este.
+//! `est_tokens`, `sources` com as posicoes em bytes -- no pacote e, de
+//! cada trecho, no texto sanitizado da fonte --, `duplicates`, `dropped`)
+//! e nao se monta nem se altera de fora -- o unico caminho para um pacote
+//! e este.
 //!
 //! A contagem de tokens (`estimate_tokens`) e o maior entre uma tabela por
 //! classe de caractere x 1,10 e o numero de pre-tokens das regex de
@@ -921,7 +924,18 @@ pub fn summary_line_pt(tokens: usize, sources: usize, duplicates: usize) -> Stri
 // ------------------------------------------------------------ frases
 
 const TERMINALS: &[char] = &['.', '!', '?', '…'];
-const CLOSERS: &[char] = &['"', '\'', '”', '’', '»', ')', ']', '}'];
+/// Os terminais do CJK (`。`, `！`, `？`, o `．` largo e o `｡` estreito):
+/// fecham a frase sem espaco a seguir, porque o chines e o japones nao
+/// separam as frases com espacos (CB-10).
+const WIDE_TERMINALS: &[char] = &['。', '！', '？', '．', '｡'];
+const CLOSERS: &[char] = &[
+    '"', '\'', '”', '’', '»', ')', ']', '}', '」', '』', '）', '］', '】', '〕', '〗', '〙', '〛',
+    '｣', '＂', '＇',
+];
+
+fn is_terminal(c: char) -> bool {
+    TERMINALS.contains(&c) || WIDE_TERMINALS.contains(&c)
+}
 
 /// Abreviaturas (sem o ponto, em minusculas) que nao fecham uma frase.
 const ABBREVIATIONS: &[&str] = &[
@@ -974,7 +988,9 @@ fn token_before(text: &str, at: usize) -> &str {
 /// fechos `"»)]` colados) seguidos de espaco e de algo que nao e minuscula
 /// -- desde que a palavra antes do ponto nao seja uma abreviatura, uma
 /// inicial ou o numero de uma lista. Um ponto entre digitos (`3.5`) nunca
-/// e seguido de espaco, e por isso nunca fecha.
+/// e seguido de espaco, e por isso nunca fecha. Os terminais do CJK (`。`,
+/// `！`, `？`, `．`, `｡`, com os fechos `」』）` colados) fecham mesmo sem
+/// espaco a seguir; o `．` entre digitos (`３．５`) nao.
 pub fn sentence_spans(text: &str) -> Vec<Range<usize>> {
     fn push(spans: &mut Vec<Range<usize>>, text: &str, start: usize, end: usize) {
         let trimmed = text[start..end].trim_end();
@@ -1002,16 +1018,23 @@ pub fn sentence_spans(text: &str) -> Vec<Range<usize>> {
             }
             start = Some(at);
         }
-        if TERMINALS.contains(&c) {
+        if is_terminal(c) {
             let mut j = i + 1;
-            while j < chars.len()
-                && (TERMINALS.contains(&chars[j].1) || CLOSERS.contains(&chars[j].1))
-            {
+            while j < chars.len() && (is_terminal(chars[j].1) || CLOSERS.contains(&chars[j].1)) {
                 j += 1;
             }
             let end = chars.get(j).map_or(text.len(), |(byte, _)| *byte);
             let at_end = j >= chars.len();
-            if at_end || chars[j].1.is_whitespace() {
+            if chars[i..j].iter().any(|(_, c)| WIDE_TERMINALS.contains(c)) {
+                let decimal = c == '．'
+                    && j == i + 1
+                    && i > 0
+                    && chars[i - 1].1.is_numeric()
+                    && chars.get(j).is_some_and(|(_, next)| next.is_numeric());
+                if !decimal && let Some(from) = start.take() {
+                    push(&mut spans, text, from, end);
+                }
+            } else if at_end || chars[j].1.is_whitespace() {
                 let next = chars[j..]
                     .iter()
                     .map(|(_, c)| *c)
@@ -1039,34 +1062,82 @@ pub fn sentence_spans(text: &str) -> Vec<Range<usize>> {
 
 /// Os trechos de `text`: frases inteiras juntas ate `limit` tokens (pelo
 /// `tokens`); uma frase maior que o limite e partida em palavras e, se uma
-/// palavra ainda for maior, em caracteres.
+/// palavra ainda for maior, em caracteres. Cada corte acha-se por busca
+/// exponencial e bissecao (`pack_units`): O(n log n) bytes medidos, e nao
+/// o trecho aberto medido de novo a cada frase, palavra ou caractere, que
+/// era O(n x janela) (CB-9).
 pub fn chunk_spans(text: &str, limit: usize, tokens: &dyn Fn(&str) -> usize) -> Vec<Range<usize>> {
     let limit = limit.max(1);
     let mut chunks = Vec::new();
-    let mut current: Option<Range<usize>> = None;
-    for sentence in sentence_spans(text) {
-        if tokens(&text[sentence.clone()]) > limit {
-            if let Some(open) = current.take() {
-                chunks.push(open);
-            }
-            hard_split(text, sentence, limit, tokens, &mut chunks);
-            continue;
+    let sentences = sentence_spans(text);
+    let mut run = 0;
+    for (index, sentence) in sentences.iter().enumerate() {
+        if measure(tokens, &text[sentence.clone()]) > limit {
+            pack_units(text, &sentences[run..index], limit, tokens, &mut chunks);
+            hard_split(text, sentence.clone(), limit, tokens, &mut chunks);
+            run = index + 1;
         }
-        current = Some(match current {
-            Some(open) if tokens(&text[open.start..sentence.end]) <= limit => {
-                open.start..sentence.end
-            }
-            Some(open) => {
-                chunks.push(open);
-                sentence
-            }
-            None => sentence,
-        });
     }
-    if let Some(open) = current {
-        chunks.push(open);
-    }
+    pack_units(text, &sentences[run..], limit, tokens, &mut chunks);
     chunks
+}
+
+/// Os tokens de `piece` pelo `tokens` de quem parte o texto. E aqui que os
+/// testes contam o trabalho da particao (os bytes medidos).
+fn measure(tokens: &dyn Fn(&str) -> usize, piece: &str) -> usize {
+    #[cfg(test)]
+    tests::count_measured(piece.len());
+    tokens(piece)
+}
+
+/// Junta as `units` (intervalos de `text`, pela ordem) em trechos: cada um
+/// vai do inicio de uma unidade ao fim da ultima que ainda cabe em `limit`,
+/// e leva sempre pelo menos uma. O corte acha-se por busca exponencial (1,
+/// 2, 4... unidades a mais) ate a primeira medicao que nao cabe, e depois
+/// por bissecao: um trecho de k unidades custa O(log k) medicoes de ate 2k
+/// unidades. E o corte da juncao unidade a unidade sempre que a contagem so
+/// cresce quando o trecho cresce -- a do `estimate_tokens` cresce nas
+/// juncoes da particao (espacos e terminais: a tabela so soma, e os
+/// pre-tokens do texto de antes da juncao ficam). Numa contagem que desce
+/// (dentro de uma palavra, uma mudanca de caixa que o o200k junta), o corte
+/// cai noutra unidade, mas cada trecho continua medido e dentro do limite.
+fn pack_units(
+    text: &str,
+    units: &[Range<usize>],
+    limit: usize,
+    tokens: &dyn Fn(&str) -> usize,
+    out: &mut Vec<Range<usize>>,
+) {
+    let mut first = 0;
+    while first < units.len() {
+        let start = units[first].start;
+        let fits = |last: usize| measure(tokens, &text[start..units[last].end]) <= limit;
+        // `good` e a ultima unidade que cabe (a primeira entra sempre);
+        // `bad`, a primeira que nao cabe, ou o fim.
+        let mut good = first;
+        let mut bad = units.len();
+        let mut step = 1;
+        while good + 1 < bad {
+            let probe = (good + step).min(bad - 1);
+            if fits(probe) {
+                good = probe;
+                step *= 2;
+            } else {
+                bad = probe;
+                break;
+            }
+        }
+        while good + 1 < bad {
+            let middle = good + (bad - good) / 2;
+            if fits(middle) {
+                good = middle;
+            } else {
+                bad = middle;
+            }
+        }
+        out.push(start..units[good].end);
+        first = good + 1;
+    }
 }
 
 /// Uma frase maior que o limite: palavras inteiras ate `limit`, e uma
@@ -1093,29 +1164,18 @@ fn hard_split(
     if let Some(start) = word_start {
         words.push(span.start + start..span.end);
     }
-    let mut open: Option<Range<usize>> = None;
-    for word in words {
-        if tokens(&text[word.clone()]) > limit {
-            if let Some(range) = open.take() {
-                out.push(range);
-            }
-            split_word(text, word, limit, tokens, out);
-            continue;
+    let mut run = 0;
+    for (index, word) in words.iter().enumerate() {
+        if measure(tokens, &text[word.clone()]) > limit {
+            pack_units(text, &words[run..index], limit, tokens, out);
+            split_word(text, word.clone(), limit, tokens, out);
+            run = index + 1;
         }
-        open = Some(match open {
-            Some(range) if tokens(&text[range.start..word.end]) <= limit => range.start..word.end,
-            Some(range) => {
-                out.push(range);
-                word
-            }
-            None => word,
-        });
     }
-    if let Some(range) = open {
-        out.push(range);
-    }
+    pack_units(text, &words[run..], limit, tokens, out);
 }
 
+/// Uma palavra maior que o limite, em pedacos de caracteres inteiros.
 fn split_word(
     text: &str,
     span: Range<usize>,
@@ -1123,19 +1183,11 @@ fn split_word(
     tokens: &dyn Fn(&str) -> usize,
     out: &mut Vec<Range<usize>>,
 ) {
-    let mut piece_start = span.start;
-    let mut previous = span.start;
-    for (index, c) in text[span.clone()].char_indices() {
-        let end = span.start + index + c.len_utf8();
-        if tokens(&text[piece_start..end]) > limit && previous > piece_start {
-            out.push(piece_start..previous);
-            piece_start = previous;
-        }
-        previous = end;
-    }
-    if piece_start < span.end {
-        out.push(piece_start..span.end);
-    }
+    let chars: Vec<Range<usize>> = text[span.clone()]
+        .char_indices()
+        .map(|(index, c)| span.start + index..span.start + index + c.len_utf8())
+        .collect();
+    pack_units(text, &chars, limit, tokens, out);
 }
 
 // ------------------------------------------------------------ pontuacao
@@ -1375,11 +1427,12 @@ pub struct Passage {
 }
 
 impl Passage {
-    /// Onde o trecho esta no texto sanitizado da fonte. Num trecho
-    /// comprimido ou cortado cujo texto a cerca teve de neutralizar (um
-    /// marcador parecido la dentro) ou escapar (uma linha que comeca por
-    /// `[`), o intervalo e aproximado: as posicoes vem do texto
-    /// neutralizado, que pode ter outro tamanho.
+    /// Onde o trecho esta no texto sanitizado da fonte: um intervalo dentro
+    /// dele, em fronteiras de caractere, de onde o texto que saiu foi tirado
+    /// (o que saiu e esse texto neutralizado e escapado para a cerca). Num
+    /// trecho comprimido vai da primeira a ultima frase escolhida -- as do
+    /// meio que ficaram de fora estao la dentro --; num cortado, do inicio
+    /// do trecho ao corte.
     pub fn source_span(&self) -> Range<usize> {
         self.source_span.clone()
     }
@@ -1679,6 +1732,13 @@ fn packed_label(source: &ContextSource, spec: &BudgetSpec) -> String {
 /// Os parenteses rectos com que um cabecalho de fonte se pode imitar.
 const OPENING_BRACKETS: &[char] = &['[', '［', '【', '〔', '〖', '〘', '〚', '⟦', '⁅', '❲', '﹝'];
 
+/// Um pedaco do texto sanitizado de uma fonte como sai dentro da cerca:
+/// neutralizado (`neutralize_inside`) e com as linhas que imitam um
+/// cabecalho escapadas.
+fn shipped(text: &str, nonce: &FenceNonce) -> String {
+    escape_header_lookalikes(&untrusted::neutralize_inside(text, nonce))
+}
+
 /// Cada linha que comeca (depois de espacos e invisiveis) por um parentese
 /// recto leva um `\` antes dele. So os cabecalhos das fontes comecam assim
 /// dentro da cerca: uma pagina que escreva `[2] resposta: Claude` nao se
@@ -1864,10 +1924,7 @@ pub fn build_context(
             continue;
         }
         for span in chunk_spans(text, spec.chunk_tokens, &tokens) {
-            let inside = escape_header_lookalikes(&untrusted::neutralize_inside(
-                &text[span.clone()],
-                &nonce,
-            ));
+            let inside = shipped(&text[span.clone()], &nonce);
             chunks.push(Chunk {
                 source: index,
                 span,
@@ -1975,6 +2032,8 @@ pub fn build_context(
     let mut allocator = Allocator {
         spec,
         pack_budget,
+        texts: &texts,
+        nonce: &nonce,
         chunks: &chunks,
         kept: &kept,
         scores: &scores,
@@ -2143,6 +2202,9 @@ const FLOOR_EPSILON: f64 = 1e-6;
 struct Allocator<'a> {
     spec: &'a BudgetSpec,
     pack_budget: usize,
+    /// O texto sanitizado de cada fonte: e dele que os cortes saem.
+    texts: &'a [String],
+    nonce: &'a FenceNonce,
     chunks: &'a [Chunk],
     kept: &'a [usize],
     scores: &'a [f64],
@@ -2319,10 +2381,18 @@ impl<'a> Allocator<'a> {
         if !room(0.0) {
             return false;
         }
-        let cut = compress(chunk, self.query_terms, self.bm25, &room)
-            .filter(|(text, _, _)| weight(text) >= missing)
-            .map(|(text, span, _)| (text, span))
-            .or_else(|| cut_prefix(chunk, &room, missing));
+        let source = &self.texts[chunk.source];
+        let cut = compress(
+            chunk,
+            source,
+            self.nonce,
+            self.query_terms,
+            self.bm25,
+            &room,
+        )
+        .filter(|(text, _, _)| weight(text) >= missing)
+        .map(|(text, span, _)| (text, span))
+        .or_else(|| cut_prefix(chunk, source, self.nonce, &room, missing));
         let Some((text, span)) = cut else {
             return false;
         };
@@ -2351,8 +2421,14 @@ impl<'a> Allocator<'a> {
         if !room(0.0) {
             return false;
         }
-        let Some((text, span, partial)) = compress(chunk, self.query_terms, self.bm25, &room)
-        else {
+        let Some((text, span, partial)) = compress(
+            chunk,
+            &self.texts[chunk.source],
+            self.nonce,
+            self.query_terms,
+            self.bm25,
+            &room,
+        ) else {
             return false;
         };
         if self.spec.tokens_of_weight(weight(&text)) < MIN_PASSAGE_TOKENS {
@@ -2389,64 +2465,84 @@ impl<'a> Allocator<'a> {
 
 /// As frases mais pontuadas de um trecho que ainda cabem, pela ordem do
 /// texto, e se ficou alguma de fora. `None` quando nem uma cabe ou o
-/// trecho e uma frase so. Qualquer frase pode ficar no inicio da linha:
-/// cada uma conta com o `\` que a escaparia, e o texto que sai e escapado.
+/// trecho e uma frase so. As frases sao as do texto da fonte (`source`, o
+/// sanitizado): o intervalo vai do inicio da primeira escolhida ao fim da
+/// ultima, dentro da fonte (CB-8), e o texto que sai e o delas juntas,
+/// neutralizado e escapado de uma vez (`shipped`). Qualquer frase pode
+/// ficar no inicio da linha: cada uma conta como sairia sozinha, com o `\`
+/// que a escaparia, mais um espaco. O texto junto volta a ser medido: se
+/// nao couber (a juncao pode formar um marcador que a neutralizacao
+/// reescreve), sai a frase escolhida menos pontuada.
 fn compress(
     chunk: &Chunk,
+    source: &str,
+    nonce: &FenceNonce,
     query: &[String],
     bm25: &Bm25,
     room: &dyn Fn(f64) -> bool,
 ) -> Option<(String, Range<usize>, bool)> {
-    let spans = sentence_spans(&chunk.text);
+    let original = &source[chunk.span.clone()];
+    let spans = sentence_spans(original);
     if spans.len() < 2 {
         return None;
     }
-    let mut ranked: Vec<(usize, f64)> = spans
+    let sentences: Vec<String> = spans
+        .iter()
+        .map(|span| shipped(&original[span.clone()], nonce))
+        .collect();
+    let mut ranked: Vec<(usize, f64)> = sentences
         .iter()
         .enumerate()
-        .map(|(index, span)| (index, bm25.score(query, &terms(&chunk.text[span.clone()]))))
+        .map(|(index, sentence)| (index, bm25.score(query, &terms(sentence))))
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Pela ordem da pontuacao: a ultima e a menos pontuada.
     let mut chosen: Vec<usize> = Vec::new();
     let mut total = 0.0;
     for (index, _) in ranked {
-        let sentence = &chunk.text[spans[index].clone()];
-        let cost = weight(&escape_header_lookalikes(sentence)) + weight(" ");
+        let cost = weight(&sentences[index]) + weight(" ");
         if room(total + cost) {
             total += cost;
             chosen.push(index);
         }
     }
-    if chosen.is_empty() {
-        return None;
-    }
-    let partial = chosen.len() < spans.len();
-    chosen.sort_unstable();
-    let text = escape_header_lookalikes(
-        &chosen
+    while !chosen.is_empty() {
+        let mut in_order = chosen.clone();
+        in_order.sort_unstable();
+        let joined = in_order
             .iter()
-            .map(|&index| &chunk.text[spans[index].clone()])
+            .map(|&index| &original[spans[index].clone()])
             .collect::<Vec<_>>()
-            .join(" "),
-    );
-    let first = spans[chosen[0]].start;
-    let last = spans[chosen[chosen.len() - 1]].end;
-    Some((
-        text,
-        chunk.span.start + first..chunk.span.start + last,
-        partial,
-    ))
+            .join(" ");
+        let text = shipped(&joined, nonce);
+        if room(weight(&text)) {
+            let first = spans[in_order[0]].start;
+            let last = spans[in_order[in_order.len() - 1]].end;
+            return Some((
+                text,
+                chunk.span.start + first..chunk.span.start + last,
+                in_order.len() < spans.len(),
+            ));
+        }
+        chosen.pop();
+    }
+    None
 }
 
-/// O inicio de um trecho ate onde couber (`room`): acaba no fim de uma
-/// palavra quando isso ja chega a `missing`, e senao no ultimo caractere
-/// que cabe. `None` quando nem um caractere cabe.
+/// O inicio de um trecho ate onde couber (`room`), cortado no texto da
+/// fonte (`source`, o sanitizado) e medido como sai (`shipped`): acaba no
+/// fim de uma palavra quando isso ja chega a `missing`, e senao no ultimo
+/// caractere que cabe. O intervalo e o do corte na fonte (CB-8). `None`
+/// quando nem um caractere cabe.
 fn cut_prefix(
     chunk: &Chunk,
+    source: &str,
+    nonce: &FenceNonce,
     room: &dyn Fn(f64) -> bool,
     missing: f64,
 ) -> Option<(String, Range<usize>)> {
-    let text = chunk.text.as_str();
+    let text = &source[chunk.span.clone()];
+    let cost = |end: usize| weight(&shipped(&text[..end], nonce));
     let ends: Vec<usize> = text
         .char_indices()
         .map(|(index, c)| index + c.len_utf8())
@@ -2456,7 +2552,7 @@ fn cut_prefix(
     let (mut low, mut high) = (0usize, ends.len());
     while low < high {
         let middle = (low + high) / 2;
-        if room(weight(&text[..ends[middle]])) {
+        if room(cost(ends[middle])) {
             low = middle + 1;
         } else {
             high = middle;
@@ -2476,7 +2572,7 @@ fn cut_prefix(
         .map(|(index, c)| index + c.len_utf8());
     let end = word_end
         .filter(|&end| {
-            let prefix = weight(&text[..end]);
+            let prefix = cost(end);
             prefix >= missing && room(prefix)
         })
         .unwrap_or(longest);
@@ -2484,11 +2580,12 @@ fn cut_prefix(
     if cut.is_empty() {
         return None;
     }
+    let out = shipped(cut, nonce);
+    if !room(weight(&out)) {
+        return None;
+    }
     let start = chunk.span.start;
-    Some((
-        cut.to_string(),
-        start..(start + cut.len()).min(chunk.span.end),
-    ))
+    Some((out, start..start + cut.len()))
 }
 
 // ------------------------------------------------------------ conversa

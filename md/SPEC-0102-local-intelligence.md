@@ -160,7 +160,8 @@ private flag) and a `BudgetSpec` (`max_input`, `reserve_output`, per-source
 floor, ~160-token chunks, `Destination::Local` or `Destination::Remote { host }`)
 and returns a `ContextPack` whose fields are private: it is read through
 `rendered()`, `est_tokens()`, `sources()` (byte spans of every header and
-passage), `duplicates()` (kept/dropped provenance and similarity) and
+passage in the pack, and of every passage inside its source's sanitized text),
+`duplicates()` (kept/dropped provenance and similarity) and
 `dropped()`, and cannot be built or mutated from outside (`compile_fail`
 doctests). The whole prompt fits `BudgetSpec::available()`: the fence
 instructions (`ContextPack::fence_instructions()`: `CONTEXT_DATA_PREAMBLE_PT`
@@ -175,7 +176,9 @@ one, or `user:pass@` — and the source label, which goes out in the header; a
 URL without a credential stays byte for byte; a private source never goes to a
 remote destination — «Modo privado: este conteúdo não pode sair do
 computador.»), chunk on sentence boundaries (`Dr. Silva` and `3.5 GHz` stay
-whole), dedupe in score order so the kept copy is the highest-scoring one
+whole; the CJK terminals `。！？` close a sentence without a following space),
+finding each cut by exponential search and bisection (O(n log n) bytes
+measured), dedupe in score order so the kept copy is the highest-scoring one
 (exact SHA-256, then SimHash filtered and Jaccard ≥ 0.8 confirmed, both from
 `untrusted::Shingles`; across different sources, near copies that disagree on
 numbers or negations are both kept), score 0.5 BM25-lite + 0.4 `Embedder`
@@ -215,6 +218,10 @@ secret in a remote pack's labels, URLs or text),
 `a_passage_cannot_forge_a_source_header`,
 `the_pack_is_deterministic_for_the_same_inputs`,
 `the_fence_is_the_untrusted_one_and_spans_point_at_the_passages`,
+`compressed_spans_stay_inside_a_source_the_fence_rewrote`,
+`cjk_text_is_chunked_at_sentence_ends_and_compressible`,
+`chunking_matches_the_unit_by_unit_greedy`,
+`chunking_work_is_n_log_n_on_megabyte_texts`,
 `split_for_map_reduce_pieces_fit_and_cover_the_text`, and the `compile_fail`
 doctests on `ContextPack`. The first rows of the token fixture
 (`context_budget/token_fixture.tsv`) were derived by hand from the o200k and
