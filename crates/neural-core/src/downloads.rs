@@ -343,17 +343,39 @@ pub fn finalize_download(
     confirmed_program: bool,
     allow_programs: bool,
 ) -> FinalizeOutcome {
+    finalize_download_with_commit(path, confirmed_program, allow_programs, |action| {
+        Some(apply_finalize_download(path, action))
+    })
+    .expect("unconditional finalization always commits")
+}
+
+/// Inspeciona o ficheiro e entrega a acao antes de tocar no disco. O chamador
+/// pode recusar o commit quando o download foi cancelado durante a leitura.
+/// A verificacao e o commit devem usar o mesmo trinco para que o cancelamento
+/// nao entre entre eles.
+pub fn finalize_download_with_commit(
+    path: &Path,
+    confirmed_program: bool,
+    allow_programs: bool,
+    commit: impl FnOnce(FinalizeAction) -> Option<FinalizeOutcome>,
+) -> Option<FinalizeOutcome> {
     let name = file_name_of(path);
     let risk = name_risk(name);
     let sniff = read_head(path).map(|head| file_risk::sniff_download(&head));
     let archive = (sniff.is_some() && is_zip_name(name)).then(|| inspect_zip_file(path));
-    match decide_finalize(
+    commit(decide_finalize(
         risk,
         sniff,
         archive.as_ref(),
         confirmed_program,
         allow_programs,
-    ) {
+    ))
+}
+
+/// Aplica o veredito ja calculado. O worker de downloads chama isto sob o
+/// trinco que tambem invalida uma inspecao cancelada.
+pub fn apply_finalize_download(path: &Path, action: FinalizeAction) -> FinalizeOutcome {
+    match action {
         FinalizeAction::Keep(inspection) => match write_motw_if_absent(path) {
             Ok(motw) => FinalizeOutcome::Kept(motw, inspection),
             Err(error) => FinalizeOutcome::KeptWithoutMotw(error.kind(), inspection),
@@ -707,6 +729,8 @@ pub struct DownloadEntry {
     pub received: u64,
     pub total: Option<u64>,
     pub state: DownloadState,
+    /// Um `Completed` repetido nao reabre uma finalizacao ja cancelada.
+    finalization_cancelled: bool,
     pub confirmed_program: bool,
     /// Um documento com macros.
     pub warn: bool,
@@ -813,6 +837,14 @@ impl DownloadManager {
             DownloadEvent::CancelRequested { id } => match self.entries.get(&id).map(|e| e.state) {
                 Some(DownloadState::Asking(_)) => self.answered(id, false),
                 Some(DownloadState::Running) => vec![DownloadEffect::CancelRunning(id)],
+                Some(DownloadState::Finalizing) => {
+                    let entry = self.entries.get_mut(&id).expect("entry still present");
+                    entry.state = DownloadState::Done(RecordOutcome::Cancelled);
+                    entry.finalization_cancelled = true;
+                    let mut effects = vec![DownloadEffect::Changed(id)];
+                    effects.extend(self.record(id));
+                    effects
+                }
                 _ => Vec::new(),
             },
             DownloadEvent::WebViewGone { webview } => self.webview_gone(webview),
@@ -858,6 +890,7 @@ impl DownloadManager {
             received: 0,
             total: start.total,
             state: DownloadState::Running,
+            finalization_cancelled: false,
             confirmed_program: false,
             warn: risk == NameRisk::Macro,
             at: start.at,
@@ -919,6 +952,9 @@ impl DownloadManager {
             return vec![DownloadEffect::ForgetOp(id)];
         };
         let mut effects = vec![DownloadEffect::ForgetOp(id)];
+        if entry.finalization_cancelled {
+            return effects;
+        }
         match end {
             DownloadEnd::Completed { path } => {
                 // Um ficheiro acabado passa SEMPRE pelo fim, mesmo depois de

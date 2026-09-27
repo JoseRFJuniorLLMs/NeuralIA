@@ -1235,7 +1235,7 @@ impl DownloadRows {
             show,
             cancel: matches!(
                 entry.state,
-                DownloadState::Running | DownloadState::Asking(_)
+                DownloadState::Running | DownloadState::Asking(_) | DownloadState::Finalizing
             ),
             tone,
         }
@@ -1468,6 +1468,20 @@ impl DownloadsUiState {
             card_sink: Box::new(Box::new(move |event| {
                 let _ = proxy.send_event(event);
             })),
+            panel_live: false,
+            announced: BTreeSet::new(),
+            badge: DownloadsBadge::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::windows_app) fn new_for_test() -> Self {
+        Self {
+            rows: DownloadRows::default(),
+            meters: BTreeMap::new(),
+            card: NativeCard::default(),
+            card_popup: None,
+            card_sink: Box::new(Box::new(|_| {})),
             panel_live: false,
             announced: BTreeSet::new(),
             badge: DownloadsBadge::default(),

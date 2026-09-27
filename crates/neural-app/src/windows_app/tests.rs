@@ -25929,6 +25929,7 @@ mod downloads_gates {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::Path;
+    use std::sync::{Arc, Barrier};
 
     use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 
@@ -26000,6 +26001,9 @@ mod downloads_gates {
     /// `downloads.json` reais.
     struct Rig {
         manager: DownloadManager,
+        finalizer: DownloadFinalizer,
+        finalized: std::sync::mpsc::Receiver<(DownloadEvent, Option<String>)>,
+        last_worker_name: Option<String>,
         ops: RefCell<DownloadOps<FakeDownload>>,
         journal: Journal,
         later: Vec<DownloadEffect>,
@@ -26009,8 +26013,15 @@ mod downloads_gates {
 
     impl Rig {
         fn new(manager: DownloadManager) -> Self {
+            let (sender, finalized) = std::sync::mpsc::channel();
             Self {
                 manager,
+                finalizer: DownloadFinalizer::new(move |event| {
+                    let name = std::thread::current().name().map(str::to_string);
+                    let _ = sender.send((event, name));
+                }),
+                finalized,
+                last_worker_name: None,
                 ops: RefCell::new(DownloadOps::default()),
                 journal: Journal::default(),
                 later: Vec::new(),
@@ -26046,9 +26057,29 @@ mod downloads_gates {
         }
 
         fn drive(&mut self, event: DownloadEvent) {
+            let completed = matches!(
+                event,
+                DownloadEvent::Ended {
+                    end: DownloadEnd::Completed { .. },
+                    ..
+                }
+            );
+            self.drive_once(event);
+            if completed {
+                let (verdict, name) = self
+                    .finalized
+                    .recv_timeout(std::time::Duration::from_secs(15))
+                    .expect("worker devolveu veredito");
+                self.last_worker_name = name;
+                self.drive_once(verdict);
+            }
+        }
+
+        fn drive_once(&mut self, event: DownloadEvent) {
             let private_mode = downloads_private_mode(self.mode());
             let run = run_download_event(
                 &mut self.manager,
+                &mut self.finalizer,
                 &self.ops,
                 self.store.as_mut(),
                 private_mode,
@@ -26315,7 +26346,7 @@ mod downloads_gates {
 
     /// Gate critico (downloads-zip-inspect; sabotado: um arquivo nao
     /// inspecionado mostrado como concluido sem mais nada), pela volta
-    /// inteira do `App` (`run_download_event`, com o `finalize_download` no
+    /// inteira do `App` (`run_download_event`, com o worker a finalizar no
     /// disco): o `pacote.zip` do E2E (setup.exe e run.bat) e apagado sem
     /// «Permitir baixar programas», com o aviso e a linha a dizer porque, e
     /// fica com ela, a dizer o que leva; um ZIP sobreposto e um 7z ficam
@@ -26471,6 +26502,210 @@ mod downloads_gates {
         ));
     }
 
+    /// Gate critico: a volta que o App embarca so enfileira. O veredito vem
+    /// da thread nomeada, e duas conclusoes simultaneas conservam a ordem.
+    #[test]
+    fn download_finalize_runs_on_the_lazy_fifo_worker() {
+        let dir = Scratch::new("fifo-finalize");
+        let mut rig = Rig::new(DownloadManager::default());
+        assert_eq!(rig.finalizer.threads_spawned(), 0);
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_arrived = Arc::clone(&arrived);
+        let worker_release = Arc::clone(&release);
+        rig.finalizer.set_before_commit(move |id| {
+            if id == DownloadId(1) {
+                worker_arrived.wait();
+                worker_release.wait();
+            }
+        });
+        for id in 1..=2 {
+            let path = dir.0.join(format!("{id}.pdf"));
+            rig.begin(id, 1, WebViewHost::External, path.clone());
+            std::fs::write(&path, PDF).expect("download");
+            rig.drive_once(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed { path },
+            });
+        }
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).unwrap().state,
+            DownloadState::Finalizing
+        );
+        assert_eq!(
+            rig.manager.entry(DownloadId(2)).unwrap().state,
+            DownloadState::Finalizing
+        );
+        assert_eq!(rig.finalizer.threads_spawned(), 1);
+        arrived.wait();
+        assert!(
+            rig.finalized.try_recv().is_err(),
+            "o primeiro veredito chegou antes do commit"
+        );
+        release.wait();
+        for expected in 1..=2 {
+            let (event, thread) = rig
+                .finalized
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("veredito do worker");
+            assert!(
+                matches!(event, DownloadEvent::Finalized { id, .. } if id == DownloadId(expected))
+            );
+            assert_eq!(thread.as_deref(), Some("neural-download-finalize"));
+            rig.drive_once(event);
+        }
+    }
+
+    /// Gate critico: a linha e o toast nao anunciam uma conclusao enquanto
+    /// o worker ainda nao devolveu o veredito; abrir/mostrar estao fechados.
+    #[test]
+    fn download_finalizing_never_looks_completed_or_openable() {
+        let dir = Scratch::new("pending-finalize");
+        let path = dir.0.join("fotos.zip");
+        let mut rig = Rig::new(DownloadManager::default());
+        rig.begin(1, 1, WebViewHost::External, path.clone());
+        std::fs::write(&path, stored_zip(&[("foto.jpg", b"image")], false)).unwrap();
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Completed { path },
+        });
+        let entry = rig.manager.entry(DownloadId(1)).unwrap();
+        assert_eq!(entry.state, DownloadState::Finalizing);
+        let mut projection = DownloadRows::default();
+        let row = projection.list(&rig.manager, &BTreeMap::new()).remove(0);
+        assert_eq!(row.status, "Verificando o arquivo…");
+        assert!(!row.open && !row.show, "{row:?}");
+        assert!(row_file(&rig.manager, &projection, row.id).is_none());
+        assert!(row.cancel, "a verificacao deve poder ser cancelada");
+        assert!(
+            download_changed(
+                &mut DownloadsUiState::new_for_test(),
+                entry,
+                std::time::Instant::now()
+            )
+            .is_none()
+        );
+        let (verdict, _) = rig
+            .finalized
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap();
+        rig.drive_once(verdict);
+        let row = DownloadRows::default()
+            .list(&rig.manager, &BTreeMap::new())
+            .remove(0);
+        assert!(row.status.starts_with("Concluído"), "{row:?}");
+    }
+
+    /// Gate critico: cancelar depois da inspecao mas antes do commit conserva
+    /// o ficheiro e descarta tanto o resultado do worker como um evento velho
+    /// que chegasse depois de a linha ter sido retirada.
+    #[test]
+    fn cancelled_or_removed_download_discards_late_verdict() {
+        use neural_core::downloads::{FinalizeOutcome, Inspection, MotwOutcome};
+        let dir = Scratch::new("cancel-finalize");
+        let path = dir.0.join("pacote.zip");
+        let mut rig = Rig::new(DownloadManager::default());
+        let arrived = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let worker_arrived = Arc::clone(&arrived);
+        let worker_release = Arc::clone(&release);
+        rig.finalizer.set_before_commit(move |_| {
+            worker_arrived.wait();
+            worker_release.wait();
+        });
+        rig.begin(1, 1, WebViewHost::External, path.clone());
+        std::fs::write(&path, stored_zip(&[("setup.exe", &pe_bytes())], false)).unwrap();
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Completed { path: path.clone() },
+        });
+        arrived.wait();
+        assert!(matches!(
+            leave_decision(LeaveKind::Close, &rig.manager),
+            LeaveDecision::Ask(prompt) if prompt.cancel == vec![DownloadId(1)]
+        ));
+        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(1) });
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).unwrap().state,
+            DownloadState::Done(RecordOutcome::Cancelled)
+        );
+        assert_eq!(
+            leave_decision(LeaveKind::Close, &rig.manager),
+            LeaveDecision::Leave
+        );
+        rig.drive_once(DownloadEvent::Finalized {
+            id: DownloadId(1),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
+        });
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).unwrap().state,
+            DownloadState::Done(RecordOutcome::Cancelled)
+        );
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Completed { path: path.clone() },
+        });
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).unwrap().state,
+            DownloadState::Done(RecordOutcome::Cancelled)
+        );
+        rig.drive_once(DownloadEvent::ClearLog);
+        assert!(rig.manager.entry(DownloadId(1)).is_none());
+        release.wait();
+        assert!(
+            rig.finalized
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err()
+        );
+        assert!(path.exists(), "cancelar nao deve apagar o ZIP");
+        assert!(rig.manager.log().entries.is_empty());
+    }
+
+    /// Medicao em release, nao gate: a mesma entrada real mede o antigo
+    /// finalize sincrono e a volta que a interface faz agora. A fixture e
+    /// gerada localmente (ZIP64 com 100 000 entradas) e passada pelo ambiente.
+    #[test]
+    #[ignore = "medicao manual com NEURALIA_BENCH_ZIP, sem GUI"]
+    fn zip_finalize_ui_thread_timing() {
+        let source = PathBuf::from(std::env::var("NEURALIA_BENCH_ZIP").expect("fixture ZIP64"));
+        let dir = Scratch::new("zip-ui-timing");
+        let direct = dir.0.join("direct.zip");
+        let worker = dir.0.join("worker.zip");
+        std::fs::copy(&source, &direct).expect("fixture direct");
+        std::fs::copy(&source, &worker).expect("fixture worker");
+        let started = std::time::Instant::now();
+        let baseline = neural_core::downloads::finalize_download(&direct, false, false);
+        let direct_time = started.elapsed();
+        let mut rig = Rig::new(DownloadManager::default());
+        rig.begin(1, 1, WebViewHost::External, worker.clone());
+        let started = std::time::Instant::now();
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Completed { path: worker },
+        });
+        let ui_time = started.elapsed();
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).unwrap().state,
+            DownloadState::Finalizing
+        );
+        let (verdict, _) = rig
+            .finalized
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let background_time = started.elapsed();
+        rig.drive_once(verdict);
+        assert!(matches!(
+            baseline,
+            neural_core::downloads::FinalizeOutcome::Kept(
+                _,
+                neural_core::downloads::Inspection::Checked
+            )
+        ));
+        eprintln!(
+            "100000-entry ZIP64: before UI {direct_time:?}; after UI dispatch {ui_time:?}; worker verdict {background_time:?}"
+        );
+    }
+
     /// Gate critico: nada de uma pagina privada nem do Modo privado chega
     /// ao `downloads.json` -- pela volta inteira do `App`
     /// (`run_download_event`, com o modo do registo das lojas e a loja
@@ -26617,7 +26852,7 @@ mod downloads_gates {
             let dir = Scratch::new("clear");
             let file = file_with(&dir.0, LOG_VERSION, "segredo.pdf");
             let stores = StoreRegistry::mint_for_test(&dir.0);
-            let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
+            let mut state = DownloadsState::open(|spec| stores.grant(spec).ok(), |_| {});
             assert_eq!(state.manager.log().entries.len(), 1);
             stores.set_mode(mode);
             clear(&mut state, &stores);
@@ -26642,7 +26877,7 @@ mod downloads_gates {
         let other = dir.0.join("tabs.json");
         std::fs::write(&other, b"{}").expect("outro");
         let stores = StoreRegistry::mint_for_test(&dir.0);
-        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
+        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok(), |_| {});
         assert!(
             state
                 .log_store
@@ -26703,8 +26938,10 @@ mod downloads_gates {
             .expect("definicoes");
         };
         write_settings(&chosen, true);
-        let state =
-            DownloadsState::open(|spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok());
+        let state = DownloadsState::open(
+            |spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok(),
+            |_| {},
+        );
         assert_eq!(
             state.manager.settings().folder.as_deref(),
             Some(chosen.as_path())
@@ -26716,8 +26953,10 @@ mod downloads_gates {
         );
 
         write_settings(&dir.0.join("nao-existe"), false);
-        let state =
-            DownloadsState::open(|spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok());
+        let state = DownloadsState::open(
+            |spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok(),
+            |_| {},
+        );
         assert_eq!(state.manager.settings().folder, None);
         assert_eq!(
             state.shared.folder.borrow().as_deref(),
@@ -26726,7 +26965,7 @@ mod downloads_gates {
         );
 
         // Sem registo: tudo por omissao, nada gravado, a pasta do sistema.
-        let state = DownloadsState::open(|_| None);
+        let state = DownloadsState::open(|_| None, |_| {});
         assert_eq!(state.manager.settings(), &DownloadSettings::default());
         assert!(state.log_store.is_none());
         assert_eq!(
@@ -26899,7 +27138,7 @@ mod downloads_gates {
         let file = dir.0.join(DOWNLOADS_SETTINGS_STORE.name);
         std::fs::write(&file, serde_json::to_vec(&body).expect("json")).expect("definicoes");
         let stores = StoreRegistry::mint_for_test(&dir.0);
-        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
+        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok(), |_| {});
         let start = |state: &mut DownloadsState, id: u64| {
             state
                 .run(
@@ -26944,7 +27183,7 @@ mod downloads_gates {
                 .any(|effect| matches!(effect, DownloadEffect::Ask { .. }))
         );
         // Sem loja (nunca no produto): nada muda.
-        let mut none = DownloadsState::open(|_| None);
+        let mut none = DownloadsState::open(|_| None, |_| {});
         assert!(none.set_allow_programs(true).is_err());
         assert!(!none.manager.settings().allow_programs);
     }

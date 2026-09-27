@@ -841,6 +841,47 @@ jobs:
           '@
             },
             @{
+              Label = "download-finalize-on-ui-thread"
+              Test = "download_finalize_runs_on_the_lazy_fifo_worker"
+              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Old = @'
+                      if finalizer.enqueue(id, path, confirmed_program, allow_programs) {
+                          None
+                      } else {
+                          debug_log(format_args!("downloads: {} sem worker de inspecao", id.0));
+                          Some(DownloadEvent::CancelRequested { id })
+                      }
+          '@
+              New = @'
+                      Some(DownloadEvent::Finalized {
+                          id,
+                          outcome: neural_core::downloads::finalize_download(&path, confirmed_program, allow_programs),
+                      })
+          '@
+            },
+            @{
+              Label = "download-shown-complete-before-verdict"
+              Test = "download_finalizing_never_looks_completed_or_openable"
+              SourcePath = "crates/neural-app/src/windows_app/downloads_ui.rs"
+              Old = @'
+                      DownloadState::Finalizing => ("Verificando o arquivo…".to_string(), "running", None),
+          '@
+              New = @'
+                      DownloadState::Finalizing => ("Concluído".to_string(), "done", None),
+          '@
+            },
+            @{
+              Label = "download-cancel-still-commits"
+              Test = "cancelled_or_removed_download_discards_late_verdict"
+              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Old = @'
+                                      (!*cancelled).then(|| apply_finalize_download(&job.path, action))
+          '@
+              New = @'
+                                      true.then(|| apply_finalize_download(&job.path, action))
+          '@
+            },
+            @{
               Label = "guard-lends-the-registry-with-a-lifetime"
               Test = "registry_is_minted_once_and_owned_by_the_guard"
               SourcePath = "crates/neural-app/src/privacy.rs"

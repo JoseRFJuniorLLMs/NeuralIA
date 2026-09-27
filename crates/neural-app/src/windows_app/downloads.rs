@@ -3,14 +3,18 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use neural_core::downloads::{
     DownloadEffect, DownloadEnd, DownloadEvent, DownloadId, DownloadLog, DownloadManager,
     DownloadSettings, DownloadStart, LOG_MAX_BYTES, LOG_VERSION, ProgressThrottle,
-    SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, finalize_download, unique_path,
+    SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, apply_finalize_download,
+    finalize_download_with_commit, unique_path,
 };
 use neural_core::json_store::{SaveOutcome, StoreGrant, StoreSpec, VersionedJsonStore};
 
+use crate::lazy_worker::{JobContext, LazyWorker};
 use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 
 // ===================== o gestor de downloads (downloads-manager) =====================
@@ -30,10 +34,10 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 //   perguntar. Um erro antes da decisao recusa.
 // - `BytesReceivedChanged`: filtrado a 250 ms (`ProgressThrottle`) antes de
 //   sair do handler. `StateChanged`: o fim (acabado, cancelado,
-//   interrompido), que larga a operacao e, se acabou, corre o
-//   `finalize_download` (sniff e, num `.zip`, o diretorio central -- com
-//   «Permitir baixar programas» de quando acabou --, depois a marca da Web
-//   ou apagar).
+//   interrompido), que larga a operacao e, se acabou, enfileira o finalize
+//   na thread `neural-download-finalize`: sniff, inspecao do ZIP com
+//   «Permitir baixar programas» de quando acabou, e marca da Web ou apagar.
+//   O veredito volta como `UserEvent::Download(DownloadEvent::Finalized)`.
 // - A WebView destruida: o handler do `DownloadStarting` guarda um
 //   `WebViewLife`; quando o WebView2 o larga, o gestor recebe `WebViewGone`
 //   e cancela e larga as operacoes dessa WebView.
@@ -634,9 +638,158 @@ pub(in crate::windows_app) fn downloads_private_mode(mode: PrivacyMode) -> bool 
     mode == PrivacyMode::Private
 }
 
+/// A fila conserva todos os downloads que acabam juntos. O `LazyWorker` tem
+/// uma vaga latest-wins, por isso ela recebe o receptor uma unica vez e a
+/// thread consome esta fila FIFO ate o `DownloadsState` ser largado.
+struct FinalizeJob {
+    id: DownloadId,
+    path: PathBuf,
+    confirmed_program: bool,
+    allow_programs: bool,
+    cancelled: Arc<Mutex<bool>>,
+}
+
+#[cfg(test)]
+type FinalizeCommitHook = Arc<dyn Fn(DownloadId) + Send + Sync>;
+#[cfg(test)]
+type FinalizeCommitProbe = Arc<Mutex<Option<FinalizeCommitHook>>>;
+
+pub(in crate::windows_app) struct DownloadFinalizer {
+    worker: LazyWorker<Receiver<FinalizeJob>>,
+    sender: Sender<FinalizeJob>,
+    receiver: Option<Receiver<FinalizeJob>>,
+    pending: BTreeMap<DownloadId, Arc<Mutex<bool>>>,
+    #[cfg(test)]
+    before_commit: FinalizeCommitProbe,
+}
+
+impl DownloadFinalizer {
+    pub(in crate::windows_app) fn new(emit: impl Fn(DownloadEvent) + Send + 'static) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        #[cfg(test)]
+        let before_commit: FinalizeCommitProbe = Arc::new(Mutex::new(None));
+        #[cfg(test)]
+        let worker_hook = Arc::clone(&before_commit);
+        let worker = LazyWorker::new(
+            "neural-download-finalize",
+            move |queue: Receiver<FinalizeJob>, _: &JobContext| {
+                for job in queue {
+                    if *job
+                        .cancelled
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    {
+                        continue;
+                    }
+                    let outcome = finalize_download_with_commit(
+                        &job.path,
+                        job.confirmed_program,
+                        job.allow_programs,
+                        |action| {
+                            #[cfg(test)]
+                            if let Some(hook) = worker_hook
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone()
+                            {
+                                hook(job.id);
+                            }
+                            let cancelled = job
+                                .cancelled
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            (!*cancelled).then(|| apply_finalize_download(&job.path, action))
+                        },
+                    );
+                    if let Some(outcome) = outcome {
+                        emit(DownloadEvent::Finalized {
+                            id: job.id,
+                            outcome,
+                        });
+                    }
+                }
+            },
+        );
+        Self {
+            worker,
+            sender,
+            receiver: Some(receiver),
+            pending: BTreeMap::new(),
+            #[cfg(test)]
+            before_commit,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::windows_app) fn set_before_commit(
+        &mut self,
+        hook: impl Fn(DownloadId) + Send + Sync + 'static,
+    ) {
+        *self
+            .before_commit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in crate::windows_app) fn threads_spawned(&self) -> usize {
+        self.worker.threads_spawned()
+    }
+
+    fn enqueue(
+        &mut self,
+        id: DownloadId,
+        path: PathBuf,
+        confirmed_program: bool,
+        allow_programs: bool,
+    ) -> bool {
+        if let Some(receiver) = self.receiver.take()
+            && self.worker.submit(receiver).is_err()
+        {
+            return false;
+        }
+        let cancelled = Arc::new(Mutex::new(false));
+        let job = FinalizeJob {
+            id,
+            path,
+            confirmed_program,
+            allow_programs,
+            cancelled: Arc::clone(&cancelled),
+        };
+        if self.sender.send(job).is_err() {
+            return false;
+        }
+        self.pending.insert(id, cancelled);
+        true
+    }
+
+    fn cancel(&mut self, id: DownloadId) {
+        if let Some(cancelled) = self.pending.remove(&id) {
+            *cancelled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        }
+    }
+
+    fn finished(&mut self, id: DownloadId) {
+        self.pending.remove(&id);
+    }
+}
+
+impl Drop for DownloadFinalizer {
+    fn drop(&mut self) {
+        for cancelled in self.pending.values() {
+            *cancelled
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        }
+    }
+}
+
 /// O estado da feature no `App`.
 pub(in crate::windows_app) struct DownloadsState {
     pub(in crate::windows_app) manager: DownloadManager,
+    finalizer: DownloadFinalizer,
     pub(in crate::windows_app) shared: DownloadsShared,
     pub(in crate::windows_app) log_store: Option<VersionedJsonStore<DownloadLog>>,
     /// `downloads-settings.json` (`StoreKind::Setting`): a seccao Downloads
@@ -650,6 +803,7 @@ impl DownloadsState {
     /// omissao e nada se grava.
     pub(in crate::windows_app) fn open(
         mut grants: impl FnMut(StoreSpec) -> Option<StoreGrant>,
+        emit: impl Fn(DownloadEvent) + Send + 'static,
     ) -> Self {
         let mut settings_store = grants(DOWNLOADS_SETTINGS_STORE).and_then(|grant| {
             VersionedJsonStore::<DownloadSettings>::open(
@@ -677,6 +831,7 @@ impl DownloadsState {
                 user_downloads_folder,
             )),
             manager: DownloadManager::new(settings, log),
+            finalizer: DownloadFinalizer::new(emit),
             log_store,
             settings_store,
         }
@@ -692,6 +847,7 @@ impl DownloadsState {
     ) -> DownloadRun {
         run_download_event(
             &mut self.manager,
+            &mut self.finalizer,
             &self.shared.ops,
             self.log_store.as_mut(),
             private_mode,
@@ -728,12 +884,13 @@ pub(in crate::windows_app) fn drive_downloads<H: DownloadHandle>(
 }
 
 /// O que o `App` faz a um efeito que nao e das operacoes. O fim do
-/// ficheiro corre ja e devolve o evento seguinte; gravar, avisar, a
+/// ficheiro entra na fila sem bloquear a janela; gravar, avisar, a
 /// pergunta «Baixar programa?» (o cartao do downloads-ui, cuja resposta
 /// chega mais tarde como `DownloadEvent::Answered`) e a linha que mudou
 /// ficam em `later` (precisam do `App` inteiro).
 pub(in crate::windows_app) fn download_app_step(
     effect: DownloadEffect,
+    finalizer: &mut DownloadFinalizer,
     later: &mut Vec<DownloadEffect>,
 ) -> Option<DownloadEvent> {
     match effect {
@@ -751,9 +908,12 @@ pub(in crate::windows_app) fn download_app_step(
             confirmed_program,
             allow_programs,
         } => {
-            let outcome = finalize_download(&path, confirmed_program, allow_programs);
-            debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
-            Some(DownloadEvent::Finalized { id, outcome })
+            if finalizer.enqueue(id, path, confirmed_program, allow_programs) {
+                None
+            } else {
+                debug_log(format_args!("downloads: {} sem worker de inspecao", id.0));
+                Some(DownloadEvent::CancelRequested { id })
+            }
         }
         DownloadEffect::Persist
         | DownloadEffect::EraseLog
@@ -787,15 +947,24 @@ pub(in crate::windows_app) struct DownloadRun {
 /// do disco (`EraseLog`). Sem loja (nunca no produto), nada toca no disco.
 pub(in crate::windows_app) fn run_download_event<H: DownloadHandle>(
     manager: &mut DownloadManager,
+    finalizer: &mut DownloadFinalizer,
     ops: &RefCell<DownloadOps<H>>,
     mut log_store: Option<&mut VersionedJsonStore<DownloadLog>>,
     private_mode: bool,
     event: DownloadEvent,
 ) -> DownloadRun {
     manager.set_private_mode(private_mode);
+    match &event {
+        DownloadEvent::CancelRequested { id } => finalizer.cancel(*id),
+        DownloadEvent::Finalized { id, outcome } => {
+            debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
+            finalizer.finished(*id);
+        }
+        _ => {}
+    }
     let mut run = DownloadRun::default();
     drive_downloads(manager, ops, event, |effect| {
-        download_app_step(effect, &mut run.later)
+        download_app_step(effect, finalizer, &mut run.later)
     });
     for effect in &run.later {
         let Some(store) = log_store.as_deref_mut() else {
