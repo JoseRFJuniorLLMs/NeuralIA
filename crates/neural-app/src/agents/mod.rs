@@ -11,8 +11,8 @@
 //!    antes de qualquer janela, WebView ou perfil ([`launch_mode`]).
 //! 2. O **hub**, dentro do NeuralIA aberto ([`hub`]): estado, perguntas,
 //!    limites, eventos para a interface. A ponte fala com ele por um named
-//!    pipe local cujo DACL so deixa entrar o utilizador atual e o SYSTEM, e
-//!    que exige um token aleatorio lido de `<data_dir>/agents/token`
+//!    pipe local cujo DACL so deixa entrar o utilizador atual, e que exige
+//!    um token aleatorio lido de `<data_dir>/agents/token`
 //!    ([`pipe`], so Windows).
 //! 3. As **conversas**, em `<data_dir>/agents/<agente>.jsonl` ([`store`]).
 //!
@@ -34,9 +34,9 @@ use std::io::{self, BufRead};
 use std::path::Path;
 
 // A API do painel «Agentes» (interface). O app (`windows_app/agents_hub.rs`)
-// so usa hoje o hub, os eventos e os registos; o resto (resumo, perguntas,
-// respostas, contexto partilhado) e do painel, que chega no
-// int-agents-finish -- ate la, so os testes o tocam.
+// usa o hub, os eventos e os registos; a persistencia nasce do grant
+// Automatic entregue pelo PrivacyGuard, por isso modo privado nao cria o
+// canal nem grava conversas.
 #[allow(unused_imports)]
 pub(crate) use hub::{
     AgentEvent, AgentHub, AgentStatusLine, AgentSummary, HubServerState, HubSnapshot,
