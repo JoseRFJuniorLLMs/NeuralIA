@@ -949,7 +949,7 @@ fn all_marks(state: &HubState) -> BTreeMap<String, AgentMarks> {
         // ligações/perguntas da sessão. Isso não lhes dá direito a reaparecer
         // em state.json: só volta a persistir o agente que voltou a ter uma
         // conversa nova.
-        .filter(|(_, entry)| !entry.conversation.records.is_empty())
+        .filter(|(_, entry)| entry.conversation.has_persistent_records())
         .map(|(agent, entry)| (agent.clone(), entry.marks))
         .collect()
 }
@@ -1941,7 +1941,17 @@ pub(crate) mod tests {
         assert!(!agents_dir.join("codex.jsonl").exists());
         assert!(!state_file.exists());
 
-        // Só Claude voltou a produzir história depois do gesto.
+        // Codex volta a falar so em Private: fica na memoria, mas isso nao
+        // lhe da direito a reaparecer quando outra atividade normal grava
+        // state.json mais tarde.
+        f.registry.set_mode(StoreMode::Private);
+        send(&f.hub, codex, "privado codex").unwrap();
+        assert_eq!(f.hub.conversation("codex").len(), 1);
+        assert!(!agents_dir.join("codex.jsonl").exists());
+        assert!(!state_file.exists());
+
+        // So Claude voltou a produzir historia persistivel depois do gesto.
+        f.registry.set_mode(StoreMode::Normal);
         f.hub.user_message("claude", "novo claude").unwrap();
         assert!(agents_dir.join("claude.jsonl").exists());
         assert!(!agents_dir.join("codex.jsonl").exists());
