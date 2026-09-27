@@ -101,9 +101,11 @@ impl ApplicationHandler<UserEvent> for App {
         self.observe_tab_session();
     }
 
-    /// Fechar a janela com o comparador aberto: as abas ficam gravadas.
+    /// Fechar a janela com o comparador aberto: as abas ficam gravadas. E
+    /// cada download a verificar acaba antes de sair (com prazo).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let _ = self.save_tab_session();
+        self.finish_downloads_before_exit();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
