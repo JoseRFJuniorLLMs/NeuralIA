@@ -22,19 +22,28 @@
 //!   arquivo compactado dentro e apagado, a menos que «Permitir baixar
 //!   programas» esteja ligada; com um disfarce ou um nome inseguro dentro,
 //!   sempre. Um que nao se deixa listar fica, como um 7z ou um RAR,
-//!   [`Inspection::NotInspected`] -- nunca «seguro».
+//!   [`Inspection::NotInspected`] -- nunca «seguro». O `neural-app` corre
+//!   este fim fora da interface ([`finalize_download_with_commit`], que le
+//!   «Permitir baixar programas» no commit); ate ao veredito o download fica
+//!   [`DownloadState::Finalizing`], que nao se cancela.
 //! - **Guardar** ([`DownloadLog`], `downloads.json`, no maximo
 //!   [`MAX_LOG_ENTRIES`]): so os downloads acabados que nao vieram de uma
 //!   pagina privada (o Split privado, um servico InPrivate) nem comecaram ou
 //!   acabaram no Modo privado ([`DownloadManager::set_private_mode`]): um
 //!   destes nunca entra no registo em memoria, e por isso nao chega ao
-//!   ficheiro quando o modo volta ao normal. A loja e `StoreKind::Automatic`:
-//!   no Modo privado tambem nao se escreve.
-//! - **Apagar** ([`DownloadEvent::ClearLog`], Ctrl+Shift+Delete): o registo
-//!   esvazia e o efeito [`DownloadEffect::EraseLog`] manda tirar o ficheiro
-//!   do disco, em qualquer modo.
+//!   ficheiro quando o modo volta ao normal. A loja do produto e
+//!   `StoreKind::GuardedAutomatic`: o gestor exclui conteudo privado antes
+//!   da loja, enquanto um download que acabou no normal pode concluir o seu
+//!   veredito mesmo se o modo global mudar para privado. Um fim a espera do
+//!   veredito fica no registo como [`RecordOutcome::Pending`], com o caminho,
+//!   e volta a correr no arranque seguinte ([`DownloadManager::resume_pending`]).
+//! - **Apagar** ([`DownloadEvent::ClearLog`], Ctrl+Shift+Delete): historico
+//!   concluido some. Uma verificacao ja em curso conserva apenas um
+//!   `recovery_only` oculto, para uma queda ainda poder retomar o veredito;
+//!   ele nunca aparece na lista nem vira historico quando o veredito chega.
+//!   Sem verificacao pendente, [`DownloadEffect::EraseLog`] tira o ficheiro.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -343,22 +352,27 @@ pub fn finalize_download(
     confirmed_program: bool,
     allow_programs: bool,
 ) -> FinalizeOutcome {
-    finalize_download_with_commit(path, confirmed_program, allow_programs, |action| {
-        Some(apply_finalize_download(path, action))
-    })
-    .expect("unconditional finalization always commits")
+    finalize_download_with_commit(
+        path,
+        confirmed_program,
+        || allow_programs,
+        |action| apply_finalize_download(path, action),
+    )
 }
 
-/// Inspeciona o ficheiro e entrega a acao antes de tocar no disco. O chamador
-/// pode recusar o commit quando o download foi cancelado durante a leitura.
-/// A verificacao e o commit devem usar o mesmo trinco para que o cancelamento
-/// nao entre entre eles.
+/// O fim em dois tempos, como a thread `neural-download-finalize` o corre:
+/// primeiro le o ficheiro (o sniff e, num `.zip`, o diretorio central); so
+/// depois pergunta «Permitir baixar programas» (`allow_programs`, lida no
+/// commit e nao quando o download acabou: desligada durante a verificacao,
+/// um ZIP com um programa dentro e apagado) e entrega a acao a `commit`, que
+/// a aplica ao disco ([`apply_finalize_download`]). Nao ha commit
+/// condicional: uma verificacao nunca se cancela, e o veredito chega sempre.
 pub fn finalize_download_with_commit(
     path: &Path,
     confirmed_program: bool,
-    allow_programs: bool,
-    commit: impl FnOnce(FinalizeAction) -> Option<FinalizeOutcome>,
-) -> Option<FinalizeOutcome> {
+    allow_programs: impl FnOnce() -> bool,
+    commit: impl FnOnce(FinalizeAction) -> FinalizeOutcome,
+) -> FinalizeOutcome {
     let name = file_name_of(path);
     let risk = name_risk(name);
     let sniff = read_head(path).map(|head| file_risk::sniff_download(&head));
@@ -368,12 +382,12 @@ pub fn finalize_download_with_commit(
         sniff,
         archive.as_ref(),
         confirmed_program,
-        allow_programs,
+        allow_programs(),
     ))
 }
 
-/// Aplica o veredito ja calculado. O worker de downloads chama isto sob o
-/// trinco que tambem invalida uma inspecao cancelada.
+/// Aplica o veredito ja calculado: a marca da Web num que fica, apagar um
+/// que nao fica.
 pub fn apply_finalize_download(path: &Path, action: FinalizeAction) -> FinalizeOutcome {
     match action {
         FinalizeAction::Keep(inspection) => match write_motw_if_absent(path) {
@@ -526,6 +540,24 @@ pub enum RecordOutcome {
     },
     Cancelled,
     Interrupted,
+    /// Acabou e ainda nao tem veredito: gravado quando o download acaba (com
+    /// o caminho), para que um fim abrupto a meio da verificacao deixe rasto,
+    /// e trocado pelo desfecho quando o veredito chega. No arranque seguinte
+    /// o fim corre de novo ([`DownloadManager::resume_pending`]); `resumed`
+    /// diz que ja voltou uma vez -- se volta outra, fica «não verificado»
+    /// sem terceira tentativa: uma verificacao que derruba a NeuralIA nao a
+    /// derruba em cada arranque. `confirmed_program`: o «Baixar programa?»
+    /// deste download teve sim (o fim de novo precisa de o saber).
+    Pending {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        confirmed_program: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resumed: bool,
+    },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Uma linha do `downloads.json`. Sem o endereco completo: so o anfitriao.
@@ -538,6 +570,11 @@ pub struct DownloadRecord {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// So para recuperar uma verificacao interrompida depois de o utilizador
+    /// ter apagado o historico. Nunca aparece na lista e nunca vira um
+    /// desfecho historico.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovery_only: bool,
     pub outcome: RecordOutcome,
     /// Quando comecou, em segundos Unix.
     pub at: u64,
@@ -625,6 +662,13 @@ pub enum DownloadEvent {
         id: DownloadId,
         outcome: FinalizeOutcome,
     },
+    /// O fim deste download perdeu-se sem veredito (a thread que o corria
+    /// rebentou a meio): o gestor pede-o outra vez (`Finalize`), e quem o
+    /// corre, sem a thread, corre-o ja. Uma linha nunca fica presa em
+    /// «Verificando o arquivo…».
+    FinalizeLost {
+        id: DownloadId,
+    },
     /// A resposta ao «Baixar programa?».
     Answered {
         id: DownloadId,
@@ -689,8 +733,10 @@ pub enum DownloadEffect {
         id: DownloadId,
         path: PathBuf,
         confirmed_program: bool,
-        /// «Permitir baixar programas» quando o download acabou: decide um
-        /// `.zip` com programas dentro.
+        /// «Permitir baixar programas» agora: decide um `.zip` com programas
+        /// dentro quando o fim corre ja (sincrono). A thread do fim nao usa
+        /// este valor: relê a definicao no commit
+        /// ([`finalize_download_with_commit`]).
         allow_programs: bool,
     },
     /// O registo mudou: gravar [`DownloadManager::log`].
@@ -711,7 +757,8 @@ pub enum DownloadState {
     /// Preso no deferral, a espera do «Baixar programa?».
     Asking(BlockReason),
     Running,
-    /// Acabou; `finalize_download` a correr.
+    /// Acabou; `finalize_download` a correr («Verificando o arquivo…»). Nao
+    /// se cancela: o veredito chega sempre, e e o que a linha mostra.
     Finalizing,
     Done(RecordOutcome),
 }
@@ -729,9 +776,12 @@ pub struct DownloadEntry {
     pub received: u64,
     pub total: Option<u64>,
     pub state: DownloadState,
-    /// Um `Completed` repetido nao reabre uma finalizacao ja cancelada.
-    finalization_cancelled: bool,
     pub confirmed_program: bool,
+    /// Falso depois de Apagar historico enquanto este arquivo ja esta em
+    /// verificacao, ou quando ele foi retomado de um recovery_only.
+    /// A verificacao continua por seguranca, mas a linha e o desfecho nao
+    /// reaparecem no historico.
+    pub history_visible: bool,
     /// Um documento com macros.
     pub warn: bool,
     pub at: u64,
@@ -833,18 +883,25 @@ impl DownloadManager {
             },
             DownloadEvent::Ended { id, end } => self.ended(id, end),
             DownloadEvent::Finalized { id, outcome } => self.finalized(id, outcome),
+            DownloadEvent::FinalizeLost { id } => match self.entries.get(&id) {
+                Some(entry) if entry.state == DownloadState::Finalizing => {
+                    vec![DownloadEffect::Finalize {
+                        id,
+                        path: entry.path.clone(),
+                        confirmed_program: entry.confirmed_program,
+                        allow_programs: self.settings.allow_programs,
+                    }]
+                }
+                _ => Vec::new(),
+            },
             DownloadEvent::Answered { id, allow } => self.answered(id, allow),
+            // A verificacao do fim (`Finalizing`) nao se cancela: o ficheiro
+            // ja esta no disco, e so o veredito o apaga ou lhe poe a marca da
+            // Web. Um Cancel que la chega (a linha, a saida, um clique velho
+            // de quando ainda corria) nao faz nada; o veredito chega depois.
             DownloadEvent::CancelRequested { id } => match self.entries.get(&id).map(|e| e.state) {
                 Some(DownloadState::Asking(_)) => self.answered(id, false),
                 Some(DownloadState::Running) => vec![DownloadEffect::CancelRunning(id)],
-                Some(DownloadState::Finalizing) => {
-                    let entry = self.entries.get_mut(&id).expect("entry still present");
-                    entry.state = DownloadState::Done(RecordOutcome::Cancelled);
-                    entry.finalization_cancelled = true;
-                    let mut effects = vec![DownloadEffect::Changed(id)];
-                    effects.extend(self.record(id));
-                    effects
-                }
                 _ => Vec::new(),
             },
             DownloadEvent::WebViewGone { webview } => self.webview_gone(webview),
@@ -853,9 +910,50 @@ impl DownloadManager {
                 Vec::new()
             }
             DownloadEvent::ClearLog => {
-                self.log.clear();
+                // Um arquivo em Finalizing ja existe no disco e ainda
+                // precisa do veredito. Apagar historico esconde a linha e o
+                // desfecho, mas conserva SOMENTE o pendente minimo para uma
+                // queda poder retomar a verificacao. O resto some.
+                let mut recovery_keys = BTreeSet::new();
+                for entry in self
+                    .entries
+                    .values_mut()
+                    .filter(|entry| entry.state == DownloadState::Finalizing)
+                {
+                    entry.history_visible = false;
+                    let record = record_of(
+                        entry,
+                        RecordOutcome::Pending {
+                            confirmed_program: entry.confirmed_program,
+                            resumed: false,
+                        },
+                    );
+                    recovery_keys.insert((record.name, record.path, record.host, record.at));
+                }
+                let mut recovery = VecDeque::new();
+                for mut record in self.log.drain(..) {
+                    let key = (
+                        record.name.clone(),
+                        record.path.clone(),
+                        record.host.clone(),
+                        record.at,
+                    );
+                    if matches!(record.outcome, RecordOutcome::Pending { .. })
+                        && recovery_keys.contains(&key)
+                    {
+                        record.recovery_only = true;
+                        recovery.push_back(record);
+                    }
+                }
+                self.log = recovery;
                 self.entries.retain(|_, entry| entry.is_active());
-                vec![DownloadEffect::EraseLog]
+                if self.log.is_empty() {
+                    vec![DownloadEffect::EraseLog]
+                } else {
+                    // Primeiro apaga o historico e todos os artefactos da
+                    // loja (.bak/.tmp); so depois nasce o journal minimo.
+                    vec![DownloadEffect::EraseLog, DownloadEffect::Persist]
+                }
             }
         }
     }
@@ -890,8 +988,8 @@ impl DownloadManager {
             received: 0,
             total: start.total,
             state: DownloadState::Running,
-            finalization_cancelled: false,
             confirmed_program: false,
+            history_visible: true,
             warn: risk == NameRisk::Macro,
             at: start.at,
         };
@@ -952,9 +1050,6 @@ impl DownloadManager {
             return vec![DownloadEffect::ForgetOp(id)];
         };
         let mut effects = vec![DownloadEffect::ForgetOp(id)];
-        if entry.finalization_cancelled {
-            return effects;
-        }
         match end {
             DownloadEnd::Completed { path } => {
                 // Um ficheiro acabado passa SEMPRE pelo fim, mesmo depois de
@@ -974,6 +1069,11 @@ impl DownloadManager {
                 if let Some(total) = entry.total {
                     entry.received = total;
                 }
+                // Acabou no Modo privado: privado ate ao fim, mesmo que o
+                // modo volte ao normal antes do veredito (quem vai para o
+                // registo decide-se aqui, nao quando a verificacao acaba).
+                // So neste passo: um `Completed` repetido nao o muda.
+                entry.private |= self.private_mode;
                 entry.path = path.clone();
                 entry.state = DownloadState::Finalizing;
                 effects.push(DownloadEffect::Finalize {
@@ -983,6 +1083,8 @@ impl DownloadManager {
                     allow_programs,
                 });
                 effects.push(DownloadEffect::Changed(id));
+                // O rasto de um fim sem veredito, antes de ele correr.
+                effects.extend(self.record(id));
             }
             DownloadEnd::Cancelled | DownloadEnd::Interrupted => {
                 if !matches!(
@@ -1036,7 +1138,125 @@ impl DownloadManager {
         };
         entry.state = DownloadState::Done(recorded);
         effects.push(DownloadEffect::Changed(id));
-        effects.extend(self.record(id));
+        // O registo pendente (o do fim) da lugar ao desfecho. Quem vai para o
+        // registo decidiu-se quando o download acabou (`ended`): o modo de
+        // agora nao conta, e um que acabou no normal nao some do registo por
+        // o veredito cair no Modo privado. No produto a loja e
+        // GuardedAutomatic justamente para esse commit tardio.
+        // O pendente como foi gravado (dentro dos tectos: um nome cortado,
+        // um caminho grande demais largado).
+        let wanted = record_of(entry, RecordOutcome::Cancelled);
+        let wanted_path = Some(entry.path.as_path())
+            .filter(|path| path.as_os_str().len() <= MAX_RECORD_PATH_BYTES);
+        let pending = self.log.iter().position(|record| {
+            matches!(record.outcome, RecordOutcome::Pending { .. })
+                && record.recovery_only == !entry.history_visible
+                && record.name == wanted.name
+                && record.host == wanted.host
+                && record.at == wanted.at
+                && record.path.as_deref() == wanted_path
+        });
+        let removed_record = pending.and_then(|index| self.log.remove(index));
+        if removed_record
+            .as_ref()
+            .is_some_and(|record| record.recovery_only)
+        {
+            entry.history_visible = false;
+        }
+        let removed = removed_record.is_some();
+        match self.push_record(id) {
+            Some(persist) => effects.push(persist),
+            None if removed => effects.push(DownloadEffect::Persist),
+            None => {}
+        }
+        effects
+    }
+
+    /// Os downloads que ficaram por verificar no `downloads.json` (a
+    /// NeuralIA fechou ou caiu com o veredito a meio): cada um volta como
+    /// uma linha desta sessao em «Verificando o arquivo…», com o numero que
+    /// `next_id` da, e o fim pedido de novo (`Finalize`, com «Permitir
+    /// baixar programas» de agora). O registo fica pendente, marcado
+    /// `resumed`, ate ao veredito; e o `Persist` vem PRIMEIRO, para essa
+    /// marca estar no disco antes de o fim correr. Um que ja tinha voltado
+    /// uma vez, ou cujo caminho nao ficou no registo, nao corre outra vez:
+    /// fica «não verificado». Um ficheiro que ja nao existe conta como
+    /// apagado (`Unreadable`), como no [`finalize_download`].
+    pub fn resume_pending(
+        &mut self,
+        mut next_id: impl FnMut() -> DownloadId,
+    ) -> Vec<DownloadEffect> {
+        let allow_programs = self.settings.allow_programs;
+        // Recovery oculto tem uma unica tentativa. Se ela ja foi iniciada e
+        // a aplicacao caiu outra vez, ou se o caminho nem coube no journal,
+        // nao ha mais acao possivel: apaga o rasto oculto em vez de o guardar
+        // para sempre depois de o utilizador ter limpado o historico.
+        let before_cleanup = self.log.len();
+        self.log.retain(|record| {
+            !(record.recovery_only
+                && matches!(record.outcome, RecordOutcome::Pending { resumed: true, .. }))
+                && !(record.recovery_only
+                    && matches!(
+                        record.outcome,
+                        RecordOutcome::Pending { resumed: false, .. }
+                    )
+                    && record.path.is_none())
+        });
+        let mut marked = self.log.len() != before_cleanup;
+        let mut effects = Vec::new();
+        let mut resumed = Vec::new();
+        for record in self.log.iter_mut() {
+            let RecordOutcome::Pending {
+                confirmed_program,
+                resumed: false,
+            } = record.outcome
+            else {
+                continue;
+            };
+            record.outcome = RecordOutcome::Pending {
+                confirmed_program,
+                resumed: true,
+            };
+            marked = true;
+            if let Some(path) = record.path.clone() {
+                resumed.push((record.clone(), path, confirmed_program));
+            }
+        }
+        if marked {
+            effects.push(DownloadEffect::Persist);
+        }
+        for (record, path, confirmed_program) in resumed {
+            let id = next_id();
+            if self.entries.contains_key(&id) {
+                continue;
+            }
+            self.entries.insert(
+                id,
+                DownloadEntry {
+                    id,
+                    // Nenhuma WebView: o `WebViewGone` nunca o apanha.
+                    webview: WebViewKey(0),
+                    private: false,
+                    warn: name_risk(&record.name) == NameRisk::Macro,
+                    name: record.name,
+                    path: path.clone(),
+                    host: record.host,
+                    received: record.bytes.unwrap_or(0),
+                    total: record.bytes,
+                    state: DownloadState::Finalizing,
+                    confirmed_program,
+                    history_visible: !record.recovery_only,
+                    at: record.at,
+                },
+            );
+            effects.push(DownloadEffect::Finalize {
+                id,
+                path,
+                confirmed_program,
+                allow_programs,
+            });
+            effects.push(DownloadEffect::Changed(id));
+        }
         effects
     }
 
@@ -1074,34 +1294,59 @@ impl DownloadManager {
     }
 
     /// Um download acabado entra no registo -- so se nao veio de uma pagina
-    /// privada nem comecou ou acabou no Modo privado. E a unica porta do
-    /// registo.
+    /// privada nem comecou ou acabou no Modo privado.
     fn record(&mut self, id: DownloadId) -> Option<DownloadEffect> {
-        let entry = self.entries.get(&id)?;
-        if entry.private || self.private_mode {
+        if self.private_mode {
             return None;
         }
-        let DownloadState::Done(outcome) = entry.state else {
+        self.push_record(id)
+    }
+
+    /// A unica porta do registo: um download que nao e privado (`private`
+    /// junta a pagina privada e o Modo privado do comeco e do fim), com o
+    /// desfecho, ou `Pending` com o caminho enquanto a verificacao corre.
+    fn push_record(&mut self, id: DownloadId) -> Option<DownloadEffect> {
+        let entry = self.entries.get(&id)?;
+        if entry.private
+            || (!entry.history_visible && matches!(entry.state, DownloadState::Done(_)))
+        {
             return None;
+        }
+        let outcome = match entry.state {
+            DownloadState::Done(outcome) => outcome,
+            DownloadState::Finalizing => RecordOutcome::Pending {
+                confirmed_program: entry.confirmed_program,
+                resumed: false,
+            },
+            DownloadState::Asking(_) | DownloadState::Running => return None,
         };
-        let kept = matches!(
-            outcome,
-            RecordOutcome::Completed { .. } | RecordOutcome::NotDeleted { .. }
-        );
-        self.log.push_front(
-            DownloadRecord {
-                name: entry.name.clone(),
-                path: kept.then(|| entry.path.clone()),
-                host: entry.host.clone(),
-                bytes: kept.then_some(entry.received),
-                outcome,
-                at: entry.at,
-            }
-            .bounded(),
-        );
+        let record = record_of(entry, outcome);
+        self.log.push_front(record);
         self.log.truncate(MAX_LOG_ENTRIES);
         Some(DownloadEffect::Persist)
     }
+}
+
+/// A linha do registo de `entry` com `outcome`, dentro dos tectos: o
+/// caminho e o tamanho so de um que ficou no disco (ou que ainda o vai
+/// verificar).
+fn record_of(entry: &DownloadEntry, outcome: RecordOutcome) -> DownloadRecord {
+    let kept = matches!(
+        outcome,
+        RecordOutcome::Completed { .. }
+            | RecordOutcome::NotDeleted { .. }
+            | RecordOutcome::Pending { .. }
+    );
+    DownloadRecord {
+        name: entry.name.clone(),
+        path: kept.then(|| entry.path.clone()),
+        host: entry.host.clone(),
+        bytes: kept.then_some(entry.received),
+        recovery_only: !entry.history_visible,
+        outcome,
+        at: entry.at,
+    }
+    .bounded()
 }
 
 #[cfg(test)]
@@ -1965,6 +2210,226 @@ mod tests {
         assert_eq!(names, vec!["normal.pdf".to_string()]);
     }
 
+    /// Gate critico (revisao do PR #176): a verificacao do fim nao se
+    /// cancela e deixa rasto. O fim grava um registo `Pending` com o caminho
+    /// (e so fora do privado: o modo do FIM conta, mesmo que o veredito caia
+    /// ja no normal); um Cancel durante a verificacao nao faz nada; o
+    /// veredito troca o pendente pelo desfecho, com o aviso; um fim perdido
+    /// pede-se outra vez; e o arranque seguinte retoma os pendentes uma vez
+    /// so, com a marca `resumed` gravada antes de o fim correr.
+    #[test]
+    fn a_verification_is_never_cancelled_and_leaves_a_pending_record() {
+        let path = |name: &str| PathBuf::from(r"C:\d").join(name);
+        let ended = |m: &mut DownloadManager, id: u64, name: &str| {
+            m.on_event(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed { path: path(name) },
+            })
+        };
+        let deleted = FinalizeOutcome::Deleted(DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+            BlockReason::Program,
+        )));
+
+        // O fim grava o pendente (com o caminho) antes do veredito.
+        let mut m = manager(false);
+        m.on_event(start(1, "pacote.zip", false));
+        let effects = ended(&mut m, 1, "pacote.zip");
+        assert!(effects.contains(&DownloadEffect::Persist), "{effects:?}");
+        let log = m.log();
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(
+            log.entries[0].outcome,
+            RecordOutcome::Pending {
+                confirmed_program: false,
+                resumed: false
+            }
+        );
+        assert_eq!(
+            log.entries[0].path.as_deref(),
+            Some(path("pacote.zip").as_path())
+        );
+        // Cancelar a verificacao nao faz nada: nem estado, nem registo.
+        assert!(
+            m.on_event(DownloadEvent::CancelRequested { id: DownloadId(1) })
+                .is_empty()
+        );
+        assert_eq!(
+            m.entry(DownloadId(1)).expect("entrada").state,
+            DownloadState::Finalizing
+        );
+        assert_eq!(m.active(), 1);
+        // O veredito chega e e aplicado: o aviso, a linha e o registo (o
+        // pendente sai, fica o desfecho).
+        let verdict = m.on_event(DownloadEvent::Finalized {
+            id: DownloadId(1),
+            outcome: deleted,
+        });
+        assert!(
+            verdict.contains(&DownloadEffect::Notice(DownloadNotice::Deleted {
+                id: DownloadId(1),
+                name: "pacote.zip".to_string(),
+                reason: DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(BlockReason::Program)),
+            })),
+            "{verdict:?}"
+        );
+        assert!(verdict.contains(&DownloadEffect::Persist), "{verdict:?}");
+        let log = m.log();
+        assert_eq!(log.entries.len(), 1, "{log:?}");
+        assert!(matches!(
+            log.entries[0].outcome,
+            RecordOutcome::Deleted { .. }
+        ));
+        // Um fim perdido pede-se outra vez; so a quem ainda verifica.
+        m.on_event(start(2, "fotos.zip", false));
+        ended(&mut m, 2, "fotos.zip");
+        assert_eq!(
+            m.on_event(DownloadEvent::FinalizeLost { id: DownloadId(2) }),
+            vec![DownloadEffect::Finalize {
+                id: DownloadId(2),
+                path: path("fotos.zip"),
+                confirmed_program: false,
+                allow_programs: false,
+            }]
+        );
+        assert!(
+            m.on_event(DownloadEvent::FinalizeLost { id: DownloadId(1) })
+                .is_empty()
+        );
+
+        // Acabou no Modo privado e o veredito chega ja no normal: nada no
+        // registo, nem o pendente.
+        let mut m = manager(false);
+        m.on_event(start(3, "antes.pdf", false));
+        m.set_private_mode(true);
+        let effects = ended(&mut m, 3, "antes.pdf");
+        assert!(!effects.contains(&DownloadEffect::Persist), "{effects:?}");
+        m.set_private_mode(false);
+        let effects = m.on_event(DownloadEvent::Finalized {
+            id: DownloadId(3),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
+        });
+        assert!(!effects.contains(&DownloadEffect::Persist), "{effects:?}");
+        assert!(m.log().entries.is_empty(), "{:?}", m.log());
+        // Acabou no normal e o veredito cai no Modo privado: o desfecho
+        // troca o pendente (que ja estava no disco); nada fica pendente.
+        m.on_event(start(4, "normal.pdf", false));
+        ended(&mut m, 4, "normal.pdf");
+        m.set_private_mode(true);
+        // Um `Completed` repetido ja no Modo privado nao o torna privado.
+        assert_eq!(
+            ended(&mut m, 4, "normal.pdf"),
+            vec![DownloadEffect::ForgetOp(DownloadId(4))]
+        );
+        assert!(!m.entry(DownloadId(4)).expect("entrada").private);
+        m.on_event(DownloadEvent::Finalized {
+            id: DownloadId(4),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
+        });
+        let outcomes: Vec<RecordOutcome> = m.log().entries.into_iter().map(|r| r.outcome).collect();
+        assert_eq!(
+            outcomes,
+            vec![RecordOutcome::Completed {
+                warn: false,
+                inspection: Inspection::Checked
+            }]
+        );
+
+        // O arranque seguinte: um pendente com caminho volta a verificar, com
+        // o `Persist` antes do `Finalize`; um sem caminho e um ja retomado
+        // ficam como estao (nao correm).
+        let pending =
+            |name: &str, path: Option<PathBuf>, confirmed_program, resumed| DownloadRecord {
+                name: name.to_string(),
+                path,
+                host: Some("example.com".to_string()),
+                bytes: Some(64),
+                recovery_only: false,
+                outcome: RecordOutcome::Pending {
+                    confirmed_program,
+                    resumed,
+                },
+                at: 7,
+            };
+        let mut m = DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog {
+                entries: vec![
+                    pending("setup.exe", Some(path("setup.exe")), true, false),
+                    pending("longe.zip", None, false, false),
+                    pending("de-novo.zip", Some(path("de-novo.zip")), false, true),
+                ],
+            },
+        );
+        let mut ids = 40..;
+        let effects = m.resume_pending(|| DownloadId(ids.next().expect("numero")));
+        assert_eq!(
+            effects,
+            vec![
+                DownloadEffect::Persist,
+                DownloadEffect::Finalize {
+                    id: DownloadId(40),
+                    path: path("setup.exe"),
+                    confirmed_program: true,
+                    allow_programs: true,
+                },
+                DownloadEffect::Changed(DownloadId(40)),
+            ]
+        );
+        let entry = m.entry(DownloadId(40)).expect("retomado");
+        assert_eq!(entry.state, DownloadState::Finalizing);
+        assert!(!entry.private && entry.confirmed_program);
+        assert!(
+            m.log().entries.iter().all(|record| matches!(
+                record.outcome,
+                RecordOutcome::Pending { resumed: true, .. }
+            ))
+        );
+        // Retomar outra vez (outro arranque sem veredito) nao corre nada.
+        let mut again = DownloadManager::new(DownloadSettings::default(), m.log());
+        assert!(again.resume_pending(|| DownloadId(90)).is_empty());
+        assert_eq!(again.entries().count(), 0);
+        // O veredito do retomado troca o pendente dele.
+        m.on_event(DownloadEvent::Finalized {
+            id: DownloadId(40),
+            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
+        });
+        let names: Vec<(String, bool)> = m
+            .log()
+            .entries
+            .into_iter()
+            .map(|r| (r.name, matches!(r.outcome, RecordOutcome::Pending { .. })))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("setup.exe".to_string(), false),
+                ("longe.zip".to_string(), true),
+                ("de-novo.zip".to_string(), true),
+            ]
+        );
+
+        // O pendente no `downloads.json`: so as marcas que dizem algo.
+        let text = serde_json::to_string(&RecordOutcome::Pending {
+            confirmed_program: false,
+            resumed: false,
+        })
+        .expect("json");
+        assert_eq!(text, r#"{"kind":"pending"}"#);
+        let back: RecordOutcome =
+            serde_json::from_str(r#"{"kind":"pending","confirmed_program":true,"resumed":true}"#)
+                .expect("json");
+        assert_eq!(
+            back,
+            RecordOutcome::Pending {
+                confirmed_program: true,
+                resumed: true
+            }
+        );
+    }
+
     /// O ciclo de um download e as operacoes do WebView2: largadas quando
     /// acaba e quando a WebView dele e destruida.
     #[test]
@@ -2070,6 +2535,7 @@ mod tests {
                 path: None,
                 host: None,
                 bytes: None,
+                recovery_only: false,
                 outcome: RecordOutcome::Cancelled,
                 at: n,
             })
@@ -2094,12 +2560,22 @@ mod tests {
         assert_eq!(log.entries[0].name.chars().count(), MAX_RECORD_NAME_CHARS);
         assert_eq!(log.entries[0].path, None, "caminho grande demais");
         assert_eq!(log.entries[MAX_LOG_ENTRIES - 1].name, "velho-198.pdf");
+        // O pendente do fim (gravado cortado: o nome, sem o caminho) saiu
+        // quando o veredito chegou.
+        assert!(
+            !log.entries
+                .iter()
+                .any(|record| matches!(record.outcome, RecordOutcome::Pending { .. })),
+            "{:?}",
+            log.entries[0]
+        );
         // 200 registos no tamanho maximo cabem no tecto do ficheiro.
         let worst = DownloadRecord {
             name: "\u{1F600}".repeat(MAX_RECORD_NAME_CHARS),
             path: Some(PathBuf::from("\\".repeat(MAX_RECORD_PATH_BYTES))),
             host: Some("h".repeat(MAX_RECORD_HOST_BYTES)),
             bytes: Some(u64::MAX),
+            recovery_only: false,
             outcome: RecordOutcome::NotDeleted {
                 reason: DeleteReason::BlockedName(BlockReason::DatabaseApp),
             },
@@ -2128,6 +2604,99 @@ mod tests {
         assert!(m.entry(DownloadId(2)).is_some());
     }
 
+    /// Gate critico: limpar o historico no meio da verificacao nao apaga
+    /// o unico rasto que permite retomar o veredito depois de uma queda,
+    /// nem faz o download reaparecer quando o veredito chega.
+    #[test]
+    fn clear_history_during_verification_keeps_only_hidden_recovery() {
+        let mut m = manager(false);
+        m.on_event(start(1, "velho.pdf", false));
+        m.on_event(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Cancelled,
+        });
+        m.on_event(start(2, "pacote.zip", false));
+        let verify_path = PathBuf::from(r"C:\\Users\\x\\Downloads\\pacote.zip");
+        m.on_event(DownloadEvent::Ended {
+            id: DownloadId(2),
+            end: DownloadEnd::Completed {
+                path: verify_path.clone(),
+            },
+        });
+        assert_eq!(m.log().entries.len(), 2);
+        assert!(matches!(
+            m.log().entries[0].outcome,
+            RecordOutcome::Pending { .. }
+        ));
+
+        assert_eq!(
+            m.on_event(DownloadEvent::ClearLog),
+            vec![DownloadEffect::EraseLog, DownloadEffect::Persist]
+        );
+        let after_clear = m.log();
+        assert_eq!(after_clear.entries.len(), 1, "{after_clear:?}");
+        assert!(after_clear.entries[0].recovery_only);
+        assert!(matches!(
+            after_clear.entries[0].outcome,
+            RecordOutcome::Pending { .. }
+        ));
+        assert!(!m.entry(DownloadId(2)).expect("verificacao").history_visible);
+
+        // Um download novo com a mesma identidade textual nao pode roubar
+        // o pending oculto: recovery_only faz parte da identidade do journal.
+        m.on_event(start(3, "pacote.zip", false));
+        m.on_event(DownloadEvent::Ended {
+            id: DownloadId(3),
+            end: DownloadEnd::Completed {
+                path: verify_path.clone(),
+            },
+        });
+        assert_eq!(m.log().entries.len(), 2);
+        assert!(!m.log().entries[0].recovery_only);
+        assert!(m.log().entries[1].recovery_only);
+
+        let effects = m.on_event(DownloadEvent::Finalized {
+            id: DownloadId(2),
+            outcome: FinalizeOutcome::Deleted(DeleteReason::DangerousContent),
+        });
+        assert!(effects.contains(&DownloadEffect::Persist), "{effects:?}");
+        assert_eq!(m.log().entries.len(), 1);
+        assert!(!m.log().entries[0].recovery_only);
+        assert!(matches!(
+            m.log().entries[0].outcome,
+            RecordOutcome::Pending { .. }
+        ));
+
+        let mut restarted = DownloadManager::new(DownloadSettings::default(), after_clear);
+        let effects = restarted.resume_pending(|| DownloadId(9));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            DownloadEffect::Finalize {
+                id: DownloadId(9),
+                ..
+            }
+        )));
+        let resumed = restarted.entry(DownloadId(9)).expect("retomado");
+        assert!(!resumed.history_visible);
+        assert!(restarted.log().entries[0].recovery_only);
+
+        // Se esta unica retomada cair outra vez antes do veredito, o arranque
+        // seguinte limpa o recovery oculto em vez de guardar o caminho para
+        // sempre. Um pending visivel continua com a regra antiga.
+        let mut after_second_crash =
+            DownloadManager::new(DownloadSettings::default(), restarted.log());
+        assert_eq!(
+            after_second_crash.resume_pending(|| DownloadId(10)),
+            vec![DownloadEffect::Persist]
+        );
+        assert!(after_second_crash.log().entries.is_empty());
+
+        restarted.on_event(DownloadEvent::Finalized {
+            id: DownloadId(9),
+            outcome: FinalizeOutcome::Deleted(DeleteReason::DangerousContent),
+        });
+        assert!(restarted.log().entries.is_empty());
+    }
     #[test]
     fn progress_is_throttled_to_250_ms() {
         let mut throttle = ProgressThrottle::default();

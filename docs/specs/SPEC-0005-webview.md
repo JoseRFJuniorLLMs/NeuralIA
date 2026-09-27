@@ -472,9 +472,9 @@ whose effects the app applies:
 - progress: `BytesReceivedChanged`, throttled to one event every 250 ms per
   download before it leaves the handler;
 - end: `StateChanged` forgets the WebView2 operation; a completed file is
-  finalized (`finalize_download`): the first 4 KiB are sniffed, an
-  unconfirmed executable, shortcut or cabinet (or an unreadable file) is
-  deleted, and anything kept gets the mark of the web (`Zone.Identifier`
+  finalized off the UI thread (see "Verification" below): the first 4 KiB
+  are sniffed, an unconfirmed executable, shortcut or cabinet (or an
+  unreadable file) is deleted, and anything kept gets the mark of the web (`Zone.Identifier`
   alternate data stream): when the file has none, NeuralIA writes
   `ZoneId=3` with no `HostUrl`; a mark WebView2 already wrote is left as it
   is, and that one may carry the `HostUrl`. The E2E below reports who wrote
@@ -536,19 +536,90 @@ whose effects the app applies:
   the question of the spike in `scripts/test-downloads.ps1`, which only
   reports it (in the CI log and the step summary).
 
+Verification. The finalize of a completed file runs on one lazy FIFO thread,
+`neural-download-finalize` (`DownloadFinalizer` in `downloads.rs`, a
+`LazyWorker` that starts with the first completed download; at start only
+when a verification is resumed, see below). For each file, in the order
+the downloads ended, it reads the file first
+(`finalize_download_with_commit`: the sniff and, for a `.zip`, the
+listing), only then reads "Permitir baixar programas" (the switch as it
+is at that moment, not when the download ended: turned off during the
+verification, a ZIP with a program inside is deleted; turned on, it is
+kept), applies the verdict (`apply_finalize_download`: the mark of the
+web, or the deletion) and sends it to the UI as
+`DownloadEvent::Finalized`. Until then the download is
+`DownloadState::Finalizing`: its row says «Verificando o arquivo…», with no
+«Abrir», «Mostrar na pasta» or «Cancelar», and nothing shows it as
+completed.
+
+A verification is never cancelled: the file is already on disk, and only
+its verdict deletes it or marks it. A Cancel that still reaches a
+verifying download (a click from when it was running, the leave cards)
+does nothing, and a verdict committed before a Cancel arrived is applied
+all the same, with its notice («Download apagado» for a deleted file). The
+Home destroys the WebViews but not the verification, and the leave cards
+count only running and waiting downloads (see "Downloads UI" below).
+Without the thread (the system refused it, or a finalize panicked in a
+build that unwinds, which hands that download and the queued ones back as
+`DownloadEvent::FinalizeLost`) the finalize runs synchronously on the UI
+thread (`finalize_download`) with the same rules, and no row stays in
+«Verificando o arquivo…»; a release build aborts on a panic, and the
+pending record below brings the file back at the next start.
+
+The orderly exit (`App::exiting`, after the window's `exit`) waits up to
+`FINALIZE_EXIT_WAIT` (5 s) for the verdicts the thread still owes, runs
+the ones it handed back synchronously, and applies them
+(`DownloadsState::finish_before_exit`), so they reach `downloads.json`
+before NeuralIA leaves; one still running at the deadline stays pending.
+`finish_before_exit` has a behaviour gate; the call to it from
+`App::exiting` needs the window and has none.
+
 Finished downloads are recorded in `downloads.json` (at most 200, name,
-folder, host, size and outcome, never the full URL), an `Automatic` store:
-nothing from the private split or an InPrivate service panel is recorded,
-and nothing that starts or finishes while the store registry is in private
-mode (`StoreMode::Private`, which no product command turns on yet) is
-recorded either, so it never reaches the file once the mode is back to
-normal; in that mode the store writes nothing. `run_download_event`, the
-app's whole `UserEvent::Download` arm, sets the manager's private mode from
-the registry before every event. Ctrl+Shift+Delete (`DownloadEvent::ClearLog`,
-effect `EraseLog`) removes `downloads.json`, its `.bak` copy and an
-interrupted write's temporary file from disk directly, in any mode and even
-when the store is read-only (a future-version or corrupt file), and leaves
-the downloaded files. Gates: `the_start_decision_table`,
+folder, host, size and outcome, never the full URL), a
+`GuardedAutomatic` store. The manager is the privacy guard for this
+specific store: private downloads are excluded before persistence, while a
+normal download may still commit its late verification verdict if the
+global store mode becomes private after the file ended. The record is
+written when the download ends, as `pending` with the file's path, and the
+verdict replaces it with the outcome. If NeuralIA stops
+before the verdict (it crashes, or the exit's wait runs out), the next
+start (`DownloadsState::open`, `DownloadManager::resume_pending`) verifies
+that file again once, in a new row «Verificando o arquivo…», with
+"Permitir baixar programas" as it is then; a file that is gone by then
+counts as deleted («não deu para verificar»). The `resumed` mark is
+written before that verification runs, so one that stops NeuralIA again
+is not retried. A normal visible pending record then says «Não verificado —
+a NeuralIA fechou durante a verificação», in the warning tone, with no
+«Abrir» or «Mostrar na pasta». A `recovery_only` record exists only because
+the user already cleared history: after its single resumed attempt has
+started, a later startup purges that hidden record instead of retaining its
+path indefinitely; a hidden pending whose path could not be stored is
+purged for the same reason. The path comes from `downloads.json` in the data folder, which
+NeuralIA trusts as it trusts its other stores.
+
+Nothing from the private split or an InPrivate service panel is
+recorded, and nothing that starts, or whose download ends (the end, before
+its verification), while the store registry is in private mode
+(`StoreMode::Private`, which no product command turns on yet) is recorded
+either, not even as `pending`, and not when the mode is back to normal
+before its verdict: it never reaches the file. A download that ended in
+normal mode keeps its record when its verdict arrives in private mode, and
+that verdict replaces `pending` immediately: this is the only
+`GuardedAutomatic` store, pinned by `guarded_automatic_is_downloads_only`.
+A private download cut short before its verdict leaves no record to resume.
+`run_download_event`, the app's whole `UserEvent::Download` arm, sets the
+manager's private mode from the registry before every event.
+
+Ctrl+Shift+Delete (`DownloadEvent::ClearLog`) removes completed download
+history. With no verification in progress it erases `downloads.json`, its
+`.bak` copy and an interrupted write's temporary file. If a file is
+already in `Finalizing`, clearing history first erases the old primary,
+`.bak` and interrupted-write temporaries, then writes only that pending
+record marked `recovery_only`: the panel filters it out, the session entry
+becomes history-invisible, a crash can still resume the verification, and
+the eventual verdict removes the recovery record without restoring a
+history row. The downloaded file itself is never deleted merely
+by clearing history. Gates: `the_start_decision_table`,
 `the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
 `private_downloads_are_never_recorded`,
 `nothing_made_in_private_mode_is_ever_recorded`,
@@ -562,12 +633,30 @@ falls in the end window, the directory or a local header, every local
 header is read, and 1 MiB or GiB per entry cost the same reads),
 `corrupt_zip64_and_overlap_zips_are_not_inspected`,
 `zip_mutation_harness_never_panics_and_never_comes_out_clean`,
-`browse_lite_listing_fails_for_the_named_reason` (neural-core) and
+`browse_lite_listing_fails_for_the_named_reason`,
+`a_verification_is_never_cancelled_and_leaves_a_pending_record`,
+`clear_history_during_verification_keeps_only_hidden_recovery`
+(neural-core) and
 `downloads_are_denied_on_every_local_host_and_managed_on_the_web`,
 `download_ops_follow_the_manager_and_are_cleared_on_finish_and_destroy`,
 `a_zip_download_is_inspected_and_not_inspected_is_shown`,
 `private_downloads_never_reach_downloads_json`,
-`clearing_history_takes_downloads_json_off_the_disk`, with
+`clearing_history_takes_downloads_json_off_the_disk`,
+`download_finalize_runs_on_the_lazy_fifo_worker`,
+`download_finalizing_never_looks_completed_or_openable`,
+`cancel_or_leave_during_verification_still_commits_the_verdict` (a ZIP
+holding `setup.exe`, an executable named as a PDF and a bidi name are
+deleted with their notice after a Cancel or a confirmed leave card, a PDF
+gets the mark of the web, and a Cancel between the commit and the verdict
+shows the real outcome),
+`a_download_that_ends_in_private_mode_is_never_recorded_after_its_verdict`,
+`a_lost_finalize_worker_falls_back_to_the_ui_thread`,
+`exit_during_verification_finishes_the_verdict_before_leaving`,
+`a_verification_cut_short_is_resumed_at_the_next_start`,
+`allow_programs_is_read_when_the_verdict_is_committed`,
+`clear_history_during_verification_preserves_recovery_without_restoring_history`,
+`normal_download_verdict_persists_even_if_global_mode_turns_private`,
+`exhausted_hidden_recovery_is_purged_after_its_single_retry`, with
 `every_webview_gets_the_hooks` requiring the manager on every `Managed` host
 and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
 tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
@@ -576,7 +665,8 @@ ran, and a mark NeuralIA wrote is `ZoneId=3` with no `HostUrl`; a
 `pacote.zip` holding `setup.exe` and `run.bat` is deleted after it finishes
 and recorded as deleted for a program inside; a `sobreposto.zip` whose two
 entries share one local header stays in the folder, recorded as not
-inspected.
+inspected. It reads only records with a verdict: the `pending` record of a
+verification still running is not one.
 
 ### Downloads UI
 
@@ -594,7 +684,8 @@ the manager shows:
   accent colour and its tooltip counts them;
 - the Downloads section of the side panel (`assets/panel/downloads.*`): this
   session's downloads (progress as "Baixando relatorio.pdf · 3,2 de 12 MB ·
-  1 min") and the records of `downloads.json`, plus the "Permitir baixar
+  1 min"; «Verificando o arquivo…», with no action, until the verdict) and
+  the records of `downloads.json`, plus the "Permitir baixar
   programas" switch, saved in `downloads-settings.json` (`StoreKind::Setting`).
   Its requests (`downloads-list`, `downloads-open`, `downloads-show`,
   `downloads-cancel`, `downloads-allow-programs`) carry only a row number
@@ -619,7 +710,13 @@ the manager shows:
   painted; never activated): "Baixar programa?" and, when Home or closing
   the window would end running downloads, `leave_decision`'s "N download(s)
   em andamento (x.zip, 43%)." with "Continuar baixando" (stays, at once)
-  and "Cancelar e sair" (armed: cancels each download, then leaves).
+  and "Cancelar e sair" (armed: cancels each download, then leaves). A
+  download being verified («Verificando o arquivo…») is neither counted
+  nor cancelled: with nothing else running, Home and closing leave at
+  once; with running downloads, the card's text adds «O arquivo em
+  verificação não é cancelado.» («Os N arquivos em verificação não são
+  cancelados.»). Closing then waits for its verdict (see "Verification"
+  under "Downloads").
   Every Home the user asks for goes through `request_home` (the bar's Home,
   the Home command, Esc in the omnibox, a typed or palette Home, Ctrl+L,
   Ctrl+K and Ctrl+N outside the comparator, the book's Close) and every

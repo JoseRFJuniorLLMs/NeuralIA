@@ -1,15 +1,15 @@
 use super::*;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use neural_core::downloads::{
     DownloadEffect, DownloadEnd, DownloadEvent, DownloadId, DownloadLog, DownloadManager,
-    DownloadSettings, DownloadStart, LOG_MAX_BYTES, LOG_VERSION, ProgressThrottle,
-    SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, apply_finalize_download,
+    DownloadSettings, DownloadStart, FinalizeOutcome, LOG_MAX_BYTES, LOG_VERSION, ProgressThrottle,
+    SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, apply_finalize_download, finalize_download,
     finalize_download_with_commit, unique_path,
 };
 use neural_core::json_store::{SaveOutcome, StoreGrant, StoreSpec, VersionedJsonStore};
@@ -34,10 +34,15 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 //   perguntar. Um erro antes da decisao recusa.
 // - `BytesReceivedChanged`: filtrado a 250 ms (`ProgressThrottle`) antes de
 //   sair do handler. `StateChanged`: o fim (acabado, cancelado,
-//   interrompido), que larga a operacao e, se acabou, enfileira o finalize
-//   na thread `neural-download-finalize`: sniff, inspecao do ZIP com
-//   «Permitir baixar programas» de quando acabou, e marca da Web ou apagar.
-//   O veredito volta como `UserEvent::Download(DownloadEvent::Finalized)`.
+//   interrompido), que larga a operacao e, se acabou, enfileira o fim na
+//   thread `neural-download-finalize` (`DownloadFinalizer`): sniff, inspecao
+//   do ZIP, «Permitir baixar programas» lida no commit, e marca da Web ou
+//   apagar. O veredito volta como `UserEvent::Download(DownloadEvent::
+//   Finalized)`; ate la a linha diz «Verificando o arquivo…», sem accoes, e
+//   nao se cancela. Sem a thread, o fim corre sincrono (`download_app_step`).
+//   O fim grava um registo pendente; a saida ordenada espera os vereditos
+//   (`DownloadsState::finish_before_exit`) e o arranque retoma os que ficaram
+//   (`DownloadManager::resume_pending`, no `DownloadsState::open`).
 // - A WebView destruida: o handler do `DownloadStarting` guarda um
 //   `WebViewLife`; quando o WebView2 o larga, o gestor recebe `WebViewGone`
 //   e cancela e larga as operacoes dessa WebView.
@@ -46,12 +51,13 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 //   `SetDefaultDownloadFolderPath`: o WebView2 guarda-a no perfil de uma
 //   sessao para a outra, por isso a do sistema e reposta quando a escolha
 //   sai (`profile_download_folder`).
-// - O registo (`downloads.json`, `StoreKind::Automatic`) nunca guarda um
-//   download do Split privado nem de um servico InPrivate, nem um que
-//   comecou ou acabou no Modo privado (o gestor, com o modo do registo das
-//   lojas posto antes de cada evento: `downloads_private_mode`); no Modo
-//   privado a loja tambem nao escreve. O Ctrl+Shift+Delete tira o ficheiro
-//   e as copias do disco (`erase_download_log`) em qualquer modo.
+// - O registo (`downloads.json`, `StoreKind::GuardedAutomatic`) nunca
+//   guarda um download do Split privado, de um servico InPrivate, nem um que
+//   comecou ou acabou no Modo privado. O gestor exclui isso antes da loja;
+//   por isso um veredito tardio de um download normal pode substituir o
+//   `pending` mesmo se o modo global ficou privado. O Ctrl+Shift+Delete
+//   apaga o historico; se ha verificacao em curso, conserva apenas o
+//   `recovery_only` oculto necessario a uma retomada apos queda.
 // - O que chega a quem usa -- os avisos, o «Baixar programa?», a lista, a
 //   seta da barra -- e do `downloads_ui.rs` (downloads-ui): o braco
 //   `download_event` entrega-lhe o que cada volta do gestor deixou.
@@ -574,8 +580,9 @@ pub(in crate::windows_app) fn user_downloads_folder() -> Option<PathBuf> {
     path.filter(|path| path.is_absolute())
 }
 
-/// Grava o registo do gestor. A loja e `Automatic`: com o modo em `Private`
-/// nao escreve nada (`SkippedPrivate`).
+/// Grava o registo do gestor. No produto a loja e `GuardedAutomatic`:
+/// downloads privados ja foram excluidos pelo gestor, e um veredito tardio
+/// de um download normal pode concluir mesmo com o modo global `Private`.
 pub(in crate::windows_app) fn persist_download_log(
     store: &mut VersionedJsonStore<DownloadLog>,
     manager: &DownloadManager,
@@ -638,15 +645,50 @@ pub(in crate::windows_app) fn downloads_private_mode(mode: PrivacyMode) -> bool 
     mode == PrivacyMode::Private
 }
 
-/// A fila conserva todos os downloads que acabam juntos. O `LazyWorker` tem
-/// uma vaga latest-wins, por isso ela recebe o receptor uma unica vez e a
-/// thread consome esta fila FIFO ate o `DownloadsState` ser largado.
+/// Quanto a saida ordenada (`App::exiting`) espera pelos vereditos que a
+/// thread do fim ainda deve. Um que nao chega a tempo fica no
+/// `downloads.json` como pendente e volta no arranque seguinte.
+pub(in crate::windows_app) const FINALIZE_EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// Um fim na fila. A fila conserva todos os downloads que acabam juntos: o
+/// `LazyWorker` tem uma vaga latest-wins, por isso recebe o receptor uma
+/// unica vez e a thread consome esta fila FIFO ate o `DownloadsState` ser
+/// largado.
 struct FinalizeJob {
     id: DownloadId,
     path: PathBuf,
     confirmed_program: bool,
-    allow_programs: bool,
-    cancelled: Arc<Mutex<bool>>,
+}
+
+/// O que a thread do fim e a da interface partilham.
+struct FinalizerShared {
+    /// «Permitir baixar programas», o espelho da definicao do gestor: a
+    /// thread le-a no commit (`finalize_download_with_commit`), nao quando
+    /// o download acabou.
+    allow_programs: AtomicBool,
+    state: Mutex<FinalizerState>,
+    /// Um veredito chegou, ou a thread perdeu-se.
+    settled: Condvar,
+}
+
+#[derive(Default)]
+struct FinalizerState {
+    /// A thread nao nasceu, ou um fim rebentou nela: tudo o que vem a seguir
+    /// corre sincrono, na thread da interface.
+    lost: bool,
+    /// Os vereditos ja aplicados ao disco que a interface ainda nao recebeu
+    /// (a saida le-os daqui, sem o event loop).
+    done: BTreeMap<DownloadId, FinalizeOutcome>,
+    /// Os que a thread devolveu sem veredito (`FinalizeLost`).
+    returned: BTreeSet<DownloadId>,
+}
+
+impl FinalizerShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, FinalizerState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[cfg(test)]
@@ -654,11 +696,18 @@ type FinalizeCommitHook = Arc<dyn Fn(DownloadId) + Send + Sync>;
 #[cfg(test)]
 type FinalizeCommitProbe = Arc<Mutex<Option<FinalizeCommitHook>>>;
 
+/// A thread `neural-download-finalize` (lazy: nasce no primeiro download que
+/// acaba) e o que a interface sabe dela. Nenhuma verificacao se cancela: a
+/// thread aplica sempre o veredito e devolve-o (`DownloadEvent::Finalized`).
+/// Sem a thread -- nao nasceu, ou um fim rebentou nela --, o fim corre
+/// sincrono na thread da interface, como antes da thread existir.
 pub(in crate::windows_app) struct DownloadFinalizer {
     worker: LazyWorker<Receiver<FinalizeJob>>,
     sender: Sender<FinalizeJob>,
     receiver: Option<Receiver<FinalizeJob>>,
-    pending: BTreeMap<DownloadId, Arc<Mutex<bool>>>,
+    shared: Arc<FinalizerShared>,
+    /// Os fins a espera do veredito, com o que o fim sincrono precisa.
+    pending: BTreeMap<DownloadId, (PathBuf, bool)>,
     #[cfg(test)]
     before_commit: FinalizeCommitProbe,
 }
@@ -666,46 +715,69 @@ pub(in crate::windows_app) struct DownloadFinalizer {
 impl DownloadFinalizer {
     pub(in crate::windows_app) fn new(emit: impl Fn(DownloadEvent) + Send + 'static) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let shared = Arc::new(FinalizerShared {
+            allow_programs: AtomicBool::new(false),
+            state: Mutex::new(FinalizerState::default()),
+            settled: Condvar::new(),
+        });
         #[cfg(test)]
         let before_commit: FinalizeCommitProbe = Arc::new(Mutex::new(None));
         #[cfg(test)]
         let worker_hook = Arc::clone(&before_commit);
+        let worker_shared = Arc::clone(&shared);
         let worker = LazyWorker::new(
             "neural-download-finalize",
             move |queue: Receiver<FinalizeJob>, _: &JobContext| {
-                for job in queue {
-                    if *job
-                        .cancelled
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    {
-                        continue;
-                    }
-                    let outcome = finalize_download_with_commit(
-                        &job.path,
-                        job.confirmed_program,
-                        job.allow_programs,
-                        |action| {
-                            #[cfg(test)]
-                            if let Some(hook) = worker_hook
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .clone()
-                            {
-                                hook(job.id);
+                while let Ok(job) = queue.recv() {
+                    // No release um panic aborta o processo (e o arranque
+                    // seguinte retoma o pendente); com unwind, a thread nao
+                    // morre calada: devolve este fim e os da fila.
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        finalize_download_with_commit(
+                            &job.path,
+                            job.confirmed_program,
+                            || {
+                                // Os gates param aqui: a inspecao ja correu,
+                                // a definicao ainda nao foi lida.
+                                #[cfg(test)]
+                                if let Some(hook) = worker_hook
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clone()
+                                {
+                                    hook(job.id);
+                                }
+                                worker_shared.allow_programs.load(Ordering::Acquire)
+                            },
+                            |action| apply_finalize_download(&job.path, action),
+                        )
+                    }));
+                    match run {
+                        Ok(outcome) => {
+                            worker_shared.lock().done.insert(job.id, outcome);
+                            worker_shared.settled.notify_all();
+                            emit(DownloadEvent::Finalized {
+                                id: job.id,
+                                outcome,
+                            });
+                        }
+                        Err(_) => {
+                            // Sob o trinco que o `enqueue` tambem toma: um
+                            // fim nunca entra na fila depois deste esvaziar.
+                            let mut lost = vec![job.id];
+                            let mut state = worker_shared.lock();
+                            state.lost = true;
+                            while let Ok(next) = queue.try_recv() {
+                                lost.push(next.id);
                             }
-                            let cancelled = job
-                                .cancelled
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            (!*cancelled).then(|| apply_finalize_download(&job.path, action))
-                        },
-                    );
-                    if let Some(outcome) = outcome {
-                        emit(DownloadEvent::Finalized {
-                            id: job.id,
-                            outcome,
-                        });
+                            state.returned.extend(lost.iter().copied());
+                            drop(state);
+                            worker_shared.settled.notify_all();
+                            for id in lost {
+                                emit(DownloadEvent::FinalizeLost { id });
+                            }
+                            return;
+                        }
                     }
                 }
             },
@@ -714,6 +786,7 @@ impl DownloadFinalizer {
             worker,
             sender,
             receiver: Some(receiver),
+            shared,
             pending: BTreeMap::new(),
             #[cfg(test)]
             before_commit,
@@ -736,60 +809,98 @@ impl DownloadFinalizer {
         self.worker.threads_spawned()
     }
 
-    fn enqueue(
-        &mut self,
-        id: DownloadId,
-        path: PathBuf,
-        confirmed_program: bool,
-        allow_programs: bool,
-    ) -> bool {
+    /// O espelho de «Permitir baixar programas» que a thread le no commit.
+    fn set_allow_programs(&self, on: bool) {
+        self.shared.allow_programs.store(on, Ordering::Release);
+    }
+
+    /// Poe o fim na fila da thread. `false`: sem thread (nao nasceu, ou
+    /// perdeu-se) -- quem chama corre-o sincrono.
+    fn enqueue(&mut self, id: DownloadId, path: PathBuf, confirmed_program: bool) -> bool {
         if let Some(receiver) = self.receiver.take()
             && self.worker.submit(receiver).is_err()
         {
+            self.shared.lock().lost = true;
             return false;
         }
-        let cancelled = Arc::new(Mutex::new(false));
+        let mut state = self.shared.lock();
+        if state.lost {
+            return false;
+        }
         let job = FinalizeJob {
             id,
-            path,
+            path: path.clone(),
             confirmed_program,
-            allow_programs,
-            cancelled: Arc::clone(&cancelled),
         };
         if self.sender.send(job).is_err() {
+            state.lost = true;
             return false;
         }
-        self.pending.insert(id, cancelled);
+        drop(state);
+        self.pending.insert(id, (path, confirmed_program));
         true
     }
 
-    fn cancel(&mut self, id: DownloadId) {
-        if let Some(cancelled) = self.pending.remove(&id) {
-            *cancelled
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
-        }
-    }
-
+    /// O veredito (ou o `FinalizeLost`) de `id` chegou a interface.
     fn finished(&mut self, id: DownloadId) {
         self.pending.remove(&id);
+        let mut state = self.shared.lock();
+        state.done.remove(&id);
+        state.returned.remove(&id);
     }
-}
 
-impl Drop for DownloadFinalizer {
-    fn drop(&mut self) {
-        for cancelled in self.pending.values() {
-            *cancelled
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+    /// A saida: espera (no maximo `wait`) que a thread de o veredito de cada
+    /// fim pendente e devolve-os como eventos para o gestor -- os que a
+    /// thread aplicou e os que ela devolveu, estes corridos agora, sincronos.
+    /// Um que o prazo apanha a meio nao volta: fica pendente no
+    /// `downloads.json` e o arranque seguinte retoma-o.
+    fn settle(&mut self, wait: Duration) -> Vec<DownloadEvent> {
+        let deadline = Instant::now() + wait;
+        let mut state = self.shared.lock();
+        loop {
+            let open = self
+                .pending
+                .keys()
+                .any(|id| !state.done.contains_key(id) && !state.returned.contains(id));
+            let now = Instant::now();
+            if !open || now >= deadline {
+                break;
+            }
+            state = self
+                .shared
+                .settled
+                .wait_timeout(state, deadline - now)
+                .map(|(state, _)| state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
         }
+        let mut events = Vec::new();
+        let mut returned = Vec::new();
+        for (id, (path, confirmed_program)) in &self.pending {
+            if let Some(outcome) = state.done.get(id) {
+                events.push(DownloadEvent::Finalized {
+                    id: *id,
+                    outcome: *outcome,
+                });
+            } else if state.returned.contains(id) {
+                returned.push((*id, path.clone(), *confirmed_program));
+            }
+        }
+        drop(state);
+        let allow_programs = self.shared.allow_programs.load(Ordering::Acquire);
+        for (id, path, confirmed_program) in returned {
+            events.push(DownloadEvent::Finalized {
+                id,
+                outcome: finalize_download(&path, confirmed_program, allow_programs),
+            });
+        }
+        events
     }
 }
 
 /// O estado da feature no `App`.
 pub(in crate::windows_app) struct DownloadsState {
     pub(in crate::windows_app) manager: DownloadManager,
-    finalizer: DownloadFinalizer,
+    pub(in crate::windows_app) finalizer: DownloadFinalizer,
     pub(in crate::windows_app) shared: DownloadsShared,
     pub(in crate::windows_app) log_store: Option<VersionedJsonStore<DownloadLog>>,
     /// `downloads-settings.json` (`StoreKind::Setting`): a seccao Downloads
@@ -825,7 +936,8 @@ impl DownloadsState {
             .as_mut()
             .map(|store| store.load().into_value())
             .unwrap_or_default();
-        Self {
+        let allow_programs = settings.allow_programs;
+        let mut state = Self {
             shared: DownloadsShared::new(profile_download_folder(
                 settings.folder.clone(),
                 user_downloads_folder,
@@ -834,7 +946,45 @@ impl DownloadsState {
             finalizer: DownloadFinalizer::new(emit),
             log_store,
             settings_store,
+        };
+        state.finalizer.set_allow_programs(allow_programs);
+        state.resume_pending();
+        state
+    }
+
+    /// Os fins que a sessao anterior deixou sem veredito (fechou ou caiu a
+    /// meio da verificacao) voltam a correr, cada um numa linha nova a
+    /// verificar. A marca `resumed` vai para o disco antes de o fim correr:
+    /// um fim que derruba a NeuralIA nao a derruba em cada arranque. Sem
+    /// pendentes (o normal), nada corre nem se escreve.
+    fn resume_pending(&mut self) {
+        let shared = &self.shared;
+        let mut effects = self.manager.resume_pending(|| shared.next_download_id());
+        if effects.is_empty() {
+            return;
         }
+        if let Some(store) = self.log_store.as_mut()
+            && let Err(error) = persist_download_log(store, &self.manager)
+        {
+            debug_log(format_args!("downloads: pendentes nao gravados ({error})"));
+        }
+        effects.retain(|effect| *effect != DownloadEffect::Persist);
+        let private_mode = self.manager.private_mode();
+        let run = run_download_effects(
+            &mut self.manager,
+            &mut self.finalizer,
+            &self.shared.ops,
+            self.log_store.as_mut(),
+            private_mode,
+            effects,
+        );
+        debug_log(format_args!(
+            "downloads: {} fim(ns) retomado(s) no arranque",
+            run.later
+                .iter()
+                .filter(|effect| matches!(effect, DownloadEffect::Changed(_)))
+                .count()
+        ));
     }
 
     /// O braco `UserEvent::Download` do `App` inteiro menos os avisos: o
@@ -854,21 +1004,50 @@ impl DownloadsState {
             event,
         )
     }
+
+    /// A saida ordenada (`App::exiting`): cada fim a meio acaba antes de a
+    /// NeuralIA sair -- a thread tem ate `wait` para dar os vereditos que
+    /// deve, os que ela devolveu correm ja, sincronos --, e cada veredito
+    /// passa pelo gestor e pelo `downloads.json` como qualquer outro. O que
+    /// o prazo apanha a meio fica pendente no registo e volta no arranque.
+    pub(in crate::windows_app) fn finish_before_exit(
+        &mut self,
+        private_mode: bool,
+        wait: Duration,
+    ) -> DownloadRun {
+        let mut total = DownloadRun::default();
+        for event in self.finalizer.settle(wait) {
+            let run = self.run(private_mode, event);
+            total.later.extend(run.later);
+        }
+        total
+    }
+
+    /// «Permitir baixar programas» mudou: o gestor e o espelho que a thread
+    /// do fim le no commit.
+    pub(in crate::windows_app) fn allow_programs_changed(&mut self, on: bool) {
+        let mut next = self.manager.settings().clone();
+        next.allow_programs = on;
+        self.manager.on_event(DownloadEvent::SettingsChanged(next));
+        self.finalizer.set_allow_programs(on);
+    }
 }
 
-/// O ciclo do gestor: cada evento, os efeitos das operacoes aplicados a
-/// `ops`, os outros a `step` -- que devolve o evento que volta ao gestor na
-/// mesma volta (o fim de um ficheiro, a resposta a uma pergunta). E o que o
-/// `App` corre, com `download_app_step`.
+/// O ciclo do gestor: os efeitos que ele deu (a um evento, ou aos fins
+/// retomados no arranque), os das operacoes aplicados a `ops`, os outros a
+/// `step` -- que devolve o evento que volta ao gestor na mesma volta (o
+/// veredito de um fim sincrono, a resposta a uma pergunta). E o que o `App`
+/// corre, com `download_app_step`.
 pub(in crate::windows_app) fn drive_downloads<H: DownloadHandle>(
     manager: &mut DownloadManager,
     ops: &RefCell<DownloadOps<H>>,
-    event: DownloadEvent,
+    first: Vec<DownloadEffect>,
     mut step: impl FnMut(DownloadEffect) -> Option<DownloadEvent>,
 ) {
-    let mut queue = VecDeque::from([event]);
-    while let Some(event) = queue.pop_front() {
-        for effect in manager.on_event(event) {
+    let mut queue = VecDeque::new();
+    let mut effects = first;
+    loop {
+        for effect in effects {
             let outcome = ops.borrow_mut().apply(effect);
             match outcome {
                 OpsOutcome::Done => {}
@@ -880,11 +1059,16 @@ pub(in crate::windows_app) fn drive_downloads<H: DownloadHandle>(
                 }
             }
         }
+        let Some(event) = queue.pop_front() else {
+            break;
+        };
+        effects = manager.on_event(event);
     }
 }
 
 /// O que o `App` faz a um efeito que nao e das operacoes. O fim do
-/// ficheiro entra na fila sem bloquear a janela; gravar, avisar, a
+/// ficheiro entra na fila da thread sem bloquear a janela -- sem a thread,
+/// corre ja, sincrono, e o veredito volta na mesma volta; gravar, avisar, a
 /// pergunta «Baixar programa?» (o cartao do downloads-ui, cuja resposta
 /// chega mais tarde como `DownloadEvent::Answered`) e a linha que mudou
 /// ficam em `later` (precisam do `App` inteiro).
@@ -908,12 +1092,14 @@ pub(in crate::windows_app) fn download_app_step(
             confirmed_program,
             allow_programs,
         } => {
-            if finalizer.enqueue(id, path, confirmed_program, allow_programs) {
-                None
-            } else {
-                debug_log(format_args!("downloads: {} sem worker de inspecao", id.0));
-                Some(DownloadEvent::CancelRequested { id })
+            if finalizer.enqueue(id, path.clone(), confirmed_program) {
+                return None;
             }
+            debug_log(format_args!("downloads: {} sem worker: fim sincrono", id.0));
+            Some(DownloadEvent::Finalized {
+                id,
+                outcome: finalize_download(&path, confirmed_program, allow_programs),
+            })
         }
         DownloadEffect::Persist
         | DownloadEffect::EraseLog
@@ -949,23 +1135,45 @@ pub(in crate::windows_app) fn run_download_event<H: DownloadHandle>(
     manager: &mut DownloadManager,
     finalizer: &mut DownloadFinalizer,
     ops: &RefCell<DownloadOps<H>>,
-    mut log_store: Option<&mut VersionedJsonStore<DownloadLog>>,
+    log_store: Option<&mut VersionedJsonStore<DownloadLog>>,
     private_mode: bool,
     event: DownloadEvent,
 ) -> DownloadRun {
     manager.set_private_mode(private_mode);
     match &event {
-        DownloadEvent::CancelRequested { id } => finalizer.cancel(*id),
         DownloadEvent::Finalized { id, outcome } => {
             debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
             finalizer.finished(*id);
         }
+        DownloadEvent::FinalizeLost { id } => {
+            debug_log(format_args!("downloads: {} perdeu o worker", id.0));
+            finalizer.finished(*id);
+        }
         _ => {}
     }
+    let first = manager.on_event(event);
+    run_download_effects(manager, finalizer, ops, log_store, private_mode, first)
+}
+
+/// A volta de `run_download_event` a partir dos efeitos que o gestor deu:
+/// o ciclo, o espelho de «Permitir baixar programas» para a thread do fim,
+/// e o registo gravado (`Persist`) ou tirado do disco (`EraseLog`).
+fn run_download_effects<H: DownloadHandle>(
+    manager: &mut DownloadManager,
+    finalizer: &mut DownloadFinalizer,
+    ops: &RefCell<DownloadOps<H>>,
+    mut log_store: Option<&mut VersionedJsonStore<DownloadLog>>,
+    private_mode: bool,
+    first: Vec<DownloadEffect>,
+) -> DownloadRun {
+    manager.set_private_mode(private_mode);
     let mut run = DownloadRun::default();
-    drive_downloads(manager, ops, event, |effect| {
+    drive_downloads(manager, ops, first, |effect| {
         download_app_step(effect, finalizer, &mut run.later)
     });
+    // A thread le a definicao no commit: a que o gestor tem depois desta
+    // volta (um `SettingsChanged` pode ter chegado nela).
+    finalizer.set_allow_programs(manager.settings().allow_programs);
     for effect in &run.later {
         let Some(store) = log_store.as_deref_mut() else {
             break;
@@ -1007,5 +1215,216 @@ impl App {
         }
         // Os avisos, a pergunta, a lista e a seta (`downloads_ui.rs`).
         self.downloads_ui_after(run.later);
+    }
+
+    /// A saida ordenada (`exiting`, depois de qualquer `event_loop.exit`):
+    /// os fins a meio acabam e ficam no `downloads.json` antes de a
+    /// NeuralIA sair (`DownloadsState::finish_before_exit`). Os avisos ja
+    /// nao se mostram.
+    pub(in crate::windows_app) fn finish_downloads_before_exit(&mut self) {
+        let private_mode = downloads_private_mode(self.privacy.mode());
+        let run = self
+            .downloads
+            .finish_before_exit(private_mode, FINALIZE_EXIT_WAIT);
+        debug_log(format_args!(
+            "downloads: saida com {} veredito(s) aplicados",
+            run.later
+                .iter()
+                .filter(|effect| matches!(effect, DownloadEffect::Changed(_)))
+                .count()
+        ));
+    }
+}
+
+#[cfg(test)]
+mod recovery_regression_tests {
+    use super::*;
+    use neural_core::json_store::{StoreMode, StoreRegistry};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+    const PDF: &[u8] = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "neuralia-download-regression-{name}-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("scratch");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_state(
+        dir: &Path,
+    ) -> (
+        DownloadsState,
+        std::sync::mpsc::Receiver<DownloadEvent>,
+        StoreRegistry,
+    ) {
+        let stores = StoreRegistry::mint_for_test(dir);
+        let (sender, events) = std::sync::mpsc::channel();
+        let state = DownloadsState::open(
+            |spec| stores.grant(spec).ok(),
+            move |event| {
+                let _ = sender.send(event);
+            },
+        );
+        (state, events, stores)
+    }
+
+    fn start_and_finish(state: &mut DownloadsState, private_mode: bool, id: u64, path: &Path) {
+        state.run(
+            private_mode,
+            DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: path.to_path_buf(),
+                host: Some("example.com".to_string()),
+                total: Some(PDF.len() as u64),
+                at: id,
+            }),
+        );
+        std::fs::write(path, PDF).expect("pdf");
+        state.run(
+            private_mode,
+            DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: path.to_path_buf(),
+                },
+            },
+        );
+    }
+
+    fn log_json(dir: &Path) -> serde_json::Value {
+        let text =
+            std::fs::read_to_string(dir.join(DOWNLOADS_LOG_STORE.name)).expect("downloads.json");
+        serde_json::from_str(&text).expect("json")
+    }
+
+    /// Gate critico: apagar o historico enquanto o arquivo ja esta em
+    /// verificacao deixa apenas o journal oculto necessario a recovery.
+    /// O verdict remove esse journal e nao ressuscita uma linha no painel.
+    #[test]
+    fn clear_history_during_verification_preserves_recovery_without_restoring_history() {
+        let dir = Scratch::new("clear");
+        let (mut state, events, _stores) = open_state(&dir.0);
+        let path = dir.0.join("relatorio.pdf");
+
+        start_and_finish(&mut state, false, 1, &path);
+        let before = log_json(&dir.0);
+        assert_eq!(before["data"]["entries"][0]["outcome"]["kind"], "pending");
+
+        // Artefactos que poderiam conservar o historico apagado. O ClearLog
+        // com recovery tem de os remover ANTES de gravar o journal minimo.
+        let backup = dir.0.join("downloads.json.bak");
+        let temp = dir.0.join(".downloads.json.regression.tmp");
+        std::fs::write(&backup, b"OLD-HISTORY").expect("backup fixture");
+        std::fs::write(&temp, b"OLD-HISTORY").expect("temp fixture");
+
+        state.run(false, DownloadEvent::ClearLog);
+        assert!(!backup.exists(), "backup antigo sobreviveu ao ClearLog");
+        assert!(!temp.exists(), "temporario antigo sobreviveu ao ClearLog");
+        let cleared = log_json(&dir.0);
+        let entries = cleared["data"]["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{cleared}");
+        assert_eq!(entries[0]["outcome"]["kind"], "pending");
+        assert_eq!(entries[0]["recovery_only"], true);
+        assert!(
+            DownloadRows::default()
+                .list(&state.manager, &BTreeMap::new())
+                .is_empty(),
+            "recovery oculto reapareceu no painel"
+        );
+
+        let verdict = events
+            .recv_timeout(Duration::from_secs(15))
+            .expect("verdict");
+        state.run(false, verdict);
+        let after = log_json(&dir.0);
+        assert!(
+            after["data"]["entries"]
+                .as_array()
+                .expect("entries")
+                .is_empty(),
+            "{after}"
+        );
+        assert!(
+            DownloadRows::default()
+                .list(&state.manager, &BTreeMap::new())
+                .is_empty(),
+            "verdict ressuscitou o historico"
+        );
+    }
+
+    /// Gate critico: um download que acabou no modo normal ja decidiu que
+    /// pertence ao journal. Se o modo global ficar privado antes de o evento
+    /// do verdict chegar, esse verdict ainda substitui pending no disco.
+    /// Assim um restart nao reexecuta uma decisao de seguranca ja aplicada.
+    #[test]
+    fn normal_download_verdict_persists_even_if_global_mode_turns_private() {
+        let dir = Scratch::new("private-verdict");
+        let (mut state, events, stores) = open_state(&dir.0);
+        let path = dir.0.join("relatorio.pdf");
+
+        start_and_finish(&mut state, false, 1, &path);
+        let pending = log_json(&dir.0);
+        assert_eq!(pending["data"]["entries"][0]["outcome"]["kind"], "pending");
+
+        let verdict = events
+            .recv_timeout(Duration::from_secs(15))
+            .expect("verdict");
+        stores.set_mode(StoreMode::Private);
+        state.run(true, verdict);
+
+        let committed = log_json(&dir.0);
+        assert_eq!(
+            committed["data"]["entries"][0]["outcome"]["kind"], "completed",
+            "{committed}"
+        );
+        assert_ne!(
+            committed["data"]["entries"][0]["outcome"]["kind"],
+            "pending"
+        );
+    }
+    /// Gate critico: recovery_only tem uma unica tentativa. Depois de um
+    /// segundo crash ele nao aparece como historico e nao conserva o caminho
+    /// escondido para sempre.
+    #[test]
+    fn exhausted_hidden_recovery_is_purged_after_its_single_retry() {
+        let log = DownloadLog {
+            entries: vec![neural_core::downloads::DownloadRecord {
+                name: "segredo.pdf".to_string(),
+                path: Some(PathBuf::from(r"C:\Baixados\segredo.pdf")),
+                host: Some("example.com".to_string()),
+                bytes: Some(42),
+                recovery_only: true,
+                outcome: neural_core::downloads::RecordOutcome::Pending {
+                    confirmed_program: false,
+                    resumed: true,
+                },
+                at: 1,
+            }],
+        };
+        let mut manager = DownloadManager::new(DownloadSettings::default(), log);
+        assert_eq!(
+            manager.resume_pending(|| DownloadId(99)),
+            vec![DownloadEffect::Persist]
+        );
+        assert!(manager.log().entries.is_empty());
+        assert_eq!(manager.entries().count(), 0);
     }
 }

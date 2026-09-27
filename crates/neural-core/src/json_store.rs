@@ -65,6 +65,12 @@ pub enum StoreKind {
     /// Efeito lateral do uso (historico, abas, largura do painel...). No modo
     /// privado as escritas nao fazem nada.
     Automatic,
+    /// Automatico, mas o produtor prova no proprio dominio que conteudo
+    /// privado nunca entra na loja. Serve para resultados tardios de uma
+    /// operacao iniciada no modo normal que precisam ser commitados mesmo
+    /// se o modo global ficou privado entretanto. Uso excepcional e
+    /// allowlisted pelo produto.
+    GuardedAutomatic,
     /// Conteudo que o utilizador pediu para guardar (notas, chaves...).
     Explicit,
     /// Uma escolha feita numa definicao ou num menu (tema, Pomodoro...).
@@ -344,7 +350,9 @@ impl StoreGrant {
         mode_of(&self.private)
     }
 
-    /// Falso so para uma loja `Automatic` com o modo em `Private`.
+    /// Falso so para uma loja Automatic comum com o modo em Private.
+    /// GuardedAutomatic continua escrevendo porque o produtor ja exclui
+    /// entradas privadas antes de chegar ao grant.
     pub fn writes_allowed(&self) -> bool {
         !(self.kind == StoreKind::Automatic && self.mode() == StoreMode::Private)
     }
@@ -1206,8 +1214,20 @@ mod tests {
             Err(StoreError::WrongShape { .. })
         ));
 
-        // O tipo decide o modo privado: Automatic nao escreve nada, Setting
-        // e Explicit escrevem.
+        // O tipo decide o modo privado: Automatic nao escreve nada;
+        // GuardedAutomatic, Setting e Explicit escrevem.
+        let mut guarded: VersionedJsonStore<Prefs> = VersionedJsonStore::open(
+            registry
+                .grant(StoreSpec::new(
+                    "guarded.json",
+                    StoreKind::GuardedAutomatic,
+                    StoreShape::File,
+                ))
+                .expect("grant guarded"),
+            1,
+            4096,
+        )
+        .expect("abrir guarded");
         let mut automatic: VersionedJsonStore<Prefs> =
             VersionedJsonStore::open(width, 1, 4096).expect("abrir");
         let mut setting = open(&registry, 4096);
@@ -1236,6 +1256,11 @@ mod tests {
             SaveOutcome::SkippedPrivate
         );
         assert!(!dir.join("panel-width.json").exists());
+        assert_eq!(
+            guarded.save(&one).expect("guarded privado"),
+            SaveOutcome::Written
+        );
+        assert!(dir.join("guarded.json").exists());
         assert_eq!(setting.save(&one).expect("setting"), SaveOutcome::Written);
         assert_eq!(
             explicit.write_token("sim").expect("explicit"),

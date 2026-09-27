@@ -17,7 +17,7 @@
 //! ainda escreve pelo caminho esta na tabela da fase 0 (SPEC-0006) e na
 //! lista do gate `no_raw_data_dir_write_outside_a_grant`.
 
-use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
+use neural_core::json_store::StoreKind::{Automatic, Explicit, GuardedAutomatic, Setting};
 use neural_core::json_store::StoreShape::{Dir, File};
 use neural_core::json_store::StoreSpec;
 
@@ -66,10 +66,14 @@ pub(crate) const AI_USAGE_STORE: StoreSpec = StoreSpec::new("ai/usage.json", Set
 pub(crate) const TRANSLATE_STORE: StoreSpec = StoreSpec::new("translate.json", Setting, File);
 /// `<data_dir>/downloads.json`: o registo dos downloads acabados
 /// (`neural_core::downloads::DownloadLog`), escrito ao fim de cada um --
-/// efeito lateral do uso. Nunca leva um download do Split privado nem de
-/// um servico InPrivate, e no Modo privado nao se escreve. Sai no
-/// Ctrl+Shift+Delete.
-pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec = StoreSpec::new("downloads.json", Automatic, File);
+/// efeito lateral do uso. Nunca leva um download do Split privado, de um
+/// servico InPrivate, nem um que comece ou acabe no Modo privado. E
+/// `GuardedAutomatic`: resultados tardios de downloads normais continuam
+/// podendo substituir o `pending` quando o modo global muda para privado,
+/// sem admitir conteudo privado. Sai no Ctrl+Shift+Delete, salvo o
+/// `recovery_only` minimo de uma verificacao ainda em curso.
+pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec =
+    StoreSpec::new("downloads.json", GuardedAutomatic, File);
 /// `<data_dir>/bookmarks.json`: os favoritos (`neural_core::bookmarks`).
 /// O utilizador pediu cada um (Ctrl+D, a estrela, importar): `Explicit` --
 /// no Split privado e no Modo privado grava na mesma, e o Ctrl+Shift+Delete
@@ -88,7 +92,9 @@ pub(crate) const AGENTS_STORE: StoreSpec = StoreSpec::new("agents", Automatic, D
 
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =
-/// o utilizador pediu para guardar; `Automatic` = efeito lateral do uso.
+/// o utilizador pediu para guardar; `Automatic` = efeito lateral do uso;
+/// `GuardedAutomatic` = automatico cujo produtor prova que dados privados
+/// nunca entram e por isso precisa concluir commits tardios em `Private`.
 /// So o gate a le; cada loja que abre por grant tem a sua constante acima.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const APP_STORES: &[StoreSpec] = &[
@@ -136,6 +142,16 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
 mod tests {
     use super::*;
     use neural_core::json_store::StoreRegistry;
+
+    #[test]
+    fn guarded_automatic_is_downloads_only() {
+        let guarded: Vec<&str> = APP_STORES
+            .iter()
+            .filter(|spec| spec.kind == GuardedAutomatic)
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(guarded, vec!["downloads.json"]);
+    }
 
     #[test]
     fn the_store_table_grants_cleanly_from_one_registry() {

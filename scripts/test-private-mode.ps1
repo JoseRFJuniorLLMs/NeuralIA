@@ -33,7 +33,7 @@ $utf8 = [Text.UTF8Encoding]::new($false)
 # pasta inteira; os outros sao um ficheiro exato (os trincos `.lock` ao lado
 # de uma loja tem a sua linha). Kind: Automatic = efeito lateral do uso (o
 # que o modo privado vai deixar de escrever); Setting = escolha num menu;
-# Explicit = o utilizador pediu para guardar. O gate
+# GuardedAutomatic = automatico cujo produtor ja exclui conteudo privado e pode concluir um commit tardio em Private; Explicit = o utilizador pediu para guardar. O gate
 # `the_e2e_allowlist_covers_a_normal_guard_session` (windows_app/tests.rs)
 # le esta lista e o Find-AllowlistRow abaixo, conduz uma sessao Normal do
 # PrivacyGuard e falha se ela deixar um ficheiro sem linha.
@@ -53,7 +53,7 @@ $allowlist = @(
     @{ Path = 'pomodoro'; Kind = 'Setting'; Why = 'as duracoes do Pomodoro' }
     @{ Path = 'adblock-settings.json'; Kind = 'Setting'; Why = 'o bloqueio ligado e os sites permitidos' }
     @{ Path = 'adblock-list.json'; Kind = 'Automatic'; Why = 'a lista baixada (renovacao semanal)' }
-    @{ Path = 'downloads.json'; Kind = 'Automatic'; Why = 'o registo dos downloads acabados' }
+    @{ Path = 'downloads.json'; Kind = 'GuardedAutomatic'; Why = 'o journal de downloads: privados sao excluidos pelo gestor; verdicts normais tardios podem concluir em Private' }
     @{ Path = 'downloads-settings.json'; Kind = 'Setting'; Why = 'a pasta dos downloads e Permitir baixar programas' }
     @{ Path = 'ai/'; Kind = 'Setting'; Why = 'ai/settings.json (finalidades e limite) e ai/usage.json (o consumo do mes, Setting para o limite sobreviver ao modo privado)' }
     @{ Path = 'translate.json'; Kind = 'Setting'; Why = 'Sempre neste site da Traducao' }

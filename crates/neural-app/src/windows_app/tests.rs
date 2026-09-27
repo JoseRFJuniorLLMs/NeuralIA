@@ -7580,17 +7580,17 @@ fn all_sources_lists_every_module() {
 /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
 /// encontrava nada: o gate corria sobre o resto do ficheiro.
 fn shipped_source() -> String {
-    let mut out = include_str!("../windows_app.rs")
+    let root = include_str!("../windows_app.rs")
         .replace("\r\n", "\n")
         .replace("pub(in crate::windows_app) fn ", "fn ");
+    let mut out = without_test_modules(&root);
     for (name, content) in ALL_MODULES {
         if *name != "tests.rs" {
+            let source = content
+                .replace("\r\n", "\n")
+                .replace("pub(in crate::windows_app) fn ", "fn ");
             out.push('\n');
-            out.push_str(
-                &content
-                    .replace("\r\n", "\n")
-                    .replace("pub(in crate::windows_app) fn ", "fn "),
-            );
+            out.push_str(&without_test_modules(&source));
         }
     }
     out.push_str("\n#[cfg(test)]\nmod tests {\n");
@@ -24110,11 +24110,11 @@ fn existing_stores_have_a_declared_kind() {
         AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
         HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
-    use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
+    use neural_core::json_store::StoreKind::{Automatic, Explicit, GuardedAutomatic, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
     let mut expected = vec![
         ("history.jsonl", Automatic, File),
-        ("downloads.json", Automatic, File),
+        ("downloads.json", GuardedAutomatic, File),
         ("downloads-settings.json", Setting, File),
         ("memory", Automatic, Dir),
         ("tabs.json", Automatic, File),
@@ -25327,7 +25327,7 @@ fn the_e2e_allowlist_covers_a_normal_guard_session() {
         .expect("a tabela da fase 0 na SPEC-0006");
     for (path, kind) in &rows {
         assert!(
-            ["Automatic", "Setting", "Explicit"].contains(&kind.as_str()),
+            ["Automatic", "GuardedAutomatic", "Setting", "Explicit"].contains(&kind.as_str()),
             "{path}: tipo {kind}"
         );
         let cited = if path.ends_with('/') {
@@ -26083,7 +26083,7 @@ mod downloads_gates {
         fn with_disk(manager: DownloadManager, dir: &Path) -> Self {
             let stores = StoreRegistry::mint_for_test(dir);
             let grant = stores.grant(DOWNLOADS_LOG_STORE).expect("grant");
-            assert_eq!(grant.kind(), StoreKind::Automatic);
+            assert_eq!(grant.kind(), StoreKind::GuardedAutomatic);
             let store = VersionedJsonStore::<DownloadLog>::open(grant, LOG_VERSION, LOG_MAX_BYTES)
                 .expect("loja");
             Self {
@@ -26624,7 +26624,7 @@ mod downloads_gates {
         assert_eq!(row.status, "Verificando o arquivo…");
         assert!(!row.open && !row.show, "{row:?}");
         assert!(row_file(&rig.manager, &projection, row.id).is_none());
-        assert!(row.cancel, "a verificacao deve poder ser cancelada");
+        assert!(!row.cancel, "a verificacao nao se cancela: {row:?}");
         assert!(
             download_changed(
                 &mut DownloadsUiState::new_for_test(),
@@ -26644,69 +26644,816 @@ mod downloads_gates {
         assert!(row.status.starts_with("Concluído"), "{row:?}");
     }
 
-    /// Gate critico: cancelar depois da inspecao mas antes do commit conserva
-    /// o ficheiro e descarta tanto o resultado do worker como um evento velho
-    /// que chegasse depois de a linha ter sido retirada.
+    /// O worker do fim para antes de cada commit ate o teste o soltar:
+    /// `at_commit` espera que ele chegue ao de `id`, `release` deixa-o
+    /// seguir. Largado o `CommitGate`, o worker segue sozinho.
+    struct CommitGate {
+        arrived: std::sync::mpsc::Receiver<DownloadId>,
+        release: std::sync::mpsc::Sender<()>,
+    }
+
+    impl CommitGate {
+        fn install(finalizer: &mut DownloadFinalizer) -> Self {
+            let (arrived_tx, arrived) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let arrived_tx = std::sync::Mutex::new(arrived_tx);
+            let release_rx = std::sync::Mutex::new(release_rx);
+            finalizer.set_before_commit(move |id| {
+                let _ = arrived_tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .send(id);
+                let _ = release_rx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .recv();
+            });
+            Self { arrived, release }
+        }
+
+        fn at_commit(&self, id: u64) {
+            assert_eq!(
+                self.arrived.recv_timeout(Duration::from_secs(15)),
+                Ok(DownloadId(id)),
+                "o worker nao chegou ao commit de {id}"
+            );
+        }
+
+        fn release(&self) {
+            self.release.send(()).expect("o worker esta a espera");
+        }
+    }
+
+    /// O `downloads.json` no disco, por ordem: (nome, `kind` do desfecho,
+    /// `resumed` de um pendente).
+    fn log_on_disk(file: &Path) -> Vec<(String, String, bool)> {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return Vec::new();
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).expect("downloads.json");
+        value["data"]["entries"]
+            .as_array()
+            .expect("entradas")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["name"].as_str().expect("nome").to_string(),
+                    entry["outcome"]["kind"].as_str().expect("kind").to_string(),
+                    entry["outcome"]["resumed"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect()
+    }
+
+    fn disk(entries: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+        entries
+            .iter()
+            .map(|(name, kind, resumed)| (name.to_string(), kind.to_string(), *resumed))
+            .collect()
+    }
+
+    /// Gate critico (revisao do PR #176, F1 e F5): «Verificando o arquivo…»
+    /// nao se cancela. A linha nao oferece Cancelar; a Home e o fechar sem
+    /// downloads a correr saem ja (a Home nao toca na verificacao, e a saida
+    /// espera o veredito); com um a correr, o cartao so cancela esse e diz
+    /// que o arquivo em verificacao fica. Um Cancel que chegue mesmo assim
+    /// -- o do cartao confirmado, um clique de quando a linha ainda corria --
+    /// nao impede o veredito: o ZIP com um programa dentro, o executavel
+    /// disfarcado e o nome inseguro sao apagados com o aviso, um PDF fica com
+    /// a marca da Web, e a linha diz o desfecho, tambem quando o Cancel cai
+    /// entre o commit do worker e a chegada do veredito a interface.
     #[test]
-    fn cancelled_or_removed_download_discards_late_verdict() {
-        use neural_core::downloads::{FinalizeOutcome, Inspection, MotwOutcome};
-        let dir = Scratch::new("cancel-finalize");
-        let path = dir.0.join("pacote.zip");
+    fn cancel_or_leave_during_verification_still_commits_the_verdict() {
+        use neural_core::downloads::Inspection;
+        use neural_core::file_risk::ZipEntryRisk;
+        let dir = Scratch::new("verify-no-cancel");
         let mut rig = Rig::new(DownloadManager::default());
-        let arrived = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let worker_arrived = Arc::clone(&arrived);
-        let worker_release = Arc::clone(&release);
-        rig.finalizer.set_before_commit(move |_| {
-            worker_arrived.wait();
-            worker_release.wait();
+        let gate = CommitGate::install(&mut rig.finalizer);
+        let zip = stored_zip(&[("setup.exe", &pe_bytes())], false);
+        let state = |rig: &Rig, id: u64| rig.manager.entry(DownloadId(id)).expect("entrada").state;
+        let row = |rig: &Rig, name: &str| {
+            DownloadRows::default()
+                .list(&rig.manager, &BTreeMap::new())
+                .into_iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("sem a linha {name}"))
+        };
+        let finish = |rig: &mut Rig, id: u64, proposed: &str, landed: &Path, bytes: &[u8]| {
+            rig.begin(id, 1, WebViewHost::External, dir.0.join(proposed));
+            std::fs::write(landed, bytes).expect("download");
+            rig.drive_once(DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: landed.to_path_buf(),
+                },
+            });
+        };
+        let verdict = |rig: &mut Rig| {
+            let (event, _) = rig
+                .finalized
+                .recv_timeout(Duration::from_secs(15))
+                .expect("veredito do worker");
+            rig.drive_once(event);
+        };
+        // O cartao da Home ou do fechar, confirmado depois do armar: o que
+        // ele manda ao gestor (`download_card_step`).
+        let leave = |rig: &mut Rig, kind: LeaveKind, body: &str| {
+            let LeaveDecision::Ask(prompt) = leave_decision(kind, &rig.manager) else {
+                panic!("sem cartao com um download a correr");
+            };
+            assert_eq!(prompt.cancel, vec![DownloadId(9)], "{prompt:?}");
+            assert_eq!(prompt.body, body);
+            let mut card = NativeCard::default();
+            let now = Instant::now();
+            let shown = download_card_step(
+                &mut card,
+                DownloadCardInput::Request(DownloadPrompt::Leave(prompt)),
+                now,
+            );
+            let token = shown.show.expect("o cartao aparece").0.token;
+            let step = download_card_step(
+                &mut card,
+                DownloadCardInput::Answer {
+                    token,
+                    button: DownloadCardButton::Confirm,
+                },
+                now + NATIVE_CARD_ARM,
+            );
+            assert_eq!(step.leave, Some(kind));
+            for event in step.events {
+                rig.drive_once(event);
+            }
+        };
+
+        // (1) O ZIP com setup.exe: a verificar, sem Cancelar nem accoes; a
+        // Home e o fechar, sem nada a correr, saem ja.
+        let pacote = dir.0.join("pacote.zip");
+        finish(&mut rig, 1, "pacote.zip", &pacote, &zip);
+        gate.at_commit(1);
+        let pending = row(&rig, "pacote.zip");
+        assert_eq!(pending.status, "Verificando o arquivo…");
+        assert!(
+            !pending.cancel && !pending.open && !pending.show,
+            "{pending:?}"
+        );
+        for kind in [LeaveKind::Home, LeaveKind::Close] {
+            assert_eq!(
+                leave_decision(kind, &rig.manager),
+                LeaveDecision::Leave,
+                "{kind:?}"
+            );
+        }
+        // Com um download a correr, a Home confirmada cancela so esse; um
+        // Cancel que chegue a linha a verificar nao faz nada.
+        rig.begin(9, 1, WebViewHost::Column(0), dir.0.join("grande.bin"));
+        leave(
+            &mut rig,
+            LeaveKind::Home,
+            "Voltar à Home cancela o download. O arquivo em verificação não é cancelado.",
+        );
+        assert!(
+            rig.journal.take().contains(&"9 cancelado".to_string()),
+            "o que corria nao foi cancelado"
+        );
+        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(1) });
+        assert_eq!(state(&rig, 1), DownloadState::Finalizing);
+        rig.later.clear();
+        gate.release();
+        verdict(&mut rig);
+        assert!(!pacote.exists(), "o ZIP com setup.exe ficou no disco");
+        assert_eq!(
+            row(&rig, "pacote.zip").status,
+            "Apagado — tinha um programa dentro · example.com"
+        );
+        assert!(
+            rig.later
+                .contains(&DownloadEffect::Notice(DownloadNotice::Deleted {
+                    id: DownloadId(1),
+                    name: "pacote.zip".to_string(),
+                    reason: DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(BlockReason::Program)),
+                })),
+            "{:?}",
+            rig.later
+        );
+
+        // (2) Um executavel com nome de PDF, com o cartao do fechar.
+        let fatura = dir.0.join("fatura.pdf");
+        finish(&mut rig, 2, "fatura.pdf", &fatura, &pe_bytes());
+        gate.at_commit(2);
+        leave(
+            &mut rig,
+            LeaveKind::Close,
+            "Fechar a NeuralIA cancela o download. O arquivo em verificação não é cancelado.",
+        );
+        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(2) });
+        assert_eq!(state(&rig, 2), DownloadState::Finalizing);
+        gate.release();
+        verdict(&mut rig);
+        assert!(!fatura.exists(), "o executavel disfarcado ficou no disco");
+        assert_eq!(
+            state(&rig, 2),
+            DownloadState::Done(RecordOutcome::Deleted {
+                reason: DeleteReason::DangerousContent
+            })
+        );
+
+        // (3) Um nome inseguro no fim (o WebView2 gravou outro nome), com o
+        // Cancel velho de quando a linha ainda corria.
+        let bidi = dir.0.join("fatura\u{202E}fdp.pdf");
+        finish(&mut rig, 3, "nota.pdf", &bidi, PDF);
+        gate.at_commit(3);
+        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(3) });
+        gate.release();
+        verdict(&mut rig);
+        assert!(!bidi.exists(), "o nome inseguro ficou no disco");
+        assert_eq!(
+            state(&rig, 3),
+            DownloadState::Done(RecordOutcome::Deleted {
+                reason: DeleteReason::BlockedName(BlockReason::BadName)
+            })
+        );
+
+        // (4) Um PDF: fica, com a marca da Web e «Concluído».
+        let pdf = dir.0.join("relatorio.pdf");
+        finish(&mut rig, 4, "relatorio.pdf", &pdf, PDF);
+        gate.at_commit(4);
+        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(4) });
+        gate.release();
+        verdict(&mut rig);
+        assert_eq!(
+            state(&rig, 4),
+            DownloadState::Done(RecordOutcome::Completed {
+                warn: false,
+                inspection: Inspection::Checked
+            })
+        );
+        assert_eq!(
+            read_motw(&pdf)
+                .expect("ler")
+                .as_deref()
+                .and_then(motw_zone_id),
+            Some(3)
+        );
+        assert!(row(&rig, "relatorio.pdf").status.starts_with("Concluído"));
+
+        // (5) O Cancel cai depois do commit e antes de o veredito chegar: a
+        // linha diz o que o worker fez, com o aviso «Download apagado».
+        let late = dir.0.join("tarde.zip");
+        finish(&mut rig, 5, "tarde.zip", &late, &zip);
+        gate.at_commit(5);
+        gate.release();
+        let (event, _) = rig
+            .finalized
+            .recv_timeout(Duration::from_secs(15))
+            .expect("veredito do worker");
+        assert!(!late.exists(), "o worker ja o apagou");
+        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(5) });
+        rig.later.clear();
+        rig.drive_once(event);
+        assert_eq!(
+            row(&rig, "tarde.zip").status,
+            "Apagado — tinha um programa dentro · example.com"
+        );
+        assert!(
+            rig.later.iter().any(|effect| matches!(
+                effect,
+                DownloadEffect::Notice(DownloadNotice::Deleted { id, .. }) if *id == DownloadId(5)
+            )),
+            "{:?}",
+            rig.later
+        );
+
+        // O que corria acaba cancelado; nada fica a verificar nem pendente,
+        // e um Completed repetido nao volta a verificar.
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(9),
+            end: DownloadEnd::Cancelled,
         });
-        rig.begin(1, 1, WebViewHost::External, path.clone());
-        std::fs::write(&path, stored_zip(&[("setup.exe", &pe_bytes())], false)).unwrap();
+        assert_eq!(rig.manager.active(), 0);
+        assert!(
+            rig.manager
+                .log()
+                .entries
+                .iter()
+                .all(|record| !matches!(record.outcome, RecordOutcome::Pending { .. })),
+            "{:?}",
+            rig.manager.log()
+        );
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(5),
+            end: DownloadEnd::Completed { path: late.clone() },
+        });
+        assert!(
+            rig.finalized
+                .recv_timeout(Duration::from_millis(250))
+                .is_err()
+        );
+    }
+
+    /// Gate critico (revisao do PR #176, F2): quem vai para o
+    /// `downloads.json` decide-se no FIM do download, nao no veredito. Um que
+    /// acaba no Modo privado nunca chega ao ficheiro, mesmo com o modo de
+    /// volta ao normal antes de o veredito chegar; um que acaba no normal
+    /// deixa o pendente no disco logo no fim, e o veredito que cai no Modo
+    /// privado troca-o imediatamente pelo desfecho: downloads.json e a unica
+    /// loja GuardedAutomatic, mas o gestor ja excluiu conteudo privado.
+    #[test]
+    fn a_download_that_ends_in_private_mode_is_never_recorded_after_its_verdict() {
+        let dir = Scratch::new("private-end");
+        let mut rig = Rig::with_disk(DownloadManager::default(), &dir.0);
+        let file = rig.store.as_ref().expect("loja").path().to_path_buf();
+        let gate = CommitGate::install(&mut rig.finalizer);
+        let verdict = |rig: &mut Rig| {
+            let (event, _) = rig
+                .finalized
+                .recv_timeout(Duration::from_secs(15))
+                .expect("veredito do worker");
+            rig.drive_once(event);
+        };
+
+        // Comecou no normal, acabou no privado, o veredito ja no normal.
+        let before = dir.0.join("comecou-antes.pdf");
+        rig.begin(80, 80, WebViewHost::Column(0), before.clone());
+        rig.set_mode(StoreMode::Private);
+        std::fs::write(&before, PDF).expect("pdf");
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(80),
+            end: DownloadEnd::Completed {
+                path: before.clone(),
+            },
+        });
+        gate.at_commit(80);
+        rig.set_mode(StoreMode::Normal);
+        gate.release();
+        verdict(&mut rig);
+        assert_eq!(log_on_disk(&file), disk(&[]));
+        assert!(
+            rig.manager.log().entries.is_empty(),
+            "{:?}",
+            rig.manager.log()
+        );
+        assert!(
+            rig.manager.entry(DownloadId(80)).expect("entrada").private,
+            "o modo do fim perdeu-se"
+        );
+
+        // Acabou no normal: o pendente vai para o disco ja no fim.
+        let normal = dir.0.join("acaba-normal.pdf");
+        rig.begin(81, 80, WebViewHost::Column(0), normal.clone());
+        std::fs::write(&normal, PDF).expect("pdf");
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(81),
+            end: DownloadEnd::Completed {
+                path: normal.clone(),
+            },
+        });
+        gate.at_commit(81);
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[("acaba-normal.pdf", "pending", false)])
+        );
+        // O veredito cai no Modo privado, mas o download acabou no normal:
+        // GuardedAutomatic deixa substituir o pending imediatamente.
+        rig.set_mode(StoreMode::Private);
+        gate.release();
+        verdict(&mut rig);
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[("acaba-normal.pdf", "completed", false)])
+        );
+        rig.set_mode(StoreMode::Normal);
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[("acaba-normal.pdf", "completed", false)])
+        );
+        let text = std::fs::read_to_string(&file).expect("downloads.json");
+        assert!(!text.contains("comecou-antes"), "{text}");
+    }
+
+    /// Gate critico (revisao do PR #176, F3): sem a thread do fim nenhuma
+    /// linha fica presa nem um arquivo fica por verificar. Aqui a thread
+    /// perde-se com um fim que rebenta nela (so com unwind: no release o
+    /// panic aborta, e o arranque seguinte retoma o pendente): esse fim
+    /// volta a interface (`FinalizeLost`) e corre sincrono, e cada fim
+    /// seguinte corre sincrono na mesma volta, com as mesmas regras -- o ZIP
+    /// com um programa dentro e apagado com o aviso, nunca «Cancelado» com o
+    /// ZIP no disco.
+    #[test]
+    fn a_lost_finalize_worker_falls_back_to_the_ui_thread() {
+        use neural_core::downloads::Inspection;
+        use neural_core::file_risk::ZipEntryRisk;
+        let dir = Scratch::new("lost-worker");
+        let mut rig = Rig::new(DownloadManager::default());
+        rig.finalizer.set_before_commit(|id| {
+            if id == DownloadId(1) {
+                panic!("um fim a rebentar na thread (simulado)");
+            }
+        });
+        let one = dir.0.join("1.pdf");
+        rig.begin(1, 1, WebViewHost::External, one.clone());
+        std::fs::write(&one, PDF).expect("pdf");
         rig.drive_once(DownloadEvent::Ended {
             id: DownloadId(1),
-            end: DownloadEnd::Completed { path: path.clone() },
+            end: DownloadEnd::Completed { path: one.clone() },
         });
-        arrived.wait();
-        assert!(matches!(
-            leave_decision(LeaveKind::Close, &rig.manager),
-            LeaveDecision::Ask(prompt) if prompt.cancel == vec![DownloadId(1)]
-        ));
-        rig.drive_once(DownloadEvent::CancelRequested { id: DownloadId(1) });
+        let (lost, thread) = rig
+            .finalized
+            .recv_timeout(Duration::from_secs(15))
+            .expect("o fim perdido volta a interface");
+        assert_eq!(lost, DownloadEvent::FinalizeLost { id: DownloadId(1) });
+        assert_eq!(thread.as_deref(), Some("neural-download-finalize"));
         assert_eq!(
-            rig.manager.entry(DownloadId(1)).unwrap().state,
-            DownloadState::Done(RecordOutcome::Cancelled)
+            rig.manager.entry(DownloadId(1)).expect("entrada").state,
+            DownloadState::Finalizing
         );
+        rig.drive_once(lost);
+        assert_eq!(
+            rig.manager.entry(DownloadId(1)).expect("entrada").state,
+            DownloadState::Done(RecordOutcome::Completed {
+                warn: false,
+                inspection: Inspection::Checked
+            })
+        );
+        assert_eq!(
+            read_motw(&one)
+                .expect("ler")
+                .as_deref()
+                .and_then(motw_zone_id),
+            Some(3)
+        );
+
+        // O seguinte corre ja, sincrono, na mesma volta.
+        let two = dir.0.join("pacote.zip");
+        rig.begin(2, 1, WebViewHost::External, two.clone());
+        std::fs::write(&two, stored_zip(&[("setup.exe", &pe_bytes())], false)).expect("zip");
+        rig.later.clear();
+        rig.drive_once(DownloadEvent::Ended {
+            id: DownloadId(2),
+            end: DownloadEnd::Completed { path: two.clone() },
+        });
+        assert!(!two.exists(), "o ZIP com setup.exe ficou no disco");
+        let reason = DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(BlockReason::Program));
+        assert_eq!(
+            rig.manager.entry(DownloadId(2)).expect("entrada").state,
+            DownloadState::Done(RecordOutcome::Deleted { reason })
+        );
+        assert!(
+            rig.later
+                .contains(&DownloadEffect::Notice(DownloadNotice::Deleted {
+                    id: DownloadId(2),
+                    name: "pacote.zip".to_string(),
+                    reason,
+                })),
+            "{:?}",
+            rig.later
+        );
+        assert_eq!(rig.manager.active(), 0, "uma linha ficou a verificar");
         assert_eq!(
             leave_decision(LeaveKind::Close, &rig.manager),
             LeaveDecision::Leave
         );
-        rig.drive_once(DownloadEvent::Finalized {
-            id: DownloadId(1),
-            outcome: FinalizeOutcome::Kept(MotwOutcome::Written, Inspection::Checked),
-        });
-        assert_eq!(
-            rig.manager.entry(DownloadId(1)).unwrap().state,
-            DownloadState::Done(RecordOutcome::Cancelled)
-        );
-        rig.drive_once(DownloadEvent::Ended {
-            id: DownloadId(1),
-            end: DownloadEnd::Completed { path: path.clone() },
-        });
-        assert_eq!(
-            rig.manager.entry(DownloadId(1)).unwrap().state,
-            DownloadState::Done(RecordOutcome::Cancelled)
-        );
-        rig.drive_once(DownloadEvent::ClearLog);
-        assert!(rig.manager.entry(DownloadId(1)).is_none());
-        release.wait();
         assert!(
             rig.finalized
-                .recv_timeout(std::time::Duration::from_millis(250))
+                .recv_timeout(Duration::from_millis(250))
                 .is_err()
         );
-        assert!(path.exists(), "cancelar nao deve apagar o ZIP");
-        assert!(rig.manager.log().entries.is_empty());
+    }
+
+    /// Gate critico (revisao do PR #176, F4, a saida ordenada): o
+    /// `App::exiting` acaba cada verificacao a meio antes de sair
+    /// (`DownloadsState::finish_before_exit`, ate `FINALIZE_EXIT_WAIT`): o
+    /// ZIP com um programa e apagado e o `downloads.json` no disco ja diz
+    /// «apagado». Um que o prazo apanha a meio fica pendente no disco, com o
+    /// arquivo, para o arranque seguinte o retomar.
+    #[test]
+    fn exit_during_verification_finishes_the_verdict_before_leaving() {
+        let dir = Scratch::new("exit-verify");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let (sender, verdicts) = std::sync::mpsc::channel();
+        let mut state = DownloadsState::open(
+            |spec| stores.grant(spec).ok(),
+            move |event| {
+                let _ = sender.send(event);
+            },
+        );
+        let file = dir.0.join(DOWNLOADS_LOG_STORE.name);
+        let gate = CommitGate::install(&mut state.finalizer);
+        let zip = stored_zip(&[("setup.exe", &pe_bytes())], false);
+        let finish = |state: &mut DownloadsState, id: u64, path: &Path| {
+            state.run(
+                false,
+                DownloadEvent::Starting(DownloadStart {
+                    id: DownloadId(id),
+                    webview: WebViewKey(1),
+                    private: false,
+                    proposed: path.to_path_buf(),
+                    host: Some("example.com".to_string()),
+                    total: None,
+                    at: id,
+                }),
+            );
+            std::fs::write(path, &zip).expect("zip");
+            state.run(
+                false,
+                DownloadEvent::Ended {
+                    id: DownloadId(id),
+                    end: DownloadEnd::Completed {
+                        path: path.to_path_buf(),
+                    },
+                },
+            );
+        };
+
+        // A saida comeca com o worker parado no commit; ele segue logo depois.
+        let pacote = dir.0.join("pacote.zip");
+        finish(&mut state, 1, &pacote);
+        gate.at_commit(1);
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[("pacote.zip", "pending", false)])
+        );
+        let release = gate.release.clone();
+        let helper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            release.send(()).expect("solta o worker");
+        });
+        let run = state.finish_before_exit(false, FINALIZE_EXIT_WAIT);
+        helper.join().expect("helper");
+        assert!(
+            run.later.contains(&DownloadEffect::Persist),
+            "{:?}",
+            run.later
+        );
+        assert!(!pacote.exists(), "o ZIP com setup.exe ficou no disco");
+        assert!(matches!(
+            state.manager.entry(DownloadId(1)).expect("entrada").state,
+            DownloadState::Done(RecordOutcome::Deleted { .. })
+        ));
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[("pacote.zip", "deleted", false)])
+        );
+        // O mesmo veredito pelo event loop (que ja nao corre) nao muda nada.
+        let late = verdicts
+            .recv_timeout(Duration::from_secs(15))
+            .expect("o evento do worker");
+        state.run(false, late);
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[("pacote.zip", "deleted", false)])
+        );
+
+        // O prazo apanha outro a meio: fica pendente no disco, com o arquivo.
+        let preso = dir.0.join("preso.zip");
+        finish(&mut state, 2, &preso);
+        gate.at_commit(2);
+        let run = state.finish_before_exit(false, Duration::from_millis(100));
+        assert!(run.later.is_empty(), "{:?}", run.later);
+        assert!(preso.exists());
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[
+                ("preso.zip", "pending", false),
+                ("pacote.zip", "deleted", false)
+            ])
+        );
+        gate.release();
+        let event = verdicts
+            .recv_timeout(Duration::from_secs(15))
+            .expect("veredito");
+        state.run(false, event);
+        assert!(!preso.exists());
+    }
+
+    /// Gate critico (revisao do PR #176, F4, a queda): o fim deixa um
+    /// registo pendente pelo `downloads.json` (a loja do grant, nada mais na
+    /// pasta de dados). Se a NeuralIA acaba a meio da verificacao sem a saida
+    /// ordenada, o arranque seguinte (`DownloadsState::open`) volta a
+    /// verifica-lo numa linha «Verificando o arquivo…» e aplica o veredito:
+    /// o ZIP com um programa e apagado; um cujo arquivo ja nao existe conta
+    /// como apagado («não deu para verificar»). A marca `resumed` vai para o
+    /// disco antes de o fim correr: se esse arranque tambem acaba a meio, o
+    /// seguinte nao corre nada e mostra «Não verificado», sem accoes. Um
+    /// download que acaba no Modo privado nao deixa pendente nenhum.
+    #[test]
+    fn a_verification_cut_short_is_resumed_at_the_next_start() {
+        let dir = Scratch::new("resume");
+        let file = dir.0.join(DOWNLOADS_LOG_STORE.name);
+        let open = |dir: &Path| {
+            let stores = StoreRegistry::mint_for_test(dir);
+            let (sender, events) = std::sync::mpsc::channel();
+            let state = DownloadsState::open(
+                |spec| stores.grant(spec).ok(),
+                move |event| {
+                    let _ = sender.send(event);
+                },
+            );
+            (state, events, stores)
+        };
+        let zip = stored_zip(&[("setup.exe", &pe_bytes())], false);
+        let finish = |state: &mut DownloadsState, private: bool, id: u64, path: &Path| {
+            state.run(
+                private,
+                DownloadEvent::Starting(DownloadStart {
+                    id: DownloadId(id),
+                    webview: WebViewKey(1),
+                    private: false,
+                    proposed: path.to_path_buf(),
+                    host: Some("example.com".to_string()),
+                    total: None,
+                    at: id,
+                }),
+            );
+            std::fs::write(path, &zip).expect("zip");
+            state.run(
+                private,
+                DownloadEvent::Ended {
+                    id: DownloadId(id),
+                    end: DownloadEnd::Completed {
+                        path: path.to_path_buf(),
+                    },
+                },
+            );
+        };
+        let rows =
+            |state: &DownloadsState| DownloadRows::default().list(&state.manager, &BTreeMap::new());
+
+        // A primeira sessao: dois acabam no normal, um no Modo privado, e a
+        // NeuralIA acaba com o worker parado no primeiro commit.
+        let (mut first, first_events, first_stores) = open(&dir.0);
+        let first_gate = CommitGate::install(&mut first.finalizer);
+        let pacote = dir.0.join("pacote.zip");
+        finish(&mut first, false, 1, &pacote);
+        first_gate.at_commit(1);
+        let sumiu = dir.0.join("sumiu.zip");
+        finish(&mut first, false, 2, &sumiu);
+        first_stores.set_mode(StoreMode::Private);
+        finish(&mut first, true, 3, &dir.0.join("segredo.zip"));
+        first_stores.set_mode(StoreMode::Normal);
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[
+                ("sumiu.zip", "pending", false),
+                ("pacote.zip", "pending", false)
+            ])
+        );
+        // O arquivo do segundo sai do disco enquanto a NeuralIA esta fechada.
+        std::fs::remove_file(&sumiu).expect("sumiu");
+
+        // O arranque seguinte: os dois voltam a verificar, com a marca
+        // `resumed` ja no disco.
+        let (mut second, second_events, _second_stores) = open(&dir.0);
+        let verifying: Vec<String> = rows(&second)
+            .into_iter()
+            .filter(|row| row.status == "Verificando o arquivo…")
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(verifying.len(), 2, "{:?}", rows(&second));
+        assert_eq!(
+            log_on_disk(&file),
+            disk(&[
+                ("sumiu.zip", "pending", true),
+                ("pacote.zip", "pending", true)
+            ])
+        );
+
+        // Se esse arranque tambem acaba antes do veredito, o terceiro nao
+        // corre nada: «Não verificado», sem Abrir nem Mostrar na pasta.
+        let (third, _third_events, _third_stores) = open(&dir.0);
+        assert_eq!(third.finalizer.threads_spawned(), 0);
+        assert_eq!(third.manager.entries().count(), 0);
+        let shown = rows(&third);
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        for row in &shown {
+            assert_eq!(
+                row.status,
+                "Não verificado — a NeuralIA fechou durante a verificação · example.com"
+            );
+            assert_eq!(row.tone, "warn");
+            assert!(!row.open && !row.show && !row.cancel, "{row:?}");
+        }
+        drop(third);
+
+        // Os vereditos do segundo arranque: o ZIP com setup.exe apagado; o
+        // que ja nao existia conta como apagado.
+        for _ in 0..2 {
+            let event = second_events
+                .recv_timeout(Duration::from_secs(15))
+                .expect("veredito retomado");
+            second.run(false, event);
+        }
+        assert!(!pacote.exists(), "o ZIP com setup.exe ficou no disco");
+        let after = rows(&second);
+        let status = |name: &str| {
+            after
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("sem {name}: {after:?}"))
+                .status
+                .clone()
+        };
+        assert_eq!(
+            status("pacote.zip"),
+            "Apagado — tinha um programa dentro · example.com"
+        );
+        assert_eq!(
+            status("sumiu.zip"),
+            "Apagado — não deu para verificar · example.com"
+        );
+        let mut on_disk = log_on_disk(&file);
+        on_disk.sort();
+        assert_eq!(
+            on_disk,
+            disk(&[
+                ("pacote.zip", "deleted", false),
+                ("sumiu.zip", "deleted", false)
+            ])
+        );
+        let text = std::fs::read_to_string(&file).expect("downloads.json");
+        assert!(!text.contains("segredo"), "{text}");
+        // A primeira sessao ja nao existe: o worker parado segue sozinho, e
+        // o teste espera-o antes de apagar a pasta.
+        drop(first_gate);
+        for _ in 0..3 {
+            first_events
+                .recv_timeout(Duration::from_secs(15))
+                .expect("o worker da primeira sessao acabou");
+        }
+    }
+
+    /// Gate critico (revisao do PR #176, F6): «Permitir baixar programas»
+    /// vale no commit do veredito, nao quando o download acabou -- pela
+    /// seccao Downloads que embarca (`DownloadsState::set_allow_programs`).
+    /// Ligada no fim e desligada durante «Verificando o arquivo…», o ZIP com
+    /// um programa e apagado; desligada no fim e ligada durante a
+    /// verificacao, fica e diz o que leva.
+    #[test]
+    fn allow_programs_is_read_when_the_verdict_is_committed() {
+        use neural_core::downloads::Inspection;
+        use neural_core::file_risk::ZipEntryRisk;
+        let dir = Scratch::new("allow-commit");
+        let stores = StoreRegistry::mint_for_test(&dir.0);
+        let (sender, verdicts) = std::sync::mpsc::channel();
+        let mut state = DownloadsState::open(
+            |spec| stores.grant(spec).ok(),
+            move |event| {
+                let _ = sender.send(event);
+            },
+        );
+        let gate = CommitGate::install(&mut state.finalizer);
+        let zip = stored_zip(&[("setup.exe", &pe_bytes())], false);
+        for (id, at_end, at_commit) in [(1u64, true, false), (2, false, true)] {
+            state.set_allow_programs(at_end).expect("gravada");
+            let path = dir.0.join(format!("pacote-{id}.zip"));
+            state.run(
+                false,
+                DownloadEvent::Starting(DownloadStart {
+                    id: DownloadId(id),
+                    webview: WebViewKey(1),
+                    private: false,
+                    proposed: path.clone(),
+                    host: None,
+                    total: None,
+                    at: id,
+                }),
+            );
+            std::fs::write(&path, &zip).expect("zip");
+            state.run(
+                false,
+                DownloadEvent::Ended {
+                    id: DownloadId(id),
+                    end: DownloadEnd::Completed { path: path.clone() },
+                },
+            );
+            gate.at_commit(id);
+            state.set_allow_programs(at_commit).expect("gravada");
+            gate.release();
+            let event = verdicts
+                .recv_timeout(Duration::from_secs(15))
+                .expect("veredito");
+            state.run(false, event);
+            let got = state.manager.entry(DownloadId(id)).expect("entrada").state;
+            if at_commit {
+                assert!(path.exists(), "ligada no commit, o ZIP foi apagado");
+                assert_eq!(
+                    got,
+                    DownloadState::Done(RecordOutcome::Completed {
+                        warn: false,
+                        inspection: Inspection::HoldsPrograms
+                    })
+                );
+            } else {
+                assert!(!path.exists(), "desligada no commit, o ZIP ficou");
+                assert_eq!(
+                    got,
+                    DownloadState::Done(RecordOutcome::Deleted {
+                        reason: DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(
+                            BlockReason::Program
+                        ))
+                    })
+                );
+            }
+        }
     }
 
     /// Medicao em release, nao gate: a mesma entrada real mede o antigo
@@ -26967,7 +27714,7 @@ mod downloads_gates {
     #[test]
     fn downloads_state_opens_through_grants_and_checks_the_folder() {
         assert_eq!(DOWNLOADS_SETTINGS_STORE.kind, StoreKind::Setting);
-        assert_eq!(DOWNLOADS_LOG_STORE.kind, StoreKind::Automatic);
+        assert_eq!(DOWNLOADS_LOG_STORE.kind, StoreKind::GuardedAutomatic);
         let system = user_downloads_folder().expect("a pasta Transferencias do utilizador");
         assert!(system.is_absolute(), "{}", system.display());
         let dir = Scratch::new("state");
@@ -27395,6 +28142,25 @@ mod downloads_gates {
                 ask(
                     "3 downloads em andamento (setup.exe e mais 2).",
                     body_many,
+                    &[4, 5, 6]
+                )
+            );
+            // Dois acabados a verificar nao contam nem se cancelam: o cartao
+            // diz que ficam.
+            for id in [10, 11] {
+                start(&mut manager, id, &format!("v{id}.zip"), None);
+                manager.on_event(DownloadEvent::Ended {
+                    id: DownloadId(id),
+                    end: DownloadEnd::Completed {
+                        path: PathBuf::from(format!(r"C:\Baixados\v{id}.zip")),
+                    },
+                });
+            }
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask(
+                    "3 downloads em andamento (setup.exe e mais 2).",
+                    &format!("{body_many} Os 2 arquivos em verificação não são cancelados."),
                     &[4, 5, 6]
                 )
             );
@@ -28309,6 +29075,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             path: None,
             host: None,
             bytes: None,
+            recovery_only: false,
             outcome: RecordOutcome::Cancelled,
             at,
         };

@@ -33,8 +33,12 @@ automatico de uma pagina):
    o gestor ao receber o WebViewGone) e com que motivo -- ou "sem resposta"
    quando a Home nao correu (nenhum show_home no log depois do pedido).
 
--SelfTest confere so a leitura do spike, da marca da Web e dos registos dos
-ZIPs sobre registos inventados, sem abrir nada (corre em qualquer maquina).
+O downloads.json so conta com veredito: o `pending` que o fim grava antes
+dele (a verificacao a meio) nao e o registo de nenhum dos gates.
+
+-SelfTest confere so a leitura do spike, da marca da Web, dos registos dos
+ZIPs e a escolha do registo com veredito sobre registos inventados, sem
+abrir nada (corre em qualquer maquina).
 #>
 param(
     [string]$ExePath,
@@ -180,6 +184,13 @@ function Get-ZipRecordFailures($Record, [bool]$OnDisk, [string]$Want) {
     return $failures
 }
 
+# O registo de `$Name` que ja tem veredito. O fim grava primeiro um
+# `pending` (o rasto de uma verificacao a meio, com o caminho), que o gestor
+# troca pelo desfecho quando o veredito chega: esse ainda nao diz nada.
+function Select-VerdictRecord([object[]]$Entries, [string]$Name) {
+    return @($Entries | Where-Object { $_.name -eq $Name -and $_.outcome.kind -ne 'pending' }) | Select-Object -First 1
+}
+
 if ($SelfTest) {
     $ours = "[ZoneTransfer]`r`nZoneId=3`r`n"
     $theirs = "[ZoneTransfer]`r`nZoneId=3`r`nReferrerUrl=http://127.0.0.1:1/`r`nHostUrl=http://127.0.0.1:1/files/relatorio`r`n"
@@ -251,7 +262,16 @@ if ($SelfTest) {
             throw "SelfTest (ZIP): $($case.Want) sobre $($case.Record | ConvertTo-Json -Compress -Depth 6) deu $($found.Count) falha(s): $($found -join '; ')"
         }
     }
-    Write-Host "test-downloads SelfTest: $($cases.Count + 2) casos do spike, $($motwCases.Count) da marca da Web e $($zipCases.Count) dos ZIPs ok."
+    # O pendente do fim nunca conta como o registo: so o desfecho.
+    $pending = & $record '{"kind":"pending"}'
+    $deleted = & $record '{"kind":"deleted","reason":{"archive-entry":{"blocked":"program"}}}'
+    if ($null -ne (Select-VerdictRecord @($pending) 'x.zip')) {
+        throw "SelfTest (registo): um pending contou como veredito."
+    }
+    if ((Select-VerdictRecord @($pending, $deleted) 'x.zip').outcome.kind -ne 'deleted') {
+        throw "SelfTest (registo): o desfecho depois de um pending nao foi o escolhido."
+    }
+    Write-Host "test-downloads SelfTest: $($cases.Count + 2) casos do spike, $($motwCases.Count) da marca da Web, $($zipCases.Count) dos ZIPs e 2 do registo com veredito ok."
     exit 0
 }
 
@@ -349,7 +369,7 @@ function Get-Record($Run, [string]$Name) {
     } catch {
         return $null
     }
-    return @($json.data.entries | Where-Object { $_.name -eq $Name }) | Select-Object -First 1
+    return Select-VerdictRecord @($json.data.entries) $Name
 }
 
 function Start-Run([string]$Name, [string]$Url, [switch]$Probe) {
