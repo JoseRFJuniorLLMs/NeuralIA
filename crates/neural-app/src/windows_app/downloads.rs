@@ -1234,3 +1234,166 @@ impl App {
         ));
     }
 }
+
+#[cfg(test)]
+mod recovery_regression_tests {
+    use super::*;
+    use neural_core::json_store::{StoreMode, StoreRegistry};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+    const PDF: &[u8] = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "neuralia-download-regression-{name}-{}-{}",
+                std::process::id(),
+                NONCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("scratch");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_state(
+        dir: &Path,
+    ) -> (
+        DownloadsState,
+        std::sync::mpsc::Receiver<DownloadEvent>,
+        StoreRegistry,
+    ) {
+        let stores = StoreRegistry::mint_for_test(dir);
+        let (sender, events) = std::sync::mpsc::channel();
+        let state = DownloadsState::open(
+            |spec| stores.grant(spec).ok(),
+            move |event| {
+                let _ = sender.send(event);
+            },
+        );
+        (state, events, stores)
+    }
+
+    fn start_and_finish(
+        state: &mut DownloadsState,
+        private_mode: bool,
+        id: u64,
+        path: &Path,
+    ) {
+        state.run(
+            private_mode,
+            DownloadEvent::Starting(DownloadStart {
+                id: DownloadId(id),
+                webview: WebViewKey(1),
+                private: false,
+                proposed: path.to_path_buf(),
+                host: Some("example.com".to_string()),
+                total: Some(PDF.len() as u64),
+                at: id,
+            }),
+        );
+        std::fs::write(path, PDF).expect("pdf");
+        state.run(
+            private_mode,
+            DownloadEvent::Ended {
+                id: DownloadId(id),
+                end: DownloadEnd::Completed {
+                    path: path.to_path_buf(),
+                },
+            },
+        );
+    }
+
+    fn log_json(dir: &Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(DOWNLOADS_LOG_STORE.name))
+            .expect("downloads.json");
+        serde_json::from_str(&text).expect("json")
+    }
+
+    /// Gate critico: apagar o historico enquanto o arquivo ja esta em
+    /// verificacao deixa apenas o journal oculto necessario a recovery.
+    /// O verdict remove esse journal e nao ressuscita uma linha no painel.
+    #[test]
+    fn clear_history_during_verification_preserves_recovery_without_restoring_history() {
+        let dir = Scratch::new("clear");
+        let (mut state, events, _stores) = open_state(&dir.0);
+        let path = dir.0.join("relatorio.pdf");
+
+        start_and_finish(&mut state, false, 1, &path);
+        let before = log_json(&dir.0);
+        assert_eq!(before["data"]["entries"][0]["outcome"]["kind"], "pending");
+
+        state.run(false, DownloadEvent::ClearLog);
+        let cleared = log_json(&dir.0);
+        let entries = cleared["data"]["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1, "{cleared}");
+        assert_eq!(entries[0]["outcome"]["kind"], "pending");
+        assert_eq!(entries[0]["recovery_only"], true);
+        assert!(
+            DownloadRows::default()
+                .list(&state.manager, &BTreeMap::new())
+                .is_empty(),
+            "recovery oculto reapareceu no painel"
+        );
+
+        let verdict = events
+            .recv_timeout(Duration::from_secs(15))
+            .expect("verdict");
+        state.run(false, verdict);
+        let after = log_json(&dir.0);
+        assert!(
+            after["data"]["entries"]
+                .as_array()
+                .expect("entries")
+                .is_empty(),
+            "{after}"
+        );
+        assert!(
+            DownloadRows::default()
+                .list(&state.manager, &BTreeMap::new())
+                .is_empty(),
+            "verdict ressuscitou o historico"
+        );
+    }
+
+    /// Gate critico: um download que acabou no modo normal ja decidiu que
+    /// pertence ao journal. Se o modo global ficar privado antes de o evento
+    /// do verdict chegar, esse verdict ainda substitui pending no disco.
+    /// Assim um restart nao reexecuta uma decisao de seguranca ja aplicada.
+    #[test]
+    fn normal_download_verdict_persists_even_if_global_mode_turns_private() {
+        let dir = Scratch::new("private-verdict");
+        let (mut state, events, stores) = open_state(&dir.0);
+        let path = dir.0.join("relatorio.pdf");
+
+        start_and_finish(&mut state, false, 1, &path);
+        let pending = log_json(&dir.0);
+        assert_eq!(pending["data"]["entries"][0]["outcome"]["kind"], "pending");
+
+        let verdict = events
+            .recv_timeout(Duration::from_secs(15))
+            .expect("verdict");
+        stores.set_mode(StoreMode::Private);
+        state.run(true, verdict);
+
+        let committed = log_json(&dir.0);
+        assert_eq!(
+            committed["data"]["entries"][0]["outcome"]["kind"],
+            "completed",
+            "{committed}"
+        );
+        assert_ne!(
+            committed["data"]["entries"][0]["outcome"]["kind"],
+            "pending"
+        );
+    }
+}
