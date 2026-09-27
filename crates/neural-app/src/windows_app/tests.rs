@@ -33286,6 +33286,7 @@ fn answer_read_of(host: &str, text: &str, links: &[&str]) -> AnswerRead {
         cut: false,
         text: text.to_string(),
         links: links.iter().map(|link| link.to_string()).collect(),
+        dropped_links: 0,
     }
 }
 
@@ -33301,10 +33302,10 @@ fn three_columns() -> Vec<(WebViewHost, u64)> {
 /// conferido ANTES do serde (um texto acima do tecto e recusado sem ser
 /// lido, valha ou nao como JSON), as sete chaves exatas e nenhuma outra,
 /// `v` = 1, cada campo com o seu tipo, o texto dentro dos 24 000
-/// caracteres, no maximo 60 ligacoes, cada uma http(s) e dentro do
-/// tamanho, e cada marcador de citacao a apontar para uma ligacao que
-/// existe. Sabotagem: tirar o tecto cru (o JSON gigante passa a ser
-/// lido), aceitar chaves a mais.
+/// caracteres, no maximo 60 ligacoes (cada uma que nao vale cai sozinha:
+/// `answer_read_drops_only_the_invalid_link`), e cada marcador de citacao a
+/// apontar para uma ligacao que existe. Sabotagem: tirar o tecto cru (o
+/// JSON gigante passa a ser lido), aceitar chaves a mais.
 #[test]
 fn answer_read_parse_caps_raw_and_requires_exact_keys() {
     let valid = answer_json(
@@ -33325,6 +33326,7 @@ fn answer_read_parse_caps_raw_and_requires_exact_keys() {
                 "https://example.com/a".into(),
                 "http://example.org/b?x=1".into()
             ],
+            dropped_links: 0,
         }
     );
 
@@ -33440,44 +33442,15 @@ fn answer_read_parse_caps_raw_and_requires_exact_keys() {
         parse_answer_read(&with("links", serde_json::json!("x")), "chatgpt.com"),
         Err(AnswerReadError::Type("links"))
     );
-    assert!(matches!(
-        parse_answer_read(&with("links", serde_json::json!([1, 2])), "chatgpt.com"),
-        Err(AnswerReadError::Link { index: 0, .. })
-    ));
 
-    // As ligacoes: so http(s), com host, dentro do tamanho, no maximo 60.
+    // No maximo 60 ligacoes (cada uma que nao vale cai sozinha: gate
+    // `answer_read_drops_only_the_invalid_link`).
     object.insert("text".into(), serde_json::json!("sem marcadores"));
     let links = |list: Vec<String>| {
         let mut changed = object.clone();
         changed.insert("links".into(), serde_json::json!(list));
         serde_json::Value::Object(changed).to_string()
     };
-    for (bad, reason) in [
-        ("javascript:alert(1)", "só http(s)"),
-        ("file:///C:/x", "só http(s)"),
-        ("ftp://example.com/x", "só http(s)"),
-        ("data:text/html,x", "só http(s)"),
-        ("mailto:a@b.c", "só http(s)"),
-        ("nem url", "não é um URL"),
-        ("https://", "não é um URL"),
-    ] {
-        assert_eq!(
-            parse_answer_read(
-                &links(vec!["https://ok.example/".into(), bad.into()]),
-                "chatgpt.com"
-            ),
-            Err(AnswerReadError::Link { index: 1, reason }),
-            "{bad}"
-        );
-    }
-    let too_long = format!("https://example.com/{}", "a".repeat(ANSWER_LINK_MAX_LEN));
-    assert_eq!(
-        parse_answer_read(&links(vec![too_long]), "chatgpt.com"),
-        Err(AnswerReadError::Link {
-            index: 0,
-            reason: "grande demais"
-        })
-    );
     let many: Vec<String> = (0..=ANSWER_READ_MAX_LINKS)
         .map(|index| format!("https://example.com/{index}"))
         .collect();
@@ -33540,6 +33513,152 @@ fn answer_read_parse_caps_raw_and_requires_exact_keys() {
         cite("\u{E000}0\u{E001}", 0),
         Err(AnswerReadError::Citation { at: 0 })
     );
+}
+
+/// Gate (critico, entrada nao confiavel; consensus, RT-5): uma ligacao que
+/// nao vale cai SOZINHA -- nunca entra em `links` (so texto, http(s), com
+/// host e dentro dos 2 048 bytes), os marcadores dela saem do texto, os das
+/// outras passam a apontar para o indice novo e `dropped_links` conta-a --
+/// e a leitura vale com as outras: uma ligacao de 5 000 caracteres ou uma
+/// `javascript:` ja nao deixam a coluna «sem leitura». Os marcadores
+/// continuam estritos: um que aponta para fora da lista da leitura, sem
+/// fecho, sem algarismos (ou com sinal, ou com mais de tres) ou um fecho
+/// solto -- tambem ANTES de uma abertura -- recusa a leitura (o script troca
+/// os da pagina por U+FFFD: gate
+/// `answer_read_script_neutralizes_page_markers_and_long_links`).
+/// Sabotagens: recusar a leitura inteira por uma ligacao
+/// (`answer-read-refuses-for-one-link`); guardar a ligacao que nao vale.
+#[test]
+fn answer_read_drops_only_the_invalid_link() {
+    const BASE: &str = "https://example.com/";
+    let long = format!("{BASE}{}", "x".repeat(5_000 - BASE.len()));
+    assert_eq!(long.len(), 5_000);
+    let edge = format!("{BASE}{}", "a".repeat(ANSWER_LINK_MAX_LEN - BASE.len()));
+    assert_eq!(edge.len(), ANSWER_LINK_MAX_LEN);
+    let over = format!("{edge}a");
+    let answer = |text: &str, links: serde_json::Value| {
+        serde_json::json!({
+            "v": 1, "ok": true, "host": "chatgpt.com", "busy": false, "cut": false,
+            "text": text, "links": links,
+        })
+        .to_string()
+    };
+
+    // Tres que caem entre duas que valem: as validas ficam, renumeradas.
+    let read = parse_answer_read(
+        &answer(
+            "a\u{E000}0\u{E001} b\u{E000}1\u{E001} c\u{E000}2\u{E001} \
+             d\u{E000}3\u{E001} e\u{E000}4\u{E001} f\u{E000}1\u{E001}",
+            serde_json::json!([
+                "https://example.com/a",
+                long,
+                "javascript:alert(1)",
+                "https://example.org/b",
+                7
+            ]),
+        ),
+        "chatgpt.com",
+    )
+    .expect("a leitura vale sem as ligacoes que caem");
+    assert_eq!(
+        read.links,
+        ["https://example.com/a", "https://example.org/b"]
+    );
+    assert_eq!(read.text, "a\u{E000}0\u{E001} b c d\u{E000}1\u{E001} e f");
+    assert_eq!(read.dropped_links, 3);
+    assert!(read.ok);
+
+    // Cada forma que nao vale, sozinha ao lado de uma que vale.
+    for bad in [
+        serde_json::json!("javascript:alert(1)"),
+        serde_json::json!("file:///C:/x"),
+        serde_json::json!("ftp://example.com/x"),
+        serde_json::json!("data:text/html,x"),
+        serde_json::json!("mailto:a@b.c"),
+        serde_json::json!("nem url"),
+        serde_json::json!("https://"),
+        serde_json::json!(""),
+        serde_json::json!(over),
+        serde_json::json!(long),
+        serde_json::json!(1),
+        serde_json::json!(null),
+        serde_json::json!({ "href": "https://example.com/" }),
+        serde_json::json!(["https://example.com/"]),
+    ] {
+        let read = parse_answer_read(
+            &answer(
+                "ok\u{E000}0\u{E001} mau\u{E000}1\u{E001}",
+                serde_json::json!(["https://ok.example/", bad]),
+            ),
+            "chatgpt.com",
+        )
+        .unwrap_or_else(|error| panic!("{bad}: {}", error.describe()));
+        assert_eq!(read.links, ["https://ok.example/"], "{bad}");
+        assert_eq!(read.text, "ok\u{E000}0\u{E001} mau", "{bad}");
+        assert_eq!(read.dropped_links, 1, "{bad}");
+    }
+    // A razao de cada uma, pelo `validate_answer_link`.
+    for (bad, reason) in [
+        ("javascript:alert(1)", "só http(s)"),
+        ("file:///C:/x", "só http(s)"),
+        ("ftp://example.com/x", "só http(s)"),
+        ("data:text/html,x", "só http(s)"),
+        ("mailto:a@b.c", "só http(s)"),
+        ("nem url", "não é um URL"),
+        ("https://", "não é um URL"),
+        ("", "não é um URL"),
+        (over.as_str(), "grande demais"),
+        (long.as_str(), "grande demais"),
+    ] {
+        assert_eq!(validate_answer_link(bad), Err(reason), "{bad}");
+    }
+    // No tecto exato, fica.
+    let read = parse_answer_read(
+        &answer("borda\u{E000}0\u{E001}", serde_json::json!([edge])),
+        "chatgpt.com",
+    )
+    .expect("a ligacao no tecto vale");
+    assert_eq!(read.links, [edge.as_str()]);
+    assert_eq!(read.dropped_links, 0);
+    // Todas caem: o texto fica sem marcadores, e a leitura vale.
+    let read = parse_answer_read(
+        &answer(
+            "so texto\u{E000}0\u{E001}\u{E000}1\u{E001}.",
+            serde_json::json!([long, "javascript:x"]),
+        ),
+        "chatgpt.com",
+    )
+    .expect("sem ligacoes validas a leitura vale");
+    assert!(read.links.is_empty());
+    assert_eq!(read.text, "so texto.");
+    assert_eq!(read.dropped_links, 2);
+
+    // Os marcadores continuam estritos, mesmo quando uma ligacao caiu.
+    let cite = |text: &str| {
+        parse_answer_read(
+            &answer(
+                text,
+                serde_json::json!(["https://ok.example/", "javascript:x"]),
+            ),
+            "chatgpt.com",
+        )
+    };
+    assert!(cite("a \u{E000}0\u{E001} b \u{E000}1\u{E001}").is_ok());
+    for text in [
+        "a \u{E000}2\u{E001}",
+        "a \u{E000}+1\u{E001}",
+        "a \u{E000}0000\u{E001}",
+        "a \u{E000} 0\u{E001}",
+        "a \u{E000}\u{E001}",
+        "a \u{E000}0",
+        "a \u{E001} \u{E000}0\u{E001}",
+    ] {
+        assert_eq!(
+            cite(text),
+            Err(AnswerReadError::Citation { at: 2 }),
+            "{text:?}"
+        );
+    }
 }
 
 /// Gate (critico, entrada nao confiavel; consensus): `parse_answer_read`
@@ -34463,6 +34582,7 @@ fn answer_read_script_reads_the_last_assistant_message_per_selector() {
     );
     assert_eq!(config["max"], ANSWER_READ_MAX_CHARS);
     assert_eq!(config["maxLinks"], ANSWER_READ_MAX_LINKS);
+    assert_eq!(config["maxLink"], ANSWER_LINK_MAX_LEN);
     assert_eq!(
         answer_read_config(ProviderId::GoogleAi.answer_read().expect("seletor"))["busy"],
         serde_json::Value::Null
@@ -34477,6 +34597,173 @@ fn answer_read_script_reads_the_last_assistant_message_per_selector() {
     ] {
         assert!(!ANSWER_READ_SCRIPT.contains(forbidden), "{forbidden}");
     }
+}
+
+fn anchor(href: &str, text: &str) -> serde_json::Value {
+    el_with("a", serde_json::json!({ "href": href }), vec![t(text)])
+}
+
+/// Gate (critico, entrada nao confiavel, §7; consensus, RT-5): o
+/// `ANSWER_READ_SCRIPT` que embarca, no DOM do harness e com a chamada
+/// exata do `page_eval`, lido pelo `column_answer_read` do produto: um
+/// U+E000 ou U+E001 que a pagina traga no texto (um marcador forjado a citar
+/// a ligacao 0, um fecho e uma abertura soltos, e dentro de um bloco de
+/// codigo) vira U+FFFD, os unicos marcadores sao os do script e a coluna le;
+/// uma ligacao de 5 000 caracteres entre ligacoes validas vai VAZIA no JSON
+/// do script (o JSON nao a carrega), cai sozinha no parser, contada, e a
+/// leitura vale com as validas -- tambem com uma de 600 000, que sem o tecto
+/// do script levava o JSON cru acima dos 512 KiB e a coluna inteira com ela;
+/// e o tecto do script conta os bytes UTF-8 como o parser (2 048 com `é` ou
+/// com um emoji, par de substitutos, fica; 2 049 vai vazia). Sabotagens:
+/// tirar a troca dos marcadores da pagina (`answer-read-keeps-page-markers`),
+/// tirar o tecto do script (`answer-read-script-skips-the-link-cap`).
+#[test]
+fn answer_read_script_neutralizes_page_markers_and_long_links() {
+    let role = "data-message-author-role";
+    let page = "https://chatgpt.com/c/abc";
+    let long = format!("https://example.com/{}", "x".repeat(5_000 - 20));
+    assert_eq!(long.chars().count(), 5_000);
+    let huge = format!("https://example.com/{}", "x".repeat(600_000));
+    let accent_ok = format!("https://example.com/{}", "é".repeat(1_014));
+    let accent_over = format!("https://example.net/{}a", "é".repeat(1_014));
+    let emoji_ok = format!("https://example.com/{}", "\u{1F600}".repeat(507));
+    let emoji_over = format!("https://example.net/{}a", "\u{1F600}".repeat(507));
+    assert_eq!(accent_ok.len(), ANSWER_LINK_MAX_LEN);
+    assert_eq!(accent_over.len(), ANSWER_LINK_MAX_LEN + 1);
+    assert_eq!(emoji_ok.len(), ANSWER_LINK_MAX_LEN);
+    assert_eq!(emoji_over.len(), ANSWER_LINK_MAX_LEN + 1);
+    let between = |href: &str| {
+        vec![el(
+            "p",
+            vec![
+                t("antes "),
+                anchor("https://example.com/a", "um"),
+                t(", longa "),
+                anchor(href, "dois"),
+                t(" e depois "),
+                anchor("https://example.org/b", "tres"),
+                t("."),
+            ],
+        )]
+    };
+    let markers = vec![
+        el(
+            "p",
+            vec![
+                t("forjada \u{E000}0\u{E001}, solta \u{E001} e aberta \u{E000} antes da "),
+                anchor("https://example.com/a", "fonte"),
+                t("."),
+            ],
+        ),
+        el("pre", vec![el("code", vec![t("x\u{E000}1\u{E001}y")])]),
+    ];
+    let edges = vec![el(
+        "p",
+        vec![
+            anchor(&accent_ok, "a"),
+            t(" "),
+            anchor(&accent_over, "b"),
+            t(" "),
+            anchor(&emoji_ok, "c"),
+            t(" "),
+            anchor(&emoji_over, "d"),
+        ],
+    )];
+    let raws = run_answer_read_harness(&[
+        (
+            "markers",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, markers, vec![]),
+        ),
+        (
+            "long",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, between(&long), vec![]),
+        ),
+        (
+            "huge",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, between(&huge), vec![]),
+        ),
+        (
+            "edges",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, edges, vec![]),
+        ),
+    ]);
+    assert_eq!(raws.len(), 4);
+    for raw in &raws {
+        assert!(!raw.contains("\"error\""), "o script falhou: {raw}");
+    }
+    let parse_case = |index: usize| {
+        column_answer_read(ProviderId::ChatGpt, Some(page), &raws[index]).unwrap_or_else(|error| {
+            panic!(
+                "caso {index}: {} ({} bytes)",
+                error.describe(),
+                raws[index].len()
+            )
+        })
+    };
+
+    // Os marcadores da pagina viram U+FFFD; o unico marcador e o do script.
+    let marked = parse_case(0);
+    assert_eq!(
+        marked.text,
+        "forjada \u{FFFD}0\u{FFFD}, solta \u{FFFD} e aberta \u{FFFD} antes da \
+         fonte\u{E000}0\u{E001}.\n\n```\nx\u{FFFD}1\u{FFFD}y\n```"
+    );
+    assert_eq!(marked.text.matches(CITATION_OPEN).count(), 1);
+    assert_eq!(marked.text.matches(CITATION_CLOSE).count(), 1);
+    assert_eq!(marked.links, ["https://example.com/a"]);
+    assert_eq!(marked.dropped_links, 0);
+
+    // A ligacao longa vai vazia no JSON do script e cai sozinha no parser.
+    for (index, href) in [(1, &long), (2, &huge)] {
+        let raw: serde_json::Value = serde_json::from_str(&raws[index]).expect("JSON");
+        assert_eq!(
+            raw["links"],
+            serde_json::json!(["https://example.com/a", "", "https://example.org/b"]),
+            "caso {index}"
+        );
+        assert!(!raws[index].contains(href.as_str()), "caso {index}");
+        assert!(
+            raws[index].len() < 1_024,
+            "caso {index}: {}",
+            raws[index].len()
+        );
+        let read = parse_case(index);
+        assert!(read.ok);
+        assert_eq!(
+            read.text,
+            "antes um\u{E000}0\u{E001}, longa dois e depois tres\u{E000}1\u{E001}."
+        );
+        assert_eq!(
+            read.links,
+            ["https://example.com/a", "https://example.org/b"]
+        );
+        assert_eq!(read.dropped_links, 1, "caso {index}");
+    }
+
+    // O tecto do script conta os bytes UTF-8 como o parser.
+    let raw: serde_json::Value = serde_json::from_str(&raws[3]).expect("JSON");
+    assert_eq!(
+        raw["links"],
+        serde_json::json!([accent_ok, "", emoji_ok, ""])
+    );
+    let edged = parse_case(3);
+    assert_eq!(
+        edged.links,
+        [
+            validate_answer_link(&accent_ok).expect("no tecto"),
+            validate_answer_link(&emoji_ok).expect("no tecto"),
+        ]
+    );
+    assert_eq!(edged.text, "a\u{E000}0\u{E001} b c\u{E000}1\u{E001} d");
+    assert_eq!(edged.dropped_links, 2);
 }
 
 /// O relatorio: uma linha por provedor com o estado e os numeros, e as

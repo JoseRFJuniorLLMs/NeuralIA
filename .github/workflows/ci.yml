@@ -893,6 +893,41 @@ jobs:
           '@
             },
             @{
+              Label = "answer-read-refuses-for-one-link"
+              Test = "answer_read_drops_only_the_invalid_link"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                      Err(_) => kept.push(None),
+          '@
+              New = @'
+                      Err(_) => return Err(AnswerReadError::Type("links")),
+          '@
+            },
+            @{
+              Label = "answer-read-keeps-page-markers"
+              Test = "answer_read_script_neutralizes_page_markers_and_long_links"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                if (mark0) value = value.split(mark0).join('\uFFFD');
+                if (mark1) value = value.split(mark1).join('\uFFFD');
+          '@
+              New = @'
+                if (mark0) value = value.split(mark0).join(mark0);
+                if (mark1) value = value.split(mark1).join(mark1);
+          '@
+            },
+            @{
+              Label = "answer-read-script-skips-the-link-cap"
+              Test = "answer_read_script_neutralizes_page_markers_and_long_links"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+                  links.push(overCap(href) ? '' : href);
+          '@
+              New = @'
+                  links.push(href);
+          '@
+            },
+            @{
               Label = "consensus-reads-the-split"
               Test = "consensus_reads_only_the_columns_never_the_split"
               SourcePath = "crates/neural-app/src/windows_app/consensus.rs"

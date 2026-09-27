@@ -247,11 +247,14 @@ reads each column natively:
   **only** — never the source opened beside a column, normal or private
   (`consensus_readable`; gate `consensus_reads_only_the_columns_never_the_split`).
   It receives its configuration as the script argument
-  (`{selector, busy, markers, max: 24000, maxLinks: 60}`) and returns
-  `{v, ok, host, busy, cut, text, links}`: the Markdown of the **last**
-  assistant message with each `http(s)` link replaced by a citation marker
-  `U+E000 n U+E001` pointing at `links[n]`. It registers no listener and
-  posts nothing; the only way back is the `evaluate_script` callback.
+  (`{selector, busy, markers, max: 24000, maxLinks: 60, maxLink: 2048}`) and
+  returns `{v, ok, host, busy, cut, text, links}`: the Markdown of the
+  **last** assistant message with each `http(s)` link replaced by a citation
+  marker `U+E000 n U+E001` pointing at `links[n]`. A `U+E000` or `U+E001`
+  already in the page text becomes `U+FFFD`, so the only markers in `text`
+  are the script's own; a link over 2 048 UTF-8 bytes is returned as an empty
+  string, so the reply never carries it. It registers no listener and posts
+  nothing; the only way back is the `evaluate_script` callback.
 - The reply is accepted only from the column's own provider page:
   `column_answer_read` (the decision `consensus_page_event` ships) first
   requires the column's page URL to belong to the column's provider by the
@@ -265,9 +268,16 @@ reads each column natively:
   script through `PageReads`).
 - `parse_answer_read` then treats the reply as untrusted data: 512 KiB cap
   before serde, exactly the seven keys, `v == 1`, typed fields, `host` equal
-  to that page's host, text within 24 000 characters, at most 60 links, each
-  `http(s)` with a host and within 2 048 bytes, every citation marker
-  pointing inside `links` (`answer_read_parse_caps_raw_and_requires_exact_keys`,
+  to that page's host, text within 24 000 characters, at most 60 links, and
+  every citation marker well formed and pointing inside the reply's `links`.
+  Only `http(s)` links with a host and within 2 048 bytes enter `links`; a
+  link that fails (the empty one the script sends for an over-long link
+  included) is dropped **alone**: its markers leave the text, the other
+  markers are renumbered and `dropped_links` counts it, instead of the whole
+  reading being refused and the column ending «sem leitura»
+  (`answer_read_parse_caps_raw_and_requires_exact_keys`,
+  `answer_read_drops_only_the_invalid_link`,
+  `answer_read_script_neutralizes_page_markers_and_long_links`,
   `answer_read_refuses_a_host_mismatch`).
 - Polling every 1.5 s until the answer **settles** (two identical reads
   without the provider's stop control), the column navigates to **another

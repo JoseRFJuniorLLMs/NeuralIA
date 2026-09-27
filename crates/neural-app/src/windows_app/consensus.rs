@@ -22,15 +22,20 @@ use crate::lazy_worker::{JobContext, LazyWorker};
 //   privada (`consensus_readable`) -- com a configuracao como ARGUMENTO
 //   (`answer_read_config`: o seletor do registo dos provedores, o botao
 //   de «a escrever», os marcadores de citacao U+E000 n U+E001, o tecto de
-//   24 000 caracteres e de 60 ligacoes). Devolve
+//   24 000 caracteres, de 60 ligacoes e de 2 048 bytes por ligacao). Devolve
 //   `{v, ok, host, busy, cut, text, links}`: o Markdown da ULTIMA mensagem
 //   do assistente, com cada ligacao trocada por um marcador que aponta
-//   para `links`. Nao escuta nada, nao publica nada (nem `postMessage`):
+//   para `links`. Um U+E000 ou U+E001 que a pagina traga no texto vira
+//   U+FFFD (os marcadores sao so os do script) e uma ligacao acima do tecto
+//   vai vazia. Nao escuta nada, nao publica nada (nem `postMessage`):
 //   o unico caminho de volta e o callback do `evaluate_script`.
 // - `parse_answer_read` le a resposta como dado nao confiavel: tecto de
 //   512 KiB ANTES do serde, as sete chaves exatas e nenhuma outra, `v` = 1,
-//   o `host` igual ao da pagina da coluna, cada ligacao http(s) com tecto
-//   de tamanho, e cada marcador a apontar para uma ligacao que existe. E
+//   o `host` igual ao da pagina da coluna e cada marcador a apontar para
+//   uma ligacao que existe; so entram em `links` as ligacoes http(s) com
+//   host e dentro do tecto -- cada uma que nao vale cai SOZINHA, com os
+//   seus marcadores, e fica contada (`dropped_links`), sem levar a
+//   leitura inteira com ela. E
 //   antes de tudo `column_answer_read` exige que a pagina da coluna SEJA
 //   do provedor dela pelas regras de host do registo
 //   (`ProviderId::from_url`: o Modo IA so com `udm=50`) e nao uma pagina de
@@ -126,6 +131,8 @@ pub(in crate::windows_app) const ANSWER_READ_SCRIPT: &str = r#"(function (config
   if (!(max > 0)) max = 24000;
   var maxLinks = Math.floor(Number(cfg.maxLinks));
   if (!(maxLinks >= 0)) maxLinks = 60;
+  var maxLink = Math.floor(Number(cfg.maxLink));
+  if (!(maxLink > 0)) maxLink = 2048;
   var markers = cfg.markers && typeof cfg.markers === 'object' ? cfg.markers : [];
   var mark0 = typeof markers[0] === 'string' && markers[0] ? markers[0] : '';
   var mark1 = typeof markers[1] === 'string' && markers[1] ? markers[1] : '';
@@ -154,10 +161,26 @@ pub(in crate::windows_app) const ANSWER_READ_SCRIPT: &str = r#"(function (config
     if (id === 'neuralia-comp-controls' || id === 'neuralia-palette') return true;
     return String(attr(el, 'aria-hidden') || '').toLowerCase() === 'true';
   }
+  // Os bytes UTF-8 de uma ligacao, contados como o parser os conta (o par
+  // de substitutos vale 1 + 3), ate passar do tecto.
+  function overCap(value) {
+    if (value.length > maxLink) return true;
+    var bytes = 0;
+    for (var j = 0; j < value.length; j++) {
+      var code = value.charCodeAt(j);
+      bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code >= 0xD800 && code <= 0xDBFF ? 1 : 3;
+      if (bytes > maxLink) return true;
+    }
+    return false;
+  }
   function walk(node, pre, depth) {
     if (!node || depth > 64) return;
     if (node.nodeType === 3) {
       var value = String(node.nodeValue || '');
+      // Um marcador que a pagina traga no texto vira U+FFFD: os marcadores
+      // do texto devolvido sao so os que este script escreve.
+      if (mark0) value = value.split(mark0).join('\uFFFD');
+      if (mark1) value = value.split(mark1).join('\uFFFD');
       if (!pre) {
         value = value.replace(/[\t\r\n ]+/g, ' ');
         var previous = parts.length ? parts[parts.length - 1] : '';
@@ -238,7 +261,9 @@ pub(in crate::windows_app) const ANSWER_READ_SCRIPT: &str = r#"(function (config
       for (i = 0; i < kids.length; i++) walk(kids[i], pre, depth + 1);
       if (cited) {
         parts.push(mark0 + links.length + mark1);
-        links.push(href);
+        // Acima do tecto a ligacao vai vazia: o parser deixa-a cair sozinha
+        // e conta-a, e o JSON devolvido nunca a carrega.
+        links.push(overCap(href) ? '' : href);
       }
       return;
     }
@@ -287,6 +312,7 @@ pub(in crate::windows_app) fn answer_read_config(
         "markers": [CITATION_OPEN.to_string(), CITATION_CLOSE.to_string()],
         "max": ANSWER_READ_MAX_CHARS,
         "maxLinks": ANSWER_READ_MAX_LINKS,
+        "maxLink": ANSWER_LINK_MAX_LEN,
     })
 }
 
@@ -316,6 +342,10 @@ pub(in crate::windows_app) struct AnswerRead {
     pub(in crate::windows_app) text: String,
     /// As ligacoes citadas, na ordem dos marcadores.
     pub(in crate::windows_app) links: Vec<String>,
+    /// Quantas ligacoes a leitura trouxe que nao valiam (nao eram texto,
+    /// nem http(s) com host, ou passavam o tecto; o script manda vazia a
+    /// que passa o tecto): cada uma caiu sozinha, com os seus marcadores.
+    pub(in crate::windows_app) dropped_links: usize,
 }
 
 /// Porque uma resposta do script foi recusada.
@@ -350,12 +380,9 @@ pub(in crate::windows_app) enum AnswerReadError {
     TooManyLinks {
         count: usize,
     },
-    /// Uma ligacao que nao vale.
-    Link {
-        index: usize,
-        reason: &'static str,
-    },
-    /// Um marcador de citacao mal formado ou a apontar para fora de `links`.
+    /// Um marcador de citacao mal formado, solto ou a apontar para fora de
+    /// `links`: o script troca os da pagina por U+FFFD, por isso um destes
+    /// e o proprio script que nao correu como embarca.
     Citation {
         at: usize,
     },
@@ -378,7 +405,6 @@ impl AnswerReadError {
             }
             Self::TooLong { chars } => format!("{chars} caracteres acima do tecto"),
             Self::TooManyLinks { count } => format!("{count} ligações acima do tecto"),
-            Self::Link { index, reason } => format!("ligação {index}: {reason}"),
             Self::Citation { at } => format!("marcador de citação inválido em {at}"),
         }
     }
@@ -389,8 +415,11 @@ const ANSWER_READ_KEYS: [&str; 7] = ["busy", "cut", "host", "links", "ok", "text
 /// Le a resposta do `ANSWER_READ_SCRIPT` como dado nao confiavel: o tecto
 /// cru antes do serde, as chaves exatas, os tipos, o `host` igual ao da
 /// pagina da coluna (`expected_host`, em minusculas), os tectos do texto e
-/// das ligacoes, cada ligacao http(s) e cada marcador de citacao a apontar
-/// para uma ligacao que existe.
+/// do numero de ligacoes, e cada marcador de citacao a apontar para uma
+/// ligacao que existe. Uma ligacao que nao vale (`validate_answer_link`)
+/// cai SOZINHA -- nunca entra em `links`, os marcadores dela saem do texto,
+/// os das outras renumeram-se e fica contada em `dropped_links` --: uma
+/// ligacao estranha nao deixa a coluna inteira sem leitura.
 pub(in crate::windows_app) fn parse_answer_read(
     raw: &str,
     expected_host: &str,
@@ -442,23 +471,30 @@ pub(in crate::windows_app) fn parse_answer_read(
             count: raw_links.len(),
         });
     }
+    // `kept[n]`: o indice novo de `links[n]` da leitura, ou `None` se caiu.
     let mut links = Vec::with_capacity(raw_links.len());
-    for (index, link) in raw_links.iter().enumerate() {
-        let link = link.as_str().ok_or(AnswerReadError::Link {
-            index,
-            reason: "não é texto",
-        })?;
-        links.push(
-            validate_answer_link(link).map_err(|reason| AnswerReadError::Link { index, reason })?,
-        );
+    let mut kept = Vec::with_capacity(raw_links.len());
+    for link in raw_links {
+        match link
+            .as_str()
+            .ok_or("não é texto")
+            .and_then(validate_answer_link)
+        {
+            Ok(link) => {
+                kept.push(Some(links.len()));
+                links.push(link);
+            }
+            Err(_) => kept.push(None),
+        }
     }
-    check_citations(&text, links.len())?;
+    let text = cite_kept_links(&text, &kept)?;
     Ok(AnswerRead {
         ok,
         host,
         busy,
         cut,
         text,
+        dropped_links: raw_links.len() - links.len(),
         links,
     })
 }
@@ -478,24 +514,40 @@ pub(in crate::windows_app) fn validate_answer_link(link: &str) -> Result<String,
     Ok(url.to_string())
 }
 
-/// Cada `U+E000 n U+E001` do texto aponta para `links[n]`; um marcador sem
-/// fecho, sem numero ou a apontar para fora recusa a leitura inteira.
-fn check_citations(text: &str, links: usize) -> Result<(), AnswerReadError> {
+/// Cada `U+E000 n U+E001` do texto aponta para `links[n]` da leitura; um
+/// marcador sem fecho, sem numero (1 a 3 algarismos), a apontar para fora ou
+/// um fecho solto recusa a leitura inteira -- o script troca por U+FFFD os
+/// que a pagina traga no texto, por isso os marcadores sao so os dele. Devolve
+/// o texto com o marcador de cada ligacao que caiu (`kept[n]` = `None`)
+/// tirado e os outros a apontar para o indice novo (`kept[n]`).
+fn cite_kept_links(text: &str, kept: &[Option<usize>]) -> Result<String, AnswerReadError> {
+    let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut offset = 0;
     while let Some(at) = rest.find(CITATION_OPEN) {
+        // Um fecho solto antes desta abertura.
+        if let Some(stray) = rest[..at].find(CITATION_CLOSE) {
+            return Err(AnswerReadError::Citation { at: offset + stray });
+        }
         let after = &rest[at + CITATION_OPEN.len_utf8()..];
         let Some(end) = after.find(CITATION_CLOSE) else {
             return Err(AnswerReadError::Citation { at: offset + at });
         };
         let digits = &after[..end];
-        let index = digits
-            .parse::<usize>()
-            .ok()
-            .filter(|_| !digits.is_empty() && digits.len() <= 3);
-        match index {
-            Some(index) if index < links => {}
-            _ => return Err(AnswerReadError::Citation { at: offset + at }),
+        let slot = Some(digits)
+            .filter(|digits| {
+                (1..=3).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|digits| digits.parse::<usize>().ok())
+            .and_then(|index| kept.get(index).copied());
+        let Some(slot) = slot else {
+            return Err(AnswerReadError::Citation { at: offset + at });
+        };
+        out.push_str(&rest[..at]);
+        if let Some(index) = slot {
+            out.push(CITATION_OPEN);
+            out.push_str(&index.to_string());
+            out.push(CITATION_CLOSE);
         }
         let consumed = at + CITATION_OPEN.len_utf8() + end + CITATION_CLOSE.len_utf8();
         offset += consumed;
@@ -505,7 +557,8 @@ fn check_citations(text: &str, links: usize) -> Result<(), AnswerReadError> {
     if let Some(stray) = rest.find(CITATION_CLOSE) {
         return Err(AnswerReadError::Citation { at: offset + stray });
     }
-    Ok(())
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// O host que a leitura da coluna do `provider` tem de trazer: o da pagina
@@ -1372,6 +1425,12 @@ impl App {
             PageEvalOutcome::Delivered { raw, .. } => {
                 match column_answer_read(column.provider, page_url.as_deref(), &raw) {
                     Ok(read) => {
+                        if read.dropped_links > 0 {
+                            debug_log(format_args!(
+                                "consensus: coluna {index}: {} ligação(ões) inválida(s) deixada(s) de fora",
+                                read.dropped_links
+                            ));
+                        }
                         if let Some(outcome) = column.observe(read) {
                             debug_log(format_args!(
                                 "consensus: coluna {index} acabou: {}",
