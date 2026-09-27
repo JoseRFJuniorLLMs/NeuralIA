@@ -852,10 +852,7 @@ impl RequestConnection for ClientConn {
     }
 }
 
-fn exchange_once(
-    conn: &mut impl RequestConnection,
-    request: &Value,
-) -> Result<Value, LinkError> {
+fn exchange_once(conn: &mut impl RequestConnection, request: &Value) -> Result<Value, LinkError> {
     conn.send_request(request)
         .map_err(|error| LinkError::Broken(error.to_string()))?;
     conn.receive_reply()
@@ -1117,10 +1114,7 @@ mod tests {
         let mut silent = raw_client(server.pipe_name());
         let server_pipe = Pipe(Arc::new(server.first.take().expect("first pipe instance")));
         let started = Instant::now();
-        assert!(!wait_for_auth_line(
-            &server_pipe,
-            Duration::from_millis(40)
-        ));
+        assert!(!wait_for_auth_line(&server_pipe, Duration::from_millis(40)));
         assert!(started.elapsed() < Duration::from_secs(1));
 
         silent.writer.write_all(b"{\"t\":\"hello\"").unwrap();
@@ -1129,10 +1123,7 @@ mod tests {
             Duration::from_millis(40)
         ));
         silent.writer.write_all(b"}\n").unwrap();
-        assert!(wait_for_auth_line(
-            &server_pipe,
-            Duration::from_millis(200)
-        ));
+        assert!(wait_for_auth_line(&server_pipe, Duration::from_millis(200)));
     }
 
     #[test]
