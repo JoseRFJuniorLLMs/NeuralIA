@@ -1042,6 +1042,17 @@ jobs:
           '@
             },
             @{
+              Label = "agents-failed-append-must-mark-stale"
+              Test = "a_failed_persistent_append_is_repaired_by_the_next_write"
+              SourcePath = "crates/neural-app/src/agents/store.rs"
+              Old = @'
+                  if write_result.is_err() {
+          '@
+              New = @'
+                  if false {
+          '@
+            },
+            @{
               Label = "agents-clear-pending-resurrects-history"
               Test = "clearing_history_with_a_pending_question_never_recreates_the_conversation"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
