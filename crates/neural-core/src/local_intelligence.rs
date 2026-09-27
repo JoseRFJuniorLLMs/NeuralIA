@@ -131,6 +131,27 @@ impl LocalIntelligence for HashingLocalIntelligence {
     }
 }
 
+/// Um vetor por texto, para quem so precisa de semelhanca: o orcamento de
+/// contexto (`crate::context_budget`) pontua cada trecho pelo cosseno com a
+/// pergunta. E a capacidade minima de um model pack (SPEC-0102 §4);
+/// enquanto nenhum esta ligado ao produto, o `HashingEmbedder` serve, sem
+/// modelo, sem rede e determinista.
+pub trait Embedder {
+    fn embed(&self, text: &str) -> Vec<f32>;
+}
+
+/// O `Embedder` do `hashed_embedding`: SHA-256 de palavras, sinonimos
+/// PT/EN e n-gramas de caracteres, normalizado. O mesmo texto da sempre o
+/// mesmo vetor, em qualquer maquina.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HashingEmbedder;
+
+impl Embedder for HashingEmbedder {
+    fn embed(&self, text: &str) -> Vec<f32> {
+        hashed_embedding(text)
+    }
+}
+
 pub fn hashed_embedding(text: &str) -> Vec<f32> {
     let normalized = text.to_lowercase();
     let chars = normalized.chars().collect::<Vec<_>>();
