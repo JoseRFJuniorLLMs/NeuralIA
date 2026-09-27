@@ -1056,6 +1056,23 @@ fn register_webview_accelerators(
 
 // ===================== a metade depois do build =====================
 
+/// Ativa o gesto nativo de pinça do WebView2. Ele é "Page Scale" e é separado
+/// do browser zoom usado pelo NeuralIA em Ctrl+/Ctrl-/Ctrl+roda: portanto o
+/// touchpad volta a ampliar/reduzir sem duplicar o caminho de zoom existente.
+fn enable_native_pinch_zoom(webview: &WebView) -> Result<(), String> {
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+    use windows_core::Interface;
+    use wry::WebViewExtWindows;
+
+    let settings = unsafe { webview.webview().Settings() }
+        .map_err(|error| format!("Settings indisponível: {error}"))?;
+    let settings = settings
+        .cast::<ICoreWebView2Settings5>()
+        .map_err(|error| format!("ICoreWebView2Settings5 indisponível: {error}"))?;
+    unsafe { settings.SetIsPinchZoomEnabled(true) }
+        .map_err(|error| format!("SetIsPinchZoomEnabled falhou: {error}"))
+}
+
 /// Quem regista no WebView2 o que a tabela manda para uma WebView acabada de
 /// construir. O produto passa o COM (`ComHookRegistrar`); o gate passa um
 /// registo que anota o que foi pedido para cada hospedeiro.
@@ -1387,6 +1404,12 @@ impl App {
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
     /// gancho e fica no log.
     fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {
+        if let Err(error) = enable_native_pinch_zoom(webview) {
+            debug_log(format_args!(
+                "pinch zoom: {} sem gesto nativo ({error})",
+                host.describe()
+            ));
+        }
         let mut registrar = ComHookRegistrar {
             webview,
             auto_scroll: self.auto_scroll.clone(),
