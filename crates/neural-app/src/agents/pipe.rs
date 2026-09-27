@@ -1094,17 +1094,26 @@ mod tests {
     #[test]
     fn unauthenticated_pipe_requires_a_complete_first_line_before_deadline() {
         let dir = TempDir::new("pipe-auth-deadline");
-        let server = HubServer::bind(&dir.0).unwrap();
+        let mut server = HubServer::bind(&dir.0).unwrap();
         let mut silent = raw_client(server.pipe_name());
-        let pipe = silent.reader.get_ref().clone();
+        let server_pipe = Pipe(Arc::new(server.first.take().expect("first pipe instance")));
         let started = Instant::now();
-        assert!(!wait_for_auth_line(&pipe, Duration::from_millis(40)));
+        assert!(!wait_for_auth_line(
+            &server_pipe,
+            Duration::from_millis(40)
+        ));
         assert!(started.elapsed() < Duration::from_secs(1));
 
         silent.writer.write_all(b"{\"t\":\"hello\"").unwrap();
-        assert!(!wait_for_auth_line(&pipe, Duration::from_millis(40)));
+        assert!(!wait_for_auth_line(
+            &server_pipe,
+            Duration::from_millis(40)
+        ));
         silent.writer.write_all(b"}\n").unwrap();
-        assert!(wait_for_auth_line(&pipe, Duration::from_millis(200)));
+        assert!(wait_for_auth_line(
+            &server_pipe,
+            Duration::from_millis(200)
+        ));
     }
 
     #[test]
