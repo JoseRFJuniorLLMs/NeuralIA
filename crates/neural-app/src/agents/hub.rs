@@ -1782,10 +1782,7 @@ pub(crate) mod tests {
         assert!(!agents_dir.join("state.json").exists());
 
         // Na sessao que continua aberta, IDs nao sao reutilizados.
-        assert_eq!(
-            f.hub.user_message("claude", "mesma sessão").unwrap().id,
-            3
-        );
+        assert_eq!(f.hub.user_message("claude", "mesma sessão").unwrap().id, 3);
         f.hub.clear_conversations().unwrap();
         assert!(!agents_dir.join("claude.jsonl").exists());
         assert!(!agents_dir.join("state.json").exists());
@@ -1794,7 +1791,10 @@ pub(crate) mod tests {
         let reopened = reopen(&f);
         reopened.load();
         assert!(reopened.conversation("claude").is_empty());
-        assert_eq!(reopened.user_message("claude", "novo começo").unwrap().id, 1);
+        assert_eq!(
+            reopened.user_message("claude", "novo começo").unwrap().id,
+            1
+        );
         // O hub so escreve dentro de <data_dir>/agents.
         let top: Vec<String> = std::fs::read_dir(&f.dir.0)
             .unwrap()
