@@ -1092,16 +1092,16 @@ jobs:
               Test = "a_failed_mark_read_save_is_retried_even_when_the_ram_mark_is_unchanged"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
               Old = @'
-                      if state
-                          .store_error
-                          .as_deref()
-                          .is_some_and(|error| error.starts_with(MARKS_ERROR_PREFIX))
-                      {
-                          state.store_error = None;
-                      }
+                          if state
+                              .store_error
+                              .as_deref()
+                              .is_some_and(|error| error.starts_with(MARKS_ERROR_PREFIX))
+                          {
+                              state.store_error = None;
+                          }
           '@
               New = @'
-                      let _ = &state.store_error;
+                          let _ = &state.store_error;
           '@
             },
             @{
