@@ -270,6 +270,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.privacy.save_session(session.clone());
                 }
             }
+            UserEvent::PdfPageText { page, text } => {
+                self.capture_pdf_page_text(page, text);
+            }
             UserEvent::AgentObservation(page) => {
                 self.handle_agent_observation(page);
             }
