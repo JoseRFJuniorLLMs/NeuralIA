@@ -1187,7 +1187,25 @@ impl DownloadManager {
         mut next_id: impl FnMut() -> DownloadId,
     ) -> Vec<DownloadEffect> {
         let allow_programs = self.settings.allow_programs;
-        let mut marked = false;
+        // Recovery oculto tem uma unica tentativa. Se ela ja foi iniciada e
+        // a aplicacao caiu outra vez, ou se o caminho nem coube no journal,
+        // nao ha mais acao possivel: apaga o rasto oculto em vez de o guardar
+        // para sempre depois de o utilizador ter limpado o historico.
+        let before_cleanup = self.log.len();
+        self.log.retain(|record| {
+            !(record.recovery_only
+                && matches!(
+                    record.outcome,
+                    RecordOutcome::Pending { resumed: true, .. }
+                ))
+                && !(record.recovery_only
+                    && matches!(
+                        record.outcome,
+                        RecordOutcome::Pending { resumed: false, .. }
+                    )
+                    && record.path.is_none())
+        });
+        let mut marked = self.log.len() != before_cleanup;
         let mut effects = Vec::new();
         let mut resumed = Vec::new();
         for record in self.log.iter_mut() {
@@ -2664,6 +2682,18 @@ mod tests {
         let resumed = restarted.entry(DownloadId(9)).expect("retomado");
         assert!(!resumed.history_visible);
         assert!(restarted.log().entries[0].recovery_only);
+
+        // Se esta unica retomada cair outra vez antes do veredito, o arranque
+        // seguinte limpa o recovery oculto em vez de guardar o caminho para
+        // sempre. Um pending visivel continua com a regra antiga.
+        let mut after_second_crash =
+            DownloadManager::new(DownloadSettings::default(), restarted.log());
+        assert_eq!(
+            after_second_crash.resume_pending(|| DownloadId(10)),
+            vec![DownloadEffect::Persist]
+        );
+        assert!(after_second_crash.log().entries.is_empty());
+
         restarted.on_event(DownloadEvent::Finalized {
             id: DownloadId(9),
             outcome: FinalizeOutcome::Deleted(DeleteReason::DangerousContent),
