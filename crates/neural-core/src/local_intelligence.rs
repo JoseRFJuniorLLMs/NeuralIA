@@ -469,7 +469,10 @@ impl ModelPackManager {
         model_bytes: &[u8],
     ) -> Result<PathBuf, String> {
         validate_manifest(manifest)?;
-        let actual = format!("{:x}", Sha256::digest(model_bytes));
+        let actual = Sha256::digest(model_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
             return Err(format!("hash do model pack {} não confere", manifest.id));
         }
@@ -494,7 +497,10 @@ impl ModelPackManager {
             .map_err(|error| error.to_string())?;
 
             let staged_bytes = fs::read(&staged_model).map_err(|error| error.to_string())?;
-            let staged_hash = format!("{:x}", Sha256::digest(staged_bytes));
+            let staged_hash = Sha256::digest(staged_bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
             if !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {
                 return Err("model pack staging hash mismatch".into());
             }
@@ -1019,9 +1025,9 @@ mod tests {
             version: "1".into(),
             file: "model.bin".into(),
             sha256: Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "test".into(),
         };
@@ -1059,9 +1065,9 @@ mod tests {
             version: version.into(),
             file: "model.bin".into(),
             sha256: Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "MIT".into(),
         }
