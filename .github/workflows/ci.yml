@@ -960,6 +960,28 @@ jobs:
           '@
             },
             @{
+              Label = "download-clear-history-drops-recovery"
+              Test = "clear_history_during_verification_preserves_recovery_without_restoring_history"
+              SourcePath = "crates/neural-core/src/downloads.rs"
+              Old = @'
+                        record.recovery_only = true;
+          '@
+              New = @'
+                        record.recovery_only = false;
+          '@
+            },
+            @{
+              Label = "download-private-verdict-not-persisted"
+              Test = "normal_download_verdict_persists_even_if_global_mode_turns_private"
+              SourcePath = "crates/neural-app/src/stores.rs"
+              Old = @'
+              StoreSpec::new("downloads.json", GuardedAutomatic, File);
+          '@
+              New = @'
+              StoreSpec::new("downloads.json", Automatic, File);
+          '@
+            },
+            @{
               Label = "agents-pipe-system-ace"
               Test = "hub_pipe_and_token_files_are_owned_by_and_open_only_to_this_user"
               SourcePath = "crates/neural-app/src/agents/pipe.rs"
