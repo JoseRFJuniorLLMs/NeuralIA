@@ -61,6 +61,23 @@ export function hideStatus(element) {
   element.classList.remove('error');
 }
 
+export function plainTextFromTextContent(content, maxChars = 1500) {
+  if (!content || !Array.isArray(content.items) || maxChars <= 0) return '';
+  let out = '';
+  for (const item of content.items) {
+    if (!item || typeof item.str !== 'string' || item.str.length === 0) continue;
+    if (out && !out.endsWith('\n')) out += ' ';
+    out += item.str;
+    if (item.hasEOL) out += '\n';
+    if (out.length >= maxChars) break;
+  }
+  return out
+    .slice(0, maxChars)
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 if (typeof document !== 'undefined') {
 const status = document.getElementById('status');
 const hud = document.getElementById('hud');
@@ -77,6 +94,9 @@ const EVICT_RADIUS = KEEP_RADIUS + 2;
 const BAND = 1200;
 const PROBE_PAGES = 8;
 const RANGE_CHUNK = 1048576;
+const PDF_TEXT_MAX_PAGES = 24;
+const PDF_TEXT_MAX_CHARS_PER_PAGE = 1500;
+const PDF_TEXT_MAX_TOTAL_CHARS = 30000;
 
 const slots = [];
 // tops[i] e o offsetTop do placeholder i e heights[i] a altura que lhe
@@ -211,6 +231,36 @@ function textContentOf(index) {
     });
   }
   return slot.text;
+}
+
+function reportPageText(page, text) {
+  const report = window.__neuralia_pdf_page_text;
+  if (typeof report === 'function' && text) report(page, text);
+}
+
+async function extractTextForMemory() {
+  if (!doc) return;
+  let total = 0;
+  const count = Math.min(PDF_TEXT_MAX_PAGES, doc.numPages);
+  for (let pageNumber = 1; pageNumber <= count && total < PDF_TEXT_MAX_TOTAL_CHARS; pageNumber++) {
+    const page = await doc.getPage(pageNumber);
+    try {
+      const content = await page.getTextContent();
+      const remaining = Math.min(
+        PDF_TEXT_MAX_CHARS_PER_PAGE,
+        PDF_TEXT_MAX_TOTAL_CHARS - total
+      );
+      const text = plainTextFromTextContent(content, remaining);
+      if (text) {
+        reportPageText(pageNumber, text);
+        total += text.length;
+      }
+    } finally {
+      if (slots[pageNumber - 1]?.page !== page && typeof page.cleanup === 'function') {
+        page.cleanup();
+      }
+    }
+  }
 }
 
 async function renderTextLayer(index, viewport, generation) {
@@ -473,6 +523,7 @@ async function load() {
   updateHud();
   document.title = 'NeuralIA · PDF · ' + doc.numPages + ' páginas';
   attachReadAloud(await documentLanguage());
+  void extractTextForMemory().catch((err) => console.error('texto PDF', err));
 }
 
 // O idioma que o PDF declara (o /Lang do catalogo, que o PDF.js da em
