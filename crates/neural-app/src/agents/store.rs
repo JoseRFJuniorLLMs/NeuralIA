@@ -641,6 +641,25 @@ impl ConversationStore {
     /// reescrita ficou por fazer (`Conversation::stale`), e ela que leva o
     /// registo ao disco: acrescentar a um ficheiro com uma linha cortada
     /// colava-o a ela, e o arranque seguinte descartava os dois.
+    /// Acrescenta um registo que pertence a uma interacao privada ja
+    /// identificada pelo dominio, mesmo que o modo global tenha voltado a
+    /// Normal. Fica visivel nesta sessao, entra em `unsaved` e NUNCA toca
+    /// no disco. Se o tecto for ultrapassado, a memoria e aparada e uma
+    /// futura escrita normal reconstroi o ficheiro apenas com registos
+    /// persistiveis.
+    pub(crate) fn append_memory_only(
+        &self,
+        conversation: &mut Conversation,
+        record: AgentRecord,
+    ) {
+        conversation.unsaved.insert(record.id);
+        conversation.records.push_back(record);
+        if conversation.over_cap() {
+            conversation.trim_to_keep();
+            conversation.stale = true;
+        }
+    }
+
     pub(crate) fn append(
         &self,
         agent: &str,
