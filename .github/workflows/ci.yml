@@ -934,14 +934,14 @@ jobs:
               Test = "a_private_origin_question_stays_memory_only_after_returning_to_normal"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
               Old = @'
-                            outcome_storage: if store.writes_allowed() {
-                                QuestionOutcomeStorage::Persist
-                            } else {
-                                QuestionOutcomeStorage::MemoryOnly
-                            },
+                                      outcome_storage: if store.writes_allowed() {
+                                          QuestionOutcomeStorage::Persist
+                                      } else {
+                                          QuestionOutcomeStorage::MemoryOnly
+                                      },
           '@
               New = @'
-                            outcome_storage: QuestionOutcomeStorage::Persist,
+                                      outcome_storage: QuestionOutcomeStorage::Persist,
           '@
             },
             @{
