@@ -580,8 +580,9 @@ pub(in crate::windows_app) fn user_downloads_folder() -> Option<PathBuf> {
     path.filter(|path| path.is_absolute())
 }
 
-/// Grava o registo do gestor. A loja e `Automatic`: com o modo em `Private`
-/// nao escreve nada (`SkippedPrivate`).
+/// Grava o registo do gestor. No produto a loja e `GuardedAutomatic`:
+/// downloads privados ja foram excluidos pelo gestor, e um veredito tardio
+/// de um download normal pode concluir mesmo com o modo global `Private`.
 pub(in crate::windows_app) fn persist_download_log(
     store: &mut VersionedJsonStore<DownloadLog>,
     manager: &DownloadManager,
@@ -1327,7 +1328,16 @@ mod recovery_regression_tests {
         let before = log_json(&dir.0);
         assert_eq!(before["data"]["entries"][0]["outcome"]["kind"], "pending");
 
+        // Artefactos que poderiam conservar o historico apagado. O ClearLog
+        // com recovery tem de os remover ANTES de gravar o journal minimo.
+        let backup = dir.0.join("downloads.json.bak");
+        let temp = dir.0.join(".downloads.json.regression.tmp");
+        std::fs::write(&backup, b"OLD-HISTORY").expect("backup fixture");
+        std::fs::write(&temp, b"OLD-HISTORY").expect("temp fixture");
+
         state.run(false, DownloadEvent::ClearLog);
+        assert!(!backup.exists(), "backup antigo sobreviveu ao ClearLog");
+        assert!(!temp.exists(), "temporario antigo sobreviveu ao ClearLog");
         let cleared = log_json(&dir.0);
         let entries = cleared["data"]["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 1, "{cleared}");
