@@ -6896,7 +6896,7 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
 /// Gate (critico: apaga dados do utilizador): o percurso do "Apagar
 /// historico" que embarca (`clear_history_targets`, o mesmo que o `App`
 /// corre depois do Sim) chega a CADA alvo registado, pela ordem da tabela,
-/// uma vez so, e a tabela cobre os quatro alvos que existem -- um alvo que
+/// uma vez so, e a tabela cobre os seis alvos que existem -- um alvo que
 /// o percurso salte, ou que saia da tabela, fica vermelho aqui. O que o
 /// `App` faz em cada alvo (esquecer a memoria, apagar o historico) NAO se
 /// prova aqui: o braco de cada um esta preso por texto em
@@ -6923,6 +6923,7 @@ fn clear_history_runs_every_registered_target() {
         ClearTarget::Memory,
         ClearTarget::EpubLibrary,
         ClearTarget::Downloads,
+        ClearTarget::Agents,
         ClearTarget::History,
     ] {
         assert_eq!(
@@ -6935,7 +6936,7 @@ fn clear_history_runs_every_registered_target() {
         );
     }
     assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
-    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 5);
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 6);
 }
 
 /// Ligacao, nao comportamento: o comportamento esta nos gates de
@@ -6988,6 +6989,10 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
             "ClearTarget::Memory => self.privacy.clear_memory(&mut self.current_research),"
         ),
         "\"Apagar histórico\" must also clear the semantic memory"
+    );
+    assert!(
+        sink.contains("ClearTarget::Agents => self.clear_agent_conversations(),"),
+        "\"Apagar histórico\" must also clear local agent conversations"
     );
     assert!(
         sink.contains("ClearTarget::History => match self.privacy.clear_history() {"),
@@ -24101,9 +24106,9 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 #[test]
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
-        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
-        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, HISTORY_STORE, KEYS_STORE,
-        LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE,
+        AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
+        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24117,6 +24122,7 @@ fn existing_stores_have_a_declared_kind() {
         ("tabs.cleared", Automatic, File),
         ("panel-width.json", Automatic, File),
         ("agent", Automatic, Dir),
+        ("agents", Automatic, Dir),
         ("WebView2", Automatic, Dir),
         ("theme", Setting, File),
         ("gmail", Setting, File),
@@ -24182,6 +24188,7 @@ fn existing_stores_have_a_declared_kind() {
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
         ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
         ("ADBLOCK_LIST_STORE", ADBLOCK_LIST_STORE.name),
+        ("AGENTS_STORE", AGENTS_STORE.name),
         ("AI_SETTINGS_STORE", AI_SETTINGS_STORE.name),
         ("AI_USAGE_STORE", AI_USAGE_STORE.name),
         ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
@@ -24235,18 +24242,29 @@ fn existing_stores_have_a_declared_kind() {
 
 // ===================== infra-privacy-guard: o portao da persistencia =====================
 
-/// O mesmo codigo sem os modulos `#[cfg(test)] mod x { ... }` escritos no
-/// meio do ficheiro (os `tab_session_gates` do `windows_app.rs`, por
-/// exemplo): um modulo fecha na linha que e so `}` com a indentacao da
-/// linha `mod` (rustfmt). O `mod tests {` do fim continua a cargo de
-/// `code_without_tests`.
+/// O mesmo codigo sem os modulos `#[cfg(test)] ... mod x { ... }` escritos
+/// no meio do ficheiro (incluindo `pub(crate) mod tests`; os
+/// `tab_session_gates` do `windows_app.rs` sao outro exemplo): um modulo
+/// fecha na linha que e so `}` com a indentacao da declaracao (rustfmt).
+/// O `mod tests {` do fim continua a cargo de `code_without_tests`.
 fn without_test_modules(code: &str) -> String {
     let mut out = String::with_capacity(code.len());
     let mut lines = code.lines().peekable();
     while let Some(line) = lines.next() {
         if line.trim() == "#[cfg(test)]"
             && let Some(next) = lines.peek()
-            && next.trim_start().starts_with("mod ")
+            && {
+                let declaration = next.trim_start();
+                [
+                    "mod ",
+                    "pub mod ",
+                    "pub(crate) mod ",
+                    "pub(super) mod ",
+                    "pub(self) mod ",
+                ]
+                .iter()
+                .any(|prefix| declaration.starts_with(prefix))
+            }
             && next.trim_end().ends_with('{')
         {
             let indent: String = next.chars().take_while(|ch| ch.is_whitespace()).collect();
@@ -24262,6 +24280,26 @@ fn without_test_modules(code: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+#[test]
+fn visible_cfg_test_modules_are_not_considered_shipped_code() {
+    let sample = r#"
+fn shipped() {}
+#[cfg(test)]
+pub(crate) mod tests {
+    use neural_core::json_store::StoreRegistry;
+    fn only_for_tests() {
+        let _ = core::mem::size_of::<StoreRegistry>();
+    }
+}
+fn shipped_too() {}
+"#;
+    let filtered = without_test_modules(sample);
+    assert!(filtered.contains("fn shipped() {}"));
+    assert!(filtered.contains("fn shipped_too() {}"));
+    assert!(!filtered.contains("StoreRegistry"), "{filtered}");
+    assert!(!filtered.contains("only_for_tests"), "{filtered}");
 }
 
 /// Um bloco `impl X {` de topo, ate ao `}` na coluna 0 que o fecha.
@@ -25399,6 +25437,16 @@ fn no_raw_data_dir_write_outside_a_grant() {
             "neural-app/src/windows_app.rs",
             1,
             "finish_agent: o trace legado do agente em agent/ (Automatic); o int-agents-finish leva-o",
+        ),
+        (
+            "neural-app/src/agents/pipe.rs",
+            1,
+            "agents/ (Automatic): metadados locais do named pipe; o canal so nasce com grant que permite escrita",
+        ),
+        (
+            "neural-app/src/agents/store.rs",
+            3,
+            "agents/ (Automatic): conversas e state.json ficam sob o caminho do StoreGrant e obedecem writes_allowed",
         ),
         (
             "neural-app/src/windows_app/app/compare.rs",

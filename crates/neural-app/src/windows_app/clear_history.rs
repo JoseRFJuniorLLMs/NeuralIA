@@ -26,6 +26,8 @@ pub(in crate::windows_app) enum ClearTarget {
     /// `downloads.json`: o registo dos downloads acabados (os ficheiros
     /// baixados ficam onde estao) e os acabados da lista da sessao.
     Downloads,
+    /// Conversas locais dos agentes externos; as credenciais do canal ficam.
+    Agents,
     /// `history.jsonl`: o historico cronologico.
     History,
 }
@@ -33,11 +35,12 @@ pub(in crate::windows_app) enum ClearTarget {
 impl ClearTarget {
     /// Todos os alvos, na ordem em que o event loop os apaga. E a lista que
     /// `CLEAR_HISTORY_TARGETS` tem de cobrir inteira.
-    pub(in crate::windows_app) const ALL: [Self; 5] = [
+    pub(in crate::windows_app) const ALL: [Self; 6] = [
         Self::Tabs,
         Self::Memory,
         Self::EpubLibrary,
         Self::Downloads,
+        Self::Agents,
         Self::History,
     ];
 }
@@ -81,6 +84,7 @@ impl ClearHistorySink for App {
             ClearTarget::Downloads => {
                 self.download_event(neural_core::downloads::DownloadEvent::ClearLog)
             }
+            ClearTarget::Agents => self.clear_agent_conversations(),
             ClearTarget::History => match self.privacy.clear_history() {
                 None => {
                     self.show_home();

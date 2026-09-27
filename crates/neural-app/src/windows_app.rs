@@ -33,7 +33,7 @@ use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_
 use crate::privacy::{PrivacyGuard, PrivacyMode};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::secrets::redact_debug_secrets;
-use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE};
+use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::json_store::StoreRegistry;
 use neural_core::{
@@ -130,6 +130,8 @@ pub(in crate::windows_app) enum UserEvent {
     /// Os favoritos (`bookmarks.rs`): o Ctrl+D ou a estrela, com o alvo que
     /// a origem deu, e as respostas da thread `neural-bookmarks`.
     Bookmarks(BookmarksEvent),
+    /// Eventos do hub local de agentes externos.
+    AgentsHub(AgentsHubEvent),
     /// Pedido da pagina local do painel lateral (canal proprio), com o
     /// numero da pagina que o mandou.
     Panel(side_panel::PanelPost),
@@ -3272,6 +3274,8 @@ pub(in crate::windows_app) struct App {
     /// `neural-bookmarks` mandou e a pagina de cada estrela. A thread so
     /// nasce no primeiro uso.
     pub(in crate::windows_app) bookmarks: BookmarksState,
+    /// Hub MCP local de agentes externos.
+    pub(in crate::windows_app) agents: AgentsHubState,
 }
 
 impl App {
@@ -3340,6 +3344,7 @@ impl App {
         // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
         let translation = TranslationState::new(proxy.clone());
         let downloads_ui = DownloadsUiState::new(proxy.clone());
+        let agents = AgentsHubState::open(privacy.store(AGENTS_STORE), &proxy);
         Self {
             document,
             pdf_bytes: Arc::new(Mutex::new(Vec::new())),
@@ -3422,6 +3427,7 @@ impl App {
             consensus: ConsensusState::new(),
             downloads_ui,
             bookmarks: BookmarksState::default(),
+            agents,
         }
     }
 }
@@ -7174,6 +7180,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
     ("distraction.rs", include_str!("windows_app/distraction.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
+    ("agents_hub.rs", include_str!("windows_app/agents_hub.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
 
@@ -7274,6 +7281,8 @@ pub(in crate::windows_app) mod distraction;
 pub(in crate::windows_app) use distraction::*;
 pub(in crate::windows_app) mod bookmarks;
 pub(in crate::windows_app) use bookmarks::*;
+pub(in crate::windows_app) mod agents_hub;
+pub(in crate::windows_app) use agents_hub::*;
 
 pub(in crate::windows_app) mod app;
 #[allow(unused_imports)]
