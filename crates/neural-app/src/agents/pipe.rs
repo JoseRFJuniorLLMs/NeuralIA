@@ -1118,10 +1118,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
 
         silent.writer.write_all(b"{\"t\":\"hello\"").unwrap();
-        assert!(!wait_for_auth_line(
-            &server_pipe,
-            Duration::from_millis(40)
-        ));
+        assert!(!wait_for_auth_line(&server_pipe, Duration::from_millis(40)));
         silent.writer.write_all(b"}\n").unwrap();
         assert!(wait_for_auth_line(&server_pipe, Duration::from_millis(200)));
     }
