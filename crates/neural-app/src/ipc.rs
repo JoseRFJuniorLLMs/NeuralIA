@@ -2,6 +2,8 @@ use neural_core::{is_local_network_target, validate_web_url};
 use serde_json::{Map, Value};
 
 pub const IPC_MAX_BYTES: usize = 8 * 1024;
+pub const PDF_TEXT_MAX_PAGES: u32 = 24;
+pub const PDF_TEXT_MAX_CHARS_PER_PAGE: usize = 1_500;
 /// Tecto de uma pergunta replicada as outras colunas (`ask`).
 pub const ASK_MAX_CHARS: usize = 2_000;
 /// Tecto do texto selecionado mandado as IAs (`search`).
@@ -118,6 +120,10 @@ pub enum IpcAction {
     },
     ResearchAnswer {
         col: usize,
+        text: String,
+    },
+    PdfPageText {
+        page: u32,
         text: String,
     },
     AgentObservation {
@@ -321,6 +327,15 @@ pub fn parse_ipc_message(body: &str, expected_cap: &str, max_columns: usize) -> 
             let text = bounded_string(args, "text", 2_048, false)?;
             Some(IpcAction::ResearchAnswer { col, text })
         }
+        "pdf-page-text" => {
+            exact_keys(args, &["page", "text"])?;
+            let page = u32::try_from(args.get("page")?.as_u64()?).ok()?;
+            if !(1..=PDF_TEXT_MAX_PAGES).contains(&page) {
+                return None;
+            }
+            let text = bounded_string(args, "text", PDF_TEXT_MAX_CHARS_PER_PAGE, false)?;
+            Some(IpcAction::PdfPageText { page, text })
+        }
         "agent-observation" => {
             exact_keys(args, &["data"])?;
             let data = bounded_string(args, "data", 7_500, false)?;
@@ -398,6 +413,46 @@ mod tests {
 
     fn message(action: &str, args: Value) -> String {
         json!({"v":1,"cap":CAP,"action":action,"args":args}).to_string()
+    }
+
+    #[test]
+    fn pdf_page_text_is_capability_authenticated_and_bounded() {
+        let parsed = parse_ipc_message(
+            &message(
+                "pdf-page-text",
+                json!({"page": 3, "text": "conteudo pesquisavel"}),
+            ),
+            CAP,
+            3,
+        );
+        assert_eq!(
+            parsed,
+            Some(IpcAction::PdfPageText {
+                page: 3,
+                text: "conteudo pesquisavel".to_string(),
+            })
+        );
+        for bad_page in [0, PDF_TEXT_MAX_PAGES + 1] {
+            assert!(
+                parse_ipc_message(
+                    &message("pdf-page-text", json!({"page": bad_page, "text": "x"})),
+                    CAP,
+                    3,
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            parse_ipc_message(
+                &message(
+                    "pdf-page-text",
+                    json!({"page": 1, "text": "x".repeat(PDF_TEXT_MAX_CHARS_PER_PAGE + 1)})
+                ),
+                CAP,
+                3,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -918,7 +973,7 @@ mod tests {
     /// ou sai uma acao: o gate abaixo exige um exemplo aceite por acao e que
     /// a SPEC-0005 (lista e contagem), a SPEC-0108 (lista e contagem) e a
     /// SPEC-0015 (contagem) digam exatamente isto.
-    const PUBLISHED_ACTION_COUNT: usize = 31;
+    const PUBLISHED_ACTION_COUNT: usize = 32;
 
     /// Nome de fio de cada variante. O `match` e exaustivo de proposito: uma
     /// variante nova nao compila sem passar por aqui, e o teste abaixo exige
@@ -953,6 +1008,7 @@ mod tests {
             IpcAction::Palette { .. } => "palette",
             IpcAction::GmailState { .. } => "gmail-state",
             IpcAction::ResearchAnswer { .. } => "research-answer",
+            IpcAction::PdfPageText { .. } => "pdf-page-text",
             IpcAction::AgentObservation { .. } => "agent-observation",
             IpcAction::Hint { .. } => "hint",
             IpcAction::Note { .. } => "note",
@@ -1039,6 +1095,7 @@ mod tests {
                 "research-answer",
                 json!({"col":0,"text":"texto suficiente"}),
             ),
+            message("pdf-page-text", json!({"page":1,"text":"texto da pagina"})),
             message(
                 "agent-observation",
                 json!({"data":"1\nhttps://example.com"}),

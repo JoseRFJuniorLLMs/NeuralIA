@@ -13,6 +13,7 @@ use crate::epub_app::{
     epub_dialog_filter, epub_drop_job, epub_request_target, handle_epub_ipc, is_epub_path,
     library_url, notice_script, parse_dialog_selection, reader_url,
 };
+use crate::ipc::{PDF_TEXT_MAX_CHARS_PER_PAGE, PDF_TEXT_MAX_PAGES};
 use neural_core::{
     HistoryEntry, MemoryDocument, MemoryKind, MemorySourceKind, ReaderArticle, ReaderBlock,
     is_pdf_url, reader_html,
@@ -27,6 +28,25 @@ use crate::windows_app::{
     parse_ipc_message, remote_capability, remote_web_target, themed_webview_builder,
     web_media_permission, wide_null, window_hwnd,
 };
+
+/// Ponte minima do viewer PDF para a memoria. Nao expoe o dispatcher generico
+/// do navegador: so reporta numero da pagina e texto limitado.
+pub(in crate::windows_app) const PDF_TEXT_BRIDGE_SCRIPT: &str = r#"
+(function () {
+  if (window.top !== window) return;
+  const capability = '__NEURALIA_CAP__';
+  const post = window.chrome.webview.postMessage.bind(window.chrome.webview);
+  const stringify = JSON.stringify;
+  window.__neuralia_pdf_page_text = function (page, text) {
+    if (!Number.isInteger(page) || page < 1 || page > 24) return;
+    if (typeof text !== 'string') return;
+    text = text.trim();
+    if (!text) return;
+    if (text.length > 1500) text = text.slice(0, 1500);
+    post(stringify({ v:1, cap:capability, action:'pdf-page-text', args:{ page, text } }));
+  };
+})();
+"#;
 
 impl App {
     /// Descarrega o PDF no worker coalescente de documentos.
@@ -55,17 +75,27 @@ impl App {
         let capability = remote_capability();
         let ipc_capability = capability.clone();
         let init_script = bind_page_script(NEURALIA_KEYMAP_SCRIPT, &capability, false);
+        let text_bridge = PDF_TEXT_BRIDGE_SCRIPT.replace("__NEURALIA_CAP__", &capability);
 
         themed_webview_builder()
             .with_custom_protocol("neuralia-pdf".to_string(), move |_id, request| {
                 serve_pdf_asset(&bytes, &request)
             })
             .with_initialization_script(init_script)
+            .with_initialization_script(text_bridge)
             .with_ipc_handler(move |request| {
-                if let Some(action) =
+                let Some(action) =
                     parse_ipc_message(request.body(), &ipc_capability, COMPARATOR_COLUMNS)
-                    && let Some(event) = common_ipc_event(action)
-                {
+                else {
+                    return;
+                };
+                let event = match action {
+                    IpcAction::PdfPageText { page, text } => {
+                        Some(UserEvent::PdfPageText { page, text })
+                    }
+                    other => common_ipc_event(other),
+                };
+                if let Some(event) = event {
                     let _ = ipc_proxy.send_event(event);
                 }
             })
@@ -122,6 +152,39 @@ impl App {
                 self.show_native_error(format!("WebView2 não pôde abrir o PDF: {error}"));
             }
         }
+    }
+
+    pub(in crate::windows_app) fn capture_pdf_page_text(&mut self, page: u32, text: String) {
+        if self.surface != Surface::Pdf || !(1..=PDF_TEXT_MAX_PAGES).contains(&page) {
+            return;
+        }
+        let Some(url) = self.page_source.clone() else {
+            return;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let text = text
+            .chars()
+            .take(PDF_TEXT_MAX_CHARS_PER_PAGE)
+            .collect::<String>();
+        let base_title = Url::parse(&url)
+            .ok()
+            .and_then(|parsed| parsed.path_segments()?.next_back().map(str::to_string))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Documento PDF".to_string());
+        let mut document = MemoryDocument::new(
+            MemoryKind::Source,
+            MemorySourceKind::Pdf,
+            format!("{base_title} · página {page}"),
+            Some(url),
+            format!("Página {page}\n\n{text}"),
+        );
+        if let Some(session) = &self.current_research {
+            document = document.session(session.id.clone());
+        }
+        self.privacy.capture(document);
     }
 
     /// Arranca (uma vez) o worker da biblioteca de livros e o servidor da
@@ -1016,4 +1079,17 @@ pub(in crate::windows_app) fn is_pdf_internal_target(target: &str) -> bool {
             && url.host_str() == Some("neuralia-pdf.localhost")
             && url.port().is_none()
     })
+}
+
+#[cfg(test)]
+mod pdf_text_tests {
+    use super::*;
+
+    #[test]
+    fn pdf_text_bridge_is_specific_and_bounded() {
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("action:'pdf-page-text'"));
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("page > 24"));
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("text.length > 1500"));
+        assert!(!PDF_TEXT_BRIDGE_SCRIPT.contains("__neuralia_act"));
+    }
 }
