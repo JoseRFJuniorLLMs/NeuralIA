@@ -1174,7 +1174,10 @@ impl DownloadRows {
         let mut shown = BTreeMap::new();
         let mut in_session: HashMap<(String, u64), usize> = HashMap::new();
         // `entries` vem pelo numero, do mais antigo para o mais novo.
-        let session: Vec<&DownloadEntry> = manager.entries().collect();
+        let session: Vec<&DownloadEntry> = manager
+            .entries()
+            .filter(|entry| entry.history_visible)
+            .collect();
         for entry in session.into_iter().rev() {
             let id = self.id_for_session(entry.id);
             *in_session
@@ -1184,7 +1187,12 @@ impl DownloadRows {
             rows.push(self.session_row(id, entry, meters.get(&entry.id)));
         }
         let mut kept = HashMap::new();
-        for record in manager.log().entries {
+        for record in manager
+            .log()
+            .entries
+            .into_iter()
+            .filter(|record| !record.recovery_only)
+        {
             let pair = (record.name.clone(), record.at);
             if let Some(count) = in_session.get_mut(&pair).filter(|count| **count > 0) {
                 *count -= 1;
