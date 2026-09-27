@@ -950,7 +950,9 @@ impl DownloadManager {
                 if self.log.is_empty() {
                     vec![DownloadEffect::EraseLog]
                 } else {
-                    vec![DownloadEffect::Persist]
+                    // Primeiro apaga o historico e todos os artefactos da
+                    // loja (.bak/.tmp); so depois nasce o journal minimo.
+                    vec![DownloadEffect::EraseLog, DownloadEffect::Persist]
                 }
             }
         }
@@ -2614,7 +2616,7 @@ mod tests {
 
         assert_eq!(
             m.on_event(DownloadEvent::ClearLog),
-            vec![DownloadEffect::Persist]
+            vec![DownloadEffect::EraseLog, DownloadEffect::Persist]
         );
         let after_clear = m.log();
         assert_eq!(after_clear.entries.len(), 1, "{after_clear:?}");
