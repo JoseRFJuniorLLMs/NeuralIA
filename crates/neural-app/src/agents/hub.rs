@@ -981,9 +981,7 @@ fn close_question(
             reason: *reason,
         },
     };
-    if persist_outcome
-        && let Some(entry) = state.agents.get_mut(&view.agent)
-    {
+    if persist_outcome && let Some(entry) = state.agents.get_mut(&view.agent) {
         let record = AgentRecord {
             id: entry.next_id(),
             ts_ms: now_ms(),
