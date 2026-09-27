@@ -51,13 +51,13 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 //   `SetDefaultDownloadFolderPath`: o WebView2 guarda-a no perfil de uma
 //   sessao para a outra, por isso a do sistema e reposta quando a escolha
 //   sai (`profile_download_folder`).
-// - O registo (`downloads.json`, `StoreKind::Automatic`) nunca guarda um
-//   download do Split privado nem de um servico InPrivate, nem um que
-//   comecou ou acabou no Modo privado (o gestor, com o modo do registo das
-//   lojas posto antes de cada evento: `downloads_private_mode`; o modo do
-//   fim fica com o download ate ao veredito); no Modo privado a loja tambem
-//   nao escreve. O Ctrl+Shift+Delete tira o ficheiro e as copias do disco
-//   (`erase_download_log`) em qualquer modo.
+// - O registo (`downloads.json`, `StoreKind::GuardedAutomatic`) nunca
+//   guarda um download do Split privado, de um servico InPrivate, nem um que
+//   comecou ou acabou no Modo privado. O gestor exclui isso antes da loja;
+//   por isso um veredito tardio de um download normal pode substituir o
+//   `pending` mesmo se o modo global ficou privado. O Ctrl+Shift+Delete
+//   apaga o historico; se ha verificacao em curso, conserva apenas o
+//   `recovery_only` oculto necessario a uma retomada apos queda.
 // - O que chega a quem usa -- os avisos, o «Baixar programa?», a lista, a
 //   seta da barra -- e do `downloads_ui.rs` (downloads-ui): o braco
 //   `download_event` entrega-lhe o que cada volta do gestor deixou.
