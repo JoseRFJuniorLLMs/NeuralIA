@@ -78,6 +78,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/translation.rs"),
     "\n",
+    include_str!("../src/windows_app/consensus.rs"),
+    "\n",
     include_str!("../src/windows_app/app/mod.rs"),
     "\n",
     include_str!("../src/windows_app/app/gmail.rs"),
@@ -110,6 +112,19 @@ const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
 const CORE_MEMORY: &str = include_str!("../../neural-core/src/memory.rs");
 const LOCAL_INTELLIGENCE: &str = include_str!("../../neural-core/src/local_intelligence.rs");
+const CONTEXT_BUDGET: &str = include_str!("../../neural-core/src/context_budget.rs");
+
+/// Todos os `.rs` debaixo de `dir`, recursivamente.
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read src dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
 
 fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     source
@@ -162,10 +177,16 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
     // comportamento em
     // `windows_app::tests::each_translation_is_named_by_its_text_and_reopens_from_history`.
     assert!(APP.contains("ResearchSession::new(request.prompt.clone()).titled(&request.label)"));
-    assert!(APP.contains("let (session, question_memory, reopen) = compare_records(&request);"));
+    // Desde a 2.5 a sessao nasce com o turno 1 (`begin_turn`) e a
+    // comparacao corre na thread `neural-consensus` sobre as respostas lidas
+    // do turno (consensus-reader-turns; `windows_app/consensus.rs`).
+    assert!(
+        APP.contains("let (mut session, question_memory, reopen) = compare_records(&request);")
+    );
     assert!(APP.contains("self.privacy.capture(question_memory);"));
     assert!(APP.contains("self.privacy.save_session(session.clone());"));
-    assert!(APP.contains("let facts = session.comparison(&ids);"));
+    assert!(APP.contains("session.comparison(&item_ids)"));
+    assert!(APP.contains("session.begin_turn("));
     assert!(APP.contains("let snapshot = session.synthesize(&ids).clone();"));
     assert!(APP.contains("session.export_markdown()"));
     assert!(APP.contains("IpcAction::ResearchAnswer"));
@@ -178,6 +199,40 @@ fn spec_0102_partial_product_uses_local_semantics_without_booting_model_packs() 
     assert!(
         !APP.contains("ModelPackManager"),
         "model-pack lifecycle is not a shipped product feature yet; update SPEC-0102 when wiring it"
+    );
+}
+
+/// O orcamento de contexto (`neural_core::context_budget`, plano 2.5) e
+/// biblioteca do core: o consenso e o primeiro a chama-lo, mais tarde.
+/// Enquanto nenhum ficheiro de `src/` o toca, a SPEC-0102 §8.2 diz isso;
+/// quem o ligar actualiza a spec e este gate. Le a arvore inteira de `src/`
+/// no disco (nao so o `ALL_SOURCES`), porque o primeiro chamador pode ser o
+/// `egress.rs` ou o `privacy.rs`, fora de `windows_app/`.
+#[test]
+fn context_budget_is_core_library_only_until_consensus_wires_it() {
+    assert!(CONTEXT_BUDGET.contains("pub fn build_context("));
+    assert!(CONTEXT_BUDGET.contains("pub struct ContextPack {"));
+    assert!(LOCAL_INTELLIGENCE.contains("pub trait Embedder {"));
+    assert!(LOCAL_INTELLIGENCE.contains("pub struct HashingEmbedder;"));
+
+    let mut files = Vec::new();
+    rust_files(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    files.sort();
+    assert!(files.len() >= 20, "so {} ficheiros em src/?", files.len());
+    let callers: Vec<String> = files
+        .iter()
+        .filter(|file| {
+            let text = std::fs::read_to_string(file).expect("read module");
+            text.contains("context_budget") || text.contains("build_context(")
+        })
+        .map(|file| file.display().to_string())
+        .collect();
+    assert!(
+        callers.is_empty(),
+        "the context budget is now called by the product; update SPEC-0102 §8.2 and this gate: {callers:?}"
     );
 }
 
@@ -287,19 +342,9 @@ fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
 /// `ALL_SOURCES`.
 #[test]
 fn all_sources_holds_every_file_of_the_windows_app_tree() {
-    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("read src/windows_app") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
-    }
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = vec![manifest.join("src/windows_app.rs")];
-    walk(&manifest.join("src/windows_app"), &mut files);
+    rust_files(&manifest.join("src/windows_app"), &mut files);
     files.sort();
     assert!(
         files.len() >= 20,
