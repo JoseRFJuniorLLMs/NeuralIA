@@ -850,7 +850,7 @@ impl AgentHub {
     pub(crate) fn clear_conversations(&self) -> Result<(), String> {
         let store = self.inner.store.clone();
         let mut result = Ok(());
-        let marks = self.with_state(|state, events| {
+        self.with_state(|state, events| {
             result = store.clear().map_err(|error| error.to_string());
             for entry in state.agents.values_mut() {
                 let last = entry.conversation.last_id();
@@ -862,9 +862,9 @@ impl AgentHub {
                 state.store_error = None;
             }
             events.push(AgentEvent::Changed);
-            all_marks(state)
         });
-        self.save_marks(&marks);
+        // Nao grava os marks aqui: isso recriaria state.json imediatamente
+        // depois do gesto que prometeu apagar os nomes/ids dos agentes.
         result
     }
 }
