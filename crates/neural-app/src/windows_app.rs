@@ -227,6 +227,12 @@ pub(in crate::windows_app) enum UserEvent {
         source_index: usize,
         text: String,
     },
+    /// Texto real extraido pelo viewer PDF interno. So o builder do PDF
+    /// traduz a acao IPC para esta variante.
+    PdfPageText {
+        page: u32,
+        text: String,
+    },
     /// Pergunta enviada na caixa de uma coluna: vai tambem as outras.
     AskEverywhere {
         source_index: usize,
