@@ -934,7 +934,7 @@ jobs:
               Test = "activity_after_clear_does_not_resurrect_other_agent_metadata"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
               Old = @'
-                      .filter(|(_, entry)| !entry.conversation.records.is_empty())
+                      .filter(|(_, entry)| entry.conversation.has_persistent_records())
           '@
               New = @'
                       .filter(|_| true)
