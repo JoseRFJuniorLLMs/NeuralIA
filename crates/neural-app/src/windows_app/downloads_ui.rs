@@ -114,6 +114,9 @@ fn inspection_note(inspection: Inspection) -> Option<&'static str> {
 /// inspecionou.
 const NOT_INSPECTED: &str = "não inspecionado";
 
+/// O que a lista diz de um download que acabou e nunca teve veredito.
+const NOT_VERIFIED: &str = "Não verificado";
+
 /// O tipo de fachada de um disfarce (`fatura.pdf.exe` -> `PDF`).
 fn decoy_label(name: &str) -> Option<String> {
     let clean = name.trim_end_matches([' ', '.']);
@@ -467,12 +470,23 @@ pub(in crate::windows_app) enum LeaveDecision {
 /// A tabela da saida. A Home e o fechar destroem todas as WebViews que
 /// descarregam (o gestor cancela os downloads delas no `WebViewGone`), por
 /// isso cada download a correr ou a espera conta. O cartao nomeia o mais
-/// antigo: «1 download em andamento (x.zip, 43%).».
+/// antigo: «1 download em andamento (x.zip, 43%).». Um que ja acabou e esta
+/// a ser verificado nao conta nem se cancela: a verificacao nao depende de
+/// WebView nenhuma (a Home deixa-a acabar) e a saida ordenada espera o
+/// veredito (`App::exiting`); com downloads a cancelar, o cartao diz que
+/// esse fica.
 pub(in crate::windows_app) fn leave_decision(
     kind: LeaveKind,
     manager: &DownloadManager,
 ) -> LeaveDecision {
-    let active: Vec<&DownloadEntry> = manager.entries().filter(|e| e.is_active()).collect();
+    let active: Vec<&DownloadEntry> = manager
+        .entries()
+        .filter(|e| matches!(e.state, DownloadState::Running | DownloadState::Asking(_)))
+        .collect();
+    let verifying = manager
+        .entries()
+        .filter(|e| e.state == DownloadState::Finalizing)
+        .count();
     let Some(first) = active.first() else {
         return LeaveDecision::Leave;
     };
@@ -496,10 +510,17 @@ pub(in crate::windows_app) fn leave_decision(
     } else {
         "os downloads"
     };
-    let body = match kind {
+    let mut body = match kind {
         LeaveKind::Home => format!("Voltar à Home cancela {them}."),
         LeaveKind::Close => format!("Fechar a NeuralIA cancela {them}."),
     };
+    match verifying {
+        0 => {}
+        1 => body.push_str(" O arquivo em verificação não é cancelado."),
+        n => body.push_str(&format!(
+            " Os {n} arquivos em verificação não são cancelados."
+        )),
+    }
     LeaveDecision::Ask(LeavePrompt {
         kind,
         title,
@@ -1077,6 +1098,12 @@ fn outcome_status(outcome: RecordOutcome, bytes: Option<u64>, host: Option<&str>
         }
         RecordOutcome::Cancelled => parts.push("Cancelado".to_string()),
         RecordOutcome::Interrupted => parts.push("Interrompido".to_string()),
+        // Um pendente so aparece como registo quando nada o verifica nesta
+        // sessao (a sessao que o verificava fechou a meio, duas vezes, ou
+        // o caminho nao ficou no registo): nunca teve veredito.
+        RecordOutcome::Pending { .. } => parts.push(format!(
+            "{NOT_VERIFIED} — a NeuralIA fechou durante a verificação"
+        )),
     }
     if let Some(host) = host {
         parts.push(host.to_string());
@@ -1090,7 +1117,9 @@ fn outcome_tone(outcome: RecordOutcome) -> &'static str {
             warn: false,
             inspection: Inspection::Checked,
         } => "done",
-        RecordOutcome::Completed { .. } | RecordOutcome::NotDeleted { .. } => "warn",
+        RecordOutcome::Completed { .. }
+        | RecordOutcome::NotDeleted { .. }
+        | RecordOutcome::Pending { .. } => "warn",
         RecordOutcome::Blocked { .. } | RecordOutcome::Deleted { .. } => "blocked",
         RecordOutcome::Cancelled | RecordOutcome::Interrupted => "done",
     }
@@ -1233,9 +1262,10 @@ impl DownloadRows {
             percent,
             open,
             show,
+            // A verificacao do fim nao se cancela (o veredito chega sempre).
             cancel: matches!(
                 entry.state,
-                DownloadState::Running | DownloadState::Asking(_) | DownloadState::Finalizing
+                DownloadState::Running | DownloadState::Asking(_)
             ),
             tone,
         }
@@ -1284,7 +1314,15 @@ pub(in crate::windows_app) fn row_file(
                 _ => None,
             }
         }
-        RowTarget::Record(key) => Some((key.path.clone()?, key.outcome)),
+        // O mesmo para um registo: um pendente guarda o caminho (para o
+        // retomar), mas nunca teve veredito -- nem «Abrir» nem «Mostrar na
+        // pasta».
+        RowTarget::Record(key) => match key.outcome {
+            RecordOutcome::Completed { .. } | RecordOutcome::NotDeleted { .. } => {
+                Some((key.path.clone()?, key.outcome))
+            }
+            _ => None,
+        },
     }
 }
 
@@ -1425,8 +1463,9 @@ impl ShellHost for WindowsShell {
 impl DownloadsState {
     /// «Permitir baixar programas»: grava so a escolha em
     /// `downloads-settings.json` (debaixo do trinco da loja: a pasta que la
-    /// esta fica como esta) e, gravada, o gestor passa a usa-la. Sem loja,
-    /// ou com a gravacao recusada, nada muda.
+    /// esta fica como esta) e, gravada, o gestor passa a usa-la -- e a
+    /// thread do fim tambem, no commit de uma verificacao ja a correr. Sem
+    /// loja, ou com a gravacao recusada, nada muda.
     pub(in crate::windows_app) fn set_allow_programs(&mut self, on: bool) -> Result<(), String> {
         let store = self
             .settings_store
@@ -1435,9 +1474,7 @@ impl DownloadsState {
         store
             .update(|settings| settings.allow_programs = on)
             .map_err(|error| error.to_string())?;
-        let mut next = self.manager.settings().clone();
-        next.allow_programs = on;
-        self.manager.on_event(DownloadEvent::SettingsChanged(next));
+        self.allow_programs_changed(on);
         Ok(())
     }
 }
