@@ -682,14 +682,21 @@ impl ConversationStore {
         if conversation.stale {
             return self.rewrite(agent, conversation);
         }
-        fs::create_dir_all(self.dir())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.conversation_path(agent))?;
-        // Um so `write_all`: a linha entra inteira ou o arranque seguinte
-        // descarta-a.
-        file.write_all(line.as_bytes())
+        let write_result = (|| {
+            fs::create_dir_all(self.dir())?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.conversation_path(agent))?;
+            // Um so `write_all`: a linha entra inteira ou o arranque
+            // seguinte descarta-a; em erro, `stale` obriga a proxima
+            // escrita a reparar o ficheiro inteiro.
+            file.write_all(line.as_bytes())
+        })();
+        if write_result.is_err() {
+            conversation.stale = true;
+        }
+        write_result
     }
 
     /// Reescreve o ficheiro com os registos que podem estar no disco: os de
