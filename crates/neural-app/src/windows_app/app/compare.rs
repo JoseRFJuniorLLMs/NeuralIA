@@ -3,7 +3,7 @@
 //! (split-windows-app-c).
 use crate::windows_app::*;
 
-use neural_core::{ProviderId, TurnOrigin, operation_key};
+use neural_core::{ProviderId, TurnOrigin};
 
 impl App {
     fn current_research_item_ids(&self) -> Vec<String> {
@@ -109,17 +109,18 @@ impl App {
 
         let (mut session, question_memory, reopen) = compare_records(&request);
         // O turno 1 da sessao: a pergunta as tres, na ordem das colunas
-        // (consensus-reader-turns; SPEC-0109 §5.1).
-        let providers: Vec<&str> = ProviderId::default_slots()
-            .iter()
-            .map(|id| id.display_name())
-            .collect();
-        session.begin_turn(
-            &operation_key(TurnOrigin::Compare, None, &request.prompt, 0),
+        // (consensus-reader-turns; rascunho da Chat Surface, OQ11).
+        let turn = begin_question_turn(
+            &mut session,
             TurnOrigin::Compare,
+            None,
             &request.prompt,
-            &providers,
+            0,
+            &ProviderId::default_slots(),
         );
+        // Um run do Consenso que ainda lia a pergunta anterior acaba aqui e
+        // grava-se na sessao DELA, antes de esta tomar o lugar.
+        self.consensus_turn_begun(&session.id, turn);
         self.privacy.capture(question_memory);
         self.privacy.save_session(session.clone());
         self.current_research = Some(session);
@@ -839,11 +840,9 @@ impl App {
         ));
         // O turno da pergunta, ANTES de as colunas navegarem: a chave leva
         // a geracao de navegacao da coluna de origem, por isso o mesmo
-        // Enter repetido e a mesma operacao (consensus-reader-turns).
-        let providers: Vec<ProviderId> = urls
-            .iter()
-            .filter_map(|(index, _)| column_provider(*index))
-            .collect();
+        // Enter repetido e a mesma operacao (consensus-reader-turns). A
+        // coluna de origem entra primeiro: ela responde a mesma pergunta.
+        let providers = ask_turn_providers(source_index, urls.iter().map(|(index, _)| *index));
         self.consensus_begin_turn(
             TurnOrigin::AskOtherColumns,
             Some(source_index),

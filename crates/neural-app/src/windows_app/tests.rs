@@ -33542,12 +33542,14 @@ fn answer_read_parse_caps_raw_and_requires_exact_keys() {
     );
 }
 
-/// Gate (critico, entrada nao confiavel; consensus): o `host` que o script
-/// devolve tem de ser o da pagina da coluna -- uma coluna que foi parar a
-/// uma pagina de login, a um parecido ou a lado nenhum nao passa por
-/// resposta de uma IA; a comparacao ignora maiusculas e nunca aceita um
-/// host esperado vazio. Sabotagem: `parse_answer_read` sem a conferencia
-/// do host.
+/// Gate (critico, entrada nao confiavel; consensus): `parse_answer_read`
+/// confere o `host` que o script devolve contra o host esperado -- um
+/// parecido, outro provedor ou lado nenhum nao passa; a comparacao ignora
+/// maiusculas e nunca aceita um host esperado vazio. No produto o esperado
+/// vem de `provider_page_host` (a pagina tem de ser do provedor da coluna:
+/// gate `consensus_reads_only_the_columns_provider_page`), por isso esta
+/// conferencia e a segunda linha, nao a que recusa a pagina de login.
+/// Sabotagem: `parse_answer_read` sem a conferencia do host.
 #[test]
 fn answer_read_refuses_a_host_mismatch() {
     let login = answer_json("accounts.google.com", "Entre na sua conta", &[]);
@@ -33584,12 +33586,6 @@ fn answer_read_refuses_a_host_mismatch() {
             .host,
         "claude.ai"
     );
-    assert_eq!(
-        page_host("https://ChatGPT.com/c/1?x=1").as_deref(),
-        Some("chatgpt.com")
-    );
-    assert_eq!(page_host("about:blank"), None);
-    assert_eq!(page_host("nada"), None);
 }
 
 /// Gate (critico, seguranca; consensus): o leitor le SO as colunas do
@@ -33629,7 +33625,7 @@ fn consensus_reads_only_the_columns_never_the_split() {
         (WebViewHost::Column(2), 3),
         (WebViewHost::Column(COMPARATOR_COLUMNS), 0),
     ];
-    let run = ConsensusRun::begin(1, 1, Instant::now(), hosts);
+    let run = ConsensusRun::begin(1, "sessao", 1, Instant::now(), hosts);
     assert_eq!(
         run.columns
             .iter()
@@ -33649,7 +33645,7 @@ fn consensus_reads_only_the_columns_never_the_split() {
         ProviderId::default_slots()
     );
     let mut state = ConsensusState::new();
-    let id = state.begin_run(1, Instant::now(), hosts);
+    let id = state.begin_run("sessao", 1, Instant::now(), hosts);
     let run = state.run_mut(id).expect("o run de agora");
     assert!(
         run.columns
@@ -33682,7 +33678,7 @@ fn consensus_reads_only_the_columns_never_the_split() {
 /// `decide_column_poll` sem o `translated`.
 #[test]
 fn consensus_never_compares_a_translated_column() {
-    let mut run = ConsensusRun::begin(1, 1, Instant::now(), three_columns());
+    let mut run = ConsensusRun::begin(1, "sessao", 1, Instant::now(), three_columns());
     let read = answer_read_of("chatgpt.com", "Olá", &[]);
     assert_eq!(
         decide_column_poll(&run.columns[1], false, false, Duration::ZERO),
@@ -33774,7 +33770,7 @@ fn consensus_never_compares_a_translated_column() {
 fn consensus_polls_until_settled_other_question_or_timeout() {
     assert_eq!(CONSENSUS_POLL_INTERVAL, Duration::from_millis(1500));
     assert_eq!(CONSENSUS_MAX_WAIT, Duration::from_secs(120));
-    let mut run = ConsensusRun::begin(1, 1, Instant::now(), three_columns());
+    let mut run = ConsensusRun::begin(1, "sessao", 1, Instant::now(), three_columns());
     let column = &mut run.columns[1];
 
     // A escrever: nada assenta, mas a leitura fica guardada; a escrever
@@ -33887,7 +33883,7 @@ fn consensus_drops_a_late_or_foreign_read() {
     let selector = ProviderId::ChatGpt.answer_read().expect("seletor");
     let mut state = ConsensusState::new();
     let now = Instant::now();
-    let first = state.begin_run(1, now, [(WebViewHost::Column(1), 0)]);
+    let first = state.begin_run("sessao", 1, now, [(WebViewHost::Column(1), 0)]);
     let (tx, rx) = channel::<PageEvalEvent>();
     let mut scheduled = Vec::new();
     let token = state
@@ -33961,7 +33957,7 @@ fn consensus_drops_a_late_or_foreign_read() {
         .expect("a leitura comeca");
     state.run_mut(first).expect("run").columns[0].pending = Some(token);
     assert_eq!(state.reads.in_flight(), 1);
-    let second = state.begin_run(2, now, [(WebViewHost::Column(1), 1)]);
+    let second = state.begin_run("sessao", 2, now, [(WebViewHost::Column(1), 1)]);
     assert_ne!(first, second);
     assert_eq!(state.reads.in_flight(), 0, "o run novo herdou leituras");
     assert!(state.run_mut(first).is_none());
@@ -34544,10 +34540,17 @@ fn consensus_report_lists_each_provider_status() {
     assert!(none.contains("Nenhuma resposta lida para comparar."));
 }
 
-/// Os turnos abrem-se onde a pergunta parte (`compare`, `ask_other_columns`
-/// e o `LoadProvider` da palette), pelo `consensus_begin_turn`, e o
-/// `research:compare` le pelo `read_consensus` -- nunca pela caixa das
-/// respostas empurradas. O `App::new` nao cria a thread do Consenso.
+/// Verificacao de FIACAO (texto-fonte; AGENTS §4.3: nao e um gate de
+/// comportamento, so prende a presenca e a ordem das chamadas): os turnos
+/// abrem-se onde a pergunta parte (`compare`, `ask_other_columns` e o
+/// `LoadProvider` da palette), pelo `begin_question_turn`; um turno novo
+/// acaba o run do anterior (`consensus_turn_begun`), no `compare` ANTES de
+/// a sessao nova tomar o lugar; e o `research:compare` le pelo
+/// `read_consensus` -- nunca pela caixa das respostas empurradas. O
+/// `App::new` nao cria a thread do Consenso. O comportamento destas pecas
+/// esta nos gates `consensus_turn_key_is_anchored_to_the_latest_turn`,
+/// `consensus_run_never_writes_into_another_session` e
+/// `a_new_turn_supersedes_the_running_read`.
 #[test]
 fn consensus_turns_open_at_every_question_source() {
     let compare = code_without_tests(include_str!("app/compare.rs"));
@@ -34557,10 +34560,33 @@ fn consensus_turns_open_at_every_question_source() {
         .and_then(|rest| rest.split("fn open_comparator(").next())
         .expect("compare()");
     assert!(
-        compare_fn.contains("session.begin_turn("),
+        compare_fn.contains("begin_question_turn("),
         "compare() sem turno"
     );
     assert!(compare_fn.contains("TurnOrigin::Compare"));
+    let begun = compare_fn
+        .find("self.consensus_turn_begun(&session.id, turn);")
+        .expect("compare() nao acaba o run da pergunta anterior");
+    let swapped = compare_fn
+        .find("self.current_research = Some(session);")
+        .expect("compare() troca a sessao");
+    assert!(
+        begun < swapped,
+        "o run anterior acaba depois de a sessao nova tomar o lugar"
+    );
+    let consensus = code_without_tests(include_str!("consensus.rs"));
+    let begin_turn = consensus
+        .split("pub(in crate::windows_app) fn consensus_begin_turn(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(in crate::windows_app) fn consensus_turn_begun(")
+                .next()
+        })
+        .expect("consensus_begin_turn()");
+    assert!(
+        begin_turn.contains("begin_question_turn(session, origin, source, text, epoch, providers)")
+    );
+    assert!(begin_turn.contains("self.consensus_turn_begun(&session_id, turn);"));
     let ask = compare
         .split("pub(in crate::windows_app) fn ask_other_columns(")
         .nth(1)
@@ -34573,6 +34599,7 @@ fn consensus_turns_open_at_every_question_source() {
         ask.contains("self.consensus_begin_turn("),
         "ask_other_columns() sem turno"
     );
+    assert!(ask.contains("ask_turn_providers(source_index,"));
     assert!(ask.contains("TurnOrigin::AskOtherColumns"));
     // Antes de as colunas navegarem: a chave leva a geracao de agora.
     let turn_at = ask.find("self.consensus_begin_turn(").expect("turno");
@@ -34626,4 +34653,664 @@ fn consensus_turns_open_at_every_question_source() {
     assert!(!app_new.contains("CONSENSUS_WORKER_NAME"));
     let state = ConsensusState::new();
     assert_eq!(state.worker_threads_spawned(), 0);
+}
+
+// ===================== consensus: a revisao RT-1..RT-4 =====================
+
+/// A pagina de login da Google com um `<main>`: o seletor do Modo IA
+/// (`main, ...`) apanha-o.
+fn google_login_page() -> serde_json::Value {
+    el(
+        "html",
+        vec![el(
+            "body",
+            vec![el(
+                "main",
+                vec![
+                    el("h1", vec![t("Fazer login")]),
+                    el("p", vec![t("Use sua Conta do Google")]),
+                ],
+            )],
+        )],
+    )
+}
+
+/// Gate (critico, entrada nao confiavel; consensus, RT-2): o que o
+/// `consensus_page_event` decide sobre uma leitura (`column_answer_read`)
+/// exige que a pagina da coluna SEJA do provedor dela pelas regras de host
+/// do registo -- nao basta o `host` da resposta bater com o da pagina,
+/// porque o script le `location.hostname` dessa mesma pagina. O script que
+/// embarca, corrido no login da Google com um `<main>` e o seletor do Modo
+/// IA, devolve `ok: true` com o texto do login, e o `PageReads` entrega-o
+/// (o URL nao mudou); a decisao recusa-o. Recusa tambem o Google sem o
+/// Modo IA (`udm` diferente de 50), o login da OpenAI na coluna do
+/// ChatGPT, a pagina de outro provedor, um parecido, uma coluna sem URL e
+/// cada host de login do registo; aceita a pagina do proprio provedor.
+/// Sabotagem: `provider_page_host` sem a conferencia do provedor (o login
+/// passa por resposta).
+#[test]
+fn consensus_reads_only_the_columns_provider_page() {
+    use neural_core::search::login_hosts;
+    let role = "data-message-author-role";
+    let raws = run_answer_read_harness(&[
+        (
+            "login-google",
+            "accounts.google.com",
+            ProviderId::GoogleAi,
+            google_login_page(),
+        ),
+        (
+            "google-sem-modo-ia",
+            "www.google.com",
+            ProviderId::GoogleAi,
+            google_login_page(),
+        ),
+        (
+            "login-openai",
+            "auth.openai.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "chatgpt-na-coluna-do-claude",
+            "chatgpt.com",
+            ProviderId::Claude,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "modo-ia",
+            "www.google.com",
+            ProviderId::GoogleAi,
+            google_login_page(),
+        ),
+        (
+            "chatgpt",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "claude",
+            "claude.ai",
+            ProviderId::Claude,
+            chat_page(role, rich_answer("Claude"), vec![]),
+        ),
+    ]);
+    // O script le a pagina de login como uma resposta, e a conferencia do
+    // host contra a propria pagina deixa-a passar: nao prova nada.
+    let own = parse_answer_read(&raws[0], "accounts.google.com").expect("o login lido");
+    assert!(own.ok && own.text.contains("Fazer login"), "{own:?}");
+
+    // O caminho que embarca: o `PageReads` entrega a leitura (o URL da
+    // coluna nao mudou), e a decisao recusa-a pelo provedor da coluna.
+    let login_url = "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.google.com%2Fsearch%3Fudm%3D50";
+    let view = FakeEvalView::at(login_url);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+    let selector = ProviderId::GoogleAi.answer_read().expect("seletor");
+    let (tx, rx) = std::sync::mpsc::channel::<PageEvalEvent>();
+    reads
+        .read_with_arg(
+            &view,
+            answer_read_spec(),
+            &answer_read_config(selector),
+            &epoch,
+            now,
+            move |event| {
+                let _ = tx.send(event);
+            },
+            |_, _| {},
+        )
+        .expect("a leitura comeca");
+    view.answer(0, &raws[0]);
+    let arrived = rx.try_recv().expect("o callback entregou");
+    let PageEvalOutcome::Delivered { raw, .. } = reads.settle(arrived, || view.page_url(), now)
+    else {
+        panic!("o PageReads nao entregou a leitura");
+    };
+    assert_eq!(
+        column_answer_read(ProviderId::GoogleAi, view.page_url().as_deref(), &raw),
+        Err(AnswerReadError::NotProviderPage {
+            provider: "Google IA",
+            host: "accounts.google.com".into(),
+        }),
+        "a pagina de login passou por resposta do Modo IA"
+    );
+
+    for (raw, provider, page) in [
+        (
+            &raws[1],
+            ProviderId::GoogleAi,
+            "https://www.google.com/search?q=raft",
+        ),
+        (
+            &raws[1],
+            ProviderId::GoogleAi,
+            "https://www.google.com/search?udm=14&udm=50&q=raft",
+        ),
+        (
+            &raws[2],
+            ProviderId::ChatGpt,
+            "https://auth.openai.com/log-in",
+        ),
+        (&raws[3], ProviderId::Claude, "https://chatgpt.com/c/1"),
+        (
+            &raws[5],
+            ProviderId::ChatGpt,
+            "https://chatgpt.com.evil.io/c/1",
+        ),
+        (&raws[5], ProviderId::ChatGpt, "https://evilchatgpt.com/c/1"),
+        (&raws[5], ProviderId::ChatGpt, "about:blank"),
+        (&raws[5], ProviderId::ChatGpt, "nada"),
+    ] {
+        assert!(
+            matches!(
+                column_answer_read(provider, Some(page), raw),
+                Err(AnswerReadError::NotProviderPage { .. })
+            ),
+            "{page} passou pela coluna do {provider:?}"
+        );
+    }
+    assert!(matches!(
+        column_answer_read(ProviderId::ChatGpt, None, &raws[5]),
+        Err(AnswerReadError::NotProviderPage { .. })
+    ));
+    for host in login_hosts() {
+        for provider in ProviderId::default_slots() {
+            assert!(
+                provider_page_host(provider, Some(&format!("https://{host}/?udm=50"))).is_err(),
+                "o login {host} passou pela coluna do {provider:?}"
+            );
+        }
+    }
+
+    // A pagina do proprio provedor passa, e o host da resposta ainda tem de
+    // bater com ela.
+    for (raw, provider, page, host) in [
+        (
+            &raws[4],
+            ProviderId::GoogleAi,
+            "https://www.google.com/search?udm=50&q=raft",
+            "www.google.com",
+        ),
+        (
+            &raws[5],
+            ProviderId::ChatGpt,
+            "https://chatgpt.com/c/abc",
+            "chatgpt.com",
+        ),
+        (
+            &raws[6],
+            ProviderId::Claude,
+            "https://Claude.ai/chat/1",
+            "claude.ai",
+        ),
+    ] {
+        let read = column_answer_read(provider, Some(page), raw)
+            .unwrap_or_else(|error| panic!("{page}: {}", error.describe()));
+        assert_eq!(read.host, host);
+        assert!(read.ok);
+    }
+    assert!(matches!(
+        column_answer_read(
+            ProviderId::ChatGpt,
+            Some("https://chatgpt.com/c/1"),
+            &answer_json("claude.ai", "Olá", &[])
+        ),
+        Err(AnswerReadError::HostMismatch { .. })
+    ));
+    assert_eq!(
+        provider_page_host(ProviderId::ChatGpt, Some("https://ChatGPT.com/c/1?x=1")),
+        Ok("chatgpt.com".to_string())
+    );
+
+    // Fiacao (presenca): o braco da leitura decide por `column_answer_read`
+    // com o provedor da coluna, nunca pelo `parse_answer_read` sozinho.
+    let source = code_without_tests(include_str!("consensus.rs"));
+    let page_event = source
+        .split("fn consensus_page_event(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn finish_consensus_run(").next())
+        .expect("consensus_page_event");
+    assert!(page_event.contains("column_answer_read(column.provider, page_url.as_deref(), &raw)"));
+    assert!(!page_event.contains("parse_answer_read("));
+}
+
+/// Um run do turno `turn` da sessao `session` sobre as tres colunas, com o
+/// fim de cada uma.
+fn finished_run(
+    session: &ResearchSession,
+    turn: u32,
+    outcomes: [ColumnOutcome; 3],
+) -> ConsensusRun {
+    let mut run = ConsensusRun::begin(1, &session.id, turn, Instant::now(), three_columns());
+    for (column, outcome) in run.columns.iter_mut().zip(outcomes) {
+        column.outcome = Some(outcome);
+    }
+    run
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-3): um run grava SO
+/// na sessao dele. O dono perguntou Q1, pediu o Consenso, e antes de ele
+/// acabar perguntou Q2 as tres (`compare`: sessao nova, tambem com o turno
+/// 1); o run de Q1 que acaba depois nao toca na sessao de Q2 -- nem item,
+/// nem tentativa, nem leitura guardada --, e na sessao de Q1 grava-se
+/// inteiro. Um run cujo turno nao existe tambem nao grava. Sabotagem:
+/// `record_consensus_run` sem a conferencia da sessao (a resposta de Q1
+/// entra na sessao de Q2).
+#[test]
+fn consensus_run_never_writes_into_another_session() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut first = ResearchSession::new("Q1");
+    let turn = begin_question_turn(&mut first, TurnOrigin::Compare, None, "Q1", 0, &slots);
+    let run = finished_run(
+        &first,
+        turn,
+        [
+            ColumnOutcome::OtherQuestion,
+            ColumnOutcome::Read(answer_read_of("chatgpt.com", "Resposta de Q1", &[])),
+            ColumnOutcome::OtherQuestion,
+        ],
+    );
+    let mut second = ResearchSession::new("Q2");
+    let second_turn = begin_question_turn(&mut second, TurnOrigin::Compare, None, "Q2", 0, &slots);
+    assert_eq!(second_turn, turn, "as duas sessoes tem o turno 1");
+    let before = serde_json::to_value(&second).expect("json");
+    assert_eq!(
+        record_consensus_run(&mut second, &run),
+        None,
+        "o run de Q1 gravou na sessao de Q2"
+    );
+    assert_eq!(
+        serde_json::to_value(&second).expect("json"),
+        before,
+        "a sessao de Q2 mudou"
+    );
+
+    let recorded = record_consensus_run(&mut first, &run).expect("a sessao do run");
+    assert_eq!(recorded.item_ids.len(), 1);
+    assert_eq!(
+        recorded
+            .answers
+            .iter()
+            .map(|answer| (answer.provider.as_str(), answer.status))
+            .collect::<Vec<_>>(),
+        [
+            ("Google IA", AttemptStatus::OtherQuestion),
+            ("ChatGPT", AttemptStatus::Read),
+            ("Claude", AttemptStatus::OtherQuestion),
+        ]
+    );
+    let item = first
+        .items
+        .iter()
+        .find(|item| item.id == recorded.item_ids[0])
+        .expect("item");
+    assert_eq!(item.text, "Resposta de Q1");
+    assert_eq!(item.turn, Some(turn));
+    assert_eq!(first.turn(turn).expect("turno").attempts.len(), 3);
+    assert_eq!(first.consensus.len(), 1);
+
+    // Um turno que a sessao nao tem: nada.
+    let ghost = finished_run(
+        &first,
+        99,
+        [
+            ColumnOutcome::Read(answer_read_of("www.google.com", "x", &[])),
+            ColumnOutcome::OtherQuestion,
+            ColumnOutcome::OtherQuestion,
+        ],
+    );
+    let items = first.items.len();
+    assert_eq!(record_consensus_run(&mut first, &ghost), None);
+    assert_eq!(first.items.len(), items);
+    assert_eq!(first.consensus.len(), 1);
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-3): um turno novo
+/// acaba o run que ainda lia o anterior. O dono pediu o Consenso do turno 2
+/// (a pergunta X escrita na coluna do ChatGPT) e, antes de ele assentar,
+/// escreveu Y na mesma coluna (turno 3, sem a coluna navegar): o run do
+/// turno 2 sai com as leituras em voo canceladas, a coluna que ja assentou
+/// fica lida, as outras saem como «outra pergunta» SEM o texto da ultima
+/// leitura (pode ja ser de Y), e grava-se no turno 2 -- a resposta de Y
+/// nunca entra no turno de X. A mesma operacao repetida (o turno 2 outra
+/// vez) nao acaba o run; outra sessao acaba. Sabotagem: `supersede` a
+/// olhar so para a sessao (o run de X continua e le a resposta de Y).
+#[test]
+fn a_new_turn_supersedes_the_running_read() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut session = ResearchSession::new("Q");
+    begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots);
+    let ask = ask_turn_providers(1, [0, 2]);
+    let x = begin_question_turn(
+        &mut session,
+        TurnOrigin::AskOtherColumns,
+        Some(1),
+        "X",
+        0,
+        &ask,
+    );
+
+    let view = FakeEvalView::at("https://chatgpt.com/c/1");
+    let epoch = NavEpoch::default();
+    let selector = ProviderId::ChatGpt.answer_read().expect("seletor");
+    let mut state = ConsensusState::new();
+    let now = Instant::now();
+    let id = state.begin_run(&session.id, x, now, three_columns());
+    let token = state
+        .reads
+        .read_with_arg(
+            &view,
+            answer_read_spec(),
+            &answer_read_config(selector),
+            &epoch,
+            now,
+            |_| {},
+            |_, _| {},
+        )
+        .expect("a leitura comeca");
+    {
+        let run = state.run_mut(id).expect("run");
+        run.columns[0].outcome = Some(ColumnOutcome::Read(answer_read_of(
+            "www.google.com",
+            "Resposta de X",
+            &[],
+        )));
+        run.columns[1].pending = Some(token);
+        run.columns[1].last = Some(answer_read_of(
+            "chatgpt.com",
+            "Começo da resposta de Y",
+            &[],
+        ));
+    }
+    assert_eq!(state.reads.in_flight(), 1);
+
+    // A mesma operacao (o turno de X outra vez): o run continua.
+    assert!(state.supersede(&session.id, x).is_none());
+    assert!(state.run_mut(id).is_some());
+    assert_eq!(state.reads.in_flight(), 1);
+
+    // Y: outro turno na mesma sessao.
+    let y = begin_question_turn(
+        &mut session,
+        TurnOrigin::AskOtherColumns,
+        Some(1),
+        "Y",
+        0,
+        &ask,
+    );
+    assert_ne!(y, x);
+    let run = state
+        .supersede(&session.id, y)
+        .expect("o turno novo nao acabou o run do anterior");
+    assert!(state.run_mut(id).is_none());
+    assert_eq!(state.reads.in_flight(), 0, "a leitura em voo sobreviveu");
+    assert_eq!(run.turn, x);
+    assert!(run.finished());
+    assert_eq!(
+        run.columns
+            .iter()
+            .map(|column| column.outcome.clone())
+            .collect::<Vec<_>>(),
+        [
+            Some(ColumnOutcome::Read(answer_read_of(
+                "www.google.com",
+                "Resposta de X",
+                &[]
+            ))),
+            Some(ColumnOutcome::OtherQuestion),
+            Some(ColumnOutcome::OtherQuestion),
+        ]
+    );
+    let recorded = record_consensus_run(&mut session, &run).expect("grava no turno de X");
+    assert_eq!(recorded.item_ids.len(), 1);
+    assert_eq!(session.turn(x).expect("X").attempts.len(), 3);
+    assert!(
+        session.turn(y).expect("Y").attempts.is_empty(),
+        "o run de X gravou no turno de Y"
+    );
+    assert!(
+        !session
+            .items
+            .iter()
+            .any(|item| item.text.contains("resposta de Y")),
+        "a resposta de Y entrou num turno"
+    );
+
+    // Outra sessao (o `compare` abriu uma nova) tambem acaba o run.
+    state.begin_run(&session.id, y, now, three_columns());
+    assert!(state.supersede("outra-sessao", 1).is_some());
+    // Sem run, nada.
+    assert!(state.supersede(&session.id, y).is_none());
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-4): a chave de
+/// operacao de uma pergunta esta ancorada no turno mais recente. Na mesma
+/// coluna, sem ela navegar (a pergunta escrita na pagina nao sobe a
+/// geracao), X, Y e X outra vez sao TRES turnos -- o segundo X nunca volta
+/// ao turno do primeiro --, e o mesmo Enter repetido enquanto a pergunta
+/// ainda e a ultima e o mesmo turno. O ordinal devolvido e sempre o do
+/// turno mais recente, o que o Consenso le. A ancora fica na sessao: depois
+/// de a gravar e ler, vale igual. Os provedores de um turno do
+/// `ask_other_columns` levam a coluna de origem primeiro. Sabotagem:
+/// `anchored_operation_key` com a ancora fixa (o X de novo devolve o turno
+/// do primeiro X).
+#[test]
+fn consensus_turn_key_is_anchored_to_the_latest_turn() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let ask = ask_turn_providers(1, [0, 2]);
+    let ask_from_1 = |session: &mut ResearchSession, text: &str, epoch: u64| {
+        let turn = begin_question_turn(
+            session,
+            TurnOrigin::AskOtherColumns,
+            Some(1),
+            text,
+            epoch,
+            &ask,
+        );
+        assert_eq!(
+            session.current_turn().map(|turn| turn.ordinal),
+            Some(turn),
+            "o turno devolvido nao e o mais recente"
+        );
+        turn
+    };
+    let mut session = ResearchSession::new("Q");
+    assert_eq!(
+        begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots),
+        1
+    );
+    let x = ask_from_1(&mut session, "X", 0);
+    assert_eq!(
+        ask_from_1(&mut session, "X", 0),
+        x,
+        "o Enter repetido abriu outro turno"
+    );
+    let y = ask_from_1(&mut session, "Y", 0);
+    let x_again = ask_from_1(&mut session, "X", 0);
+    assert_eq!((x, y), (2, 3));
+    assert_eq!(x_again, 4, "o X de novo voltou ao turno {x}");
+    assert_eq!(ask_from_1(&mut session, "X", 0), x_again);
+    // A coluna navegou: a mesma pergunta e outra operacao.
+    let moved = ask_from_1(&mut session, "X", 1);
+    assert_eq!(moved, 5);
+    // Gravada e lida: a ancora vem da sessao.
+    let mut reloaded: ResearchSession =
+        serde_json::from_str(&serde_json::to_string(&session).expect("json")).expect("rele");
+    assert_eq!(ask_from_1(&mut reloaded, "X", 1), moved);
+    assert_eq!(ask_from_1(&mut reloaded, "Y", 1), 6);
+    // Uma chave gravada sem ancora (antes dela) e a sua propria base.
+    let mut old = ResearchSession::new("antiga");
+    let plain = neural_core::operation_key(TurnOrigin::AskOtherColumns, Some(1), "X", 0);
+    old.begin_turn(&plain, TurnOrigin::AskOtherColumns, "X", &["ChatGPT"]);
+    assert_eq!(anchored_operation_key(&old, &plain), plain);
+    assert_eq!(ask_from_1(&mut old, "X", 0), 1);
+    assert_eq!(ask_from_1(&mut old, "Y", 0), 2);
+
+    // A coluna de origem responde a mesma pergunta: entra primeiro.
+    assert_eq!(
+        ask,
+        [
+            ProviderId::ChatGpt,
+            ProviderId::GoogleAi,
+            ProviderId::Claude
+        ]
+    );
+    assert_eq!(
+        session.turn(x).expect("X").providers,
+        ["ChatGPT", "Google IA", "Claude"]
+    );
+    assert_eq!(ask_turn_providers(0, [1, 2]), slots);
+    assert_eq!(
+        ask_turn_providers(2, [2, 0, 1, 7]),
+        [
+            ProviderId::Claude,
+            ProviderId::GoogleAi,
+            ProviderId::ChatGpt
+        ]
+    );
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-4): o Consenso le SO
+/// as colunas que o turno mais recente perguntou. Depois de uma pergunta da
+/// palette so ao ChatGPT, as respostas velhas que ficaram na coluna do
+/// Modo IA e na do Claude nao sao lidas para esse turno (`consensus_hosts`)
+/// -- e, mesmo que um run as trouxesse, nao se gravam nele. Sabotagem:
+/// `consensus_hosts` sem o filtro pelo turno (as tres colunas sao lidas).
+#[test]
+fn consensus_reads_only_the_providers_of_the_latest_turn() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut session = ResearchSession::new("Q");
+    let compare = begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots);
+    let load = begin_question_turn(
+        &mut session,
+        TurnOrigin::LoadProvider,
+        Some(1),
+        "só ao ChatGPT",
+        0,
+        &[ProviderId::ChatGpt],
+    );
+    let generation = |column: WebViewHost| match column {
+        WebViewHost::Column(index) => 10 + index as u64,
+        _ => 0,
+    };
+    let latest = session.current_turn().expect("turno");
+    assert_eq!(latest.ordinal, load);
+    assert_eq!(
+        consensus_hosts(latest, COMPARATOR_COLUMNS, generation),
+        [(WebViewHost::Column(1), 11)],
+        "uma coluna que o turno nao perguntou foi lida"
+    );
+    let all = session.turn(compare).expect("compare");
+    assert_eq!(
+        consensus_hosts(all, COMPARATOR_COLUMNS, generation),
+        [
+            (WebViewHost::Column(0), 10),
+            (WebViewHost::Column(1), 11),
+            (WebViewHost::Column(2), 12)
+        ]
+    );
+    // So as colunas a vista.
+    assert_eq!(
+        consensus_hosts(all, 2, generation),
+        [(WebViewHost::Column(0), 10), (WebViewHost::Column(1), 11)]
+    );
+    assert!(consensus_hosts(all, 0, generation).is_empty());
+
+    // Um run que trouxesse as tres para o turno do ChatGPT so grava o ChatGPT.
+    let run = finished_run(
+        &session,
+        load,
+        [
+            ColumnOutcome::Read(answer_read_of("www.google.com", "velha do Modo IA", &[])),
+            ColumnOutcome::Read(answer_read_of("chatgpt.com", "nova do ChatGPT", &[])),
+            ColumnOutcome::Read(answer_read_of("claude.ai", "velha do Claude", &[])),
+        ],
+    );
+    let recorded = record_consensus_run(&mut session, &run).expect("grava");
+    assert_eq!(
+        recorded
+            .answers
+            .iter()
+            .map(|answer| answer.provider.as_str())
+            .collect::<Vec<_>>(),
+        ["ChatGPT"]
+    );
+    assert_eq!(recorded.item_ids.len(), 1);
+    let turn = session.turn(load).expect("turno");
+    assert_eq!(turn.attempts.len(), 1);
+    assert_eq!(turn.attempts[0].provider, "ChatGPT");
+    assert!(
+        !session.items.iter().any(|item| item.text.contains("velha")),
+        "uma resposta velha entrou no turno"
+    );
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-1): a pagina continua
+/// a empurrar a resposta (`research-answer`) depois de o Consenso a ler, e
+/// o braco `ResearchAnswer` do event loop (o provedor da coluna pelo
+/// `research_answer_provider`, com o nome da coluna -- «ChatGPT», o mesmo
+/// do turno -- e o `upsert_provider_answer`) nunca escreve por cima do item
+/// do turno: o texto, as ligacoes e o item da tentativa ficam. Sabotagem
+/// (no `neural-core`): `upsert_provider_answer` sem o `item.turn.is_none()`.
+#[test]
+fn research_answer_push_never_overwrites_a_turn_answer() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut session = ResearchSession::new("Q");
+    let turn = begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots);
+    let run = finished_run(
+        &session,
+        turn,
+        [
+            ColumnOutcome::Translated,
+            ColumnOutcome::Read(answer_read_of(
+                "chatgpt.com",
+                "Resposta lida \u{E000}0\u{E001}",
+                &["https://example.com/a"],
+            )),
+            ColumnOutcome::OtherQuestion,
+        ],
+    );
+    let recorded = record_consensus_run(&mut session, &run).expect("grava");
+    let read_id = recorded.item_ids[0].clone();
+
+    // O braco `ResearchAnswer`: o provedor pelo nome da coluna 1.
+    let translation = TranslationState::with_sink(Box::new(|_| {}));
+    let provider = research_answer_provider(&translation, Some("ChatGPT"), 1).expect("provedor");
+    assert_eq!(provider, ProviderId::ChatGpt.display_name());
+    let pushed =
+        session.upsert_provider_answer(provider.clone(), "texto empurrado pela pagina", None);
+    assert_ne!(pushed, read_id, "o empurrao foi ao item do turno");
+    session.upsert_provider_answer(provider, "texto empurrado outra vez", None);
+
+    let item = session
+        .items
+        .iter()
+        .find(|item| item.id == read_id)
+        .expect("item do turno");
+    assert_eq!(item.text, "Resposta lida \u{E000}0\u{E001}");
+    assert_eq!(item.links, ["https://example.com/a"]);
+    assert_eq!(item.turn, Some(turn));
+    let attempt = session
+        .turn(turn)
+        .expect("turno")
+        .attempts_of("ChatGPT")
+        .next()
+        .expect("tentativa")
+        .clone();
+    assert_eq!(attempt.item_id.as_deref(), Some(read_id.as_str()));
+    let pushed_item = session
+        .items
+        .iter()
+        .find(|item| item.id == pushed)
+        .expect("item empurrado");
+    assert_eq!(pushed_item.text, "texto empurrado outra vez");
+    assert_eq!(pushed_item.turn, None);
 }

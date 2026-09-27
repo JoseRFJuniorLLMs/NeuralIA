@@ -91,11 +91,13 @@ pub struct ProviderAttempt {
 }
 
 /// Um turno da sessão: uma pergunta feita a um conjunto de provedores, com
-/// os invariantes da SPEC-0109 §5.1 (OQ8): o `ordinal` é único na sessão e
-/// nunca se reutiliza; a ordem dos provedores fica gravada na criação; as
-/// tentativas por provedor só se acrescentam; e `begin_turn` é idempotente
-/// pela chave de operação (`operation_key`): repetir a mesma operação
-/// devolve o mesmo turno em vez de abrir outro.
+/// os invariantes do rascunho da Chat Surface (OQ8; o rascunho ainda não
+/// está na árvore e a sua numeração está pendente, OQ11): o `ordinal` é
+/// único na sessão e nunca se reutiliza; a ordem dos provedores fica
+/// gravada na criação; as tentativas por provedor só se acrescentam, e só
+/// dos provedores que o turno perguntou; e `begin_turn` é idempotente pela
+/// chave de operação (`operation_key`): repetir a mesma operação devolve o
+/// mesmo turno em vez de abrir outro.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResearchTurn {
     pub ordinal: u32,
@@ -110,6 +112,11 @@ pub struct ResearchTurn {
 }
 
 impl ResearchTurn {
+    /// O turno perguntou a `provider` (está em `providers`).
+    pub fn asked(&self, provider: &str) -> bool {
+        self.providers.iter().any(|name| name == provider)
+    }
+
     /// As tentativas de `provider`, na ordem em que foram feitas.
     pub fn attempts_of<'a>(
         &'a self,
@@ -236,6 +243,11 @@ impl ResearchSession {
         )
     }
 
+    /// O caminho antigo (`research-answer`, a resposta que a página
+    /// empurra): atualiza a última resposta EMPURRADA de `provider`, ou cria
+    /// uma. Uma resposta lida para um turno (`add_turn_answer`, com `turn`)
+    /// nunca é o alvo: a página continua a empurrar depois de o Consenso a
+    /// ler, e o texto que uma tentativa registou não muda por baixo dela.
     pub fn upsert_provider_answer(
         &mut self,
         provider: impl Into<String>,
@@ -246,6 +258,7 @@ impl ResearchSession {
         let text = text.into();
         if let Some(item) = self.items.iter_mut().rev().find(|item| {
             item.kind == ResearchItemKind::ProviderAnswer
+                && item.turn.is_none()
                 && item.provider.as_deref() == Some(provider.as_str())
         }) {
             let updated_at = unix_seconds();
@@ -286,7 +299,7 @@ impl ResearchSession {
         )
     }
 
-    // ----- os turnos (SPEC-0109 §5.1) -----
+    // ----- os turnos (rascunho da Chat Surface, numeração pendente: OQ11) -----
 
     /// Abre um turno para a operação `operation_key`, ou devolve o que essa
     /// chave já abriu (idempotente: um clique repetido, um evento entregue
@@ -338,7 +351,9 @@ impl ResearchSession {
 
     /// Mais uma tentativa de `provider` no turno `ordinal`: acrescenta
     /// sempre uma linha nova (numerada a seguir à última desse provedor) e
-    /// nunca escreve por cima de uma anterior. `None` se o turno não existe.
+    /// nunca escreve por cima de uma anterior. `None` se o turno não existe
+    /// ou não perguntou a `provider`: a resposta de uma coluna que ficou de
+    /// fora do turno nunca é uma tentativa dele.
     pub fn record_attempt(
         &mut self,
         ordinal: u32,
@@ -347,7 +362,11 @@ impl ResearchSession {
         item_id: Option<String>,
     ) -> Option<u32> {
         let created_at = unix_seconds();
-        let turn = self.turns.iter_mut().find(|turn| turn.ordinal == ordinal)?;
+        let turn = self
+            .turns
+            .iter_mut()
+            .find(|turn| turn.ordinal == ordinal)
+            .filter(|turn| turn.asked(provider))?;
         let attempt = turn
             .attempts
             .iter()
@@ -368,14 +387,18 @@ impl ResearchSession {
 
     /// A resposta lida de `provider` no turno `ordinal`, como um item novo
     /// (uma leitura nova nunca substitui a anterior: cada tentativa tem o
-    /// seu item), com as ligações citadas.
+    /// seu item), com as ligações citadas. `None`, e nenhum item, se o
+    /// turno não existe ou não perguntou a `provider`.
     pub fn add_turn_answer(
         &mut self,
         ordinal: u32,
         provider: &str,
         text: impl Into<String>,
         links: Vec<String>,
-    ) -> String {
+    ) -> Option<String> {
+        if !self.turn(ordinal).is_some_and(|turn| turn.asked(provider)) {
+            return None;
+        }
         let id = self.push_item(
             ResearchItemKind::ProviderAnswer,
             format!("Resposta · {provider} · turno {ordinal}"),
@@ -388,7 +411,7 @@ impl ResearchSession {
             item.turn = Some(ordinal);
             item.links = links;
         }
-        id
+        Some(id)
     }
 
     /// Guarda uma leitura do Consenso, largando a mais antiga quando já há
@@ -826,7 +849,7 @@ mod tests {
         assert!(markdown.contains("Gemini"));
     }
 
-    // ----- os turnos (consensus-reader-turns; SPEC-0109 §5.1) -----
+    // ----- os turnos (consensus-reader-turns; rascunho da Chat Surface, OQ11) -----
 
     const THREE: [&str; 3] = ["Google IA", "ChatGPT", "Claude"];
 
@@ -904,12 +927,14 @@ mod tests {
             session.record_attempt(turn, "ChatGPT", AttemptStatus::MaybeIncomplete, None),
             Some(1)
         );
-        let item = session.add_turn_answer(
-            turn,
-            "ChatGPT",
-            "texto lido",
-            vec!["https://example.com/a".into()],
-        );
+        let item = session
+            .add_turn_answer(
+                turn,
+                "ChatGPT",
+                "texto lido",
+                vec!["https://example.com/a".into()],
+            )
+            .expect("o turno perguntou ao ChatGPT");
         assert_eq!(
             session.record_attempt(turn, "ChatGPT", AttemptStatus::Read, Some(item.clone())),
             Some(2)
@@ -961,6 +986,110 @@ mod tests {
         assert_eq!(answer.turn, Some(turn));
         assert_eq!(answer.links, ["https://example.com/a"]);
         assert_eq!(answer.kind, ResearchItemKind::ProviderAnswer);
+    }
+
+    /// Gate (crítico, dados do utilizador; RT-4): um turno só recebe
+    /// tentativas e respostas dos provedores que perguntou -- depois de uma
+    /// pergunta da palette só ao ChatGPT, a resposta velha do Claude que
+    /// ficou na coluna dele não entra no turno, nem como tentativa nem como
+    /// item. Sabotagem: `record_attempt` sem o `asked` (o Claude entra como
+    /// tentativa 1 do turno do ChatGPT).
+    #[test]
+    fn a_turn_records_only_the_providers_it_asked() {
+        let mut session = ResearchSession::new("só quem perguntou");
+        let turn = session.begin_turn("load:1:x", TurnOrigin::LoadProvider, "x", &["ChatGPT"]);
+        assert!(session.turn(turn).expect("turno").asked("ChatGPT"));
+        assert!(!session.turn(turn).expect("turno").asked("Claude"));
+        let items = session.items.len();
+        assert_eq!(
+            session.record_attempt(turn, "Claude", AttemptStatus::Read, None),
+            None,
+            "um provedor fora do turno ganhou uma tentativa"
+        );
+        assert_eq!(
+            session.add_turn_answer(turn, "Claude", "resposta velha", Vec::new()),
+            None,
+            "um provedor fora do turno ganhou um item"
+        );
+        assert_eq!(session.items.len(), items);
+        assert_eq!(
+            session.add_turn_answer(99, "ChatGPT", "sem turno", Vec::new()),
+            None
+        );
+        assert_eq!(session.items.len(), items);
+        let answer = session
+            .add_turn_answer(turn, "ChatGPT", "resposta nova", Vec::new())
+            .expect("o turno perguntou ao ChatGPT");
+        assert_eq!(
+            session.record_attempt(turn, "ChatGPT", AttemptStatus::Read, Some(answer)),
+            Some(1)
+        );
+        let recorded = session.turn(turn).expect("turno");
+        assert_eq!(recorded.attempts.len(), 1);
+        assert_eq!(recorded.attempts[0].provider, "ChatGPT");
+        assert_eq!(session.items.len(), items + 1);
+    }
+
+    /// Gate (crítico, dados do utilizador; RT-1): a resposta que a página
+    /// empurra (`research-answer`, `upsert_provider_answer`) nunca escreve
+    /// por cima da resposta que o Consenso leu para um turno -- mesmo com o
+    /// mesmo nome de provedor: atualiza a última resposta empurrada, ou cria
+    /// uma nova, e o item do turno fica com o texto e as ligações que a
+    /// tentativa registou. Sabotagem: tirar o `item.turn.is_none()` do
+    /// `upsert_provider_answer` (o texto empurrado substitui o do turno).
+    #[test]
+    fn legacy_upsert_never_touches_a_turn_answer() {
+        let mut session = ResearchSession::new("empurrada e lida");
+        let pushed = session.upsert_provider_answer("ChatGPT", "empurrada 1", None);
+        let turn = session.begin_turn("compare:t", TurnOrigin::Compare, "t", &THREE);
+        let read = session
+            .add_turn_answer(
+                turn,
+                "ChatGPT",
+                "lida no turno",
+                vec!["https://example.com/r".into()],
+            )
+            .expect("item do turno");
+        session.record_attempt(turn, "ChatGPT", AttemptStatus::Read, Some(read.clone()));
+
+        // A página continua a empurrar: vai para a resposta empurrada.
+        let again = session.upsert_provider_answer("ChatGPT", "empurrada 2", None);
+        assert_eq!(again, pushed, "o upsert não foi à resposta empurrada");
+        fn item(session: &ResearchSession, id: &str) -> ResearchItem {
+            session
+                .items
+                .iter()
+                .find(|item| item.id == id)
+                .expect("item")
+                .clone()
+        }
+        assert_eq!(item(&session, &pushed).text, "empurrada 2");
+        let turn_item = item(&session, &read);
+        assert_eq!(
+            turn_item.text, "lida no turno",
+            "o texto do turno mudou por baixo da tentativa"
+        );
+        assert_eq!(turn_item.links, ["https://example.com/r"]);
+        assert_eq!(turn_item.turn, Some(turn));
+
+        // Sem resposta empurrada antes, o Claude lido no turno também fica:
+        // o empurrão cria um item novo, sem turno.
+        let claude = session
+            .add_turn_answer(turn, "Claude", "Claude lido", Vec::new())
+            .expect("item do turno");
+        let pushed_claude = session.upsert_provider_answer("Claude", "Claude empurrado", None);
+        assert_ne!(pushed_claude, claude);
+        assert_eq!(item(&session, &claude).text, "Claude lido");
+        assert_eq!(item(&session, &pushed_claude).turn, None);
+        assert_eq!(
+            session
+                .turn(turn)
+                .expect("turno")
+                .attempts_of("ChatGPT")
+                .next()
+                .and_then(|attempt| attempt.item_id.as_deref()),
+            Some(read.as_str())
+        );
     }
 
     /// Gate (dados do utilizador): uma sessão gravada pela 2.4 -- sem

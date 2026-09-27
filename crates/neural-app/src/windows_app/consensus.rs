@@ -1,8 +1,9 @@
 use super::*;
 
-use neural_core::search::{AnswerReadSelector, ProviderId};
+use neural_core::search::{AnswerReadSelector, ProviderId, is_login_host};
 use neural_core::{
-    AttemptStatus, ComparisonFact, ResearchSession, SnapshotAnswer, TurnOrigin, operation_key,
+    AttemptStatus, ComparisonFact, ResearchSession, ResearchTurn, SnapshotAnswer, TurnOrigin,
+    operation_key,
 };
 
 use crate::lazy_worker::{JobContext, LazyWorker};
@@ -28,9 +29,13 @@ use crate::lazy_worker::{JobContext, LazyWorker};
 //   o unico caminho de volta e o callback do `evaluate_script`.
 // - `parse_answer_read` le a resposta como dado nao confiavel: tecto de
 //   512 KiB ANTES do serde, as sete chaves exatas e nenhuma outra, `v` = 1,
-//   o `host` igual ao da pagina da coluna (uma coluna que foi parar a uma
-//   pagina de login nao passa por resposta), cada ligacao http(s) com
-//   tecto de tamanho, e cada marcador a apontar para uma ligacao que existe.
+//   o `host` igual ao da pagina da coluna, cada ligacao http(s) com tecto
+//   de tamanho, e cada marcador a apontar para uma ligacao que existe. E
+//   antes de tudo `column_answer_read` exige que a pagina da coluna SEJA
+//   do provedor dela pelas regras de host do registo
+//   (`ProviderId::from_url`: o Modo IA so com `udm=50`) e nao uma pagina de
+//   login (`is_login_host`): uma coluna que foi parar ao login da Google,
+//   com um `<main>` que o seletor do Modo IA apanha, nao passa por resposta.
 // - A sondagem: a cada 1,5 s (`Timers`) le-se outra vez cada coluna ate a
 //   resposta ASSENTAR (duas leituras iguais, sem o botao de parar), ate a
 //   coluna NAVEGAR para outra pergunta (a geracao de navegacao subiu:
@@ -44,8 +49,10 @@ use crate::lazy_worker::{JobContext, LazyWorker};
 //   comparada» (`Translated`) e nunca entra na comparacao (critica C9).
 // - Um provedor sem seletor no registo sai como «não lida» (`Unreadable`).
 // - No fim, o turno da sessao (`ResearchSession::begin_turn`, os
-//   invariantes da SPEC-0109 §5.1) recebe uma TENTATIVA por coluna (nunca
-//   por cima da anterior), o texto lido vira um item com `links`, a
+//   invariantes do rascunho da Chat Surface, numeracao pendente: OQ11)
+//   recebe uma TENTATIVA por coluna que o turno perguntou (nunca por cima
+//   da anterior; `record_consensus_run`, e so na sessao e no turno do run),
+//   o texto lido vira um item com `links`, a
 //   leitura fica como um `ConsensusSnapshot` (no maximo 8 por sessao) e a
 //   sessao grava-se pelo `PrivacyGuard::save_session` (a loja `memory/`,
 //   `Automatic`: no modo privado nao grava). A comparacao das entidades,
@@ -54,9 +61,16 @@ use crate::lazy_worker::{JobContext, LazyWorker};
 //   como `Compared`, que a mostra.
 //
 // Os turnos abrem-se onde a pergunta parte: `compare` (as tres IAs),
-// `ask_other_columns` (a pergunta escrita numa coluna segue as outras) e o
-// `LoadProvider` da palette (uma so coluna) -- `App::consensus_begin_turn`,
-// com a chave de operacao de `neural_core::operation_key`.
+// `ask_other_columns` (a pergunta escrita numa coluna segue as outras; a
+// coluna de origem responde-a tambem) e o `LoadProvider` da palette (uma so
+// coluna) -- `begin_question_turn`, com a chave de operacao de
+// `neural_core::operation_key` ANCORADA no turno mais recente
+// (`anchored_operation_key`): repetir a pergunta enquanto ela ainda e a
+// ultima devolve o mesmo turno; a mesma pergunta depois de outra e outro
+// turno. O Consenso le sempre o turno mais recente e so as colunas que ele
+// perguntou (`consensus_hosts`); um turno ou uma sessao novos acabam o run
+// que ainda lia o anterior (`ConsensusState::supersede`): o que ja assentou
+// fica, o resto sai como «outra pergunta — não comparada».
 
 /// O nome da thread do Consenso.
 pub(in crate::windows_app) const CONSENSUS_WORKER_NAME: &str = "neural-consensus";
@@ -324,6 +338,12 @@ pub(in crate::windows_app) enum AnswerReadError {
         expected: String,
         got: String,
     },
+    /// A pagina da coluna nao e do provedor dela (outro site, o Google sem
+    /// o Modo IA) ou e uma pagina de login.
+    NotProviderPage {
+        provider: &'static str,
+        host: String,
+    },
     TooLong {
         chars: usize,
     },
@@ -352,6 +372,9 @@ impl AnswerReadError {
             Self::Type(field) => format!("tipo errado em {field}"),
             Self::HostMismatch { expected, got } => {
                 format!("host {got:?} em vez de {expected:?}")
+            }
+            Self::NotProviderPage { provider, host } => {
+                format!("a página {host:?} não é do {provider}")
             }
             Self::TooLong { chars } => format!("{chars} caracteres acima do tecto"),
             Self::TooManyLinks { count } => format!("{count} ligações acima do tecto"),
@@ -485,12 +508,47 @@ fn check_citations(text: &str, links: usize) -> Result<(), AnswerReadError> {
     Ok(())
 }
 
-/// O host de um URL de pagina, em minusculas (o que `parse_answer_read`
-/// exige no `host` da resposta). `None` sem host.
-pub(in crate::windows_app) fn page_host(url: &str) -> Option<String> {
-    Url::parse(url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host.to_ascii_lowercase()))
+/// O host que a leitura da coluna do `provider` tem de trazer: o da pagina
+/// da coluna (`page_url`, o mesmo que o `PageReads` conferiu a chegada), e
+/// SO quando essa pagina e do provedor pelas regras de host do registo
+/// (`ProviderId::from_url`: http(s), o host exato ou subdominio quando a
+/// regra os aceita, o Google so com o primeiro `udm` igual a `50`) e nao e
+/// uma pagina de login. Comparar a resposta com o host da propria pagina
+/// nao prova nada -- o script le `location.hostname` dessa mesma pagina --;
+/// e o provedor da coluna que diz se a pagina e uma resposta.
+pub(in crate::windows_app) fn provider_page_host(
+    provider: ProviderId,
+    page_url: Option<&str>,
+) -> Result<String, AnswerReadError> {
+    let url = page_url.and_then(|page| Url::parse(page).ok());
+    let host = url
+        .as_ref()
+        .and_then(Url::host_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let on_provider_page = url
+        .as_ref()
+        .is_some_and(|url| ProviderId::from_url(url) == Some(provider));
+    if !on_provider_page || host.is_empty() || is_login_host(&host) {
+        return Err(AnswerReadError::NotProviderPage {
+            provider: provider.display_name(),
+            host,
+        });
+    }
+    Ok(host)
+}
+
+/// A decisao de `consensus_page_event` sobre uma leitura que chegou da
+/// coluna do `provider`: a pagina tem de ser do provedor
+/// (`provider_page_host`) e a resposta passa em `parse_answer_read` contra
+/// o host dela.
+pub(in crate::windows_app) fn column_answer_read(
+    provider: ProviderId,
+    page_url: Option<&str>,
+    raw: &str,
+) -> Result<AnswerRead, AnswerReadError> {
+    let expected = provider_page_host(provider, page_url)?;
+    parse_answer_read(raw, &expected)
 }
 
 // ===================== o que se le: so as colunas =====================
@@ -677,6 +735,8 @@ pub(in crate::windows_app) fn decide_column_poll(
 #[derive(Debug)]
 pub(in crate::windows_app) struct ConsensusRun {
     pub(in crate::windows_app) id: u64,
+    /// A sessao (`ResearchSession::id`) do turno: o run so grava nela.
+    pub(in crate::windows_app) session: String,
     pub(in crate::windows_app) turn: u32,
     pub(in crate::windows_app) started: Instant,
     pub(in crate::windows_app) columns: Vec<ColumnRead>,
@@ -688,6 +748,7 @@ impl ConsensusRun {
     /// lado, a privada -- fica de fora, por muito que venha na lista.
     pub(in crate::windows_app) fn begin(
         id: u64,
+        session: &str,
         turn: u32,
         started: Instant,
         hosts: impl IntoIterator<Item = (WebViewHost, u64)>,
@@ -712,6 +773,7 @@ impl ConsensusRun {
             .collect();
         Self {
             id,
+            session: session.to_string(),
             turn,
             started,
             columns,
@@ -730,6 +792,19 @@ impl ConsensusRun {
         self.columns
             .iter_mut()
             .find(|column| column.pending == Some(token))
+    }
+
+    /// Uma pergunta nova chegou antes de o run acabar: cada coluna que
+    /// ainda nao assentou sai como «outra pergunta — não comparada» -- sem
+    /// texto, nem o da ultima leitura, que pode ja ser da pergunta nova --,
+    /// e as que ja assentaram ficam como estavam.
+    pub(in crate::windows_app) fn interrupt(&mut self) {
+        for column in &mut self.columns {
+            column.pending = None;
+            if column.outcome.is_none() {
+                column.outcome = Some(ColumnOutcome::OtherQuestion);
+            }
+        }
     }
 
     /// As colunas que so esperam o original voltar, quando todas as outras
@@ -811,6 +886,147 @@ fn snapshot_answer(provider: &str, outcome: &ColumnOutcome) -> SnapshotAnswer {
     }
 }
 
+/// O que um run gravou na sessao: as respostas da leitura guardada e os
+/// itens com o texto lido (o que a thread compara).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::windows_app) struct RecordedRun {
+    pub(in crate::windows_app) answers: Vec<SnapshotAnswer>,
+    pub(in crate::windows_app) item_ids: Vec<String>,
+}
+
+/// Grava um run acabado na sessao: uma tentativa e (com texto) um item por
+/// coluna que o turno perguntou, e a leitura guardada. `None`, e a sessao
+/// intacta, quando ela ja nao e a do run (o dono abriu outra pergunta as
+/// tres entretanto, ou apagou o historico) ou o turno do run nao existe:
+/// as leituras de uma pergunta nunca entram noutra. Uma coluna que o turno
+/// nao perguntou nao grava nada (`ResearchTurn::asked`).
+pub(in crate::windows_app) fn record_consensus_run(
+    session: &mut ResearchSession,
+    run: &ConsensusRun,
+) -> Option<RecordedRun> {
+    if session.id != run.session {
+        return None;
+    }
+    let asked: Vec<&'static str> = {
+        let turn = session.turn(run.turn)?;
+        run.columns
+            .iter()
+            .map(|column| column.provider.display_name())
+            .filter(|provider| turn.asked(provider))
+            .collect()
+    };
+    let mut answers = Vec::with_capacity(asked.len());
+    let mut item_ids = Vec::new();
+    for column in &run.columns {
+        let provider = column.provider.display_name();
+        if !asked.contains(&provider) {
+            continue;
+        }
+        let outcome = column
+            .outcome
+            .clone()
+            .unwrap_or_else(|| ColumnOutcome::Failed(CONSENSUS_FAILED.to_string()));
+        let item_id = outcome
+            .read()
+            .filter(|read| !read.text.is_empty())
+            .and_then(|read| {
+                session.add_turn_answer(run.turn, provider, read.text.clone(), read.links.clone())
+            });
+        if let Some(id) = &item_id {
+            item_ids.push(id.clone());
+        }
+        session.record_attempt(run.turn, provider, outcome.status(), item_id);
+        answers.push(snapshot_answer(provider, &outcome));
+    }
+    if answers.is_empty() {
+        return None;
+    }
+    session.push_consensus(run.turn, answers.clone());
+    Some(RecordedRun { answers, item_ids })
+}
+
+// ===================== os turnos: qual, e que colunas =====================
+
+/// A chave de operacao de uma pergunta, ANCORADA no turno mais recente da
+/// sessao: `base` (`operation_key`: origem, coluna, resumo do texto e
+/// geracao de navegacao da coluna) mais `@<ordinal do turno mais recente>`.
+/// Se o turno mais recente e a mesma operacao (um Enter repetido, um evento
+/// em duplicado), devolve a chave dele -- o mesmo turno. Senao a ancora
+/// muda: perguntar X, depois Y, depois X outra vez na mesma coluna (a
+/// geracao dela nao sobe numa pergunta escrita na pagina) sao tres turnos,
+/// nunca o X de volta ao turno de antes. Deterministica e guardada na
+/// sessao: nada de relogio nem de contador que um reinicio zere.
+pub(in crate::windows_app) fn anchored_operation_key(
+    session: &ResearchSession,
+    base: &str,
+) -> String {
+    match session.current_turn() {
+        Some(turn) if operation_base(&turn.operation_key) == base => turn.operation_key.clone(),
+        Some(turn) => format!("{base}@{}", turn.ordinal),
+        None => format!("{base}@0"),
+    }
+}
+
+/// A chave sem a ancora (uma chave gravada antes da ancora e toda base).
+fn operation_base(key: &str) -> &str {
+    key.split_once('@').map_or(key, |(base, _)| base)
+}
+
+/// Abre (ou reencontra) o turno de uma pergunta: a chave ancorada
+/// (`anchored_operation_key`) e os provedores na ordem em que a pergunta
+/// seguiu. Devolve o ordinal, que e sempre o do turno mais recente.
+pub(in crate::windows_app) fn begin_question_turn(
+    session: &mut ResearchSession,
+    origin: TurnOrigin,
+    source: Option<usize>,
+    text: &str,
+    epoch: u64,
+    providers: &[ProviderId],
+) -> u32 {
+    let key = anchored_operation_key(session, &operation_key(origin, source, text, epoch));
+    let names: Vec<&str> = providers.iter().map(|id| id.display_name()).collect();
+    session.begin_turn(&key, origin, text, &names)
+}
+
+/// Os provedores de um turno do `ask_other_columns`: a coluna de origem
+/// primeiro -- a pergunta foi escrita na pagina dela, e ela segue a
+/// conversa com a mesma pergunta -- e depois as colunas para onde a
+/// pergunta seguiu.
+pub(in crate::windows_app) fn ask_turn_providers(
+    source: usize,
+    targets: impl IntoIterator<Item = usize>,
+) -> Vec<ProviderId> {
+    let mut providers: Vec<ProviderId> = Vec::new();
+    for index in std::iter::once(source).chain(targets) {
+        if let Some(provider) = column_provider(index)
+            && !providers.contains(&provider)
+        {
+            providers.push(provider);
+        }
+    }
+    providers
+}
+
+/// As colunas que o Consenso le para `turn`: so as `columns` do comparador
+/// cujo provedor o turno perguntou, cada uma com a sua geracao de
+/// navegacao de agora. Depois de uma pergunta da palette so ao ChatGPT, a
+/// resposta velha que ficou nas outras colunas nao e lida para esse turno.
+pub(in crate::windows_app) fn consensus_hosts(
+    turn: &ResearchTurn,
+    columns: usize,
+    generation: impl Fn(WebViewHost) -> u64,
+) -> Vec<(WebViewHost, u64)> {
+    (0..columns.min(COMPARATOR_COLUMNS))
+        .filter(|index| {
+            column_provider(*index).is_some_and(|provider| turn.asked(provider.display_name()))
+        })
+        .map(|index| {
+            let column = WebViewHost::Column(index);
+            (column, generation(column))
+        })
+        .collect()
+}
+
 // ===================== o estado e o evento =====================
 
 /// O trabalho da thread `neural-consensus`.
@@ -867,10 +1083,11 @@ impl ConsensusState {
         self.worker.as_ref().map_or(0, LazyWorker::threads_spawned)
     }
 
-    /// Um run novo sobre `hosts`; o anterior, se havia, cai com as suas
-    /// leituras em voo.
+    /// Um run novo do turno `turn` da sessao `session` sobre `hosts`; o
+    /// anterior, se havia, cai com as suas leituras em voo.
     pub(in crate::windows_app) fn begin_run(
         &mut self,
+        session: &str,
         turn: u32,
         started: Instant,
         hosts: impl IntoIterator<Item = (WebViewHost, u64)>,
@@ -878,8 +1095,31 @@ impl ConsensusState {
         self.reads.cancel_all();
         self.next_run = self.next_run.wrapping_add(1).max(1);
         let id = self.next_run;
-        self.run = Some(ConsensusRun::begin(id, turn, started, hosts));
+        self.run = Some(ConsensusRun::begin(id, session, turn, started, hosts));
         id
+    }
+
+    /// Abriu-se o turno `turn` da sessao `session`: um run que lia OUTRO
+    /// turno (ou outra sessao) acaba aqui -- as leituras em voo caem, e o
+    /// run sai interrompido (`ConsensusRun::interrupt`) para se gravar no
+    /// turno dele. `None` sem run, ou quando o run ja e deste turno (a mesma
+    /// operacao repetida).
+    pub(in crate::windows_app) fn supersede(
+        &mut self,
+        session: &str,
+        turn: u32,
+    ) -> Option<ConsensusRun> {
+        let superseded = self
+            .run
+            .as_ref()
+            .is_some_and(|run| run.session != session || run.turn != turn);
+        if !superseded {
+            return None;
+        }
+        self.reads.cancel_all();
+        let mut run = self.run.take()?;
+        run.interrupt();
+        Some(run)
     }
 
     /// O run `id`, se ainda e o de agora (os gates; a sonda vai pelo campo
@@ -908,8 +1148,9 @@ impl App {
     /// Abre (ou reencontra) o turno de uma pergunta na sessao viva -- sem
     /// sessao, nasce uma com a pergunta. `source` e a coluna de onde a
     /// pergunta partiu (`None` na pergunta as tres), e a chave de operacao
-    /// leva a geracao de navegacao dela de AGORA: a mesma pergunta repetida
-    /// antes de a coluna navegar e a mesma operacao.
+    /// leva a geracao de navegacao dela de AGORA, ancorada no turno mais
+    /// recente (`begin_question_turn`). Um run que ainda lia outro turno
+    /// acaba aqui (`consensus_turn_begun`).
     pub(in crate::windows_app) fn consensus_begin_turn(
         &mut self,
         origin: TurnOrigin,
@@ -920,67 +1161,81 @@ impl App {
         let epoch = source
             .and_then(|index| self.translation.epoch(WebViewHost::Column(index)))
             .map_or(0, |epoch| epoch.current());
-        let key = operation_key(origin, source, text, epoch);
-        let names: Vec<&str> = providers.iter().map(|id| id.display_name()).collect();
         let session = self
             .current_research
             .get_or_insert_with(|| ResearchSession::new(text.to_string()));
         let before = session.turns.len();
-        let turn = session.begin_turn(&key, origin, text, &names);
+        let turn = begin_question_turn(session, origin, source, text, epoch, providers);
+        let session_id = session.id.clone();
         if session.turns.len() != before {
             self.privacy.save_session(session.clone());
         }
+        self.consensus_turn_begun(&session_id, turn);
         turn
     }
 
-    /// `research:compare`: le as respostas das colunas do turno de agora
-    /// pelo lado nativo. Sem sessao ou sem colunas a vista, diz porque.
+    /// Abriu-se o turno `turn` da sessao `session_id`: o run que lia outro
+    /// turno ou outra sessao acaba (`ConsensusState::supersede`) e grava-se
+    /// no turno DELE, sem relatorio -- o dono ja fez outra pergunta. Em
+    /// `compare` chama-se ANTES de a sessao nova tomar o lugar da anterior,
+    /// para o run se gravar na sessao dele; se ela ja nao for a viva, cai.
+    pub(in crate::windows_app) fn consensus_turn_begun(&mut self, session_id: &str, turn: u32) {
+        if let Some(run) = self.consensus.supersede(session_id, turn) {
+            debug_log(format_args!(
+                "consensus: run {} do turno {} interrompido pelo turno {turn}",
+                run.id, run.turn
+            ));
+            self.record_consensus(&run, false);
+        }
+    }
+
+    /// `research:compare`: le as respostas das colunas do turno mais
+    /// recente pelo lado nativo -- so as que esse turno perguntou
+    /// (`consensus_hosts`). Sem sessao ou sem colunas a vista, diz porque.
     /// Devolve se um run comecou.
     pub(in crate::windows_app) fn read_consensus(&mut self) -> bool {
-        if self.current_research.is_none() {
+        let Some(session) = self.current_research.as_ref() else {
             self.show_native_text(CONSENSUS_TITLE, CONSENSUS_NO_SESSION);
             return false;
+        };
+        let columns = match (&self.surface, &self.comparator) {
+            (Surface::Comparator, Some(comp)) => comp.views.len(),
+            _ => 0,
+        };
+        if columns == 0 {
+            self.show_native_text(CONSENSUS_TITLE, CONSENSUS_NO_COLUMNS);
+            return false;
         }
-        let hosts: Vec<(WebViewHost, u64)> = match (&self.surface, &self.comparator) {
-            (Surface::Comparator, Some(comp)) => (0..comp.views.len())
-                .map(|index| {
-                    // `column`, nao `host`: o gate `every_webview_gets_the_hooks`
-                    // prende o nome `host` ao sitio de nascimento da fonte ao lado.
-                    let column = WebViewHost::Column(index);
-                    let generation = self
-                        .translation
-                        .epoch(column)
-                        .map_or(0, |epoch| epoch.current());
-                    (column, generation)
-                })
-                .collect(),
-            _ => Vec::new(),
+        if session.current_turn().is_none() {
+            // Uma sessao de antes dos turnos: a pergunta dela e o turno 1.
+            let question = session.question.clone();
+            self.consensus_begin_turn(
+                TurnOrigin::Compare,
+                None,
+                &question,
+                &ProviderId::default_slots(),
+            );
+        }
+        let translation = &self.translation;
+        let Some((session_id, turn, hosts)) = self.current_research.as_ref().and_then(|session| {
+            let turn = session.current_turn()?;
+            // `column`, nao `host`: o gate `every_webview_gets_the_hooks`
+            // prende o nome `host` ao sitio de nascimento da fonte ao lado.
+            let hosts = consensus_hosts(turn, columns, |column| {
+                translation.epoch(column).map_or(0, |epoch| epoch.current())
+            });
+            Some((session.id.clone(), turn.ordinal, hosts))
+        }) else {
+            self.show_native_text(CONSENSUS_TITLE, CONSENSUS_NO_SESSION);
+            return false;
         };
         if hosts.is_empty() {
             self.show_native_text(CONSENSUS_TITLE, CONSENSUS_NO_COLUMNS);
             return false;
         }
-        let question = self
-            .current_research
-            .as_ref()
-            .map(|session| session.question.clone())
-            .unwrap_or_default();
-        let turn = match self
-            .current_research
-            .as_ref()
-            .and_then(|session| session.current_turn())
-            .map(|turn| turn.ordinal)
-        {
-            Some(turn) => turn,
-            // Uma sessao de antes dos turnos: a pergunta dela e o turno 1.
-            None => self.consensus_begin_turn(
-                TurnOrigin::Compare,
-                None,
-                &question,
-                &ProviderId::default_slots(),
-            ),
-        };
-        let id = self.consensus.begin_run(turn, Instant::now(), hosts);
+        let id = self
+            .consensus
+            .begin_run(&session_id, turn, Instant::now(), hosts);
         debug_log(format_args!("consensus: run {id} do turno {turn} começou"));
         self.show_splash(CONSENSUS_READING.to_string(), 2);
         self.consensus_poll(id);
@@ -1078,9 +1333,10 @@ impl App {
     }
 
     /// Uma leitura chegou (ou passou do prazo): o `PageReads` confere o
-    /// prazo, o tecto, a geracao e o URL; depois `parse_answer_read` le a
-    /// resposta contra o host da pagina da coluna. Uma leitura de um token
-    /// que ja nao e de nenhuma coluna (o run acabou, ou e outro) cai.
+    /// prazo, o tecto, a geracao e o URL; depois `column_answer_read` exige
+    /// que a pagina seja do provedor da coluna e le a resposta contra o host
+    /// dela. Uma leitura de um token que ja nao e de nenhuma coluna (o run
+    /// acabou, ou e outro) cai.
     fn consensus_page_event(&mut self, event: PageEvalEvent) {
         let token = match &event {
             PageEvalEvent::Arrived { token, .. } | PageEvalEvent::Expired(token) => *token,
@@ -1114,8 +1370,7 @@ impl App {
         };
         match outcome {
             PageEvalOutcome::Delivered { raw, .. } => {
-                let expected = page_url.as_deref().and_then(page_host).unwrap_or_default();
-                match parse_answer_read(&raw, &expected) {
+                match column_answer_read(column.provider, page_url.as_deref(), &raw) {
                     Ok(read) => {
                         if let Some(outcome) = column.observe(read) {
                             debug_log(format_args!(
@@ -1151,47 +1406,42 @@ impl App {
         }
     }
 
-    /// Todas as colunas acabaram: as tentativas no turno, os itens com as
-    /// ligacoes, a leitura guardada (no maximo 8), a sessao gravada pelo
-    /// guard, e a comparacao para a thread.
+    /// Todas as colunas acabaram: grava o run (`record_consensus`) e manda
+    /// a comparacao para a thread.
     fn finish_consensus_run(&mut self) {
         let Some(run) = self.consensus.run.take() else {
             return;
         };
+        self.record_consensus(&run, true);
+    }
+
+    /// Grava um run na sessao viva (`record_consensus_run`: as tentativas no
+    /// turno, os itens com as ligacoes, a leitura guardada, no maximo 8) e
+    /// grava a sessao pelo guard; com `report`, a comparacao vai para a
+    /// thread. Se a sessao viva ja nao e a do run, nada se grava.
+    fn record_consensus(&mut self, run: &ConsensusRun, report: bool) {
         let Some(session) = self.current_research.as_mut() else {
+            debug_log(format_args!("consensus: run {} sem sessão: caiu", run.id));
             return;
         };
-        let turn = run.turn;
-        let mut answers = Vec::with_capacity(run.columns.len());
-        let mut item_ids = Vec::new();
-        for column in &run.columns {
-            let outcome = column
-                .outcome
-                .clone()
-                .unwrap_or_else(|| ColumnOutcome::Failed(CONSENSUS_FAILED.to_string()));
-            let provider = column.provider.display_name();
-            let item_id = outcome
-                .read()
-                .filter(|read| !read.text.is_empty())
-                .map(|read| {
-                    session.add_turn_answer(turn, provider, read.text.clone(), read.links.clone())
-                });
-            if let Some(id) = &item_id {
-                item_ids.push(id.clone());
-            }
-            session.record_attempt(turn, provider, outcome.status(), item_id);
-            answers.push(snapshot_answer(provider, &outcome));
-        }
-        session.push_consensus(turn, answers.clone());
+        let Some(recorded) = record_consensus_run(session, run) else {
+            debug_log(format_args!(
+                "consensus: run {} de outra sessão ou turno: caiu",
+                run.id
+            ));
+            return;
+        };
         let snapshot = session.clone();
         self.privacy.save_session(snapshot.clone());
-        self.submit_consensus_job(ConsensusJob::Compare {
-            run: run.id,
-            session: Box::new(snapshot),
-            item_ids,
-            turn,
-            answers,
-        });
+        if report {
+            self.submit_consensus_job(ConsensusJob::Compare {
+                run: run.id,
+                session: Box::new(snapshot),
+                item_ids: recorded.item_ids,
+                turn: run.turn,
+                answers: recorded.answers,
+            });
+        }
     }
 
     /// A thread `neural-consensus`, criada na primeira vez que e precisa.
