@@ -54,8 +54,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_READMODE_BYTE,
-    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    PIPE_TYPE_BYTE, PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -309,8 +309,9 @@ fn user_only_directory_sddl(sid: &str) -> String {
 
 fn set_private_security(path: &Path, descriptor: &SecurityDescriptor) -> Result<(), String> {
     let wide = wide_path(path);
-    let info =
-        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    let info = OWNER_SECURITY_INFORMATION
+        | DACL_SECURITY_INFORMATION
+        | PROTECTED_DACL_SECURITY_INFORMATION;
     // SAFETY: caminho terminado em zero; descriptor permanece vivo durante a chamada.
     if unsafe { SetFileSecurityW(wide.as_ptr(), info, descriptor.0) } == 0 {
         return Err(last_error("SetFileSecurityW"));
@@ -326,7 +327,11 @@ fn protect_agents_directory(dir: &Path, sid: &str) -> Result<(), String> {
     let file_descriptor = user_only_descriptor(sid)?;
     for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
-        if entry.file_type().map_err(|error| error.to_string())?.is_file() {
+        if entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_file()
+        {
             set_private_security(&entry.path(), &file_descriptor)?;
         }
     }
