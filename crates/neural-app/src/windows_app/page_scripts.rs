@@ -1487,46 +1487,10 @@ pub(in crate::windows_app) const NEURALIA_KEYMAP_SCRIPT: &str = r#"
     }
   }, true);
 
-  // Ctrl + roda do rato, e a pinca do touchpad (o Chromium entrega-a como
-  // ctrl+wheel), sobem e descem os mesmos degraus do Ctrl+= e do Ctrl+-, com
-  // o mesmo aviso. O zoom do proprio WebView2 esta desligado (o wry deixa
-  // IsZoomControlEnabled e IsPinchZoomEnabled a false): um mecanismo so, sem
-  // zoom a dobrar.
-  const defer = setTimeout;
-  // Pixels de roda por degrau: um entalhe de rato (100) sobe um degrau; a
-  // pinca, que chega em pedacos pequenos, soma ate la.
-  const WHEEL_ZOOM_STEP = 30;
-  // Uma pausa maior do que isto comeca um gesto novo.
-  const WHEEL_ZOOM_IDLE_MS = 400;
-  let wheelZoomSum = 0;
-  let wheelZoomAt = -Infinity;
-  function wheelZoomAction(e) {
-    const unit = e.deltaMode === 1 ? 33 : (e.deltaMode === 2 ? 800 : 1);
-    const dy = Number(e.deltaY) * unit;
-    if (!isFinite(dy) || dy === 0) { return null; }
-    const at = Number(e.timeStamp) || 0;
-    if (at - wheelZoomAt > WHEEL_ZOOM_IDLE_MS || (wheelZoomSum < 0) !== (dy < 0)) {
-      wheelZoomSum = 0;
-    }
-    wheelZoomAt = at;
-    wheelZoomSum += dy;
-    if (Math.abs(wheelZoomSum) < WHEEL_ZOOM_STEP) { return null; }
-    const action = wheelZoomSum < 0 ? 'zoomin' : 'zoomout';
-    wheelZoomSum = 0;
-    return action;
-  }
-  window.addEventListener('wheel', function (e) {
-    if (!e.isTrusted || !e.ctrlKey) { return; }
-    const wheel = e;
-    // Decide-se depois de o evento passar por todos: uma pagina que trata o
-    // gesto ela propria (um mapa, um editor) chama preventDefault, e ai o
-    // zoom e dela -- como no Chrome.
-    defer(function () {
-      if (wheel.defaultPrevented) { return; }
-      const action = wheelZoomAction(wheel);
-      if (action) { act(action); }
-    }, 0);
-  }, { passive: true });
+  // A pinça do touchpad e Ctrl+roda ficam com o WebView2 nativo.
+  // `themed_webview_builder().with_hotkeys_zoom(true)` aplica o mesmo gesto
+  // inclusive a paginas/frames que nao recebem este keymap. Nao repetimos o
+  // gesto aqui: dois mecanismos fariam cada pinça saltar dois níveis de zoom.
 })();
 "#;
 
