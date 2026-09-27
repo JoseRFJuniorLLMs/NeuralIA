@@ -1095,10 +1095,7 @@ mod tests {
                 "research-answer",
                 json!({"col":0,"text":"texto suficiente"}),
             ),
-            message(
-                "pdf-page-text",
-                json!({"page":1,"text":"texto da pagina"}),
-            ),
+            message("pdf-page-text", json!({"page":1,"text":"texto da pagina"})),
             message(
                 "agent-observation",
                 json!({"data":"1\nhttps://example.com"}),
