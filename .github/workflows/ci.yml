@@ -1064,6 +1064,30 @@ jobs:
           '@
             },
             @{
+              Label = "agents-marks-failure-must-not-advance-generation"
+              Test = "marks_writer_retries_a_generation_after_a_failed_write"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                  write(&snapshot.marks)?;
+                  self.persisted_generation = snapshot.generation;
+          '@
+              New = @'
+                  self.persisted_generation = snapshot.generation;
+                  write(&snapshot.marks)?;
+          '@
+            },
+            @{
+              Label = "agents-marks-old-snapshot-must-not-overwrite-new"
+              Test = "marks_writer_never_lets_an_older_snapshot_overwrite_a_newer_one"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                  if snapshot.generation <= self.persisted_generation {
+          '@
+              New = @'
+                  if false {
+          '@
+            },
+            @{
               Label = "agents-clear-partial-failure-hides-survivors"
               Test = "a_partial_clear_failure_keeps_disk_survivors_visible_in_memory"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
