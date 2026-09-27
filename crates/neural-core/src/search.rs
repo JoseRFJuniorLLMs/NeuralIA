@@ -91,6 +91,35 @@ fn first_query_value(url: &Url, name: &str) -> Option<String> {
         .map(|(_, value)| value.into_owned())
 }
 
+/// De onde vem a confiança num seletor de leitura de respostas
+/// (consensus-reader-turns, plano 2.5).
+///
+/// Sem uma sessão com login não há captura do DOM real de nenhum provedor:
+/// `Grounded` diz que o seletor coincide com o que o script das colunas que
+/// embarca (`COMPARATOR_INJECT_SCRIPT`, o leitor `research-answer`) usa em
+/// produção desde a 2.0 E tem fixture; `Assumed` diz que só há a fixture
+/// sintética e o seletor foi ASSUMIDO a partir da estrutura conhecida do
+/// site -- a verificar com o F12 numa sessão com login e a fixar por
+/// fixture (SPEC-0101 §10). Um provedor sem seletor lê-se como «não lida».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectorGrounding {
+    Grounded,
+    Assumed,
+}
+
+/// Como se lê a resposta de um provedor na página dele
+/// (`ANSWER_READ_SCRIPT`, pelo `page_eval`): `answer` casa com TODAS as
+/// mensagens do assistente e o leitor fica com a ÚLTIMA; `busy` casa com o
+/// controlo que só existe enquanto o provedor ainda escreve (um botão de
+/// parar), ou `None` se não se conhece um -- aí a leitura assenta só na
+/// estabilidade do texto entre duas sondas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnswerReadSelector {
+    pub answer: &'static str,
+    pub busy: Option<&'static str>,
+    pub grounding: SelectorGrounding,
+}
+
 /// Metadados estáticos de um provedor de IA.
 #[derive(Debug, Clone, Copy)]
 pub struct ProviderInfo {
@@ -104,7 +133,8 @@ pub struct ProviderInfo {
     pub hosts: &'static [HostRule],
     /// A fonte única dos nomes próprios: `all_self_names` junta-os daqui.
     pub self_names: &'static [&'static str],
-    pub answer_selector: Option<&'static str>,
+    /// O seletor de leitura de respostas; `None` = «não lida» no Consenso.
+    pub answer_read: Option<AnswerReadSelector>,
 }
 
 /// O registro. Só os 3 slots padrão são selecionáveis até ao item
@@ -131,7 +161,14 @@ static PROVIDERS: &[ProviderInfo] = &[
             HostRule::udm50("www.google.com"),
         ],
         self_names: &["Google IA", "AI Mode", "Modo IA"],
-        answer_selector: Some(r#"main, [data-message-author-role="assistant"], [role="article"]"#),
+        // ASSUMIDO (SPEC-0101 §10): o Modo IA não marca as mensagens; lê-se
+        // o último bloco de resposta que se conhece. Sem controlo de «a
+        // escrever» conhecido: a leitura assenta na estabilidade do texto.
+        answer_read: Some(AnswerReadSelector {
+            answer: r#"main, [data-message-author-role="assistant"], [role="article"]"#,
+            busy: None,
+            grounding: SelectorGrounding::Assumed,
+        }),
     },
     ProviderInfo {
         id: ProviderId::ChatGpt,
@@ -146,7 +183,14 @@ static PROVIDERS: &[ProviderInfo] = &[
         self_names: &[
             "ChatGPT", "OpenAI", "GPT-4", "GPT-3", "GPT-5", "GPT-o1", "GPT-4o", "GPT-n", "GPT",
         ],
-        answer_selector: Some(r#"[data-message-author-role="assistant"]"#),
+        // Fundado: o mesmo `[data-message-author-role="assistant"]` que o
+        // leitor `research-answer` do script das colunas usa em produção,
+        // com a fixture `ANSWER_FIXTURES`. O botão de parar é ASSUMIDO.
+        answer_read: Some(AnswerReadSelector {
+            answer: r#"[data-message-author-role="assistant"]"#,
+            busy: Some(r#"button[data-testid="stop-button"]"#),
+            grounding: SelectorGrounding::Grounded,
+        }),
     },
     ProviderInfo {
         id: ProviderId::Claude,
@@ -156,7 +200,13 @@ static PROVIDERS: &[ProviderInfo] = &[
         default_slot: Some(2),
         hosts: &[HostRule::with_subdomains("claude.ai")],
         self_names: &["Claude", "Anthropic"],
-        answer_selector: Some(r#"[data-message-author-role="assistant"]"#),
+        // ASSUMIDO (SPEC-0101 §10): o claude.ai marca as mensagens como o
+        // ChatGPT na fixture sintética; a verificar com o F12 e a fixar.
+        answer_read: Some(AnswerReadSelector {
+            answer: r#"[data-message-author-role="assistant"]"#,
+            busy: Some(r#"button[aria-label="Stop response"]"#),
+            grounding: SelectorGrounding::Assumed,
+        }),
     },
     ProviderInfo {
         id: ProviderId::Perplexity,
@@ -169,7 +219,7 @@ static PROVIDERS: &[ProviderInfo] = &[
             HostRule::exact("www.perplexity.ai"),
         ],
         self_names: &["Perplexity"],
-        answer_selector: None,
+        answer_read: None,
     },
     ProviderInfo {
         id: ProviderId::Gemini,
@@ -179,7 +229,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         default_slot: None,
         hosts: &[HostRule::exact("gemini.google.com")],
         self_names: &["Gemini", "Bard"],
-        answer_selector: None,
+        answer_read: None,
     },
     ProviderInfo {
         id: ProviderId::DeepSeek,
@@ -189,7 +239,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         default_slot: None,
         hosts: &[HostRule::exact("chat.deepseek.com")],
         self_names: &["DeepSeek"],
-        answer_selector: None,
+        answer_read: None,
     },
     ProviderInfo {
         id: ProviderId::Copilot,
@@ -199,7 +249,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         default_slot: None,
         hosts: &[HostRule::exact("copilot.microsoft.com")],
         self_names: &["Copilot", "Microsoft Copilot", "Microsoft"],
-        answer_selector: None,
+        answer_read: None,
     },
     ProviderInfo {
         id: ProviderId::Grok,
@@ -209,7 +259,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         default_slot: None,
         hosts: &[HostRule::exact("grok.com")],
         self_names: &["Grok", "xAI"],
-        answer_selector: None,
+        answer_read: None,
     },
     ProviderInfo {
         id: ProviderId::Mistral,
@@ -219,7 +269,7 @@ static PROVIDERS: &[ProviderInfo] = &[
         default_slot: None,
         hosts: &[HostRule::exact("chat.mistral.ai")],
         self_names: &["Mistral", "Le Chat"],
-        answer_selector: None,
+        answer_read: None,
     },
 ];
 
@@ -303,12 +353,19 @@ impl ProviderId {
         self.info().self_names
     }
 
+    /// O CSS que casa com as mensagens do assistente (a última é a resposta).
     pub fn answer_selector(self) -> Option<&'static str> {
-        self.info().answer_selector
+        self.answer_read().map(|read| read.answer)
     }
 
+    /// O seletor de leitura de respostas inteiro, com a sua fundamentação.
+    pub fn answer_read(self) -> Option<AnswerReadSelector> {
+        self.info().answer_read
+    }
+
+    /// Sem seletor: o Consenso mostra «não lida» para este provedor.
     pub fn is_unreadable(self) -> bool {
-        self.answer_selector().is_none()
+        self.answer_read().is_none()
     }
 
     pub fn from_key(key: &str) -> Option<ProviderId> {
@@ -772,22 +829,29 @@ mod tests {
     }
 
     /// Fixtures mínimas com a forma de uma conversa: a pergunta de quem
-    /// escreve (PERGUNTA) e a resposta (RESPOSTA). São sintéticas (sem uma
-    /// sessão com login não há captura do DOM real), por isso provam que o
-    /// seletor é CSS válido e escolhe a resposta e nunca a pergunta, não que
-    /// o site ao vivo não mudou de estrutura.
+    /// escreve (PERGUNTA), uma resposta anterior (ANTIGA) e a resposta de
+    /// agora (RESPOSTA). São sintéticas (sem uma sessão com login não há
+    /// captura do DOM real), por isso provam que o seletor é CSS válido e
+    /// que a ÚLTIMA ocorrência é a resposta de agora e nunca a pergunta nem
+    /// a anterior, não que o site ao vivo não mudou de estrutura
+    /// (`SelectorGrounding`).
     const ANSWER_FIXTURES: &[(ProviderId, &str)] = &[
         (
             ProviderId::GoogleAi,
             r#"<html><body>
                 <form role="search"><textarea name="q">PERGUNTA sobre Raft</textarea></form>
                 <div id="rhs"><a href="/">Fontes</a></div>
-                <main><div><p>RESPOSTA do Modo IA sobre Raft</p></div></main>
+                <main>
+                    <div role="article"><p>ANTIGA resposta do Modo IA</p></div>
+                    <div role="article"><p>RESPOSTA do Modo IA sobre Raft</p></div>
+                </main>
             </body></html>"#,
         ),
         (
             ProviderId::ChatGpt,
             r#"<html><body><main>
+                <div data-message-author-role="user"><p>PERGUNTA anterior</p></div>
+                <div data-message-author-role="assistant"><p>ANTIGA resposta do ChatGPT</p></div>
                 <div data-message-author-role="user"><p>PERGUNTA sobre Raft</p></div>
                 <div data-message-author-role="assistant"><div class="markdown"><p>RESPOSTA do ChatGPT</p></div></div>
                 <form><textarea>PERGUNTA seguinte</textarea></form>
@@ -796,6 +860,8 @@ mod tests {
         (
             ProviderId::Claude,
             r#"<html><body><main>
+                <div data-message-author-role="user"><p>PERGUNTA anterior</p></div>
+                <div data-message-author-role="assistant"><p>ANTIGA resposta do Claude</p></div>
                 <div data-message-author-role="user"><p>PERGUNTA sobre Raft</p></div>
                 <div data-message-author-role="assistant"><p>RESPOSTA do Claude</p></div>
                 <fieldset><div contenteditable="true">PERGUNTA seguinte</div></fieldset>
@@ -807,8 +873,10 @@ mod tests {
     fn every_provider_has_answer_fixture_or_is_marked_unreadable() {
         for &pid in ProviderId::all() {
             let fixture = ANSWER_FIXTURES.iter().find(|(id, _)| *id == pid);
-            match (pid.answer_selector(), fixture) {
-                (Some(raw), Some((_, html))) => {
+            match (pid.answer_read(), fixture) {
+                (Some(read), Some((_, html))) => {
+                    let raw = read.answer;
+                    assert_eq!(pid.answer_selector(), Some(raw));
                     let selector = scraper::Selector::parse(raw)
                         .unwrap_or_else(|error| panic!("{pid:?}: seletor inválido: {error:?}"));
                     let document = scraper::Html::parse_document(html);
@@ -824,6 +892,26 @@ mod tests {
                         !text.contains("PERGUNTA"),
                         "{pid:?}: o seletor {raw:?} também lê a pergunta"
                     );
+                    // A ÚLTIMA ocorrência é a resposta de agora (o leitor
+                    // fica com ela): nunca a anterior.
+                    let last: String = document
+                        .select(&selector)
+                        .last()
+                        .map(|element| element.text().collect())
+                        .unwrap_or_default();
+                    assert!(
+                        last.contains("RESPOSTA") && !last.contains("ANTIGA"),
+                        "{pid:?}: a última ocorrência de {raw:?} não é a resposta de agora: {last:?}"
+                    );
+                    // O botão de parar, quando há um, é CSS válido e nunca
+                    // casa com a fixture parada (senão a leitura nunca
+                    // assentava).
+                    if let Some(busy) = read.busy {
+                        let busy = scraper::Selector::parse(busy).unwrap_or_else(|error| {
+                            panic!("{pid:?}: seletor de ocupado inválido: {error:?}")
+                        });
+                        assert_eq!(document.select(&busy).count(), 0, "{pid:?}");
+                    }
                     assert!(!pid.is_unreadable());
                 }
                 (None, None) => assert!(pid.is_unreadable()),
@@ -831,6 +919,21 @@ mod tests {
                 (None, Some(_)) => panic!("{pid:?} tem fixture mas está marcado como não lido"),
             }
         }
+        // A fundamentação de cada seletor (SPEC-0101 §10): só o ChatGPT tem
+        // o seletor do script que embarca E a fixture; os outros são
+        // ASSUMIDOS até serem verificados com o F12 e fixados por fixture.
+        let grounding: Vec<(ProviderId, SelectorGrounding)> = ProviderId::all()
+            .iter()
+            .filter_map(|&pid| pid.answer_read().map(|read| (pid, read.grounding)))
+            .collect();
+        assert_eq!(
+            grounding,
+            [
+                (ProviderId::GoogleAi, SelectorGrounding::Assumed),
+                (ProviderId::ChatGpt, SelectorGrounding::Grounded),
+                (ProviderId::Claude, SelectorGrounding::Assumed),
+            ]
+        );
         let readable: Vec<ProviderId> = ProviderId::all()
             .iter()
             .copied()

@@ -121,6 +121,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// Traduzir pagina (`translation.rs`): o 文A ou o menu, as leituras do
     /// `page_eval`, a thread `neural-translate` e o cartao.
     Translate(TranslateEvent),
+    /// O leitor de respostas do Consenso (`consensus.rs`): a sonda de
+    /// 1,5 s, as leituras do `page_eval` e a thread `neural-consensus`.
+    Consensus(ConsensusEvent),
     /// A interface dos downloads (`downloads_ui.rs`): o Ctrl+J, a seta da
     /// barra e os cliques no cartao «Baixar programa?» ou da saida.
     DownloadsUi(DownloadsUiEvent),
@@ -3252,6 +3255,10 @@ pub(in crate::windows_app) struct App {
     /// Nasce sem thread, sem cofre e sem disco; a thread `neural-translate`
     /// so no primeiro clique.
     pub(in crate::windows_app) translation: TranslationState,
+    /// O leitor de respostas do Consenso (`consensus.rs`): as leituras das
+    /// colunas do turno e o run em curso. Nasce sem thread: a
+    /// `neural-consensus` so no primeiro relatorio.
+    pub(in crate::windows_app) consensus: ConsensusState,
     /// A interface dos downloads (`downloads_ui.rs`): as linhas do painel,
     /// a velocidade de cada um, o cartao e a seta da barra.
     pub(in crate::windows_app) downloads_ui: DownloadsUiState,
@@ -3399,6 +3406,8 @@ impl App {
             egress: None,
             downloads,
             translation,
+            // Sem thread: a `neural-consensus` so no primeiro relatorio.
+            consensus: ConsensusState::new(),
             downloads_ui,
             bookmarks: BookmarksState::default(),
         }
@@ -7149,6 +7158,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("commands.rs", include_str!("windows_app/commands.rs")),
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("translation.rs", include_str!("windows_app/translation.rs")),
+    ("consensus.rs", include_str!("windows_app/consensus.rs")),
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
     ("distraction.rs", include_str!("windows_app/distraction.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
@@ -7244,6 +7254,8 @@ pub(in crate::windows_app) mod keymap;
 pub(in crate::windows_app) use keymap::*;
 pub(in crate::windows_app) mod translation;
 pub(in crate::windows_app) use translation::*;
+pub(in crate::windows_app) mod consensus;
+pub(in crate::windows_app) use consensus::*;
 pub(in crate::windows_app) mod adblock;
 pub(in crate::windows_app) use adblock::*;
 pub(in crate::windows_app) mod distraction;

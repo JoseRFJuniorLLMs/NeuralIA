@@ -518,6 +518,22 @@ impl App {
             PaletteRoute::LoadProvider { query } => {
                 match self.provider_query_url(source_index, &query) {
                     Ok(url) => {
+                        let has_view = self
+                            .comparator
+                            .as_ref()
+                            .is_some_and(|comp| comp.views.get(source_index).is_some());
+                        if has_view {
+                            // O turno desta coluna, antes de ela navegar
+                            // (consensus-reader-turns).
+                            let providers: Vec<_> =
+                                column_provider(source_index).into_iter().collect();
+                            self.consensus_begin_turn(
+                                neural_core::TurnOrigin::LoadProvider,
+                                Some(source_index),
+                                &query,
+                                &providers,
+                            );
+                        }
                         if let Some(view) = self
                             .comparator
                             .as_ref()

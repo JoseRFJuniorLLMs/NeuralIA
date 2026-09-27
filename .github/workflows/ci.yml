@@ -859,6 +859,64 @@ jobs:
                   &self.registry
               }
           '@
+            },
+            @{
+              Label = "answer-read-skips-the-host-check"
+              Test = "answer_read_refuses_a_host_mismatch"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if expected.is_empty() || host != expected {
+                  return Err(AnswerReadError::HostMismatch {
+          '@
+              New = @'
+              if false {
+                  return Err(AnswerReadError::HostMismatch {
+          '@
+            },
+            @{
+              Label = "answer-read-cap-after-serde"
+              Test = "answer_read_parse_caps_raw_and_requires_exact_keys"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if raw.len() > ANSWER_READ_MAX_RAW_BYTES {
+                  return Err(AnswerReadError::OverCap { bytes: raw.len() });
+              }
+              let value: serde_json::Value =
+                  serde_json::from_str(raw).map_err(|_| AnswerReadError::NotJson)?;
+          '@
+              New = @'
+              let value: serde_json::Value =
+                  serde_json::from_str(raw).map_err(|_| AnswerReadError::NotJson)?;
+              if raw.len() > ANSWER_READ_MAX_RAW_BYTES {
+                  return Err(AnswerReadError::OverCap { bytes: raw.len() });
+              }
+          '@
+            },
+            @{
+              Label = "consensus-reads-the-split"
+              Test = "consensus_reads_only_the_columns_never_the_split"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              matches!(host, WebViewHost::Column(index) if index < COMPARATOR_COLUMNS)
+          '@
+              New = @'
+              matches!(host, WebViewHost::Column(index) | WebViewHost::Split(index) if index < COMPARATOR_COLUMNS)
+          '@
+            },
+            @{
+              Label = "consensus-compares-a-translated-column"
+              Test = "consensus_never_compares_a_translated_column"
+              SourcePath = "crates/neural-app/src/windows_app/consensus.rs"
+              Old = @'
+              if translated || column.pending.is_some() {
+                  return PollAction::Wait;
+              }
+          '@
+              New = @'
+              if column.pending.is_some() {
+                  return PollAction::Wait;
+              }
+          '@
             }
           )
 
