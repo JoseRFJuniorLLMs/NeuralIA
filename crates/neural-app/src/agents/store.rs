@@ -746,7 +746,9 @@ impl ConversationStore {
             let name = entry.file_name().to_string_lossy().into_owned();
             let conversation = name.ends_with(".jsonl") || name.ends_with(".jsonl.tmp");
             let state = name == STATE_FILE || name == format!("{STATE_FILE}.tmp");
-            if (conversation || state) && let Err(error) = fs::remove_file(entry.path()) {
+            if (conversation || state)
+                && let Err(error) = fs::remove_file(entry.path())
+            {
                 first_error.get_or_insert(error);
             }
         }
