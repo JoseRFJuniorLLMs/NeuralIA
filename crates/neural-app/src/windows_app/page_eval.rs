@@ -127,12 +127,23 @@ pub(in crate::windows_app) static TRANSLATE_RESTORE_READ: ReadOnlyScript = ReadO
     arg: ScriptArg::Json,
 };
 
+/// O Consenso (`consensus.rs`): a ultima mensagem do assistente de uma
+/// coluna, em Markdown com marcadores de citacao. Recebe a configuracao
+/// (seletor, marcadores, tectos) como argumento. §7: o sim do dono para a
+/// 2.5 (consensus-reader-turns).
+pub(in crate::windows_app) static ANSWER_READ: ReadOnlyScript = ReadOnlyScript {
+    name: "answer-read",
+    source: ANSWER_READ_SCRIPT,
+    arg: ScriptArg::Json,
+};
+
 /// Os unicos scripts que `PageReads::read` corre.
 pub(in crate::windows_app) static READ_ONLY_SCRIPTS: &[&ReadOnlyScript] = &[
     &NOTE_CAPTURE_READ,
     &TRANSLATE_COLLECT_READ,
     &TRANSLATE_APPLY_READ,
     &TRANSLATE_RESTORE_READ,
+    &ANSWER_READ,
 ];
 
 fn registered(script: &ReadOnlyScript) -> bool {

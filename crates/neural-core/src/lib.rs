@@ -8,6 +8,7 @@ pub mod agent_security;
 pub mod ai_policy;
 pub mod bookmarks;
 pub mod config;
+pub mod context_budget;
 pub mod distraction;
 pub mod domains;
 pub mod downloads;
@@ -55,9 +56,10 @@ pub use library::{BookEntry, Bookmark, Library, LibraryError, Position};
 pub use reader::{ReaderArticle, ReaderBlock, ReaderClient};
 pub use render::reader_html;
 pub use search::{
-    ProviderId, ProviderInfo, all_self_names, chatgpt_search_url, claude_search_url,
-    copilot_search_url, deepseek_search_url, gemini_search_url, google_ai_url, grok_search_url,
-    is_ai_provider_host, is_login_host, login_hosts, mistral_search_url, perplexity_search_url,
+    AnswerReadSelector, ProviderId, ProviderInfo, SelectorGrounding, all_self_names,
+    chatgpt_search_url, claude_search_url, copilot_search_url, deepseek_search_url,
+    gemini_search_url, google_ai_url, grok_search_url, is_ai_provider_host, is_login_host,
+    login_hosts, mistral_search_url, perplexity_search_url,
 };
 pub use security::{
     Locality, is_forbidden_ip, is_local_network_target, validate_redirect_target, validate_web_url,
@@ -68,9 +70,10 @@ pub use agent_security::{
     PolicyDecision, redact_sensitive_text,
 };
 pub use local_intelligence::{
-    ActiveModelPack, EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalBenchmark,
-    LocalIntelligence, ModelPackActivation, ModelPackManager, ModelPackManifest,
-    ModelPackSelection, benchmark_local_intelligence, cosine_similarity, hashed_embedding,
+    ActiveModelPack, EMBEDDING_DIM, Embedder, HashingEmbedder, HashingLocalIntelligence,
+    IntentClass, LocalBenchmark, LocalIntelligence, ModelPackActivation, ModelPackManager,
+    ModelPackManifest, ModelPackSelection, benchmark_local_intelligence, cosine_similarity,
+    hashed_embedding,
 };
 pub use memory::{
     CaptureOutcome, ForgetReport, ForgetScope, MemoryDoctorReport, MemoryDocument, MemoryHit,
@@ -78,7 +81,9 @@ pub use memory::{
 };
 pub use pomodoro::{Phase, Pomodoro, PomodoroEvent, PomodoroSettings, PomodoroSettingsError};
 pub use research::{
-    ComparisonFact, ResearchItem, ResearchItemKind, ResearchSession, SynthesisSnapshot,
+    AttemptStatus, ComparisonFact, ConsensusSnapshot, MAX_CONSENSUS_SNAPSHOTS, ProviderAttempt,
+    ResearchItem, ResearchItemKind, ResearchSession, ResearchTurn, SnapshotAnswer,
+    SynthesisSnapshot, TurnOrigin, operation_key,
 };
 
 pub use agent_protocol::{AgentAction, AgentElement, AgentRuntimeConfig, ObservedPage};

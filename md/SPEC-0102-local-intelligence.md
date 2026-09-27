@@ -149,6 +149,93 @@ intelligence is shipped; optional pack lifecycle is library infrastructure only.
 The acceptance criteria below that mention enabling/uninstalling a pack remain
 open product criteria, not claims about the current browser.
 
+## 8.2. Context budget (library-only)
+
+`neural_core::context_budget` decides what enters a prompt before any call is
+made, without I/O or network. `build_context(question, sources, spec, embedder)`
+takes `ContextSource`s (id `[A-Za-z0-9_-]{1,16}`, label, kind
+`Answer|Page|Reader|Pdf|Epub|Transcript|Note|Memory|Selection|ChatTurn|Tab`,
+locator `Block|PdfPage|Epub{spine,block}|Time(secs)`, url, text, priority,
+private flag) and a `BudgetSpec` (`max_input`, `reserve_output`, per-source
+floor, ~160-token chunks, `Destination::Local` or `Destination::Remote { host }`)
+and returns a `ContextPack` whose fields are private: it is read through
+`rendered()`, `est_tokens()`, `sources()` (byte spans of every header and
+passage in the pack, and of every passage inside its source's sanitized text),
+`duplicates()` (kept/dropped provenance and similarity) and
+`dropped()`, and cannot be built or mutated from outside (`compile_fail`
+doctests). The whole prompt fits `BudgetSpec::available()`: the fence
+instructions (`ContextPack::fence_instructions()`: `CONTEXT_DATA_PREAMBLE_PT`
+and the nonce notice, one message) plus the user message
+(`ContextPack::user_message()`: the question, a blank line and the pack), with
+the nonce counted at its heaviest; task instructions, if any, belong to
+`reserve_output`. The pipeline: sanitize through `untrusted` (a remote
+destination goes through the existing `agent_security::redact_sensitive_text`
+and `redact_url`: the source URL, every URL inside the text that carries a
+credential — a credential parameter such as `sig=` or `code=`, a fragment with
+one, or `user:pass@` — and the source label, which goes out in the header; a
+URL without a credential stays byte for byte; a private source never goes to a
+remote destination — «Modo privado: este conteúdo não pode sair do
+computador.»), chunk on sentence boundaries (`Dr. Silva` and `3.5 GHz` stay
+whole; the CJK terminals `。！？` close a sentence without a following space),
+finding each cut by exponential search and bisection (O(n log n) bytes
+measured), dedupe in score order so the kept copy is the highest-scoring one
+(exact SHA-256, then SimHash filtered and Jaccard ≥ 0.8 confirmed, both from
+`untrusted::Shingles`; across different sources, near copies that disagree on
+numbers or negations are both kept), score 0.5 BM25-lite + 0.4 `Embedder`
+cosine + 0.1 priority, per-source floors (round-robin, with what the other
+sources still need reserved: a whole chunk only goes in when it leaves that
+room, otherwise a cut of it — its best sentences, or its beginning; when all
+floors and headers fit, each source gets at least min(floor, its text),
+otherwise the largest common floor that fits), greedy allocation with
+extractive compression, and the `untrusted` nonce fence, where a passage line
+that starts with an opening square bracket or a look-alike (`[2] resposta:`,
+`［3］`) gets a leading `\` so page text cannot pose as another source's
+header. `estimate_tokens` is the larger of a per-character-class table × 1.10
+and the pre-token count of the published o200k and Llama 3 split regexes
+(simulated by hand; +4 per message). Each regex's pre-token count is a hard
+lower bound of that tokenizer's tokens, which covers what the table alone
+under-counted (alternating letters and digits, hex ids, case switches, short
+lines); the estimate is at or above the fixture, but it is not a guarantee
+against the real tokenizers: BPE can split more inside a pre-token (long base64
+or random ids), which is what `TokenCalibration` corrects. `TokenCalibration` is
+an EWMA of real/estimated clamped to [0.6, 2.0]; `fit_conversation` drops the
+oldest turns and never starts on an orphan answer; `split_for_map_reduce` cuts a
+long text into pieces that fit one call at a time, each with the fence
+instructions and its own fence (`MAP_FENCE_LABEL`). The `Embedder` trait and the
+deterministic `HashingEmbedder` live in `local_intelligence.rs`. Summary line:
+«≈ 3 200 tokens · 4 fontes · 2 trechos repetidos removidos».
+
+Gates in `crates/neural-core/src/context_budget/tests.rs` (Windows and Linux):
+`budget_is_never_exceeded_over_200_seeded_cases` (the whole prompt, and no
+secret in a remote pack's labels, URLs or text),
+`estimator_is_conservative_against_the_token_fixture`,
+`pretokens_follow_the_published_split_regexes`,
+`near_duplicates_are_removed_once_with_provenance`,
+`near_duplicates_that_disagree_are_both_kept`,
+`the_relevant_passage_survives_the_cut`, `every_source_keeps_its_floor`,
+`floors_hold_when_a_whole_best_chunk_would_eat_another_floor`,
+`remote_destination_redacts_secrets_and_refuses_private_sources`,
+`a_passage_cannot_forge_a_source_header`,
+`the_pack_is_deterministic_for_the_same_inputs`,
+`the_fence_is_the_untrusted_one_and_spans_point_at_the_passages`,
+`compressed_spans_stay_inside_a_source_the_fence_rewrote`,
+`cjk_text_is_chunked_at_sentence_ends_and_compressible`,
+`chunking_matches_the_unit_by_unit_greedy`,
+`chunking_work_is_n_log_n_on_megabyte_texts`,
+`split_for_map_reduce_pieces_fit_and_cover_the_text`, and the `compile_fail`
+doctests on `ContextPack`. The first rows of the token fixture
+(`context_budget/token_fixture.tsv`) were derived by hand from the o200k and
+Llama 3 pre-tokenization rules and rounded up, not measured with a tokenizer;
+the review rows carry the pre-token counts of the published regexes (a hard
+lower bound); the gate only requires the estimator to be at or above both
+columns.
+
+`neural_core::context_budget` is **not wired into the product yet**: no file
+under `crates/neural-app/src` calls `build_context` (gate
+`context_budget_is_core_library_only_until_consensus_wires_it` in
+`crates/neural-app/tests/spec_product_wiring.rs`). The 2.5 consensus work is
+its first caller; whoever wires it updates this section and that gate.
+
 ## 9. Acceptance criteria
 
 1. NeuralIA launches normally with no model installed;

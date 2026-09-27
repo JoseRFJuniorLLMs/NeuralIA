@@ -1173,6 +1173,8 @@ mod tests {
             updated_at: alpha.last_seen_at,
             items: Vec::new(),
             syntheses: Vec::new(),
+            turns: Vec::new(),
+            consensus: Vec::new(),
         };
         upsert(&path, &alpha, Some(&session)).unwrap();
 
@@ -1187,6 +1189,8 @@ mod tests {
             updated_at: beta.last_seen_at,
             items: Vec::new(),
             syntheses: Vec::new(),
+            turns: Vec::new(),
+            consensus: Vec::new(),
         };
         upsert(&path, &beta, Some(&session2)).unwrap();
 
