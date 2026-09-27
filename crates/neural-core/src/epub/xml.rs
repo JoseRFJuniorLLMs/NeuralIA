@@ -177,7 +177,7 @@ fn resolve_reference(reference: &BytesRef<'_>) -> String {
             _ => char::REPLACEMENT_CHARACTER.to_string(),
         };
     }
-    match resolve_entity(&name) {
+    match resolve_entity(name) {
         Some(value) => value.to_string(),
         // Desconhecida: fica literal. Nunca se expande nada vindo do documento.
         None => format!("&{name};"),
