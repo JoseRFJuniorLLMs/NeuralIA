@@ -39,7 +39,7 @@ use crate::windows_app::{
     services::{
         Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
         raise_webview_host, register_service_panel_events, service_event_is_current,
-        service_panel_permission,
+        service_init_script, service_panel_permission,
     },
     show_popup_without_activation,
     side_panel::{
@@ -158,13 +158,14 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
-        // Sem IPC, sem scripts injetados, sem `record`/`capture`: nada do que
-        // corre num painel de servico chega ao historico ou a memoria do
-        // NeuralIA. O privado (Respiracao) tambem nao deixa nada no perfil
-        // do WebView2: e InPrivate.
-        // A trava de navegacao (NavGate::Service, a politica do servico) vem
-        // de `hooked_builder`, como em todas as WebViews.
-        let builder = themed_webview_builder()
+        // Sem IPC e sem `record`/`capture`: nada do que corre num painel de
+        // servico chega ao historico ou a memoria do NeuralIA. O YouTube recebe
+        // somente a timeline visual do NeuralIA, sem capability/postMessage;
+        // Meet, WhatsApp, Gmail e Respiracao continuam sem script de pagina.
+        // O privado (Respiracao) tambem nao deixa nada no perfil do WebView2:
+        // e InPrivate. A trava de navegacao (NavGate::Service, a politica do
+        // servico) vem de `hooked_builder`, como em todas as WebViews.
+        let mut builder = themed_webview_builder()
             .with_incognito(service.private())
             .with_url(service.url())
             .with_bounds(logical_rect(area))
@@ -172,6 +173,9 @@ impl App {
             // Caminho A do WebRTC: camera e microfone pelo aviso do
             // WebView2 -- salvo no painel privado, onde sao recusados.
             .with_permission_handler(move |kind| service_panel_permission(service, kind));
+        if let Some(script) = service_init_script(service) {
+            builder = builder.with_initialization_script(script);
+        }
         let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);
         let built = hooked.build_hooked_as_child(window);
         match built {
