@@ -66,9 +66,7 @@ impl AgentsHubState {
         let hub = open_agents_hub(grant, move |event| {
             let _ = proxy.send_event(UserEvent::AgentsHub(AgentsHubEvent::Hub(event)));
         });
-        if channel_allowed
-            && let Some(hub) = &hub
-        {
+        if channel_allowed && let Some(hub) = &hub {
             agents::pipe::start(hub.clone());
         }
         Self { hub }
