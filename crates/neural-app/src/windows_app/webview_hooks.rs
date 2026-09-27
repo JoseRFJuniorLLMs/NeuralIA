@@ -1077,7 +1077,9 @@ fn enable_native_pinch_zoom(webview: &WebView) -> Result<(), String> {
 /// script de página.
 pub(in crate::windows_app) fn service_visual_script(host: WebViewHost) -> Option<&'static str> {
     match host {
-        WebViewHost::Service(Service::YouTube) => Some(SPLIT_SCROLL_RAIL_SCRIPT),
+        WebViewHost::Service(Service::YouTube) | WebViewHost::Service(Service::Gmail) => {
+            Some(SPLIT_SCROLL_RAIL_SCRIPT)
+        }
         _ => None,
     }
 }
