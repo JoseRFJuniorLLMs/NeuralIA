@@ -1787,6 +1787,45 @@ pub(crate) mod tests {
         assert_eq!(reopened.total_unread(), 0);
     }
 
+    /// Gate crítico: apagar o histórico não pode ser desfeito por uma
+    /// pergunta que já estava pendente. O cartão continua vivo em memória e
+    /// o agente ainda recebe a resposta, mas nem a resposta nem o fecho da
+    /// pergunta podem recriar a conversa que o utilizador acabou de apagar.
+    #[test]
+    fn clearing_history_with_a_pending_question_never_recreates_the_conversation() {
+        let f = fixture("clear-pending");
+        let claude = f.hub.connect("claude").unwrap();
+        let question = ask(&f.hub, claude, 600).unwrap();
+        let agents_dir = f.dir.0.join("agents");
+        let conversation = agents_dir.join("claude.jsonl");
+        let state_file = agents_dir.join("state.json");
+        assert!(conversation.exists());
+
+        f.hub.clear_conversations().unwrap();
+        assert!(!conversation.exists());
+        assert!(!state_file.exists());
+        assert_eq!(f.hub.pending_questions().len(), 1);
+
+        f.hub
+            .answer_question(question, QuestionAnswer::Button(0))
+            .unwrap();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, question, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"answered","answer":"Sim","via":"button"})
+        );
+        assert!(f.hub.conversation("claude").is_empty());
+        assert!(
+            !conversation.exists(),
+            "responder a pergunta apagada ressuscitou claude.jsonl"
+        );
+        assert!(
+            !state_file.exists(),
+            "responder a pergunta apagada ressuscitou state.json"
+        );
+    }
+
     #[test]
     fn clearing_conversations_keeps_ids_growing_and_writes_nothing_else() {
         let f = fixture("clear");
