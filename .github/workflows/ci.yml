@@ -897,14 +897,14 @@ jobs:
               Test = "unauthenticated_pipe_requires_a_complete_first_line_before_deadline"
               SourcePath = "crates/neural-app/src/agents/pipe.rs"
               Old = @'
-                      if std::time::Instant::now() >= deadline {
-                          return false;
-                      }
+                  if std::time::Instant::now() >= deadline {
+                      return false;
+                  }
           '@
               New = @'
-                      if std::time::Instant::now() >= deadline {
-                          return true;
-                      }
+                  if std::time::Instant::now() >= deadline {
+                      return true;
+                  }
           '@
             },
             @{
@@ -923,13 +923,13 @@ jobs:
               Test = "a_failed_send_is_never_replayed"
               SourcePath = "crates/neural-app/src/agents/pipe.rs"
               Old = @'
-                  conn.send_request(request)
-                      .map_err(|error| LinkError::Broken(error.to_string()))?;
+              conn.send_request(request)
+                  .map_err(|error| LinkError::Broken(error.to_string()))?;
           '@
               New = @'
-                  let _ = conn.send_request(request);
-                  conn.send_request(request)
-                      .map_err(|error| LinkError::Broken(error.to_string()))?;
+              let _ = conn.send_request(request);
+              conn.send_request(request)
+                  .map_err(|error| LinkError::Broken(error.to_string()))?;
           '@
             },
             @{
