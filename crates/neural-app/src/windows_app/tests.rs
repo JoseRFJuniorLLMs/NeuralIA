@@ -7580,17 +7580,17 @@ fn all_sources_lists_every_module() {
 /// windows-latest) o `include_str!` traz CRLF, e um `split("\n}\n")` nao
 /// encontrava nada: o gate corria sobre o resto do ficheiro.
 fn shipped_source() -> String {
-    let mut out = include_str!("../windows_app.rs")
+    let root = include_str!("../windows_app.rs")
         .replace("\r\n", "\n")
         .replace("pub(in crate::windows_app) fn ", "fn ");
+    let mut out = without_test_modules(&root);
     for (name, content) in ALL_MODULES {
         if *name != "tests.rs" {
+            let source = content
+                .replace("\r\n", "\n")
+                .replace("pub(in crate::windows_app) fn ", "fn ");
             out.push('\n');
-            out.push_str(
-                &content
-                    .replace("\r\n", "\n")
-                    .replace("pub(in crate::windows_app) fn ", "fn "),
-            );
+            out.push_str(&without_test_modules(&source));
         }
     }
     out.push_str("\n#[cfg(test)]\nmod tests {\n");
