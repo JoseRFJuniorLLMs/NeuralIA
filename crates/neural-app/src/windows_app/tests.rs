@@ -6896,7 +6896,7 @@ fn private_palette_paths_never_touch_history_or_context_tabs() {
 /// Gate (critico: apaga dados do utilizador): o percurso do "Apagar
 /// historico" que embarca (`clear_history_targets`, o mesmo que o `App`
 /// corre depois do Sim) chega a CADA alvo registado, pela ordem da tabela,
-/// uma vez so, e a tabela cobre os quatro alvos que existem -- um alvo que
+/// uma vez so, e a tabela cobre os seis alvos que existem -- um alvo que
 /// o percurso salte, ou que saia da tabela, fica vermelho aqui. O que o
 /// `App` faz em cada alvo (esquecer a memoria, apagar o historico) NAO se
 /// prova aqui: o braco de cada um esta preso por texto em
@@ -6923,6 +6923,7 @@ fn clear_history_runs_every_registered_target() {
         ClearTarget::Memory,
         ClearTarget::EpubLibrary,
         ClearTarget::Downloads,
+        ClearTarget::Agents,
         ClearTarget::History,
     ] {
         assert_eq!(
@@ -6935,7 +6936,7 @@ fn clear_history_runs_every_registered_target() {
         );
     }
     assert_eq!(CLEAR_HISTORY_TARGETS.last(), Some(&ClearTarget::History));
-    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 5);
+    assert_eq!(CLEAR_HISTORY_TARGETS.len(), 6);
 }
 
 /// Ligacao, nao comportamento: o comportamento esta nos gates de
@@ -6988,6 +6989,10 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
             "ClearTarget::Memory => self.privacy.clear_memory(&mut self.current_research),"
         ),
         "\"Apagar histórico\" must also clear the semantic memory"
+    );
+    assert!(
+        sink.contains("ClearTarget::Agents => self.clear_agent_conversations(),"),
+        "\"Apagar histórico\" must also clear local agent conversations"
     );
     assert!(
         sink.contains("ClearTarget::History => match self.privacy.clear_history() {"),
@@ -24101,8 +24106,9 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 #[test]
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
-        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
-        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, HISTORY_STORE, KEYS_STORE,
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE,
+        APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, HISTORY_STORE,
+        KEYS_STORE,
         LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
@@ -24117,6 +24123,7 @@ fn existing_stores_have_a_declared_kind() {
         ("tabs.cleared", Automatic, File),
         ("panel-width.json", Automatic, File),
         ("agent", Automatic, Dir),
+        ("agents", Automatic, Dir),
         ("WebView2", Automatic, Dir),
         ("theme", Setting, File),
         ("gmail", Setting, File),
@@ -24182,6 +24189,7 @@ fn existing_stores_have_a_declared_kind() {
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
         ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
         ("ADBLOCK_LIST_STORE", ADBLOCK_LIST_STORE.name),
+        ("AGENTS_STORE", AGENTS_STORE.name),
         ("AI_SETTINGS_STORE", AI_SETTINGS_STORE.name),
         ("AI_USAGE_STORE", AI_USAGE_STORE.name),
         ("DOWNLOADS_LOG_STORE", DOWNLOADS_LOG_STORE.name),
@@ -25399,6 +25407,16 @@ fn no_raw_data_dir_write_outside_a_grant() {
             "neural-app/src/windows_app.rs",
             1,
             "finish_agent: o trace legado do agente em agent/ (Automatic); o int-agents-finish leva-o",
+        ),
+        (
+            "neural-app/src/agents/pipe.rs",
+            1,
+            "agents/ (Automatic): metadados locais do named pipe; o canal so nasce com grant que permite escrita",
+        ),
+        (
+            "neural-app/src/agents/store.rs",
+            9,
+            "agents/ (Automatic): conversas e state.json ficam sob o caminho do StoreGrant e obedecem writes_allowed",
         ),
         (
             "neural-app/src/windows_app/app/compare.rs",
