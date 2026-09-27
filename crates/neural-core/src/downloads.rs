@@ -556,12 +556,12 @@ pub enum RecordOutcome {
     },
 }
 
-/// Uma linha do `downloads.json`. Sem o endereco completo: so o anfitriao.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Uma linha do `downloads.json`. Sem o endereco completo: so o anfitriao.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadRecord {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
