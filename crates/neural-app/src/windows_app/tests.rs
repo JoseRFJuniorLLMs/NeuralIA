@@ -89,6 +89,27 @@ fn youtube_is_minimized_not_closed_by_internal_panel_transitions() {
 }
 
 #[test]
+fn youtube_uses_the_neuralia_timeline_instead_of_the_native_scrollbar() {
+    let script = service_timeline_script(Service::YouTube)
+        .expect("YouTube ficou sem a timeline vertical do NeuralIA");
+
+    assert!(script.contains("neuralia-split-scroll-rail"));
+    assert!(
+        script.contains("*::-webkit-scrollbar{width:0!important;height:0!important"),
+        "a scrollbar normal do Chromium voltou a aparecer no YouTube"
+    );
+    assert!(script.contains("function semanticAnchors()"));
+
+    for service in [Service::Meet, Service::WhatsApp, Service::Gmail, Service::Breath] {
+        assert_eq!(
+            service_timeline_script(service),
+            None,
+            "{service:?} herdou a timeline do YouTube sem pedido"
+        );
+    }
+}
+
+#[test]
 fn youtube_surface_transitions_use_the_preserving_path_not_direct_close() {
     let panels = normalize_newlines(include_str!("app/panels.rs"));
     let chrome = normalize_newlines(include_str!("app/chrome.rs"));
