@@ -53,8 +53,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -73,6 +73,8 @@ const LOCK_FILE: &str = "hub.lock";
 const MAX_PIPE_INSTANCES: u32 = 16;
 const PIPE_BUFFER_BYTES: u32 = 64 * 1024;
 const BUSY_WAIT_MS: u32 = 2_000;
+const AUTH_LINE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTH_POLL: Duration = Duration::from_millis(25);
 
 /// Um HANDLE do Windows que se fecha sozinho.
 pub(crate) struct OwnedHandle(HANDLE);
@@ -673,7 +675,46 @@ impl HubServer {
     }
 }
 
+fn wait_for_auth_line(pipe: &Pipe, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut peek = vec![0u8; HUB_MAX_REQUEST_BYTES + 1];
+    loop {
+        let mut read = 0u32;
+        let mut available = 0u32;
+        // SAFETY: o pipe e um handle valido e o buffer vive durante a chamada.
+        let ok = unsafe {
+            PeekNamedPipe(
+                pipe.0.raw(),
+                peek.as_mut_ptr().cast(),
+                u32::try_from(peek.len()).unwrap_or(u32::MAX),
+                &mut read,
+                &mut available,
+                core::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return false;
+        }
+        let shown = usize::try_from(read).unwrap_or(0).min(peek.len());
+        if peek[..shown].contains(&b'\n')
+            || usize::try_from(available).unwrap_or(0) > HUB_MAX_REQUEST_BYTES
+        {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(AUTH_POLL);
+    }
+}
+
 fn serve_connection(pipe: Pipe, hub: AgentHub, token: String) {
+    // Antes do hello autenticado nenhuma ponte legitima fica muda. O prazo
+    // impede clientes locais de esgotarem as 16 instancias com ligacoes que
+    // nunca completam sequer a primeira linha.
+    if !wait_for_auth_line(&pipe, AUTH_LINE_TIMEOUT) {
+        return;
+    }
     let mut session = HubSession::new(hub, token);
     let mut reader = BufReader::new(pipe.clone());
     let mut writer = pipe;
@@ -925,9 +966,7 @@ mod tests {
         assert!(flags.contains('P'), "DACL must be protected: {sddl}");
         let mut trustees: Vec<String> = aces.iter().map(|(_, _, sid)| full_sid(sid)).collect();
         trustees.sort_unstable();
-        let mut expected = vec![full_sid("SY"), me.to_string()];
-        expected.sort_unstable();
-        assert_eq!(trustees, expected, "{sddl}");
+        assert_eq!(trustees, vec![me.to_string()], "{sddl}");
         for (kind, rights, _) in &aces {
             assert_eq!(kind, "A", "{sddl}");
             assert!(rights == "FA" || rights == "0x1f01ff", "{sddl}");
@@ -1011,6 +1050,22 @@ mod tests {
                 "{other}"
             );
         }
+    }
+
+    #[test]
+    fn unauthenticated_pipe_requires_a_complete_first_line_before_deadline() {
+        let dir = TempDir::new("pipe-auth-deadline");
+        let server = HubServer::bind(&dir.0).unwrap();
+        let mut silent = raw_client(server.pipe_name());
+        let pipe = silent.reader.get_ref().clone();
+        let started = Instant::now();
+        assert!(!wait_for_auth_line(&pipe, Duration::from_millis(40)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        silent.writer.write_all(b"{\"t\":\"hello\"").unwrap();
+        assert!(!wait_for_auth_line(&pipe, Duration::from_millis(40)));
+        silent.writer.write_all(b"}\n").unwrap();
+        assert!(wait_for_auth_line(&pipe, Duration::from_millis(200)));
     }
 
     #[test]
