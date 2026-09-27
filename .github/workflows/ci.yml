@@ -882,6 +882,57 @@ jobs:
           '@
             },
             @{
+              Label = "agents-pipe-system-ace"
+              Test = "hub_pipe_and_token_files_are_owned_by_and_open_only_to_this_user"
+              SourcePath = "crates/neural-app/src/agents/pipe.rs"
+              Old = @'
+              format!("O:{sid}D:P(A;;FA;;;{sid})")
+          '@
+              New = @'
+              format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})")
+          '@
+            },
+            @{
+              Label = "agents-auth-timeout-disabled"
+              Test = "unauthenticated_pipe_requires_a_complete_first_line_before_deadline"
+              SourcePath = "crates/neural-app/src/agents/pipe.rs"
+              Old = @'
+                      if std::time::Instant::now() >= deadline {
+                          return false;
+                      }
+          '@
+              New = @'
+                      if std::time::Instant::now() >= deadline {
+                          return true;
+                      }
+          '@
+            },
+            @{
+              Label = "agents-clear-keeps-state"
+              Test = "a_private_session_never_reaches_the_disk_even_through_a_rewrite"
+              SourcePath = "crates/neural-app/src/agents/store.rs"
+              Old = @'
+                      let state = name == STATE_FILE || name == format!("{STATE_FILE}.tmp");
+          '@
+              New = @'
+                      let state = false;
+          '@
+            },
+            @{
+              Label = "agents-replays-failed-send"
+              Test = "a_failed_send_is_never_replayed"
+              SourcePath = "crates/neural-app/src/agents/pipe.rs"
+              Old = @'
+                  conn.send_request(request)
+                      .map_err(|error| LinkError::Broken(error.to_string()))?;
+          '@
+              New = @'
+                  let _ = conn.send_request(request);
+                  conn.send_request(request)
+                      .map_err(|error| LinkError::Broken(error.to_string()))?;
+          '@
+            },
+            @{
               Label = "guard-lends-the-registry-with-a-lifetime"
               Test = "registry_is_minted_once_and_owned_by_the_guard"
               SourcePath = "crates/neural-app/src/privacy.rs"
