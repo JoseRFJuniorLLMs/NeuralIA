@@ -607,7 +607,11 @@ pub fn operation_key(origin: TurnOrigin, source: Option<usize>, text: &str, epoc
     let source = source.map_or_else(|| "-".to_string(), |index| index.to_string());
     let mut digest = Sha256::new();
     digest.update(text.trim().as_bytes());
-    let hex = format!("{:x}", digest.finalize());
+    let hex = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
     format!("{origin}:{source}:{}:{epoch}", &hex[..16])
 }
 
