@@ -1122,7 +1122,11 @@ pub(crate) mod tests {
             .unwrap_err();
         assert!(!error.to_string().is_empty());
         assert_eq!(
-            conversation.records.iter().map(|record| record.id).collect::<Vec<_>>(),
+            conversation
+                .records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
             vec![1, 2]
         );
 
