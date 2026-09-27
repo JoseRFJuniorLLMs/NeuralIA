@@ -910,10 +910,17 @@ impl AgentHub {
     /// delas), mas o desfecho delas passa a ser so de memoria: responder,
     /// cancelar ou expirar depois do clear nao recria a conversa apagada.
     pub(crate) fn clear_conversations(&self) -> Result<(), String> {
+        self.clear_conversations_with(|store| store.clear())
+    }
+
+    fn clear_conversations_with(
+        &self,
+        clear: impl FnOnce(&ConversationStore) -> std::io::Result<()>,
+    ) -> Result<(), String> {
         let store = self.inner.store.clone();
         let mut result = Ok(());
         self.with_state(|state, events| {
-            result = store.clear().map_err(|error| error.to_string());
+            result = clear(&store).map_err(|error| error.to_string());
             for entry in state.agents.values_mut() {
                 let last = entry.conversation.last_id();
                 entry.marks.next_id = entry.marks.next_id.max(last + 1);
@@ -1936,6 +1943,52 @@ pub(crate) mod tests {
         );
         still_cleared();
         assert!(f.hub.pending_questions().is_empty());
+    }
+
+    /// Gate crítico: uma falha parcial ao apagar não pode deixar a UI
+    /// fingir que tudo sumiu. O hub recarrega o que realmente sobreviveu no
+    /// disco; o que já foi removido fica fora. Assim um restart não traz
+    /// "fantasmas" que a sessão atual escondeu.
+    #[test]
+    fn a_partial_clear_failure_keeps_disk_survivors_visible_in_memory() {
+        let f = fixture("clear-partial-error");
+        let claude = f.hub.connect("claude").unwrap();
+        let codex = f.hub.connect("codex").unwrap();
+        send(&f.hub, claude, "claude antes").unwrap();
+        send(&f.hub, codex, "codex antes").unwrap();
+
+        let agents_dir = f.dir.0.join("agents");
+        let claude_file = agents_dir.join("claude.jsonl");
+        let codex_file = agents_dir.join("codex.jsonl");
+        assert!(claude_file.exists());
+        assert!(codex_file.exists());
+        assert_eq!(f.hub.conversation("claude").len(), 1);
+        assert_eq!(f.hub.conversation("codex").len(), 1);
+
+        let error = f
+            .hub
+            .clear_conversations_with(|_| {
+                std::fs::remove_file(&claude_file)?;
+                Err(std::io::Error::other("falha simulada depois do primeiro ficheiro"))
+            })
+            .unwrap_err();
+        assert!(error.contains("falha simulada"), "{error}");
+
+        // Claude saiu mesmo do disco; Codex sobreviveu e deve continuar
+        // visível já nesta sessão, não só depois de reiniciar.
+        assert!(!claude_file.exists());
+        assert!(codex_file.exists());
+        assert!(f.hub.conversation("claude").is_empty());
+        assert_eq!(
+            f.hub.conversation("codex").len(),
+            1,
+            "a UI escondeu um ficheiro que o clear falhado deixou no disco"
+        );
+
+        let reopened = reopen(&f);
+        reopened.load();
+        assert!(reopened.conversation("claude").is_empty());
+        assert_eq!(reopened.conversation("codex").len(), 1);
     }
 
     /// Gate crítico: atividade nova depois de limpar o histórico só pode
