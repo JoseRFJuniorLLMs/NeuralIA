@@ -975,9 +975,13 @@ jobs:
               Test = "clear_history_during_verification_preserves_recovery_without_restoring_history"
               SourcePath = "crates/neural-core/src/downloads.rs"
               Old = @'
+                    // Primeiro apaga o historico e todos os artefactos da
+                    // loja (.bak/.tmp); so depois nasce o journal minimo.
                     vec![DownloadEffect::EraseLog, DownloadEffect::Persist]
           '@
               New = @'
+                    // Primeiro apaga o historico e todos os artefactos da
+                    // loja (.bak/.tmp); so depois nasce o journal minimo.
                     vec![DownloadEffect::Persist]
           '@
             },
