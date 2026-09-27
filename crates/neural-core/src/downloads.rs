@@ -39,7 +39,7 @@
 //!   esvazia e o efeito [`DownloadEffect::EraseLog`] manda tirar o ficheiro
 //!   do disco, em qualquer modo.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -554,6 +554,10 @@ pub enum RecordOutcome {
 
 /// Uma linha do `downloads.json`. Sem o endereco completo: so o anfitriao.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub struct DownloadRecord {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,6 +566,11 @@ pub struct DownloadRecord {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// So para recuperar uma verificacao interrompida depois de o utilizador
+    /// ter apagado o historico. Nunca aparece na lista e nunca vira um
+    /// desfecho historico.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovery_only: bool,
     pub outcome: RecordOutcome,
     /// Quando comecou, em segundos Unix.
     pub at: u64,
@@ -764,6 +773,11 @@ pub struct DownloadEntry {
     pub total: Option<u64>,
     pub state: DownloadState,
     pub confirmed_program: bool,
+    /// Falso depois de Apagar historico enquanto este arquivo ja esta em
+    /// verificacao, ou quando ele foi retomado de um recovery_only.
+    /// A verificacao continua por seguranca, mas a linha e o desfecho nao
+    /// reaparecem no historico.
+    pub history_visible: bool,
     /// Um documento com macros.
     pub warn: bool,
     pub at: u64,
@@ -892,9 +906,48 @@ impl DownloadManager {
                 Vec::new()
             }
             DownloadEvent::ClearLog => {
-                self.log.clear();
+                // Um arquivo em Finalizing ja existe no disco e ainda
+                // precisa do veredito. Apagar historico esconde a linha e o
+                // desfecho, mas conserva SOMENTE o pendente minimo para uma
+                // queda poder retomar a verificacao. O resto some.
+                let mut recovery_keys = BTreeSet::new();
+                for entry in self
+                    .entries
+                    .values_mut()
+                    .filter(|entry| entry.state == DownloadState::Finalizing)
+                {
+                    entry.history_visible = false;
+                    let record = record_of(
+                        entry,
+                        RecordOutcome::Pending {
+                            confirmed_program: entry.confirmed_program,
+                            resumed: false,
+                        },
+                    );
+                    recovery_keys.insert((record.name, record.path, record.host, record.at));
+                }
+                let mut recovery = VecDeque::new();
+                for mut record in self.log.drain(..) {
+                    let key = (
+                        record.name.clone(),
+                        record.path.clone(),
+                        record.host.clone(),
+                        record.at,
+                    );
+                    if matches!(record.outcome, RecordOutcome::Pending { .. })
+                        && recovery_keys.contains(&key)
+                    {
+                        record.recovery_only = true;
+                        recovery.push_back(record);
+                    }
+                }
+                self.log = recovery;
                 self.entries.retain(|_, entry| entry.is_active());
-                vec![DownloadEffect::EraseLog]
+                if self.log.is_empty() {
+                    vec![DownloadEffect::EraseLog]
+                } else {
+                    vec![DownloadEffect::Persist]
+                }
             }
         }
     }
@@ -930,6 +983,7 @@ impl DownloadManager {
             total: start.total,
             state: DownloadState::Running,
             confirmed_program: false,
+            history_visible: true,
             warn: risk == NameRisk::Macro,
             at: start.at,
         };
@@ -1095,7 +1149,14 @@ impl DownloadManager {
                 && record.at == wanted.at
                 && record.path.as_deref() == wanted_path
         });
-        let removed = pending.and_then(|index| self.log.remove(index)).is_some();
+        let removed_record = pending.and_then(|index| self.log.remove(index));
+        if removed_record
+            .as_ref()
+            .is_some_and(|record| record.recovery_only)
+        {
+            entry.history_visible = false;
+        }
+        let removed = removed_record.is_some();
         match self.push_record(id) {
             Some(persist) => effects.push(persist),
             None if removed => effects.push(DownloadEffect::Persist),
@@ -1162,6 +1223,7 @@ impl DownloadManager {
                     total: record.bytes,
                     state: DownloadState::Finalizing,
                     confirmed_program,
+                    history_visible: !record.recovery_only,
                     at: record.at,
                 },
             );
@@ -1223,7 +1285,9 @@ impl DownloadManager {
     /// desfecho, ou `Pending` com o caminho enquanto a verificacao corre.
     fn push_record(&mut self, id: DownloadId) -> Option<DownloadEffect> {
         let entry = self.entries.get(&id)?;
-        if entry.private {
+        if entry.private
+            || (!entry.history_visible && matches!(entry.state, DownloadState::Done(_)))
+        {
             return None;
         }
         let outcome = match entry.state {
@@ -1256,6 +1320,7 @@ fn record_of(entry: &DownloadEntry, outcome: RecordOutcome) -> DownloadRecord {
         path: kept.then(|| entry.path.clone()),
         host: entry.host.clone(),
         bytes: kept.then_some(entry.received),
+        recovery_only: !entry.history_visible,
         outcome,
         at: entry.at,
     }
@@ -2256,6 +2321,7 @@ mod tests {
                 path,
                 host: Some("example.com".to_string()),
                 bytes: Some(64),
+                recovery_only: false,
                 outcome: RecordOutcome::Pending {
                     confirmed_program,
                     resumed,
@@ -2447,6 +2513,7 @@ mod tests {
                 path: None,
                 host: None,
                 bytes: None,
+                recovery_only: false,
                 outcome: RecordOutcome::Cancelled,
                 at: n,
             })
@@ -2486,6 +2553,7 @@ mod tests {
             path: Some(PathBuf::from("\\".repeat(MAX_RECORD_PATH_BYTES))),
             host: Some("h".repeat(MAX_RECORD_HOST_BYTES)),
             bytes: Some(u64::MAX),
+            recovery_only: false,
             outcome: RecordOutcome::NotDeleted {
                 reason: DeleteReason::BlockedName(BlockReason::DatabaseApp),
             },
@@ -2514,6 +2582,66 @@ mod tests {
         assert!(m.entry(DownloadId(2)).is_some());
     }
 
+    /// Gate critico: limpar o historico no meio da verificacao nao apaga
+    /// o unico rasto que permite retomar o veredito depois de uma queda,
+    /// nem faz o download reaparecer quando o veredito chega.
+    #[test]
+    fn clear_history_during_verification_keeps_only_hidden_recovery() {
+        let mut m = manager(false);
+        m.on_event(start(1, "velho.pdf", false));
+        m.on_event(DownloadEvent::Ended {
+            id: DownloadId(1),
+            end: DownloadEnd::Cancelled,
+        });
+        m.on_event(start(2, "pacote.zip", false));
+        let verify_path = PathBuf::from(r"C:\\Users\\x\\Downloads\\pacote.zip");
+        m.on_event(DownloadEvent::Ended {
+            id: DownloadId(2),
+            end: DownloadEnd::Completed {
+                path: verify_path.clone(),
+            },
+        });
+        assert_eq!(m.log().entries.len(), 2);
+        assert!(matches!(
+            m.log().entries[0].outcome,
+            RecordOutcome::Pending { .. }
+        ));
+
+        assert_eq!(
+            m.on_event(DownloadEvent::ClearLog),
+            vec![DownloadEffect::Persist]
+        );
+        let after_clear = m.log();
+        assert_eq!(after_clear.entries.len(), 1, "{after_clear:?}");
+        assert!(after_clear.entries[0].recovery_only);
+        assert!(matches!(
+            after_clear.entries[0].outcome,
+            RecordOutcome::Pending { .. }
+        ));
+        assert!(!m.entry(DownloadId(2)).expect("verificacao").history_visible);
+
+        let effects = m.on_event(DownloadEvent::Finalized {
+            id: DownloadId(2),
+            outcome: FinalizeOutcome::Deleted(DeleteReason::DangerousContent),
+        });
+        assert!(effects.contains(&DownloadEffect::Persist), "{effects:?}");
+        assert!(m.log().entries.is_empty());
+
+        let mut restarted = DownloadManager::new(DownloadSettings::default(), after_clear);
+        let effects = restarted.resume_pending(|| DownloadId(9));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            DownloadEffect::Finalize { id: DownloadId(9), .. }
+        )));
+        let resumed = restarted.entry(DownloadId(9)).expect("retomado");
+        assert!(!resumed.history_visible);
+        assert!(restarted.log().entries[0].recovery_only);
+        restarted.on_event(DownloadEvent::Finalized {
+            id: DownloadId(9),
+            outcome: FinalizeOutcome::Deleted(DeleteReason::DangerousContent),
+        });
+        assert!(restarted.log().entries.is_empty());
+    }
     #[test]
     fn progress_is_throttled_to_250_ms() {
         let mut throttle = ProgressThrottle::default();
