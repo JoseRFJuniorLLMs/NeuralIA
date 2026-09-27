@@ -930,6 +930,17 @@ jobs:
           '@
             },
             @{
+              Label = "agents-clear-resurrects-other-metadata"
+              Test = "activity_after_clear_does_not_resurrect_other_agent_metadata"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                      .filter(|(_, entry)| !entry.conversation.records.is_empty())
+          '@
+              New = @'
+                      .filter(|_| true)
+          '@
+            },
+            @{
               Label = "agents-replays-failed-send"
               Test = "a_failed_send_is_never_replayed"
               SourcePath = "crates/neural-app/src/agents/pipe.rs"
