@@ -1472,6 +1472,65 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn marks_writer_retries_a_generation_after_a_failed_write() {
+        let snapshot = MarksSnapshot {
+            generation: 1,
+            marks: BTreeMap::new(),
+        };
+        let mut writer = MarksWriter::default();
+        let error = writer
+            .persist(&snapshot, |_| Err(std::io::Error::other("falha")))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(writer.persisted_generation, 0);
+
+        let mut writes = 0;
+        assert!(
+            writer
+                .persist(&snapshot, |_| {
+                    writes += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(writes, 1);
+        assert_eq!(writer.persisted_generation, 1);
+    }
+
+    #[test]
+    fn marks_writer_never_lets_an_older_snapshot_overwrite_a_newer_one() {
+        let old = MarksSnapshot {
+            generation: 1,
+            marks: BTreeMap::new(),
+        };
+        let new = MarksSnapshot {
+            generation: 2,
+            marks: BTreeMap::new(),
+        };
+        let mut writer = MarksWriter::default();
+        let mut writes = Vec::new();
+
+        assert!(
+            writer
+                .persist(&new, |_| {
+                    writes.push(2);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .persist(&old, |_| {
+                    writes.push(1);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(writes, vec![2]);
+        assert_eq!(writer.persisted_generation, 2);
+    }
+
+    #[test]
     fn hub_session_rejects_a_wrong_or_missing_token_before_anything_else() {
         let f = fixture("token");
         let hello =
