@@ -2078,6 +2078,56 @@ pub(crate) mod tests {
         );
     }
 
+    /// Gate crítico: uma pergunta criada em Private continua privada ate
+    /// ao fim. Voltar a Normal antes de responder nao pode fazer a resposta
+    /// aparecer no disco; pergunta e resposta continuam visiveis em memoria.
+    #[test]
+    fn a_private_origin_question_stays_memory_only_after_returning_to_normal() {
+        let f = fixture("private-question-outcome");
+        let claude = f.hub.connect("claude").unwrap();
+        let agents_dir = f.dir.0.join("agents");
+        let conversation = agents_dir.join("claude.jsonl");
+        let state_file = agents_dir.join("state.json");
+
+        f.registry.set_mode(StoreMode::Private);
+        let question = ask(&f.hub, claude, 600).unwrap();
+        assert_eq!(f.hub.conversation("claude").len(), 1);
+        assert!(!conversation.exists());
+        assert!(!state_file.exists());
+
+        // O cartão nasceu privado. Mudar o modo global não muda a origem.
+        f.registry.set_mode(StoreMode::Normal);
+        f.hub
+            .answer_question(question, QuestionAnswer::Button(0))
+            .unwrap();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, question, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"answered","answer":"Sim","via":"button"})
+        );
+
+        let memory = f.hub.conversation("claude");
+        assert_eq!(memory.len(), 2, "{memory:?}");
+        assert!(matches!(
+            memory.last().map(|record| &record.body),
+            Some(RecordBody::UserAnswer { text, .. }) if text == "Sim"
+        ));
+        assert!(
+            !conversation.exists(),
+            "o desfecho de uma pergunta Private vazou para claude.jsonl"
+        );
+        assert!(!state_file.exists());
+
+        // Uma atividade normal posterior pode persistir a si propria, mas
+        // uma reescrita nunca leva pergunta/resposta privadas junto.
+        f.hub.user_message("claude", "normal depois").unwrap();
+        let file = std::fs::read_to_string(&conversation).expect("conversa normal");
+        assert!(file.contains("normal depois"), "{file}");
+        assert!(!file.contains("Posso continuar?"), "{file}");
+        assert!(!file.contains("\"kind\":\"answer\""), "{file}");
+    }
+
     /// Gate crítico: o `last_id` que um agente recebeu no modo privado
     /// pode ser maior do que o último id persistido, porque o privado não
     /// grava nem a conversa nem `next_id`. Se o NeuralIA reiniciar, esse id
