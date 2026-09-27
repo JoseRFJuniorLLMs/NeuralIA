@@ -128,6 +128,19 @@ where
     }
 }
 
+pub(in crate::windows_app) fn service_transition_input(
+    service: Service,
+    state: ServicePanelState,
+) -> Option<ServiceInput> {
+    if service == Service::YouTube {
+        (!state.minimized()).then_some(ServiceInput::Minimize)
+    } else if state.minimized() {
+        None
+    } else {
+        Some(ServiceInput::Close)
+    }
+}
+
 impl App {
     /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha
     /// -- ou, minimizado, volta (`ServicePanelState`).
@@ -217,13 +230,9 @@ impl App {
         let Some(panel) = self.service_panel.as_ref() else {
             return;
         };
-        if panel.service == Service::YouTube {
-            if !panel.state.minimized() {
-                self.service_input(ServiceInput::Minimize);
-            }
-            return;
+        if let Some(input) = service_transition_input(panel.service, panel.state) {
+            self.service_input(input);
         }
-        self.close_service_panel();
     }
 
     /// Outro painel da direita precisa do espaco. YouTube minimiza; os demais
