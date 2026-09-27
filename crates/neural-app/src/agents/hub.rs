@@ -1486,6 +1486,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn successful_marks_retry_does_not_clear_an_unrelated_store_error() {
+        let f = fixture("marks-unrelated-error");
+        let claude = f.hub.connect("claude").unwrap();
+        send(&f.hub, claude, "mensagem").unwrap();
+
+        {
+            let mut state = f.hub.lock();
+            state.store_error = Some("falha de conversa independente".to_string());
+        }
+
+        f.hub.mark_read("claude");
+        assert_eq!(
+            f.hub.snapshot().store_error.as_deref(),
+            Some("falha de conversa independente")
+        );
+    }
+
+    #[test]
     fn marks_writer_retries_a_generation_after_a_failed_write() {
         let snapshot = MarksSnapshot {
             generation: 1,
