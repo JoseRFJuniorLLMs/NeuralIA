@@ -909,7 +909,7 @@ jobs:
             },
             @{
               Label = "agents-clear-keeps-state"
-              Test = "a_private_session_never_reaches_the_disk_even_through_a_rewrite"
+              Test = "clearing_conversations_keeps_ids_growing_and_writes_nothing_else"
               SourcePath = "crates/neural-app/src/agents/store.rs"
               Old = @'
                       let state = name == STATE_FILE || name == format!("{STATE_FILE}.tmp");
