@@ -64,6 +64,63 @@ fn the_tissue_runs_right_through_where_the_brand_sits() {
 }
 
 #[test]
+fn youtube_is_minimized_not_closed_by_internal_panel_transitions() {
+    let visible = ServicePanelState::default();
+    assert_eq!(
+        service_transition_input(Service::YouTube, visible),
+        Some(ServiceInput::Minimize)
+    );
+
+    let mut minimized = ServicePanelState::default();
+    assert_eq!(
+        minimized.step(ServiceInput::Minimize),
+        ServiceEffect::Relayout
+    );
+    assert!(minimized.minimized());
+    assert_eq!(service_transition_input(Service::YouTube, minimized), None);
+
+    // Outros servicos mantem o contrato anterior: uma transicao interna pode
+    // fecha-los. A excecao deliberada e o YouTube, porque o dono quer a
+    // reproducao/sessao viva como uma aba em segundo plano.
+    assert_eq!(
+        service_transition_input(Service::WhatsApp, ServicePanelState::default()),
+        Some(ServiceInput::Close)
+    );
+}
+
+#[test]
+fn youtube_surface_transitions_use_the_preserving_path_not_direct_close() {
+    let panels = normalize_newlines(include_str!("app/panels.rs"));
+    let chrome = normalize_newlines(include_str!("app/chrome.rs"));
+    let pages = normalize_newlines(include_str!("app/pages.rs"));
+    let compare = normalize_newlines(include_str!("app/compare.rs"));
+
+    assert!(
+        panels.contains("self.close_docked_service_panel();"),
+        "Ctrl+H/Live deixou de passar pelo caminho que minimiza YouTube"
+    );
+    assert!(
+        chrome.matches("self.service_panel_for_transition();").count() >= 2,
+        "Home/destroy voltaram a fechar YouTube diretamente"
+    );
+    assert!(
+        pages.contains("self.service_panel_for_transition();"),
+        "troca para Livros voltou a fechar YouTube"
+    );
+    assert!(
+        compare.contains("self.service_panel_for_transition();"),
+        "nova pesquisa voltou a fechar YouTube"
+    );
+
+    for source in [&chrome, &pages, &compare] {
+        assert!(
+            !source.contains("self.close_service_panel();"),
+            "uma transicao interna ainda destroi o YouTube"
+        );
+    }
+}
+
+#[test]
 fn the_window_and_taskbar_icons_come_from_the_project_icon() {
     // O `resumed` pousa na janela o que `app_icons` devolve. Com o id do
     // recurso errado (ou sem o assets/logo.ico compilado no executavel) a
