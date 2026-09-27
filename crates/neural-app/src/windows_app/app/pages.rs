@@ -8,12 +8,12 @@ use windows_sys::Win32::Foundation::HWND;
 use wry::http::{Request, Response as HttpResponse};
 use wry::{NewWindowResponse, PermissionResponse, WebViewBuilder};
 
-use crate::ipc::{PDF_TEXT_MAX_CHARS_PER_PAGE, PDF_TEXT_MAX_PAGES};
 use crate::epub_app::{
     EpubJob, EpubNotice, EpubResponse, EpubRuntime, EpubUiRequest, ServeJob, dispatch_epub_request,
     epub_dialog_filter, epub_drop_job, epub_request_target, handle_epub_ipc, is_epub_path,
     library_url, notice_script, parse_dialog_selection, reader_url,
 };
+use crate::ipc::{PDF_TEXT_MAX_CHARS_PER_PAGE, PDF_TEXT_MAX_PAGES};
 use neural_core::{
     HistoryEntry, MemoryDocument, MemoryKind, MemorySourceKind, ReaderArticle, ReaderBlock,
     is_pdf_url, reader_html,
@@ -1080,7 +1080,6 @@ pub(in crate::windows_app) fn is_pdf_internal_target(target: &str) -> bool {
             && url.port().is_none()
     })
 }
-
 
 #[cfg(test)]
 mod pdf_text_tests {
