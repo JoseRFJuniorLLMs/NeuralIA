@@ -279,6 +279,10 @@ struct MarksSnapshot {
 #[derive(Debug, Default)]
 struct MarksWriter {
     persisted_generation: u64,
+    /// Maior geração que já chegou a este writer, mesmo que a escrita tenha
+    /// falhado. Um snapshot mais velho nunca pode passar depois dela e
+    /// sobrescrever/mascarar a tentativa mais nova.
+    latest_generation_seen: u64,
 }
 
 impl MarksWriter {
@@ -290,9 +294,12 @@ impl MarksWriter {
         snapshot: &MarksSnapshot,
         write: impl FnOnce(&BTreeMap<String, AgentMarks>) -> std::io::Result<()>,
     ) -> std::io::Result<bool> {
-        if snapshot.generation <= self.persisted_generation {
+        if snapshot.generation < self.latest_generation_seen
+            || snapshot.generation <= self.persisted_generation
+        {
             return Ok(false);
         }
+        self.latest_generation_seen = self.latest_generation_seen.max(snapshot.generation);
         write(&snapshot.marks)?;
         self.persisted_generation = snapshot.generation;
         Ok(true)
@@ -1527,6 +1534,50 @@ pub(crate) mod tests {
         );
         assert_eq!(writes, 1);
         assert_eq!(writer.persisted_generation, 1);
+    }
+
+    #[test]
+    fn marks_writer_never_accepts_an_older_snapshot_after_a_newer_write_failed() {
+        let old = MarksSnapshot {
+            generation: 1,
+            marks: BTreeMap::new(),
+        };
+        let new = MarksSnapshot {
+            generation: 2,
+            marks: BTreeMap::new(),
+        };
+        let mut writer = MarksWriter::default();
+
+        let error = writer
+            .persist(&new, |_| Err(std::io::Error::other("disco indisponível")))
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(writer.persisted_generation, 0);
+        assert_eq!(writer.latest_generation_seen, 2);
+
+        let mut stale_writes = 0;
+        assert!(
+            !writer
+                .persist(&old, |_| {
+                    stale_writes += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(stale_writes, 0);
+        assert_eq!(writer.persisted_generation, 0);
+
+        let mut retry_writes = 0;
+        assert!(
+            writer
+                .persist(&new, |_| {
+                    retry_writes += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert_eq!(retry_writes, 1);
+        assert_eq!(writer.persisted_generation, 2);
     }
 
     #[test]
