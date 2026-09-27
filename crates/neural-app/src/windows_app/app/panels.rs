@@ -128,6 +128,12 @@ where
     }
 }
 
+pub(in crate::windows_app) fn service_timeline_script(
+    service: Service,
+) -> Option<&'static str> {
+    (service == Service::YouTube).then_some(SPLIT_SCROLL_RAIL_SCRIPT)
+}
+
 pub(in crate::windows_app) fn service_transition_input(
     service: Service,
     state: ServicePanelState,
@@ -183,6 +189,14 @@ impl App {
             // Caminho A do WebRTC: camera e microfone pelo aviso do
             // WebView2 -- salvo no painel privado, onde sao recusados.
             .with_permission_handler(move |kind| service_panel_permission(service, kind));
+        // O YouTube usa a mesma timeline vertical do NeuralIA/Split:
+        // a scrollbar nativa some e a rail semantica tracejada passa a ser
+        // a navegacao vertical. Os outros servicos nao recebem este script.
+        let builder = if let Some(script) = service_timeline_script(service) {
+            builder.with_initialization_script(script.to_string())
+        } else {
+            builder
+        };
         let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);
         let built = hooked.build_hooked_as_child(window);
         match built {
