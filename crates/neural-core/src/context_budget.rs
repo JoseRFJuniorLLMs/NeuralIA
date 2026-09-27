@@ -9,38 +9,67 @@
 //!
 //! 1. **sanitizar** (`untrusted::sanitize`): invisiveis, bidi e controlos
 //!    fora; com destino `Remote` as linhas sensiveis passam pelo
-//!    `redact_sensitive_text` que ja existe, e o URL de cada fonte pelo
-//!    `redact_url`. Uma fonte de uma sessao privada nunca vai para um
-//!    destino remoto (`ContextError::PrivateContent`).
+//!    `redact_sensitive_text` que ja existe, e cada URL que leva uma
+//!    credencial (parametro, fragmento ou `utilizador:senha@`) pelo
+//!    `redact_url` -- o URL da fonte, os que estao no texto e os que estao
+//!    no nome da fonte, que tambem passa pelo `redact_sensitive_text` (o
+//!    titulo de uma aba sai da maquina no cabecalho). Uma fonte de uma
+//!    sessao privada nunca vai para um destino remoto
+//!    (`ContextError::PrivateContent`).
 //! 2. **partir em trechos** de ~`chunk_tokens` (160 por omissao) em
 //!    fronteiras de frase: `Dr. Silva` e `3.5 GHz` ficam inteiros
 //!    (abreviaturas, iniciais e decimais nao fecham frase).
-//! 3. **deduplicar**: o SHA-256 do texto normalizado apanha as copias
-//!    exactas; o SimHash das janelas (`untrusted::Shingles`) filtra as
-//!    parecidas e o Jaccard >= 0.8 confirma. Cada repeticao fica registada
-//!    com a proveniencia (quem ficou, quem saiu, a semelhanca).
+//! 3. **deduplicar**, pela ordem da pontuacao, para a copia que fica ser a
+//!    mais pontuada (numa igualdade, a primeira): o SHA-256 do texto
+//!    normalizado apanha as copias exactas; o SimHash das janelas
+//!    (`untrusted::Shingles`) filtra as parecidas e o Jaccard >= 0.8
+//!    confirma. Entre fontes diferentes, duas copias parecidas que divergem
+//!    nos numeros ou nas negacoes (`baixou 12%` contra `subiu 40%`,
+//!    `funciona` contra `nao funciona`) ficam as duas: a divergencia e o
+//!    que o consenso tem de ver. Cada repeticao removida fica registada com
+//!    a proveniencia (quem ficou, quem saiu, a semelhanca).
 //! 4. **pontuar**: 0.5 x BM25-lite contra a pergunta + 0.4 x cosseno do
 //!    `Embedder` + 0.1 x prioridade da fonte.
-//! 5. **garantir o piso** de cada fonte (`floor_per_source`): os melhores
-//!    trechos de cada uma entram primeiro, para uma fonte forte nao apagar
-//!    as outras.
+//! 5. **garantir o piso** de cada fonte (`floor_per_source`), por rondas:
+//!    os melhores trechos de cada uma entram primeiro, com o que as outras
+//!    ainda precisam reservado -- um trecho so entra inteiro se deixar esse
+//!    espaco, e senao entra cortado (as frases mais pontuadas, ou o inicio
+//!    do trecho). Quando os pisos e os cabecalhos cabem, cada fonte recebe
+//!    pelo menos `min(piso, o seu texto)`; quando nao cabem, cada uma recebe
+//!    o maior piso comum que cabe.
 //! 6. **alocar** o resto por pontuacao, com **compressao extractiva**
 //!    (as frases mais pontuadas de um trecho que ja nao cabe inteiro).
 //! 7. **cercar** com o nonce do `untrusted` (`fence_lines`,
-//!    `neutralize_inside`): o texto do pacote e dado, nunca instrucao.
+//!    `neutralize_inside`): o texto do pacote e dado, nunca instrucao. Uma
+//!    linha de um trecho que comeca por um parentese recto (`[2] resposta:`,
+//!    `［3］`) leva um `\` a frente: so os cabecalhos das fontes comecam
+//!    assim, e o texto de uma pagina nao se faz passar por outra fonte.
+//!
+//! O prompt inteiro cabe em `spec.available()`: as instrucoes da cerca
+//! (`ContextPack::fence_instructions`, uma mensagem) e a pergunta com o
+//! pacote (`ContextPack::user_message`, outra), com o nonce contado ao peso
+//! maximo.
 //!
 //! O `ContextPack` que sai tem campos privados: le-se (`rendered`,
 //! `est_tokens`, `sources` com as posicoes em bytes, `duplicates`,
 //! `dropped`) e nao se monta nem se altera de fora -- o unico caminho para
 //! um pacote e este.
 //!
-//! A contagem de tokens (`estimate_tokens`) e uma tabela por classe de
-//! caractere x 1,10, mais 4 por mensagem; por construcao fica ACIMA dos
-//! tokenizadores reais (fixture em `context_budget/token_fixture.tsv`), e
-//! a `TokenCalibration` (EWMA da razao real/estimada, presa a [0,6; 2,0])
+//! A contagem de tokens (`estimate_tokens`) e o maior entre uma tabela por
+//! classe de caractere x 1,10 e o numero de pre-tokens das regex de
+//! pre-tokenizacao publicadas do o200k e do Llama 3, mais 4 por mensagem.
+//! Os pre-tokens de cada regex sao um limite inferior duro dos tokens do
+//! seu tokenizador (o BPE nunca junta dois) e seguram o texto onde a
+//! tabela sozinha contava de menos: letras e digitos alternados (`a1a1`,
+//! ids hexadecimais, lances de xadrez), mudancas de maiuscula (`aBaB`),
+//! linhas curtas. A estimativa fica em ou acima das duas colunas da fixture
+//! (`context_budget/token_fixture.tsv`), mas NAO e uma garantia contra os
+//! tokenizadores reais: dentro de um pre-token o BPE pode partir mais do
+//! que a tabela conta (um base64 ou um id aleatorio longos). A
+//! `TokenCalibration` (EWMA da razao real/estimada, presa a [0,6; 2,0])
 //! encosta-a ao modelo em uso quando a API devolve a contagem real.
 //! `fit_conversation` corta a conversa mais antiga; `split_for_map_reduce`
-//! parte um texto longo em pedacos que cabem, um a um.
+//! parte um texto longo em pedacos que cabem, um a um, com a cerca.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -59,14 +88,16 @@ pub const TOKEN_SAFETY_FACTOR: f64 = 1.10;
 /// O custo fixo de cada mensagem (papel, separadores do modelo de conversa).
 pub const MESSAGE_OVERHEAD_TOKENS: usize = 4;
 
-/// O peso de um caractere na estimativa, por classe. Calibrado para ficar
-/// ACIMA do o200k e do tokenizador do Llama 3: cada palavra e pelo menos
-/// um token, por isso o espaco que a antecede vale quase um (0,7) e as
-/// letras pouco (0,22) -- `a b c d` sao quatro tokens, `processador` dois
-/// ou tres; um digito custa quase um token (`\p{N}{1,3}`: `2026-09-26` sao
-/// seis); a pontuacao ASCII e quase sempre um token cada; um espaco a
-/// seguir a outro e uma sequencia, com custo; um emoji ou uma letra fora
-/// do BMP pode cair em bytes (ate 4 tokens); o CJK ate 3 por caractere.
+/// O peso de um caractere na tabela, por classe, pensado para o texto
+/// corrido: cada palavra e pelo menos um token, por isso o espaco que a
+/// antecede vale quase um (0,7) e as letras pouco (0,22) -- `a b c d` sao
+/// quatro tokens, `processador` dois ou tres; um digito custa quase um
+/// token (`\p{N}{1,3}`: `2026-09-26` sao seis); a pontuacao ASCII e quase
+/// sempre um token cada; um espaco a seguir a outro e uma sequencia, com
+/// custo; um emoji ou uma letra fora do BMP pode cair em bytes (ate 4
+/// tokens); o CJK ate 3 por caractere. Onde as letras pesam pouco demais
+/// (`a1a1`, `aBaB`, linhas curtas) quem segura a contagem e o numero de
+/// pre-tokens (`pretoken_count`).
 fn char_weight(c: char, after_space: bool) -> f64 {
     match c {
         ' ' if after_space => 0.6,
@@ -89,10 +120,11 @@ fn char_weight(c: char, after_space: bool) -> f64 {
     }
 }
 
-/// A soma dos pesos de `text` (aditiva: o peso de `a + b` e o de `a` mais
-/// o de `b`, com a ressalva de um espaco a seguir a outro, que nao muda com
-/// a juncao porque as partes juntam-se sempre com uma mudanca de linha).
-fn weight(text: &str) -> f64 {
+/// A soma dos pesos da tabela em `text` (aditiva: a de `a + b` e a de `a`
+/// mais a de `b`, com a ressalva de um espaco a seguir a outro, que nao
+/// muda com a juncao porque as partes juntam-se com uma mudanca de linha
+/// ou depois de um texto sem espacos no fim).
+fn table_weight(text: &str) -> f64 {
     let mut total = 0.0;
     let mut after_space = false;
     for c in text.chars() {
@@ -102,15 +134,285 @@ fn weight(text: &str) -> f64 {
     total
 }
 
+// ------------------------------------------------------------ pre-tokens
+//
+// Os tokenizadores BPE partem o texto em pre-tokens com uma regex e so
+// depois juntam bytes dentro de cada um: um pre-token e pelo menos um
+// token, e dois nunca se juntam. Contar os pre-tokens da um limite
+// inferior duro. As duas regex publicadas, simuladas a mao (sem crate de
+// regex), com as classes do Unicode aproximadas pelas da `std`: `\p{L}` e
+// alfabetica, nao numerica e nao marca; `\p{M}` sao os blocos de marcas
+// combinantes de `is_mark`; `\p{Lt}` (`ǅ`) e a letra com caixa que nao e
+// maiuscula nem minuscula. Em 14 000 textos aleatorios, comparados com as
+// proprias regex (latino, acentos soltos, CJK, hangul, kana, hebraico,
+// arabe, `ǅ`, `ʰ`, emoji, digitos de outras escritas), a contagem foi a das
+// regex em todos, fora os sinais vocalicos das escritas indicas (`\p{Mc}`,
+// alfabeticos para a `std`), que aqui contam como letras: o Llama 3, que
+// os parte, pode ter mais pre-tokens nessas escritas, onde a tabela ja
+// pesa 0,75 x 1,10 por caractere.
+//
+// o200k_base:
+//   [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//   |[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?
+//   |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// Llama 3:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}
+//   | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+
+/// `\p{M}` nos blocos de marcas combinantes: os acentos soltos
+/// (U+0300-036F e as extensoes), os sinais do cirilico, do hebraico e do
+/// arabe, as marcas do kana e os seletores de variante.
+fn is_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{0591}'..='\u{05BD}'
+            | '\u{05BF}'
+            | '\u{05C1}'..='\u{05C2}'
+            | '\u{05C4}'..='\u{05C5}'
+            | '\u{05C7}'
+            | '\u{0610}'..='\u{061A}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0670}'
+            | '\u{06D6}'..='\u{06DC}'
+            | '\u{06DF}'..='\u{06E4}'
+            | '\u{06E7}'..='\u{06E8}'
+            | '\u{06EA}'..='\u{06ED}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{302A}'..='\u{302F}'
+            | '\u{3099}'..='\u{309A}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FE20}'..='\u{FE2F}'
+    )
+}
+
+/// `\p{L}`.
+fn is_letter(c: char) -> bool {
+    c.is_alphabetic() && !c.is_numeric() && !is_mark(c)
+}
+
+/// `\p{Lt}`: uma letra com caixa que nao e maiuscula nem minuscula (`ǅ`).
+fn is_titlecase(c: char) -> bool {
+    is_letter(c) && !c.is_lowercase() && !c.is_uppercase() && c.to_lowercase().next() != Some(c)
+}
+
+/// Sem caixa: nem maiuscula nem minuscula tem outra forma (`ʰ`, `ª`, CJK).
+fn is_caseless(c: char) -> bool {
+    c.to_uppercase().next() == Some(c) && c.to_lowercase().next() == Some(c)
+}
+
+/// `[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]`: uma letra que nao e minuscula (as
+/// modificadoras como `ʰ`, minusculas para a `std`, nao tem caixa e contam
+/// dos dois lados), ou uma marca.
+fn is_upper_side(c: char) -> bool {
+    (is_letter(c) && (!c.is_lowercase() || is_caseless(c))) || is_mark(c)
+}
+
+/// `[\p{Ll}\p{Lm}\p{Lo}\p{M}]`: uma letra que nao e maiuscula nem de titulo,
+/// ou uma marca.
+fn is_lower_side(c: char) -> bool {
+    (is_letter(c) && !c.is_uppercase() && !is_titlecase(c)) || is_mark(c)
+}
+
+fn is_line_break(c: char) -> bool {
+    c == '\r' || c == '\n'
+}
+
+/// `[^\r\n\p{L}\p{N}]`: o que pode ir colado a frente de uma palavra.
+fn is_word_lead(c: char) -> bool {
+    !is_line_break(c) && !is_letter(c) && !c.is_numeric()
+}
+
+/// `[^\s\p{L}\p{N}]`: pontuacao e simbolos.
+fn is_symbol(c: char) -> bool {
+    !c.is_whitespace() && !is_letter(c) && !c.is_numeric()
+}
+
+/// `(?i:'s|'t|'re|'ve|'m|'ll|'d)` a comecar em `at`: onde acaba.
+fn contraction_end(chars: &[char], at: usize) -> Option<usize> {
+    if chars.get(at) != Some(&'\'') {
+        return None;
+    }
+    let lower = |offset: usize| chars.get(at + offset).map(|c| c.to_ascii_lowercase());
+    match (lower(1), lower(2)) {
+        (Some('s' | 't' | 'm' | 'd'), _) => Some(at + 2),
+        (Some('r' | 'v'), Some('e')) | (Some('l'), Some('l')) => Some(at + 3),
+        _ => None,
+    }
+}
+
+/// `\p{N}{1,3}`.
+fn digits_end(chars: &[char], at: usize) -> usize {
+    let mut end = at;
+    while end < chars.len() && end - at < 3 && chars[end].is_numeric() {
+        end += 1;
+    }
+    end
+}
+
+/// ` ?[^\s\p{L}\p{N}]+` seguido de `[\r\n/]*` (o200k) ou `[\r\n]*` (Llama 3).
+fn symbol_run_end(chars: &[char], at: usize, slash_tail: bool) -> Option<usize> {
+    let start = if chars[at] == ' ' && chars.get(at + 1).is_some_and(|c| is_symbol(*c)) {
+        at + 1
+    } else {
+        at
+    };
+    if !is_symbol(chars[start]) {
+        return None;
+    }
+    let mut end = start;
+    while end < chars.len() && is_symbol(chars[end]) {
+        end += 1;
+    }
+    while end < chars.len() && (is_line_break(chars[end]) || (slash_tail && chars[end] == '/')) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// `\s*[\r\n]+|\s+(?!\S)|\s+`, a comecar num espaco em `at`.
+fn whitespace_end(chars: &[char], at: usize) -> usize {
+    let mut run = at;
+    while run < chars.len() && chars[run].is_whitespace() {
+        run += 1;
+    }
+    if let Some(last) = (at..run).rev().find(|&index| is_line_break(chars[index])) {
+        return last + 1;
+    }
+    if run == chars.len() || run - at < 2 {
+        return run;
+    }
+    // O ultimo espaco vai com a palavra que se segue.
+    run - 1
+}
+
+fn upper_run_end(chars: &[char], start: usize) -> usize {
+    let mut end = start;
+    while end < chars.len() && is_upper_side(chars[end]) {
+        end += 1;
+    }
+    end
+}
+
+/// `U*L+` a partir de `start`: o `U*` mais longo que deixa um `L` a seguir,
+/// e o `L+` inteiro.
+fn upper_then_lower_end(chars: &[char], start: usize) -> Option<usize> {
+    let split = (start..=upper_run_end(chars, start))
+        .rev()
+        .find(|&split| chars.get(split).is_some_and(|c| is_lower_side(*c)))?;
+    let mut end = split;
+    while end < chars.len() && is_lower_side(chars[end]) {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// O pre-token do o200k que comeca em `at`: onde acaba.
+fn o200k_next(chars: &[char], at: usize) -> usize {
+    // `P?`: primeiro com o caractere de `at` colado a frente, depois sem ele
+    // (uma marca e as duas coisas); a primeira alternativa, `U*L+`, e
+    // tentada das duas formas antes da segunda, `U+L*`.
+    let starts = [is_word_lead(chars[at]).then_some(at + 1), Some(at)];
+    let word = starts
+        .iter()
+        .flatten()
+        .find_map(|&start| upper_then_lower_end(chars, start))
+        .or_else(|| {
+            starts
+                .iter()
+                .flatten()
+                .find(|&&start| chars.get(start).is_some_and(|c| is_upper_side(*c)))
+                .map(|&start| upper_run_end(chars, start))
+        });
+    if let Some(end) = word {
+        return contraction_end(chars, end).unwrap_or(end);
+    }
+    if chars[at].is_numeric() {
+        return digits_end(chars, at);
+    }
+    symbol_run_end(chars, at, true).unwrap_or_else(|| whitespace_end(chars, at))
+}
+
+/// O pre-token do Llama 3 que comeca em `at`: onde acaba.
+fn llama3_next(chars: &[char], at: usize) -> usize {
+    if let Some(end) = contraction_end(chars, at) {
+        return end;
+    }
+    let start = if is_word_lead(chars[at]) { at + 1 } else { at };
+    if chars.get(start).is_some_and(|c| is_letter(*c)) {
+        let mut end = start;
+        while end < chars.len() && is_letter(chars[end]) {
+            end += 1;
+        }
+        return end;
+    }
+    if chars[at].is_numeric() {
+        return digits_end(chars, at);
+    }
+    symbol_run_end(chars, at, false).unwrap_or_else(|| whitespace_end(chars, at))
+}
+
+fn count_pretokens(chars: &[char], next: fn(&[char], usize) -> usize) -> usize {
+    let mut count = 0;
+    let mut at = 0;
+    while at < chars.len() {
+        at = next(chars, at).max(at + 1);
+        count += 1;
+    }
+    count
+}
+
+/// O maior dos dois numeros de pre-tokens de `text`, o do o200k e o do
+/// Llama 3. Cada um e um limite inferior dos tokens do seu tokenizador; a
+/// estimativa, que nunca fica abaixo deste numero, nunca fica abaixo de
+/// nenhum dos dois.
+pub fn pretoken_count(text: &str) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    count_pretokens(&chars, o200k_next).max(count_pretokens(&chars, llama3_next))
+}
+
+/// O custo de `text` em tokens, antes de arredondar e de calibrar: o maior
+/// entre a tabela x 1,10 e o numero de pre-tokens. Subaditivo nas juncoes
+/// que o pacote usa (uma mudanca de linha, ou um espaco depois de um texto
+/// sem espacos no fim): a tabela soma-se e os pre-tokens de `a`, da juncao
+/// e de `b` nunca sao menos do que os do texto junto. E isso que deixa a
+/// alocacao contar por partes e garantir a contagem do texto final.
+fn weight(text: &str) -> f64 {
+    (table_weight(text) * TOKEN_SAFETY_FACTOR).max(pretoken_count(text) as f64)
+}
+
+/// `weight` de um texto que leva o nonce da cerca, ao peso maximo de
+/// qualquer nonce do mesmo tamanho: a tabela com o nonce so de digitos (o
+/// caractere hexadecimal mais pesado) e os pre-tokens com digitos e letras
+/// alternados (um pre-token por caractere, o maximo; comeca num digito,
+/// que nao se cola ao `=` de antes, e acaba numa letra). Nao depende do
+/// sorteio e fica em ou acima do peso do texto com o nonce verdadeiro.
+fn weight_with_nonce(text: &str, nonce: &FenceNonce) -> f64 {
+    let nonce = nonce.as_str();
+    if nonce.is_empty() || !text.contains(nonce) {
+        return weight(text);
+    }
+    let digits = "9".repeat(nonce.len());
+    let alternating: String = (0..nonce.len())
+        .map(|index| if index % 2 == 0 { '9' } else { 'a' })
+        .collect();
+    let table = table_weight(&text.replace(nonce, &digits)) * TOKEN_SAFETY_FACTOR;
+    table.max(pretoken_count(&text.replace(nonce, &alternating)) as f64)
+}
+
 fn tokens_from_weight(weight: f64) -> usize {
     if weight <= 0.0 {
         return 0;
     }
-    (weight * TOKEN_SAFETY_FACTOR).ceil() as usize
+    weight.ceil() as usize
 }
 
-/// Os tokens de um texto: a tabela por classe de caractere x 1,10,
-/// arredondada para cima. Zero para o texto vazio.
+/// Os tokens de um texto: o maior entre a tabela por classe de caractere
+/// x 1,10 (arredondada para cima) e o numero de pre-tokens. Zero para o
+/// texto vazio.
 pub fn estimate_tokens(text: &str) -> usize {
     tokens_from_weight(weight(text))
 }
@@ -452,7 +754,9 @@ pub struct BudgetSpec {
 
 impl BudgetSpec {
     /// `max_input` e o limite de entrada do modelo; `reserve_output` fica
-    /// livre para a resposta.
+    /// livre para a resposta e para as instrucoes da tarefa, se as houver
+    /// (texto do codigo, como a instrucao do mapa). As instrucoes da cerca,
+    /// a pergunta e o pacote contam-se no resto (`available`).
     pub fn new(max_input: usize, reserve_output: usize, destination: Destination) -> Self {
         Self {
             max_input,
@@ -465,7 +769,9 @@ impl BudgetSpec {
     }
 
     /// Os tokens que cada fonte com conteudo recebe antes da alocacao por
-    /// pontuacao (0 desliga o piso).
+    /// pontuacao (0 desliga o piso): pelo menos `min(piso, o seu texto)`
+    /// quando os pisos de todas, com os cabecalhos, cabem; senao, o maior
+    /// piso comum que cabe.
     pub fn with_floor_per_source(mut self, tokens: usize) -> Self {
         self.floor_per_source = tokens;
         self
@@ -521,10 +827,23 @@ impl BudgetSpec {
         self.tokens(text) + MESSAGE_OVERHEAD_TOKENS
     }
 
-    /// O que sobra para o pacote depois da pergunta (como mensagem):
-    /// `None` quando nem a pergunta cabe.
+    /// Os tokens da mensagem com as instrucoes da cerca
+    /// (`ContextPack::fence_instructions`), calibrados, com o nonce ao peso
+    /// maximo: o mesmo numero para qualquer nonce.
+    pub fn fence_instructions_tokens(&self) -> usize {
+        let nonce = FenceNonce::fresh();
+        self.tokens_of_weight(weight_with_nonce(&fence_instructions_text(&nonce), &nonce))
+            + MESSAGE_OVERHEAD_TOKENS
+    }
+
+    /// O que sobra para o pacote em `available()` depois das instrucoes da
+    /// cerca (uma mensagem), da pergunta (outra, a do utilizador) e da linha
+    /// em branco que a separa do pacote. `None` quando nem isto cabe.
     pub fn pack_budget(&self, question: &str) -> Option<usize> {
-        self.available().checked_sub(self.message_tokens(question))
+        self.available()
+            .checked_sub(self.fence_instructions_tokens())?
+            .checked_sub(self.message_tokens(question))?
+            .checked_sub(self.tokens(QUESTION_SEPARATOR))
     }
 
     fn tokens_of_weight(&self, weight: f64) -> usize {
@@ -1057,9 +1376,10 @@ pub struct Passage {
 
 impl Passage {
     /// Onde o trecho esta no texto sanitizado da fonte. Num trecho
-    /// comprimido cujo texto a cerca teve de neutralizar (um marcador
-    /// parecido la dentro), o intervalo e aproximado: as posicoes vem do
-    /// texto neutralizado, que pode ter outro tamanho.
+    /// comprimido ou cortado cujo texto a cerca teve de neutralizar (um
+    /// marcador parecido la dentro) ou escapar (uma linha que comeca por
+    /// `[`), o intervalo e aproximado: as posicoes vem do texto
+    /// neutralizado, que pode ter outro tamanho.
     pub fn source_span(&self) -> Range<usize> {
         self.source_span.clone()
     }
@@ -1077,7 +1397,8 @@ impl Passage {
         self.score
     }
 
-    /// So as frases mais pontuadas do trecho entraram.
+    /// So parte do trecho entrou: as frases mais pontuadas, ou o inicio
+    /// dele quando o piso de uma fonte teve de caber num espaco curto.
     pub fn is_compressed(&self) -> bool {
         self.compressed
     }
@@ -1101,6 +1422,7 @@ impl PackedSource {
         &self.id
     }
 
+    /// O nome como vai no pacote (redigido com destino remoto).
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -1143,7 +1465,11 @@ impl PackedSource {
 /// let spec = BudgetSpec::new(4096, 512, Destination::Local);
 /// let pack = build_context("consumo do processador", &[page], &spec, &HashingEmbedder).unwrap();
 /// assert!(pack.rendered().contains("3.5 GHz"));
-/// assert!(pack.est_tokens() <= spec.available());
+/// // O prompt inteiro: as instrucoes da cerca e a mensagem do utilizador.
+/// assert!(
+///     spec.message_tokens(&pack.fence_instructions()) + spec.message_tokens(&pack.user_message())
+///         <= spec.available()
+/// );
 /// ```
 ///
 /// Nao se constroi de fora (todos os campos estao na lista: o unico erro
@@ -1154,6 +1480,7 @@ impl PackedSource {
 /// use neural_core::untrusted::FenceNonce;
 /// let pack = ContextPack {
 ///     rendered: String::new(),
+///     question: String::new(),
 ///     est_tokens: 0,
 ///     sources: Vec::new(),
 ///     duplicates: Vec::new(),
@@ -1176,6 +1503,7 @@ impl PackedSource {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextPack {
     rendered: String,
+    question: String,
     est_tokens: usize,
     sources: Vec<PackedSource>,
     duplicates: Vec<Duplicate>,
@@ -1185,16 +1513,36 @@ pub struct ContextPack {
 }
 
 impl ContextPack {
-    /// O texto cercado, pronto para a mensagem do utilizador a seguir a
-    /// pergunta. As instrucoes levam `untrusted::CONTEXT_DATA_PREAMBLE_PT`
-    /// e `untrusted::fence_notice_pt(pack.nonce())`.
+    /// O texto cercado. Vai na mensagem do utilizador a seguir a pergunta
+    /// (`user_message`), e as instrucoes levam `fence_instructions`.
     pub fn rendered(&self) -> &str {
         &self.rendered
     }
 
+    /// A pergunta, sem invisiveis, como entra na mensagem do utilizador.
+    pub fn question(&self) -> &str {
+        &self.question
+    }
+
+    /// A mensagem do utilizador: a pergunta, uma linha em branco
+    /// (`QUESTION_SEPARATOR`) e o pacote. Conta no orcamento.
+    pub fn user_message(&self) -> String {
+        format!("{}{QUESTION_SEPARATOR}{}", self.question, self.rendered)
+    }
+
+    /// As instrucoes que acompanham o pacote, numa mensagem propria (a de
+    /// sistema): `untrusted::CONTEXT_DATA_PREAMBLE_PT` e o aviso do nonce
+    /// deste pacote (`untrusted::fence_notice_pt`), como o `PromptBuilder`
+    /// as escreve. Contam no orcamento; as instrucoes da tarefa, se as
+    /// houver, contam-se na reserva de saida.
+    pub fn fence_instructions(&self) -> String {
+        fence_instructions_text(&self.nonce)
+    }
+
     /// Os tokens de `rendered`, calibrados pelo `BudgetSpec`, com o nonce
     /// da cerca contado ao peso maximo: nao depende do sorteio e fica
-    /// sempre em ou acima da contagem do texto tal como sai.
+    /// sempre em ou acima da contagem do texto tal como sai. Com a pergunta
+    /// e as instrucoes da cerca, cabe em `BudgetSpec::available`.
     pub fn est_tokens(&self) -> usize {
         self.est_tokens
     }
@@ -1232,6 +1580,171 @@ impl ContextPack {
 /// O nome da cerca do pacote.
 pub const PACK_FENCE_LABEL: &str = "contexto";
 
+/// O que separa a pergunta do pacote na mensagem do utilizador.
+pub const QUESTION_SEPARATOR: &str = "\n\n";
+
+/// As instrucoes que acompanham dados cercados com `nonce`, como o
+/// `PromptBuilder` as escreve quando nao ha outras.
+fn fence_instructions_text(nonce: &FenceNonce) -> String {
+    format!(
+        "{}\n{}",
+        untrusted::CONTEXT_DATA_PREAMBLE_PT,
+        untrusted::fence_notice_pt(nonce)
+    )
+}
+
+/// No destino remoto, cada URL de `text` que leva uma credencial passa pelo
+/// `redact_url`; localmente o texto fica como esta.
+fn redact_urls_for(destination: &Destination, text: String) -> String {
+    if destination.is_remote() {
+        redact_urls(&text)
+    } else {
+        text
+    }
+}
+
+fn is_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'-')
+}
+
+/// Onde comeca o esquema de um URL cujo `://` esta em `separator`: `None`
+/// sem uma letra antes.
+fn scheme_start(text: &str, separator: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut start = separator;
+    while start > 0 && is_scheme_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    while start < separator && !bytes[start].is_ascii_alphabetic() {
+        start += 1;
+    }
+    (start < separator).then_some(start)
+}
+
+/// O que fecha uma frase ou um parentese a seguir a um URL, e nao e dele.
+const URL_TRAILERS: &[char] = &[
+    '.', ',', ';', ':', '!', '?', ')', ']', '}', '>', '"', '\'', '»', '”', '’',
+];
+
+/// Cada `esquema://...` de `text` (ate ao espaco, ou ate ao URL seguinte
+/// dentro dele, sem a pontuacao que fecha a frase) passa pelo `redact_url`
+/// quando ele apaga alguma coisa: o valor de um parametro que e credencial
+/// (`sig=`, `code=`, `access_token=`...), um fragmento com uma, ou o
+/// `utilizador:senha@`. Um URL sem nada disso fica byte a byte.
+fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(found) = text[search..].find("://") {
+        let separator = search + found;
+        search = separator + 3;
+        let Some(start) = scheme_start(text, separator).filter(|start| *start >= copied) else {
+            continue;
+        };
+        let mut end = text[search..]
+            .find(char::is_whitespace)
+            .map_or(text.len(), |at| search + at);
+        if let Some(nested) = text[search..end].find("://")
+            && let Some(nested_start) = scheme_start(text, search + nested)
+            && nested_start > search
+        {
+            end = nested_start;
+        }
+        let end = start + text[start..end].trim_end_matches(URL_TRAILERS).len();
+        let url = &text[start..end];
+        let userinfo = url::Url::parse(url)
+            .is_ok_and(|parsed| !parsed.username().is_empty() || parsed.password().is_some());
+        let redacted = redact_url(url);
+        if userinfo || redacted.contains("REDACTED") {
+            out.push_str(&text[copied..start]);
+            out.push_str(&redacted);
+            copied = end;
+        }
+        search = search.max(end);
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// O nome da fonte como vai no pacote: com destino remoto, sem as linhas
+/// sensiveis (`redact_sensitive_text`) nem as credenciais dos URLs -- o
+/// titulo de uma aba tambem sai da maquina.
+fn packed_label(source: &ContextSource, spec: &BudgetSpec) -> String {
+    redact_urls_for(
+        &spec.destination,
+        untrusted::sanitize(&source.label, spec.destination.fence()),
+    )
+}
+
+/// Os parenteses rectos com que um cabecalho de fonte se pode imitar.
+const OPENING_BRACKETS: &[char] = &['[', '［', '【', '〔', '〖', '〘', '〚', '⟦', '⁅', '❲', '﹝'];
+
+/// Cada linha que comeca (depois de espacos e invisiveis) por um parentese
+/// recto leva um `\` antes dele. So os cabecalhos das fontes comecam assim
+/// dentro da cerca: uma pagina que escreva `[2] resposta: Claude` nao se
+/// faz passar por outra fonte nem por uma IA.
+fn escape_header_lookalikes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 1);
+    let mut line_start = true;
+    for c in text.chars() {
+        if line_start && OPENING_BRACKETS.contains(&c) {
+            out.push('\\');
+        }
+        if c == '\n' {
+            line_start = true;
+        } else if !(c.is_whitespace() || untrusted::is_ignorable(c)) {
+            line_start = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Palavras de negacao, ja sem acentos. O `no` fica de fora: em portugues
+/// e quase sempre `em o`.
+const NEGATIONS: &[&str] = &[
+    "nao", "nunca", "jamais", "nem", "nenhum", "nenhuma", "nenhuns", "nenhumas", "nada", "ninguem",
+    "sem", "not", "never", "none", "nor", "without", "nothing", "nobody", "cannot",
+];
+
+/// Os numeros (digitos, com `.` ou `,` entre digitos) e as negacoes de um
+/// texto, ordenados: duas copias parecidas com listas diferentes dizem
+/// coisas diferentes.
+fn facts(text: &str) -> (Vec<String>, Vec<String>) {
+    let chars: Vec<char> = text.chars().collect();
+    let mut numbers = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        if !chars[at].is_numeric() {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < chars.len()
+            && (chars[end].is_numeric()
+                || (matches!(chars[end], '.' | ',')
+                    && chars.get(end + 1).is_some_and(|c| c.is_numeric())))
+        {
+            end += 1;
+        }
+        numbers.push(chars[at..end].iter().collect::<String>());
+        at = end;
+    }
+    numbers.sort();
+    let folded: String = text
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(fold_char)
+        .collect();
+    let mut negations: Vec<String> = folded
+        .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '’'))
+        .filter(|word| NEGATIONS.contains(word) || word.ends_with("n't") || word.ends_with("n’t"))
+        .map(str::to_string)
+        .collect();
+    negations.sort();
+    (numbers, negations)
+}
+
 struct Chunk {
     source: usize,
     span: Range<usize>,
@@ -1247,6 +1760,40 @@ struct Placed {
     weight: f64,
     score: f64,
     compressed: bool,
+}
+
+/// A pontuacao de cada trecho de `indices` (0,5 BM25 + 0,4 cosseno + 0,1
+/// prioridade), com o IDF do BM25 tirado desses trechos.
+fn score_chunks(
+    indices: &[usize],
+    chunks: &[Chunk],
+    sources: &[ContextSource],
+    query_terms: &[String],
+    cosines: &[f64],
+) -> (Bm25, Vec<f64>) {
+    let documents: Vec<Vec<String>> = indices.iter().map(|&at| chunks[at].terms.clone()).collect();
+    let bm25 = Bm25::new(&documents);
+    let lexical: Vec<f64> = documents
+        .iter()
+        .map(|document| bm25.score(query_terms, document))
+        .collect();
+    let lexical_max = lexical.iter().copied().fold(0.0f64, f64::max);
+    let scores = indices
+        .iter()
+        .zip(&lexical)
+        .map(|(&at, &lexical)| {
+            let lexical = if lexical_max > 0.0 {
+                lexical / lexical_max
+            } else {
+                0.0
+            };
+            let priority = f64::from(sources[chunks[at].source].priority) / f64::from(PRIORITY_MAX);
+            SCORE_WEIGHT_BM25 * lexical
+                + SCORE_WEIGHT_COSINE * cosines[at]
+                + SCORE_WEIGHT_PRIORITY * priority
+        })
+        .collect();
+    (bm25, scores)
 }
 
 /// Monta o pacote: `question` e o pedido do utilizador (conta no
@@ -1271,7 +1818,7 @@ pub fn build_context(
     let fence = spec.destination.fence();
     let texts: Vec<String> = sources
         .iter()
-        .map(|source| source.text.sanitized(fence))
+        .map(|source| redact_urls_for(&spec.destination, source.text.sanitized(fence)))
         .collect();
     let mut dropped: Vec<Dropped> = sources
         .iter()
@@ -1295,13 +1842,12 @@ pub fn build_context(
             limit: spec.max_input,
         });
     };
-    // O nonce conta ao peso maximo (so digitos): a contagem do pacote nao
-    // depende do sorteio e fica sempre em ou acima da do texto que sai.
-    let heaviest_nonce = "9".repeat(nonce.as_str().len());
-    let canonical = |text: &str| text.replace(nonce.as_str(), &heaviest_nonce);
     // O que ja esta gasto antes de qualquer trecho: as duas linhas da
-    // cerca e as mudancas de linha que as juntam ao corpo.
-    let frame_weight = weight(&canonical(&begin)) + weight(&canonical(&end)) + 2.0 * weight("\n");
+    // cerca, com o nonce ao peso maximo (a contagem do pacote nao depende
+    // do sorteio e fica sempre em ou acima da do texto que sai), e as
+    // mudancas de linha que as juntam ao corpo.
+    let frame_weight =
+        weight_with_nonce(&begin, &nonce) + weight_with_nonce(&end, &nonce) + 2.0 * weight("\n");
     let too_small = || ContextError::ModelTooSmall {
         limit: spec.max_input,
     };
@@ -1309,7 +1855,8 @@ pub fn build_context(
         return Err(too_small());
     }
 
-    // 2. Trechos.
+    // 2. Trechos, ja como saem: neutralizados para a cerca e com as linhas
+    // que imitam um cabecalho escapadas.
     let tokens = |text: &str| spec.tokens(text);
     let mut chunks: Vec<Chunk> = Vec::new();
     for (index, text) in texts.iter().enumerate() {
@@ -1317,7 +1864,10 @@ pub fn build_context(
             continue;
         }
         for span in chunk_spans(text, spec.chunk_tokens, &tokens) {
-            let inside = untrusted::neutralize_inside(&text[span.clone()], &nonce);
+            let inside = escape_header_lookalikes(&untrusted::neutralize_inside(
+                &text[span.clone()],
+                &nonce,
+            ));
             chunks.push(Chunk {
                 source: index,
                 span,
@@ -1328,73 +1878,19 @@ pub fn build_context(
         }
     }
 
-    // 3. Deduplicacao: exacta pelo SHA-256, parecida pelo SimHash e Jaccard.
-    let mut duplicates = Vec::new();
-    let mut kept: Vec<usize> = Vec::new();
-    let mut exact: BTreeMap<[u8; 32], usize> = BTreeMap::new();
-    let mut fingerprints: Vec<(Shingles, u64)> = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let digest: [u8; 32] = Sha256::digest(normalized(&chunk.text).as_bytes()).into();
-        let reference = |at: usize| PassageRef {
-            source: sources[chunks[at].source].id.clone(),
-            span: chunks[at].span.clone(),
-        };
-        if let Some(&first) = exact.get(&digest) {
-            duplicates.push(Duplicate {
-                kept: reference(first),
-                dropped: reference(index),
-                similarity: 1.0,
-                exact: true,
-            });
-            continue;
-        }
-        let shingles = Shingles::of(&chunk.text);
-        let simhash = shingles.simhash();
-        let near = kept
-            .iter()
-            .zip(&fingerprints)
-            .filter(|(_, (_, other))| (simhash ^ *other).count_ones() <= SIMHASH_MAX_DISTANCE)
-            .map(|(&at, (other, _))| (at, shingles.jaccard(other)))
-            .find(|(_, jaccard)| *jaccard >= NEAR_DUPLICATE_JACCARD);
-        if let Some((first, jaccard)) = near {
-            duplicates.push(Duplicate {
-                kept: reference(first),
-                dropped: reference(index),
-                similarity: jaccard,
-                exact: false,
-            });
-            continue;
-        }
-        exact.insert(digest, index);
-        kept.push(index);
-        fingerprints.push((shingles, simhash));
-    }
-
-    // 4. Pontuacao.
+    // 3. Deduplicacao (exacta pelo SHA-256, parecida pelo SimHash e
+    // Jaccard), pela ordem da pontuacao de todos os trechos: a copia que
+    // fica e a mais pontuada; numa igualdade, a primeira.
     let query_terms = terms(&question);
-    let documents: Vec<Vec<String>> = kept.iter().map(|&at| chunks[at].terms.clone()).collect();
-    let bm25 = Bm25::new(&documents);
-    let lexical: Vec<f64> = documents
-        .iter()
-        .map(|document| bm25.score(&query_terms, document))
-        .collect();
-    let lexical_max = lexical.iter().copied().fold(0.0f64, f64::max);
     let query_vector = if question.trim().is_empty() {
         Vec::new()
     } else {
         embedder.embed(&question)
     };
-    let scores: Vec<f64> = kept
+    let cosines: Vec<f64> = chunks
         .iter()
-        .zip(&lexical)
-        .map(|(&at, &lexical)| {
-            let chunk = &chunks[at];
-            let bm25 = if lexical_max > 0.0 {
-                lexical / lexical_max
-            } else {
-                0.0
-            };
-            let cosine = if query_vector.is_empty() {
+        .map(|chunk| {
+            if query_vector.is_empty() {
                 0.0
             } else {
                 f64::from(cosine_similarity(
@@ -1402,13 +1898,71 @@ pub fn build_context(
                     &embedder.embed(&chunk.text),
                 ))
                 .clamp(0.0, 1.0)
-            };
-            let priority = f64::from(sources[chunk.source].priority) / f64::from(PRIORITY_MAX);
-            SCORE_WEIGHT_BM25 * bm25
-                + SCORE_WEIGHT_COSINE * cosine
-                + SCORE_WEIGHT_PRIORITY * priority
+            }
         })
         .collect();
+    let mut order: Vec<usize> = (0..chunks.len()).collect();
+    let (_, first_scores) = score_chunks(&order, &chunks, sources, &query_terms, &cosines);
+    order.sort_by(|&a, &b| first_scores[b].total_cmp(&first_scores[a]).then(a.cmp(&b)));
+    let reference = |at: usize| PassageRef {
+        source: sources[chunks[at].source].id.clone(),
+        span: chunks[at].span.clone(),
+    };
+    let mut removed: Vec<(usize, Duplicate)> = Vec::new();
+    let mut kept: Vec<usize> = Vec::new();
+    let mut exact: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+    let mut fingerprints: Vec<(usize, Shingles, u64)> = Vec::new();
+    for index in order {
+        let chunk = &chunks[index];
+        let digest: [u8; 32] = Sha256::digest(normalized(&chunk.text).as_bytes()).into();
+        if let Some(&first) = exact.get(&digest) {
+            removed.push((
+                index,
+                Duplicate {
+                    kept: reference(first),
+                    dropped: reference(index),
+                    similarity: 1.0,
+                    exact: true,
+                },
+            ));
+            continue;
+        }
+        let shingles = Shingles::of(&chunk.text);
+        let simhash = shingles.simhash();
+        // Entre fontes diferentes, uma copia parecida que diverge nos
+        // numeros ou nas negacoes nao e repeticao: e o desacordo que o
+        // consenso tem de ver, e fica.
+        let near = fingerprints
+            .iter()
+            .filter(|(_, _, other)| (simhash ^ *other).count_ones() <= SIMHASH_MAX_DISTANCE)
+            .map(|(at, other, _)| (*at, shingles.jaccard(other)))
+            .find(|&(at, jaccard)| {
+                jaccard >= NEAR_DUPLICATE_JACCARD
+                    && (chunks[at].source == chunk.source
+                        || facts(&chunks[at].text) == facts(&chunk.text))
+            });
+        if let Some((first, jaccard)) = near {
+            removed.push((
+                index,
+                Duplicate {
+                    kept: reference(first),
+                    dropped: reference(index),
+                    similarity: jaccard,
+                    exact: false,
+                },
+            ));
+            continue;
+        }
+        exact.insert(digest, index);
+        kept.push(index);
+        fingerprints.push((index, shingles, simhash));
+    }
+    kept.sort_unstable();
+    removed.sort_by_key(|(index, _)| *index);
+    let duplicates: Vec<Duplicate> = removed.into_iter().map(|(_, dup)| dup).collect();
+
+    // 4. Pontuacao, com o IDF dos trechos que ficaram.
+    let (bm25, scores) = score_chunks(&kept, &chunks, sources, &query_terms, &cosines);
 
     // 5 e 6. Piso por fonte e alocacao por pontuacao.
     let headers: Vec<String> = sources
@@ -1434,64 +1988,11 @@ pub fn build_context(
         source_open: vec![false; sources.len()],
         source_weight: vec![0.0; sources.len()],
     };
-
-    // O piso: cada fonte com conteudo recebe ate `floor_per_source` dos
-    // seus melhores trechos antes de a pontuacao global decidir o resto.
-    // Se os pisos somados nao cabem, cada fonte recebe uma parte igual.
     if spec.floor_per_source > 0 {
-        let floor_weight =
-            spec.floor_per_source as f64 / TOKEN_SAFETY_FACTOR / spec.calibration.factor;
-        let content_weight: Vec<f64> = (0..sources.len())
-            .map(|source| {
-                kept.iter()
-                    .filter(|&&at| chunks[at].source == source)
-                    .map(|&at| chunks[at].weight)
-                    .sum()
-            })
-            .collect();
-        let with_content = content_weight.iter().filter(|w| **w > 0.0).count().max(1);
-        let mut needs: Vec<f64> = content_weight
-            .iter()
-            .map(|content| content.min(floor_weight))
-            .collect();
-        let budget_weight = (pack_budget as f64 / spec.calibration.factor / TOKEN_SAFETY_FACTOR
-            - frame_weight)
-            .max(0.0);
-        if needs.iter().sum::<f64>() > budget_weight {
-            let share = budget_weight / with_content as f64;
-            for need in &mut needs {
-                *need = need.min(share);
-            }
-        }
-        // Por rondas: cada fonte mete um trecho por ronda, para a primeira
-        // nao gastar o que era das seguintes quando o espaco e pouco.
-        let mut queues: Vec<Vec<usize>> = (0..sources.len())
-            .map(|source| {
-                let mut positions: Vec<usize> = (0..kept.len())
-                    .filter(|&position| chunks[kept[position]].source == source)
-                    .collect();
-                allocator.by_score(&mut positions);
-                positions.reverse();
-                positions
-            })
-            .collect();
-        loop {
-            let mut progressed = false;
-            for (source, queue) in queues.iter_mut().enumerate() {
-                if allocator.source_weight[source] >= needs[source] {
-                    continue;
-                }
-                while let Some(position) = queue.pop() {
-                    if allocator.place(position) {
-                        progressed = true;
-                        break;
-                    }
-                }
-            }
-            if !progressed {
-                break;
-            }
-        }
+        allocator.place_floors(
+            sources.len(),
+            spec.floor_per_source as f64 / spec.calibration.factor,
+        );
     }
 
     let mut positions: Vec<usize> = (0..kept.len())
@@ -1572,7 +2073,7 @@ pub fn build_context(
         let section = section_start..rendered.len();
         packed.push(PackedSource {
             id: source.id.clone(),
-            label: source.label.clone(),
+            label: packed_label(source, spec),
             kind: source.kind,
             url: header_url(source, spec),
             locator: source.locator,
@@ -1583,10 +2084,11 @@ pub fn build_context(
         rendered.push('\n');
     }
     rendered.push_str(&end);
-    let est_tokens = spec.tokens_of_weight(weight(&canonical(&rendered)));
+    let est_tokens = spec.tokens_of_weight(weight_with_nonce(&rendered, &nonce));
 
     Ok(ContextPack {
         rendered,
+        question,
         est_tokens,
         sources: packed,
         duplicates,
@@ -1608,14 +2110,15 @@ fn header_url(source: &ContextSource, spec: &BudgetSpec) -> Option<String> {
 
 /// `[1] página: Título — https://… (p. 3)`.
 fn header_line(index: usize, source: &ContextSource, spec: &BudgetSpec) -> String {
+    let label = packed_label(source, spec);
     let mut line = format!(
         "[{}] {}: {}",
         index + 1,
         source.kind.label_pt(),
-        if source.label.is_empty() {
+        if label.is_empty() {
             source.id.as_str()
         } else {
-            source.label.as_str()
+            label.as_str()
         }
     );
     if let Some(url) = header_url(source, spec) {
@@ -1627,6 +2130,13 @@ fn header_line(index: usize, source: &ContextSource, spec: &BudgetSpec) -> Strin
     }
     line
 }
+
+/// A folga do piso de cada fonte, em tokens crus: cobre o ultimo caractere
+/// de um corte (o mais pesado da tabela vale 3,7 x 1,10; um pre-token, 1) e
+/// os arredondamentos.
+const FLOOR_SLACK_WEIGHT: f64 = 5.0;
+/// Abaixo disto uma fonte ja chegou ao piso (arredondamentos).
+const FLOOR_EPSILON: f64 = 1e-6;
 
 /// A alocacao: o que ja esta gasto, o que entrou e a unica pergunta que
 /// decide se mais um trecho cabe (`fits`).
@@ -1647,12 +2157,16 @@ struct Allocator<'a> {
     source_weight: Vec<f64>,
 }
 
-impl Allocator<'_> {
+impl<'a> Allocator<'a> {
     /// O teste do orcamento: com `cost` a mais, o pacote continua a caber?
     /// Meio peso de folga, porque a soma por partes e a do texto final so
     /// diferem por arredondamento de virgula flutuante.
     fn fits(&self, cost: f64) -> bool {
         self.spec.tokens_of_weight(self.used + cost + 0.5) <= self.pack_budget
+    }
+
+    fn chunk(&self, position: usize) -> &'a Chunk {
+        &self.chunks[self.kept[position]]
     }
 
     /// O cabecalho e as duas mudancas de linha da seccao, so na primeira
@@ -1667,7 +2181,7 @@ impl Allocator<'_> {
 
     fn by_score(&self, positions: &mut [usize]) {
         positions.sort_by(|&a, &b| {
-            let (left, right) = (&self.chunks[self.kept[a]], &self.chunks[self.kept[b]]);
+            let (left, right) = (self.chunk(a), self.chunk(b));
             self.scores[b]
                 .total_cmp(&self.scores[a])
                 .then(left.source.cmp(&right.source))
@@ -1675,10 +2189,151 @@ impl Allocator<'_> {
         });
     }
 
+    /// Os trechos de cada fonte, do menos para o mais pontuado: `pop` da o
+    /// melhor que resta.
+    fn queues(&self, sources: usize) -> Vec<Vec<usize>> {
+        (0..sources)
+            .map(|source| {
+                let mut positions: Vec<usize> = (0..self.kept.len())
+                    .filter(|&position| self.chunk(position).source == source)
+                    .collect();
+                self.by_score(&mut positions);
+                positions.reverse();
+                positions
+            })
+            .collect()
+    }
+
+    /// O espaco que a fonte `source` ainda pede para chegar ao piso com os
+    /// trechos de `queue`, pela ordem: o texto que falta, o cabecalho se
+    /// ainda nao abriu, uma mudanca de linha por trecho e a folga.
+    fn reservation(&self, source: usize, missing: f64, queue: &[usize]) -> f64 {
+        if missing <= FLOOR_EPSILON || queue.is_empty() {
+            return 0.0;
+        }
+        let mut covered = 0.0;
+        let mut pieces = 0usize;
+        for &position in queue.iter().rev() {
+            pieces += 1;
+            covered += self.chunk(position).weight;
+            if covered >= missing {
+                break;
+            }
+        }
+        missing + self.header_cost(source) + self.separator * pieces as f64 + FLOOR_SLACK_WEIGHT
+    }
+
+    fn reservations(&self, needs: &[f64], queues: &[Vec<usize>]) -> Vec<f64> {
+        (0..needs.len())
+            .map(|source| {
+                self.reservation(
+                    source,
+                    needs[source] - self.source_weight[source],
+                    &queues[source],
+                )
+            })
+            .collect()
+    }
+
+    /// O piso (`floor`, em tokens crus): por rondas, cada fonte que ainda
+    /// nao chegou ao seu mete o melhor trecho que lhe resta, com o que as
+    /// outras ainda pedem reservado (`reservation`). Quando os pisos de
+    /// todas nao cabem, o piso comum desce ate ao maior que cabe.
+    fn place_floors(&mut self, sources: usize, floor: f64) {
+        let mut queues = self.queues(sources);
+        let content: Vec<f64> = queues
+            .iter()
+            .map(|queue| {
+                queue
+                    .iter()
+                    .map(|&position| self.chunk(position).weight)
+                    .sum()
+            })
+            .collect();
+        let needs_under = |cap: f64| -> Vec<f64> { content.iter().map(|c| c.min(cap)).collect() };
+        let mut needs = needs_under(floor);
+        if !self.fits(self.reservations(&needs, &queues).iter().sum()) {
+            let (mut low, mut high) = (0.0, floor);
+            for _ in 0..48 {
+                let middle = (low + high) / 2.0;
+                if self.fits(
+                    self.reservations(&needs_under(middle), &queues)
+                        .iter()
+                        .sum(),
+                ) {
+                    low = middle;
+                } else {
+                    high = middle;
+                }
+            }
+            needs = needs_under(low);
+        }
+        let mut reserved = self.reservations(&needs, &queues);
+        loop {
+            let mut progressed = false;
+            for source in 0..sources {
+                let missing = needs[source] - self.source_weight[source];
+                if missing <= FLOOR_EPSILON {
+                    continue;
+                }
+                let Some(position) = queues[source].pop() else {
+                    continue;
+                };
+                let others: f64 = reserved
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| *other != source)
+                    .map(|(_, reserve)| reserve)
+                    .sum();
+                progressed |= self.place_within(position, others, missing);
+                reserved[source] = self.reservation(
+                    source,
+                    needs[source] - self.source_weight[source],
+                    &queues[source],
+                );
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    /// Mete o trecho `position` inteiro se depois dele ainda cabe `others`
+    /// (o que as outras fontes tem reservado); senao, o maior corte dele que
+    /// cabe: as frases mais pontuadas, se chegam a `missing`, ou o inicio do
+    /// trecho ate onde couber.
+    fn place_within(&mut self, position: usize, others: f64, missing: f64) -> bool {
+        let chunk = self.chunk(position);
+        let opening = self.header_cost(chunk.source);
+        if self.fits(opening + chunk.weight + self.separator + others) {
+            self.admit(
+                position,
+                opening,
+                chunk.span.clone(),
+                chunk.text.clone(),
+                false,
+            );
+            return true;
+        }
+        let room = |extra: f64| self.fits(opening + self.separator + extra + others);
+        if !room(0.0) {
+            return false;
+        }
+        let cut = compress(chunk, self.query_terms, self.bm25, &room)
+            .filter(|(text, _, _)| weight(text) >= missing)
+            .map(|(text, span, _)| (text, span))
+            .or_else(|| cut_prefix(chunk, &room, missing));
+        let Some((text, span)) = cut else {
+            return false;
+        };
+        self.admit(position, opening, span, text, true);
+        true
+    }
+
     /// Mete o trecho `position` (indice em `kept`) inteiro se cabe, ou so
     /// as frases mais pontuadas que cabem; `false` se nada dele entra.
     fn place(&mut self, position: usize) -> bool {
-        let chunk = &self.chunks[self.kept[position]];
+        let chunk = self.chunk(position);
         let opening = self.header_cost(chunk.source);
         let full = opening + chunk.weight + self.separator;
         if self.fits(full) {
@@ -1715,7 +2370,7 @@ impl Allocator<'_> {
         text: String,
         compressed: bool,
     ) {
-        let source = self.chunks[self.kept[position]].source;
+        let source = self.chunk(position).source;
         let text_weight = weight(&text);
         self.used += opening + text_weight + self.separator;
         self.placed_flag[position] = true;
@@ -1734,7 +2389,8 @@ impl Allocator<'_> {
 
 /// As frases mais pontuadas de um trecho que ainda cabem, pela ordem do
 /// texto, e se ficou alguma de fora. `None` quando nem uma cabe ou o
-/// trecho e uma frase so.
+/// trecho e uma frase so. Qualquer frase pode ficar no inicio da linha:
+/// cada uma conta com o `\` que a escaparia, e o texto que sai e escapado.
 fn compress(
     chunk: &Chunk,
     query: &[String],
@@ -1754,7 +2410,8 @@ fn compress(
     let mut chosen: Vec<usize> = Vec::new();
     let mut total = 0.0;
     for (index, _) in ranked {
-        let cost = weight(&chunk.text[spans[index].clone()]) + weight(" ");
+        let sentence = &chunk.text[spans[index].clone()];
+        let cost = weight(&escape_header_lookalikes(sentence)) + weight(" ");
         if room(total + cost) {
             total += cost;
             chosen.push(index);
@@ -1765,17 +2422,72 @@ fn compress(
     }
     let partial = chosen.len() < spans.len();
     chosen.sort_unstable();
-    let text = chosen
-        .iter()
-        .map(|&index| &chunk.text[spans[index].clone()])
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = escape_header_lookalikes(
+        &chosen
+            .iter()
+            .map(|&index| &chunk.text[spans[index].clone()])
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
     let first = spans[chosen[0]].start;
     let last = spans[chosen[chosen.len() - 1]].end;
     Some((
         text,
         chunk.span.start + first..chunk.span.start + last,
         partial,
+    ))
+}
+
+/// O inicio de um trecho ate onde couber (`room`): acaba no fim de uma
+/// palavra quando isso ja chega a `missing`, e senao no ultimo caractere
+/// que cabe. `None` quando nem um caractere cabe.
+fn cut_prefix(
+    chunk: &Chunk,
+    room: &dyn Fn(f64) -> bool,
+    missing: f64,
+) -> Option<(String, Range<usize>)> {
+    let text = chunk.text.as_str();
+    let ends: Vec<usize> = text
+        .char_indices()
+        .map(|(index, c)| index + c.len_utf8())
+        .collect();
+    // O maior prefixo que cabe (o peso so cresce com o texto, fora
+    // desvios de um pre-token; cada candidato e confirmado pelo `room`).
+    let (mut low, mut high) = (0usize, ends.len());
+    while low < high {
+        let middle = (low + high) / 2;
+        if room(weight(&text[..ends[middle]])) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let longest = ends[..low].last().copied()?;
+    let word_end = text[..longest]
+        .char_indices()
+        .rev()
+        .find(|&(index, c)| {
+            !c.is_whitespace()
+                && text[index + c.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+        })
+        .map(|(index, c)| index + c.len_utf8());
+    let end = word_end
+        .filter(|&end| {
+            let prefix = weight(&text[..end]);
+            prefix >= missing && room(prefix)
+        })
+        .unwrap_or(longest);
+    let cut = text[..end].trim_end();
+    if cut.is_empty() {
+        return None;
+    }
+    let start = chunk.span.start;
+    Some((
+        cut.to_string(),
+        start..(start + cut.len()).min(chunk.span.end),
     ))
 }
 
@@ -1912,37 +2624,59 @@ impl MapPiece {
         &self.text
     }
 
-    /// Os tokens do pedaco como mensagem.
+    /// Os tokens da chamada deste pedaco, como o `PromptBuilder` a monta
+    /// com `.data(MAP_FENCE_LABEL, ...)`: as instrucoes da cerca numa
+    /// mensagem e o pedaco cercado (neutralizado) noutra, com o nonce ao
+    /// peso maximo. A instrucao do mapa e a resposta ficam na reserva de
+    /// saida.
     pub fn est_tokens(&self) -> usize {
         self.est_tokens
     }
 }
 
-/// Parte `text` (sanitizado para o destino do `spec`) em pedacos que
-/// cabem, cada um, em `spec.available()` como mensagem, em fronteiras de
-/// frase. A reserva de saida do `spec` deve cobrir a instrucao do mapa e a
+/// O nome da cerca de cada pedaco do mapa.
+pub const MAP_FENCE_LABEL: &str = "trecho";
+
+/// Parte `text` (sanitizado para o destino do `spec`; no remoto, com as
+/// credenciais dos URLs redigidas) em pedacos, em fronteiras de frase, que
+/// cabem cada um em `spec.available()` ja com a cerca: as instrucoes da
+/// cerca e o pedaco cercado com `MAP_FENCE_LABEL` (`MapPiece::est_tokens`).
+/// A reserva de saida do `spec` deve cobrir a instrucao do mapa e a
 /// resposta. Sem texto e `EmptySources`; sem espaco para um trecho,
 /// `ModelTooSmall`.
 pub fn split_for_map_reduce(text: &str, spec: &BudgetSpec) -> Result<Vec<MapPiece>, ContextError> {
-    let text = untrusted::sanitize(text, spec.destination.fence());
+    let text = redact_urls_for(
+        &spec.destination,
+        untrusted::sanitize(text, spec.destination.fence()),
+    );
     if text.trim().is_empty() {
         return Err(ContextError::EmptySources);
     }
+    // O custo fixo de cada chamada: a mensagem das instrucoes da cerca, a
+    // mensagem do pedaco e as linhas que o cercam, com o nonce ao peso
+    // maximo.
+    let nonce = FenceNonce::fresh();
+    let (begin, end) = untrusted::fence_lines(MAP_FENCE_LABEL, &nonce);
+    let frame =
+        weight_with_nonce(&begin, &nonce) + weight_with_nonce(&end, &nonce) + 2.0 * weight("\n");
+    let fixed =
+        spec.fence_instructions_tokens() + MESSAGE_OVERHEAD_TOKENS + spec.tokens_of_weight(frame);
     let Some(limit) = spec
         .available()
-        .checked_sub(MESSAGE_OVERHEAD_TOKENS)
+        .checked_sub(fixed)
         .filter(|limit| *limit >= MIN_PASSAGE_TOKENS)
     else {
         return Err(ContextError::ModelTooSmall {
             limit: spec.max_input,
         });
     };
-    let tokens = |piece: &str| spec.tokens(piece);
+    // O pedaco conta como sai da cerca: neutralizado.
+    let tokens = |piece: &str| spec.tokens(&untrusted::neutralize_inside(piece, &nonce));
     Ok(chunk_spans(&text, limit, &tokens)
         .into_iter()
         .map(|span| {
             let text = text[span].to_string();
-            let est_tokens = spec.message_tokens(&text);
+            let est_tokens = fixed + tokens(&text);
             MapPiece { text, est_tokens }
         })
         .collect())

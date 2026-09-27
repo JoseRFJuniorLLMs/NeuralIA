@@ -193,8 +193,9 @@ fn angle_weight(c: char) -> Option<(u8, usize)> {
 
 /// Pontos de codigo ignoraveis (Default_Ignorable_Code_Point, mais os que
 /// `sanitize` ja tira): nao quebram uma sequencia de sinais nem a palavra
-/// do marcador, porque quem le o texto nao os ve.
-fn is_ignorable(c: char) -> bool {
+/// do marcador, porque quem le o texto nao os ve. O `context_budget` usa-os
+/// para achar o inicio visivel de uma linha.
+pub(crate) fn is_ignorable(c: char) -> bool {
     is_stripped_char(c)
         || matches!(
             c,

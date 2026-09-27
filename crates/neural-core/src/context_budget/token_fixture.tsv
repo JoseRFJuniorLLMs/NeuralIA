@@ -32,3 +32,22 @@
 6	6	Authorization: Bearer abc123
 15	15	«≈ 3 200 tokens · 4 fontes»
 24	24	[1] página: Artigo — https://a.b/c (p. 3)
+#
+# Linhas da revisao (CB-1, texto onde a tabela sozinha contava de menos):
+# as colunas sao o numero de PRE-TOKENS das regex publicadas do o200k_base e
+# do Llama 3, contado com as proprias regex (node, `\p{..}`, sem vocabulario).
+# E um limite inferior duro do real (o BPE nunca junta dois pre-tokens); onde
+# cada pre-token e um so caractere ASCII (a1a1..., A1B2..., x  a) e tambem a
+# contagem real. Nas outras o real pode ser maior -- e para isso que existe a
+# TokenCalibration.
+8	8	a1a1a1a1
+12	12	A1B2C3D4E5F6
+200	200	ok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\nok\n
+3	3	x  a
+6	1	aBaBaBaBaB
+15	15	3f2a9c1e7b4d8f60
+12	12	e4 e5 Nf3 Nc6 Bb5 a6
+9	6	aGVsbG8gd29ybGQ=
+18	18	| a | 1 |\n| b | 2 |\n| c | 3 |
+6	6	SKU-4471-XL/B
+7	3	getElementById(userId)
