@@ -365,7 +365,11 @@ fn embedding_bytes(values: &[f32]) -> Vec<u8> {
 
 fn entity_id(normalized: &str, entity_type: &str) -> String {
     let material = format!("entity\0{normalized}\0{entity_type}");
-    format!("{:x}", Sha256::digest(material.as_bytes()))[..24].to_string()
+    Sha256::digest(material.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..24]
+        .to_string()
 }
 
 fn upsert_page_base(transaction: &Transaction<'_>, document: &MemoryDocument) -> io::Result<()> {
