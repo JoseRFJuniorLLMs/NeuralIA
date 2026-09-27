@@ -9,10 +9,12 @@ use crate::agents::{self, AgentEvent, AgentHub, QuestionView, RecordBody};
 // decide e guarda; aqui vive so o que o liga ao produto:
 //
 // - o hub nasce no `App::new` sobre a loja `agents` (`<data_dir>/agents`,
-//   `Automatic`), aberta SO pelo grant entregue pelo `PrivacyGuard` -- numa
-//   sessao privada nao ha persistencia nem canal -- e o
-//   canal (named pipe) abre numa thread propria (`agents::pipe::start`),
-//   nunca na thread da janela;
+//   `Automatic`), aberta SO pelo grant entregue pelo `PrivacyGuard`:
+//   se o App ja nasce com a grant sem escrita, nao se cria um canal novo;
+//   se entrou em Private depois de um arranque Normal, o canal que ja existia
+//   continua em memoria, mas conversa/estado nao escrevem nada. O canal
+//   (named pipe) abre numa thread propria (`agents::pipe::start`), nunca na
+//   thread da janela;
 // - cada `AgentEvent` que o hub anuncia vira UM evento da janela,
 //   `UserEvent::AgentsHub(AgentsHubEvent::Hub(..))`, entregue pela thread do
 //   canal atraves do `EventLoopProxy`;
@@ -40,10 +42,12 @@ pub(in crate::windows_app) struct AgentsHubState {
 }
 
 /// O hub do produto, sem janela: pede o grant da loja `agents` ao registo
-/// das lojas do `App` e cria o hub sobre ela -- e por isso o hub obedece ao
-/// modo do registo (numa sessao privada nada vai ao disco). Sem registo nao
-/// ha hub. O `AgentsHubState::open` chama isto e depois abre o canal; o gate
-/// e `the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode`.
+/// das lojas do `App` e cria o hub sobre ela -- e por isso a persistencia
+/// obedece ao modo do registo (numa sessao privada nada da conversa/estado vai
+/// ao disco). Sem registo nao ha hub. `AgentsHubState::open` so abre um canal
+/// novo quando a grant permite escrita naquele arranque; um canal criado antes
+/// de entrar em Private continua ativo em memoria. O gate e
+/// `the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode`.
 fn open_agents_hub(
     grant: Option<neural_core::json_store::StoreGrant>,
     notify: impl Fn(AgentEvent) + Send + Sync + 'static,
