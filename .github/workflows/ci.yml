@@ -919,6 +919,17 @@ jobs:
           '@
             },
             @{
+              Label = "agents-clear-pending-resurrects-history"
+              Test = "clearing_history_with_a_pending_question_never_recreates_the_conversation"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                    question.persist_outcome = false;
+          '@
+              New = @'
+                    question.persist_outcome = true;
+          '@
+            },
+            @{
               Label = "agents-replays-failed-send"
               Test = "a_failed_send_is_never_replayed"
               SourcePath = "crates/neural-app/src/agents/pipe.rs"
