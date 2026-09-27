@@ -2030,7 +2030,9 @@ pub(crate) mod tests {
             .hub
             .clear_conversations_with(|_| {
                 std::fs::remove_file(&claude_file)?;
-                Err(std::io::Error::other("falha simulada depois do primeiro ficheiro"))
+                Err(std::io::Error::other(
+                    "falha simulada depois do primeiro ficheiro",
+                ))
             })
             .unwrap_err();
         assert!(error.contains("falha simulada"), "{error}");
