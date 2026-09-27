@@ -968,7 +968,10 @@ mod tests {
         assert_eq!(fts_count(&path, "cafe").unwrap(), 1);
 
         first.body = "python novo outro corpus".into();
-        first.content_hash = format!("{:x}", Sha256::digest(first.body.as_bytes()));
+        first.content_hash = Sha256::digest(first.body.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         first.last_seen_at = first.last_seen_at.saturating_add(1);
         upsert(&path, &first, None).unwrap();
         assert_eq!(fts_count(&path, "cafe").unwrap(), 0);
