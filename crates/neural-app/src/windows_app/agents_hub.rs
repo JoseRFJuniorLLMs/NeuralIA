@@ -46,11 +46,10 @@ pub(in crate::windows_app) struct AgentsHubState {
 /// ha hub. O `AgentsHubState::open` chama isto e depois abre o canal; o gate
 /// e `the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode`.
 fn open_agents_hub(
-    stores: Option<&StoreRegistry>,
+    grant: Option<neural_core::json_store::StoreGrant>,
     notify: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Option<AgentHub> {
-    let grant = stores?.grant(AGENTS_STORE).ok()?;
-    let store = ConversationStore::open(grant).ok()?;
+    let store = ConversationStore::open(grant?).ok()?;
     Some(AgentHub::new(store, notify))
 }
 
@@ -59,14 +58,17 @@ impl AgentsHubState {
     /// (`open_agents_hub`) e abre o canal fora desta thread
     /// (`agents::pipe::start`: le as conversas e faz o bind do named pipe).
     pub(in crate::windows_app) fn open(
-        stores: Option<&StoreRegistry>,
+        grant: Option<neural_core::json_store::StoreGrant>,
         proxy: &EventLoopProxy<UserEvent>,
     ) -> Self {
+        let channel_allowed = grant.as_ref().is_some_and(|grant| grant.writes_allowed());
         let proxy = proxy.clone();
-        let hub = open_agents_hub(stores, move |event| {
+        let hub = open_agents_hub(grant, move |event| {
             let _ = proxy.send_event(UserEvent::AgentsHub(AgentsHubEvent::Hub(event)));
         });
-        if let Some(hub) = &hub {
+        if channel_allowed
+            && let Some(hub) = &hub
+        {
             agents::pipe::start(hub.clone());
         }
         Self { hub }
@@ -176,7 +178,7 @@ mod tests {
         let registry = StoreRegistry::mint_for_test(&root.0);
         let seen: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let hub = open_agents_hub(Some(&registry), move |event| {
+        let hub = open_agents_hub(registry.grant(AGENTS_STORE).ok(), move |event| {
             sink.lock().unwrap().push(event);
         })
         .expect("o hub do produto");
