@@ -38,6 +38,11 @@ jobs:
       - name: Baseline Memory Doctor recovery gate
         run: cargo test --locked -p neural-core --test spec_0107_doctor -- --nocapture
 
+      # The injected delay must dominate the rebuild's own noise: with /10 the
+      # sabotaged ratio was 9.9-11.6x against the 8.0 limit and one slow
+      # 128-document run (1.21 s) gave 7.81x (run 36275825263). With /5 the
+      # sleep alone is 625 ms vs 10.4 s per rebuild (16x), so noise of a few
+      # hundred ms on the small side can no longer pull it under 8.0.
       - name: Prove ratio gate catches quadratic rebuild delay
         shell: bash
         run: |
@@ -50,7 +55,7 @@ jobs:
                   let sessions = self.research_sessions()?;
           '''
           new = '''        let docs = self.documents()?;
-                  let sabotage_units = ((docs.len() / 10).max(1) as u64).pow(2);
+                  let sabotage_units = ((docs.len() / 5).max(1) as u64).pow(2);
                   std::thread::sleep(std::time::Duration::from_millis(sabotage_units));
                   let sessions = self.research_sessions()?;
           '''

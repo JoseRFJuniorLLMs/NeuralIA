@@ -1,9 +1,9 @@
 # SPEC-0114 — Anti-distração (avisos de cookies, newsletter e barras fixas)
 
-**Status:** Proposta. Código e gates na branch `feat/anti-distracao` (plano
-2.4, item anti-distracao, cortável); passa a «Implementada» só com os gates
-verdes no CI do PR e o sim do dono no §7 do `AGENTS.md` (script injetado
-novo).
+**Status:** Proposta. Código e gates na `release/2.4.0` (PR #168; plano
+2.4, item anti-distracao, cortável), verdes no CI do PR; o script injetado
+novo espera o sim do dono no §7 do `AGENTS.md` antes de entrar na `main`, e
+a ligação pelo COM ainda não tem teste que corra o exe (abaixo).
 
 ## Objetivo
 
