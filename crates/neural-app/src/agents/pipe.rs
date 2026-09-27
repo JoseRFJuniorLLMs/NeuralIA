@@ -1013,10 +1013,8 @@ mod tests {
         }
     }
 
-    fn assert_user_only(sddl: &str, me: &str) {
-        let (owner, flags, aces) = parse_sddl(sddl);
-        assert_eq!(full_sid(&owner), me, "{sddl}");
-        assert!(flags.contains('P'), "DACL must be protected: {sddl}");
+    fn assert_dacl_user_only(sddl: &str, me: &str) {
+        let (_owner, _flags, aces) = parse_sddl(sddl);
         let mut trustees: Vec<String> = aces.iter().map(|(_, _, sid)| full_sid(sid)).collect();
         trustees.sort_unstable();
         assert_eq!(trustees, vec![me.to_string()], "{sddl}");
@@ -1024,6 +1022,13 @@ mod tests {
             assert_eq!(kind, "A", "{sddl}");
             assert!(rights == "FA" || rights == "0x1f01ff", "{sddl}");
         }
+    }
+
+    fn assert_user_only(sddl: &str, me: &str) {
+        let (owner, flags, _aces) = parse_sddl(sddl);
+        assert_eq!(full_sid(&owner), me, "{sddl}");
+        assert!(flags.contains('P'), "DACL must be protected: {sddl}");
+        assert_dacl_user_only(sddl, me);
     }
 
     fn hello(token: &str) -> Value {
@@ -1074,11 +1079,17 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit())
         );
         assert_eq!(server.pipe_name(), format!("{PIPE_PREFIX}{id}"));
-        for name in [TOKEN_FILE, PIPE_FILE, "legacy.jsonl", "new-state.json"] {
+        for name in [TOKEN_FILE, PIPE_FILE, "legacy.jsonl"] {
             let file = File::open(dir.0.join(name)).unwrap();
             let sddl = handle_sddl(file.as_raw_handle(), SE_FILE_OBJECT).unwrap();
             assert_user_only(&sddl, &me);
         }
+        // Um ficheiro novo herda a DACL user-only da pasta. O owner do
+        // objeto pode ser o owner padrao do token (por exemplo BA no runner
+        // administrador); isso nao acrescenta nenhum trustee a DACL.
+        let inherited = File::open(dir.0.join("new-state.json")).unwrap();
+        let sddl = handle_sddl(inherited.as_raw_handle(), SE_FILE_OBJECT).unwrap();
+        assert_dacl_user_only(&sddl, &me);
         // Nada de temporarios deixados para tras.
         let leftovers: Vec<String> = fs::read_dir(&dir.0)
             .unwrap()
