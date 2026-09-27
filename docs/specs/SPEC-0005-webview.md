@@ -41,12 +41,12 @@ message transport through WebView2, but every accepted message is a bounded JSON
 envelope authenticated with a per-WebView capability. The native side exposes
 no filesystem API, credential API or arbitrary native-call object.
 
-The closed action set has 31 names: `home`, `back`, `restore`,
+The closed action set has 32 names: `home`, `back`, `restore`,
 `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`,
 `omnibox`, `history`, `clearhistory`, `fullscreen`, `devtools`,
 `viewsource`, `newtab`, `expand`, `shortcut-expand`, `minimize`, `split`,
 `link`, `ask`, `search`, `split-close`, `split-expand`, `palette`, `gmail-state`,
-`research-answer`, `agent-observation`, `hint` and `note`. Unknown actions, extra fields,
+`research-answer`, `pdf-page-text`, `agent-observation`, `hint` and `note`. Unknown actions, extra fields,
 wrong types, oversized messages and invalid per-action arguments are rejected.
 The parser gate `protocol_accepts_exactly_the_published_actions`
 (`crates/neural-app/src/ipc.rs`) reads this list and fails when it differs from
