@@ -1095,15 +1095,16 @@ fn install_service_visual_script(webview: &WebView, host: WebViewHost) -> Result
     use wry::WebViewExtWindows;
 
     let core = webview.webview();
-    let handler =
-        AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(move |result, _id| {
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |result, _id| {
             if let Err(error) = result {
                 debug_log(format_args!(
                     "service visual: timeline não registrada ({error})"
                 ));
             }
             Ok(())
-        }));
+        },
+    ));
     unsafe { core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script), &handler) }
         .map_err(|error| format!("AddScriptToExecuteOnDocumentCreated: {error}"))?;
     let _ = webview.evaluate_script(script);
@@ -1488,7 +1489,6 @@ impl App {
         self.adblock_page_loaded(page);
     }
 }
-
 
 #[cfg(test)]
 mod service_visual_tests {
