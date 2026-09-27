@@ -31,13 +31,17 @@
 //!   pagina privada (o Split privado, um servico InPrivate) nem comecaram ou
 //!   acabaram no Modo privado ([`DownloadManager::set_private_mode`]): um
 //!   destes nunca entra no registo em memoria, e por isso nao chega ao
-//!   ficheiro quando o modo volta ao normal. A loja e `StoreKind::Automatic`:
-//!   no Modo privado tambem nao se escreve. Um fim a espera do veredito fica
-//!   no registo como [`RecordOutcome::Pending`], com o caminho, e volta a
-//!   correr no arranque seguinte ([`DownloadManager::resume_pending`]).
-//! - **Apagar** ([`DownloadEvent::ClearLog`], Ctrl+Shift+Delete): o registo
-//!   esvazia e o efeito [`DownloadEffect::EraseLog`] manda tirar o ficheiro
-//!   do disco, em qualquer modo.
+//!   ficheiro quando o modo volta ao normal. A loja do produto e
+//!   `StoreKind::GuardedAutomatic`: o gestor exclui conteudo privado antes
+//!   da loja, enquanto um download que acabou no normal pode concluir o seu
+//!   veredito mesmo se o modo global mudar para privado. Um fim a espera do
+//!   veredito fica no registo como [`RecordOutcome::Pending`], com o caminho,
+//!   e volta a correr no arranque seguinte ([`DownloadManager::resume_pending`]).
+//! - **Apagar** ([`DownloadEvent::ClearLog`], Ctrl+Shift+Delete): historico
+//!   concluido some. Uma verificacao ja em curso conserva apenas um
+//!   `recovery_only` oculto, para uma queda ainda poder retomar o veredito;
+//!   ele nunca aparece na lista nem vira historico quando o veredito chega.
+//!   Sem verificacao pendente, [`DownloadEffect::EraseLog`] tira o ficheiro.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
