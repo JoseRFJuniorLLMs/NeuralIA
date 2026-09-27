@@ -4,7 +4,8 @@ use windows_sys::Win32::{
     Foundation::{HWND, POINT},
     Graphics::Gdi::{ClientToScreen, InvalidateRect, ScreenToClient},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, SW_HIDE, SWP_NOACTIVATE, SetWindowPos, ShowWindow,
+        CreateWindowExW, DestroyWindow, HWND_TOP, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SetWindowPos, ShowWindow,
     },
 };
 use winit::{
@@ -532,16 +533,19 @@ impl App {
         let mut origin = POINT { x: 0, y: 0 };
         unsafe {
             ClientToScreen(owner, &mut origin);
+            // A pega e uma janela auxiliar separada da WebView. Coloca-la
+            // explicitamente no topo e mostra-la no MESMO SetWindowPos evita
+            // o bug em que a WebView recem-criada ficava por cima ate o
+            // primeiro minimizar/restaurar do painel.
             SetWindowPos(
                 handle,
-                std::ptr::null_mut(),
+                HWND_TOP,
                 origin.x + (area.x * scale).round() as i32,
                 origin.y + (area.y * scale).round() as i32,
                 (area.width * scale).round().max(3.0) as i32,
                 (area.height * scale).round().max(1.0) as i32,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            show_popup_without_activation(handle);
             InvalidateRect(handle, std::ptr::null(), 1);
         }
     }
