@@ -987,10 +987,7 @@ jobs:
               SourcePath = "crates/neural-core/src/downloads.rs"
               Old = @'
             !(record.recovery_only
-                && matches!(
-                    record.outcome,
-                    RecordOutcome::Pending { resumed: true, .. }
-                ))
+                && matches!(record.outcome, RecordOutcome::Pending { resumed: true, .. }))
           '@
               New = @'
             true
