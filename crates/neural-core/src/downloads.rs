@@ -1194,10 +1194,7 @@ impl DownloadManager {
         let before_cleanup = self.log.len();
         self.log.retain(|record| {
             !(record.recovery_only
-                && matches!(
-                    record.outcome,
-                    RecordOutcome::Pending { resumed: true, .. }
-                ))
+                && matches!(record.outcome, RecordOutcome::Pending { resumed: true, .. }))
                 && !(record.recovery_only
                     && matches!(
                         record.outcome,
