@@ -982,6 +982,21 @@ jobs:
           '@
             },
             @{
+              Label = "download-hidden-recovery-lingers"
+              Test = "exhausted_hidden_recovery_is_purged_after_its_single_retry"
+              SourcePath = "crates/neural-core/src/downloads.rs"
+              Old = @'
+            !(record.recovery_only
+                && matches!(
+                    record.outcome,
+                    RecordOutcome::Pending { resumed: true, .. }
+                ))
+          '@
+              New = @'
+            true
+          '@
+            },
+            @{
               Label = "download-private-verdict-not-persisted"
               Test = "normal_download_verdict_persists_even_if_global_mode_turns_private"
               SourcePath = "crates/neural-app/src/stores.rs"
