@@ -647,11 +647,7 @@ impl ConversationStore {
     /// no disco. Se o tecto for ultrapassado, a memoria e aparada e uma
     /// futura escrita normal reconstroi o ficheiro apenas com registos
     /// persistiveis.
-    pub(crate) fn append_memory_only(
-        &self,
-        conversation: &mut Conversation,
-        record: AgentRecord,
-    ) {
+    pub(crate) fn append_memory_only(&self, conversation: &mut Conversation, record: AgentRecord) {
         conversation.unsaved.insert(record.id);
         conversation.records.push_back(record);
         if conversation.over_cap() {
