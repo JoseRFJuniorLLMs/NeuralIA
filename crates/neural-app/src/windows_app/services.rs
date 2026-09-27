@@ -3,7 +3,9 @@ use super::*;
 // Servicos no painel lateral (caminho A do WebRTC, aprovado pelo dono): o
 // servico corre como uma pagina da internet comum -- contatos e chamadas sao
 // os dele; o NeuralIA so libera camera e microfone pelo aviso do WebView2.
-// Sem scripts injetados e sem o canal IPC do painel do historico.
+// Nao ha canal IPC do painel do historico. O YouTube recebe somente a timeline
+// visual do NeuralIA (sem capability e sem postMessage); os outros servicos
+// continuam sem scripts injetados.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum Service {
     /// Videochamada: o Google Meet.
@@ -19,6 +21,13 @@ pub(in crate::windows_app) enum Service {
 /// O video de respiracao que o dono escolheu.
 pub(in crate::windows_app) const BREATH_VIDEO_URL: &str =
     "https://www.youtube.com/watch?v=UJBknAsxfrA";
+
+/// O unico script de pagina permitido no painel de servicos: a timeline
+/// visual/semantica do NeuralIA no YouTube. Nao leva capability, nao publica
+/// mensagens no canal IPC e so troca a scrollbar nativa pela rail tracejada.
+pub(in crate::windows_app) fn service_init_script(service: Service) -> Option<&'static str> {
+    (service == Service::YouTube).then_some(super::page_scripts::SPLIT_SCROLL_RAIL_SCRIPT)
+}
 
 impl Service {
     pub(in crate::windows_app) fn url(self) -> &'static str {
@@ -730,4 +739,36 @@ pub(in crate::windows_app) fn gmail_is_new_mail(
     unread > 0
         && !key.is_empty()
         && previous_key.is_some_and(|previous| !previous.is_empty() && previous != key)
+}
+
+
+#[cfg(test)]
+mod youtube_timeline_tests {
+    use super::*;
+
+    #[test]
+    fn only_youtube_service_gets_the_neuralia_scroll_timeline() {
+        assert_eq!(
+            service_init_script(Service::YouTube),
+            Some(super::page_scripts::SPLIT_SCROLL_RAIL_SCRIPT)
+        );
+        for service in [Service::Meet, Service::WhatsApp, Service::Gmail, Service::Breath] {
+            assert_eq!(
+                service_init_script(service),
+                None,
+                "{service:?} must not receive a service page script"
+            );
+        }
+    }
+
+    #[test]
+    fn youtube_timeline_hides_native_scrollbars_and_draws_the_shared_rail() {
+        let script = service_init_script(Service::YouTube).expect("youtube timeline");
+        assert!(script.contains("neuralia-split-scroll-rail"));
+        assert!(script.contains("*::-webkit-scrollbar{width:0!important"));
+        assert!(script.contains("function semanticAnchors()"));
+        assert!(script.contains("requestAnimationFrame(() =>"));
+        assert!(!script.contains("chrome.webview.postMessage"));
+        assert!(!script.contains("__NEURALIA_CAP__"));
+    }
 }
