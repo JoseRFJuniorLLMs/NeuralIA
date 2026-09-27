@@ -847,6 +847,7 @@ impl AgentHub {
     }
 
     fn save_marks(&self, snapshot: &MarksSnapshot) {
+        const MARKS_ERROR_PREFIX: &str = "Não foi possível gravar o estado dos agentes:";
         let result = {
             let mut writer = self
                 .inner
@@ -855,10 +856,23 @@ impl AgentHub {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             writer.persist(snapshot, |marks| self.inner.store.save_marks(marks))
         };
-        if let Err(error) = result {
-            let message = format!("Não foi possível gravar o estado dos agentes: {error}");
-            eprintln!("[agents] {message}");
-            self.lock().store_error = Some(message);
+        match result {
+            Err(error) => {
+                let message = format!("{MARKS_ERROR_PREFIX} {error}");
+                eprintln!("[agents] {message}");
+                self.lock().store_error = Some(message);
+            }
+            Ok(true) => {
+                let mut state = self.lock();
+                if state
+                    .store_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(MARKS_ERROR_PREFIX))
+                {
+                    state.store_error = None;
+                }
+            }
+            Ok(false) => {}
         }
     }
 
@@ -2064,6 +2078,10 @@ pub(crate) mod tests {
         assert!(
             state_file.is_file(),
             "mark_read nao repetiu o state.json que tinha falhado"
+        );
+        assert!(
+            f.hub.snapshot().store_error.is_none(),
+            "uma repeticao bem-sucedida deixou o erro antigo preso no painel"
         );
 
         let reopened = reopen(&f);
