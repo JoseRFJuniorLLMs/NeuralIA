@@ -429,7 +429,7 @@ impl ModelPackManager {
         let path = pack.join(&manifest.file);
         reject_symlink(&path, "ficheiro do model pack")?;
         let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let actual = format!("{:x}", Sha256::digest(bytes));
+        let actual = Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
             return Err(format!("hash do model pack {} não confere", manifest.id));
         }
@@ -911,7 +911,7 @@ mod tests {
             id: "other".into(),
             version: "1".into(),
             file: "model.bin".into(),
-            sha256: format!("{:x}", Sha256::digest(b"model")),
+            sha256: Sha256::digest(b"model").iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "test".into(),
         };
@@ -938,7 +938,7 @@ mod tests {
             id: "semantic-small".into(),
             version: "1".into(),
             file: "model.bin".into(),
-            sha256: format!("{:x}", Sha256::digest(first)),
+            sha256: Sha256::digest(first).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "test".into(),
         };
@@ -1009,7 +1009,7 @@ mod tests {
             id: "semantic-small".into(),
             version: "1".into(),
             file: "model.bin".into(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "test".into(),
         };
@@ -1046,7 +1046,7 @@ mod tests {
             id: id.into(),
             version: version.into(),
             file: "model.bin".into(),
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "MIT".into(),
         }
