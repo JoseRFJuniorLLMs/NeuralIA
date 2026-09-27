@@ -2,7 +2,6 @@ use super::*;
 
 use crate::agents::store::ConversationStore;
 use crate::agents::{self, AgentEvent, AgentHub, QuestionView, RecordBody};
-use crate::stores::AGENTS_STORE;
 
 // ===================== os agentes externos no app (agents-hub) =====================
 //
@@ -10,8 +9,8 @@ use crate::stores::AGENTS_STORE;
 // decide e guarda; aqui vive so o que o liga ao produto:
 //
 // - o hub nasce no `App::new` sobre a loja `agents` (`<data_dir>/agents`,
-//   `Automatic`), aberta SO pelo grant do registo das lojas -- numa sessao
-//   privada as conversas ficam fora do disco; sem registo nao ha hub -- e o
+//   `Automatic`), aberta SO pelo grant entregue pelo `PrivacyGuard` -- numa
+//   sessao privada nao ha persistencia nem canal -- e o
 //   canal (named pipe) abre numa thread propria (`agents::pipe::start`),
 //   nunca na thread da janela;
 // - cada `AgentEvent` que o hub anuncia vira UM evento da janela,
