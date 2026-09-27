@@ -609,11 +609,12 @@ manager's private mode from the registry before every event.
 Ctrl+Shift+Delete (`DownloadEvent::ClearLog`) removes completed download
 history. With no verification in progress it erases `downloads.json`, its
 `.bak` copy and an interrupted write's temporary file. If a file is
-already in `Finalizing`, clearing history instead persists only that
-pending record marked `recovery_only`: the panel filters it out, the
-session entry becomes history-invisible, a crash can still resume the
-verification, and the eventual verdict removes the recovery record without
-restoring a history row. The downloaded file itself is never deleted merely
+already in `Finalizing`, clearing history first erases the old primary,
+`.bak` and interrupted-write temporaries, then writes only that pending
+record marked `recovery_only`: the panel filters it out, the session entry
+becomes history-invisible, a crash can still resume the verification, and
+the eventual verdict removes the recovery record without restoring a
+history row. The downloaded file itself is never deleted merely
 by clearing history. Gates: `the_start_decision_table`,
 `the_finalize_decision_table`, `motw_is_written_and_read_back_through_the_ads`,
 `private_downloads_are_never_recorded`,
