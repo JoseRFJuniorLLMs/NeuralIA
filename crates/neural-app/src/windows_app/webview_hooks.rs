@@ -1488,3 +1488,37 @@ impl App {
         self.adblock_page_loaded(page);
     }
 }
+
+
+#[cfg(test)]
+mod service_visual_tests {
+    use super::*;
+
+    #[test]
+    fn only_youtube_gets_the_shared_neuralia_timeline() {
+        assert_eq!(
+            service_visual_script(WebViewHost::Service(Service::YouTube)),
+            Some(SPLIT_SCROLL_RAIL_SCRIPT)
+        );
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::Gmail,
+            Service::Breath,
+        ] {
+            assert_eq!(
+                service_visual_script(WebViewHost::Service(service)),
+                None,
+                "{service:?} received the YouTube timeline"
+            );
+        }
+
+        let script = service_visual_script(WebViewHost::Service(Service::YouTube))
+            .expect("YouTube timeline");
+        assert!(script.contains("neuralia-split-scroll-rail"));
+        assert!(script.contains("*::-webkit-scrollbar{width:0!important"));
+        assert!(script.contains("function semanticAnchors()"));
+        assert!(!script.contains("chrome.webview.postMessage"));
+        assert!(!script.contains("__NEURALIA_CAP__"));
+    }
+}
