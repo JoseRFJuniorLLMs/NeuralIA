@@ -188,6 +188,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Keys(event) => self.keys_event(event),
             UserEvent::WebView(event) => self.webview_event(event),
             UserEvent::Adblock(event) => self.adblock_event(event),
+            UserEvent::Distraction(event) => self.distraction_event(event),
             UserEvent::Download(event) => self.download_event(event),
             UserEvent::Translate(event) => self.translation_event(event),
             UserEvent::Bookmarks(event) => self.bookmarks_event(event),
@@ -265,7 +266,7 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 if let (Some(provider), Some(session)) = (provider, &mut self.current_research) {
                     session.upsert_provider_answer(provider, text, None);
-                    self.memory.save_session(session.clone());
+                    self.privacy.save_session(session.clone());
                 }
             }
             UserEvent::AgentObservation(page) => {
@@ -357,6 +358,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.show_omnibox_passive(true);
                     self.position_omnibox();
                     self.request_redraw();
+                    // Marco lido por `scripts/test-comparator-first-paint.ps1`.
+                    debug_log(format_args!("RelayoutComparator: aplicado"));
                 }
             }
             UserEvent::RestoreHomeDecorations => {

@@ -425,12 +425,16 @@ impl App {
         match route_input(&input) {
             InputRoute::Agent(spec) => self.start_browser_agent(&spec),
             InputRoute::MemoryQuery(query) => {
-                self.memory.query(query);
+                self.privacy.query_memory(query);
                 self.show_splash("Buscando na memória local…".to_string(), 2);
             }
             InputRoute::MemoryRebuild => {
-                self.memory.rebuild();
-                self.show_splash("Reconstrução da memória agendada.".to_string(), 3);
+                let text = if self.privacy.rebuild_memory() {
+                    "Reconstrução da memória agendada."
+                } else {
+                    "Modo privado: a memória não é reconstruída."
+                };
+                self.show_splash(text.to_string(), 3);
             }
             InputRoute::History => self.show_recent_history(),
             InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
@@ -618,7 +622,7 @@ impl App {
     /// Pede a lista ao worker; a caixa aparece quando `HistoryLoaded` voltar.
     /// A leitura (lock + ficheiro inteiro) nunca corre no event loop.
     pub(in crate::windows_app) fn show_recent_history(&self) {
-        if let Some(result) = self.history.recent(HISTORY_RECENT_LIMIT) {
+        if let Some(result) = self.privacy.recent_history(HISTORY_RECENT_LIMIT) {
             self.show_history_entries(result);
         }
     }

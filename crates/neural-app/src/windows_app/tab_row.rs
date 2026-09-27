@@ -66,7 +66,7 @@ impl GroupColor {
 
 /// Um grupo de abas na barra de titulo: nome, cor e se esta fechado.
 #[derive(Debug, Clone)]
-pub(in crate::windows_app) struct ContextGroup {
+pub(crate) struct ContextGroup {
     pub(in crate::windows_app) id: u64,
     pub(in crate::windows_app) name: String,
     pub(in crate::windows_app) color: GroupColor,
@@ -76,7 +76,7 @@ pub(in crate::windows_app) struct ContextGroup {
 /// Uma aba de contexto. O `group` e o id do grupo, nao um indice: fechar um
 /// grupo no meio nao pode renumerar as abas dos outros.
 #[derive(Debug, Clone)]
-pub(in crate::windows_app) struct ContextTab {
+pub(crate) struct ContextTab {
     /// Identidade estavel. A URL pode repetir em grupos diferentes e por isso
     /// nunca serve para decidir qual aba esta aberta ou deve ser fechada.
     pub(in crate::windows_app) id: u64,

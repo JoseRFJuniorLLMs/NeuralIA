@@ -115,7 +115,7 @@ impl App {
                 if let Some(session) = &self.current_research {
                     document = document.session(session.id.clone());
                 }
-                self.memory.capture(document);
+                self.privacy.capture(document);
                 self.begin_reading_session(true);
             }
             Err(error) => {
@@ -354,9 +354,9 @@ impl App {
                 Some(memory_id),
                 body,
             );
-            self.memory.save_session(session.clone());
+            self.privacy.save_session(session.clone());
         }
-        self.memory.capture(document);
+        self.privacy.capture(document);
     }
 
     pub(in crate::windows_app) fn reader_webview_builder(&self) -> WebViewBuilder<'static> {
@@ -473,7 +473,7 @@ impl App {
                     if let Some(session) = &self.current_research {
                         document = document.session(session.id.clone());
                     }
-                    self.memory.capture(document);
+                    self.privacy.capture(document);
                 }
                 self.schedule_gmail_probe(4);
                 self.begin_reading_session(is_pdf);
@@ -542,7 +542,7 @@ impl App {
     }
 
     pub(in crate::windows_app) fn record(&self, kind: HistoryKind, input: String, target: String) {
-        self.history.append(HistoryEntry::now(kind, input, target));
+        self.privacy.record(HistoryEntry::now(kind, input, target));
     }
 }
 

@@ -70,7 +70,7 @@ impl App {
             return;
         }
         let snapshot = session.synthesize(&ids).clone();
-        self.memory.save_session(session.clone());
+        self.privacy.save_session(session.clone());
         self.show_native_text("NeuralIA — Síntese com proveniência", &snapshot.output);
     }
 
@@ -128,8 +128,8 @@ impl App {
         self.next_generation();
 
         let (session, question_memory, reopen) = compare_records(&request);
-        self.memory.capture(question_memory);
-        self.memory.save_session(session.clone());
+        self.privacy.capture(question_memory);
+        self.privacy.save_session(session.clone());
         self.current_research = Some(session);
 
         self.record(HistoryKind::Ask, reopen, "comparator-3col".to_string());
@@ -266,7 +266,7 @@ impl App {
         // carrega agora: a pergunta e o contexto ativo de cada coluna, e cada
         // aba restaurada so abre quando for escolhida. O que esta no disco e
         // o que acabou de ser lido: nada a regravar ate alguma aba mudar.
-        let (restored, tabs_notice) = self.tab_session.restore();
+        let (restored, tabs_notice) = self.privacy.restore_tabs();
 
         let targets = [
             ("Google Gemini", google_url),
@@ -290,14 +290,22 @@ impl App {
                 .with_url(url.as_str());
             let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);
 
+            // O build e sincrono: cria o controller do WebView2 dentro de um
+            // pump aninhado, e o container WRY da coluna ja nasce visivel
+            // antes dele. Num arranque a frio a coluna 0 paga o processo do
+            // browser (segundos; as outras, 0,1 a 1 s) e ate la so ela se ve.
+            // O log diz quanto tempo cada uma levou.
+            debug_log(format_args!("open_comparator: coluna {i} a construir"));
             match hooked.build_hooked_as_child(window) {
                 Ok(wv) => {
+                    debug_log(format_args!("open_comparator: coluna {i} construida"));
                     let _ = wv.zoom(self.zoom);
                     #[cfg(feature = "accel-spike")]
                     self.accel_spike_hook(&wv, crate::accel_spike::SpikeHost::Column);
                     views.push(ComparatorView { webview: wv, name });
                 }
                 Err(error) => {
+                    debug_log(format_args!("open_comparator: coluna {i} falhou: {error}"));
                     self.show_native_error(format!("WebView2 não pôde abrir {name}: {error}"));
                     return;
                 }
@@ -324,6 +332,12 @@ impl App {
     }
 
     fn activate_comparator(&mut self, sync_remote_buttons: bool) {
+        // `scripts/test-comparator-first-paint.ps1` espera por esta linha (e
+        // pelas dos dois relayouts) antes de contar as superficies visiveis.
+        debug_log(format_args!(
+            "activate_comparator: {} coluna(s)",
+            self.comparator.as_ref().map_or(0, |comp| comp.views.len())
+        ));
         self.bar_hover = None;
         self.forget_tab_gesture();
         self.surface = Surface::Comparator;

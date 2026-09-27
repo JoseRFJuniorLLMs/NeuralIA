@@ -112,8 +112,27 @@ jobs:
           $comparatorInjectPath = "crates/neural-app/src/windows_app/page_scripts.rs"
           $utf8 = [Text.UTF8Encoding]::new($false)
 
+          # Speed without a weaker proof (owner, 26/09/2026). dtolnay/rust-toolchain
+          # exports CARGO_INCREMENTAL=0 for the whole job, so each sabotage used to
+          # rebuild the whole neural-app crate from scratch, twice (the unit-test
+          # harness and the plain bin the integration tests need), about 35 s each.
+          # Each sabotage edits one file of one crate: incremental builds redo only
+          # what that edit and the previous restore touched. The restored tree is
+          # still proved below by a build made the way the rest of the job builds.
+          $jobIncremental = $env:CARGO_INCREMENTAL
+          $env:CARGO_INCREMENTAL = "1"
+
           function Write-Exact([string]$path, [string]$text) {
             [IO.File]::WriteAllText((Resolve-Path -LiteralPath $path), $text, $utf8)
+          }
+
+          # The restore is checked, not assumed: the next sabotage has to start
+          # from the shipped bytes, not from a tree that is merely equivalent.
+          function Restore-Exact([string]$path, [byte[]]$bytes, [string]$hash, [string]$label) {
+            [IO.File]::WriteAllBytes($path, $bytes)
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $hash) {
+              throw "Sabotage '$label' did not restore $path byte-identical."
+            }
           }
 
           function Replace-Exact([string]$text, [string]$old, [string]$new, [string]$label) {
@@ -145,17 +164,28 @@ jobs:
           # to turn red by itself. A build error or another failing test does not count.
           # An Ignored gate is a CI-only real Win32 focus gate (#[ignore] in the
           # local suite): it runs alone with --ignored --exact.
+          # Only the NeuralIA bin's unit-test harness is built and run: every gate
+          # lives in crates/neural-app/src (scripts/test-release-contract.mjs holds
+          # each one there), and the package's other targets (the plain bin for the
+          # integration tests, tests/*.rs, the example) never run a gate.
+          # The log must show neural-app compiled: a run of a binary left over from
+          # the previous sabotage (often red on the same gate) would prove nothing.
           function Assert-GateRed([string]$label, [string]$test, [string]$targetPath, [string]$old, [string]$new, [bool]$ignored) {
             $resolved = (Resolve-Path -LiteralPath $targetPath).Path
+            $originalBytes = [IO.File]::ReadAllBytes($resolved)
+            $originalHash = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash
             $original = [IO.File]::ReadAllText($resolved, $utf8)
             $broken = Replace-Exact $original $old $new $label
             Write-Exact $resolved $broken
             try {
-              $filter = if ($ignored) { @('--', '--ignored', '--exact', "windows_app::tests::$test") } else { @($test) }
+              $filter = if ($ignored) { @('--bin', 'NeuralIA', '--', '--ignored', '--exact', "windows_app::tests::$test") } else { @('--bin', 'NeuralIA', $test) }
               $run = Invoke-GateTest $filter
             }
             finally {
-              Write-Exact $resolved $original
+              Restore-Exact $resolved $originalBytes $originalHash $label
+            }
+            if ($run.Log -notmatch 'Compiling(\x1b\[[0-9;]*m)*\s+neural-app v') {
+              throw "Sabotage '$label' was not compiled: cargo did not rebuild neural-app for it."
             }
             if ($run.Code -eq 0) {
               throw "Sabotage '$label' unexpectedly stayed green: $test"
@@ -559,18 +589,309 @@ jobs:
                       UserEvent::RunCommandKey { key, .. } => {
                           if let Some(event) = resolve_command(key, CommandOrigin::Host(WebViewHost::External)) {
           '@
+            },
+            @{
+              Label = "second-registry-mint-in-a-feature-module"
+              Test = "registry_is_minted_once_and_owned_by_the_guard"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+              fn adblock_list_grant(&self) -> Option<StoreGrant> {
+                  self.privacy.store(ADBLOCK_LIST_STORE)
+              }
+          '@
+              New = @'
+              fn adblock_list_grant(&self) -> Option<StoreGrant> {
+                  StoreRegistry::mint(&self.config.data_dir)
+                      .ok()?
+                      .grant(ADBLOCK_LIST_STORE)
+                      .ok()
+              }
+          '@
+            },
+            @{
+              Label = "tab-save-bypasses-the-guard"
+              Test = "history_memory_and_tabs_are_written_only_through_the_privacy_guard"
+              SourcePath = "crates/neural-app/src/windows_app/app/tabs.rs"
+              Old = @'
+                  self.privacy
+                      .save_tabs(&mut comp.contexts, &mut comp.groups, split)
+          '@
+              New = @'
+                  TabPersistence::open(&self.config.data_dir)
+                      .save_now(&mut comp.contexts, &mut comp.groups, split)
+          '@
+            },
+            @{
+              Label = "memory-capture-bypass-beside-the-guard"
+              Test = "history_memory_and_tabs_are_written_only_through_the_privacy_guard"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                  self.tabs.forget(contexts, groups, split)
+              }
+          }
+          '@
+              New = @'
+                  self.tabs.forget(contexts, groups, split)
+              }
+          }
+
+          /// Um atalho ao lado do guard: a memoria sem o modo.
+          pub(crate) fn capture_raw(guard: &PrivacyGuard, document: MemoryDocument) {
+              guard.memory.capture(document);
+          }
+          '@
+            },
+            @{
+              Label = "raw-data-dir-write-in-a-feature-module"
+              Test = "no_raw_data_dir_write_outside_a_grant"
+              SourcePath = "crates/neural-app/src/windows_app/app/tools.rs"
+              Old = @'
+                  let saved = outcome.save.map(|settings| {
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+              New = @'
+                  let saved = outcome.save.map(|settings| {
+                      let _ = std::fs::write(self.config.data_dir.join("x.json"), b"x");
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+            },
+            @{
+              Label = "test-constructor-ignores-the-mode"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                  registry.set_mode(mode.into());
+          '@
+              New = @'
+                  let _ = mode;
+          '@
+            },
+            @{
+              Label = "record-ignores-the-mode"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                  if !self.history_grant.writes_allowed() {
+                      return;
+                  }
+                  self.history.append(entry);
+          '@
+              New = @'
+                  self.history.append(entry);
+          '@
+            },
+            @{
+              Label = "e2e-allowlist-without-the-history-lock"
+              Test = "the_e2e_allowlist_covers_a_normal_guard_session"
+              SourcePath = "scripts/test-private-mode.ps1"
+              Old = @'
+              @{ Path = 'history.jsonl.lock'; Kind = 'Automatic'; Why = 'o trinco dos escritores do historico (HistoryStore): nasce na primeira gravacao e fica' }
+          '@
+              New = @'
+              # (sem a linha do history.jsonl.lock)
+          '@
+            },
+            @{
+              Label = "save-tabs-due-ignores-the-mode"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                      .then_some(Ok(TabSave::SkippedPrivate));
+          '@
+              New = @'
+                      .then_some(Ok::<_, std::io::Error>(TabSave::SkippedPrivate))
+                      .and(self.tabs.save_due(token, contexts, groups, split));
+          '@
+            },
+            @{
+              Label = "private-rebuild-writes-the-index"
+              Test = "private_guard_turns_automatic_stores_into_noops"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+                      return false;
+                  }
+                  self.memory.rebuild();
+          '@
+              New = @'
+                      self.memory.rebuild();
+                      return false;
+                  }
+                  self.memory.rebuild();
+          '@
+            },
+            @{
+              Label = "tab-session-save-beside-the-guard"
+              Test = "history_memory_and_tabs_are_written_only_through_the_privacy_guard"
+              SourcePath = "crates/neural-app/src/windows_app/app/tabs.rs"
+              Old = @'
+                  let split = comparator_split_key(comp);
+                  self.privacy
+                      .save_tabs(&mut comp.contexts, &mut comp.groups, split)
+          '@
+              New = @'
+                  let split = comparator_split_key(comp);
+                  let _ = crate::tab_session::save(
+                      &crate::tab_session::path_in(&self.config.data_dir),
+                      &snapshot_tab_session(&comp.contexts, &comp.groups, split),
+                  );
+                  self.privacy
+                      .save_tabs(&mut comp.contexts, &mut comp.groups, split)
+          '@
+            },
+            @{
+              Label = "raw-history-write-through-file-options"
+              Test = "no_raw_data_dir_write_outside_a_grant"
+              SourcePath = "crates/neural-app/src/windows_app/app/tools.rs"
+              Old = @'
+                  let saved = outcome.save.map(|settings| {
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+              New = @'
+                  let saved = outcome.save.map(|settings| {
+                      let _ = std::fs::File::options()
+                          .create(true)
+                          .append(true)
+                          .open(self.config.data_dir.join("history.jsonl"))
+                          .and_then(|mut file| std::io::Write::write_all(&mut file, b"x"));
+                      crate::pomodoro_ui::save_settings(&self.config.data_dir.join("pomodoro"), settings)
+                  });
+          '@
+            },
+            @{
+              Label = "zip-not-inspected-shown-as-done"
+              Test = "a_zip_download_is_inspected_and_not_inspected_is_shown"
+              SourcePath = "crates/neural-app/src/windows_app/downloads_ui.rs"
+              Old = @'
+                  Inspection::NotInspected => Some(NOT_INSPECTED),
+          '@
+              New = @'
+                  Inspection::NotInspected => None,
+          '@
+            },
+            @{
+              Label = "distraction-clicks-a-reject-that-accepts"
+              Test = "distraction_never_clicks_accept"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+              return hasPhrase(padded, C.reject) && !hasAccept(padded);
+          '@
+              New = @'
+              return hasPhrase(padded, C.reject);
+          '@
+            },
+            @{
+              Label = "distraction-acts-on-ai-pages"
+              Test = "distraction_leaves_ai_provider_pages_untouched"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+              if (hit && (rule[2] !== true || udm === '50')) return;
+          '@
+              New = @'
+              if (false && hit && (rule[2] !== true || udm === '50')) return;
+          '@
+            },
+            @{
+              Label = "distraction-ignores-the-site-toggle"
+              Test = "per_site_toggle_off_injects_nothing"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+            var on = hasOwn(C.sites, site) ? C.sites[site] === true : C.on === true;
+          '@
+              New = @'
+            var on = C.on === true;
+          '@
+            },
+            @{
+              Label = "distraction-restores-scroll-under-a-paywall"
+              Test = "paywall_overlays_are_never_touched"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+              if (hasMarker(names, C.paywall) || hasMarker(text, C.paywall) || query(el, C.paywallSel).n) {
+                walled = true;
+                return;
+          '@
+              New = @'
+              if (hasMarker(names, C.paywall) || hasMarker(text, C.paywall) || query(el, C.paywallSel).n) {
+                return;
+          '@
+            },
+            @{
+              Label = "distraction-uses-the-page-querySelectorAll"
+              Test = "distraction_script_posts_nothing_and_survives_a_poisoned_page"
+              SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
+              Old = @'
+                list = root === D ? qsaDoc(D, selector)
+          '@
+              New = @'
+                list = root === D ? document.querySelectorAll(selector)
+          '@
+            },
+            @{
+              Label = "distraction-private-toggle-written"
+              Test = "a_toggle_in_private_is_never_written"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+                  let outcome = if private {
+          '@
+              New = @'
+                  let outcome = if false {
+          '@
+            },
+            @{
+              Label = "guard-lends-the-registry-with-a-lifetime"
+              Test = "registry_is_minted_once_and_owned_by_the_guard"
+              SourcePath = "crates/neural-app/src/privacy.rs"
+              Old = @'
+              pub(crate) fn store(&self, spec: StoreSpec) -> Option<StoreGrant> {
+                  self.registry.grant(spec).ok()
+              }
+          '@
+              New = @'
+              pub(crate) fn store(&self, spec: StoreSpec) -> Option<StoreGrant> {
+                  self.registry().grant(spec).ok()
+              }
+
+              /// O registo, emprestado a quem o pedir.
+              pub(crate) fn registry(&self) -> &'_ StoreRegistry {
+                  &self.registry
+              }
+          '@
             }
           )
 
+          # Run grouped by target file (files in first-appearance order, matrix order
+          # inside a file), so consecutive incremental builds differ in one file.
+          # Every entry is still applied alone to the shipped bytes: the order
+          # changes no proof.
+          $byFile = [ordered]@{}
+          foreach ($sabotage in $sabotages) {
+            $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
+            if (-not $byFile.Contains($target)) {
+              $byFile[$target] = [Collections.Generic.List[object]]::new()
+            }
+            $byFile[$target].Add($sabotage)
+          }
+
           try {
-            foreach ($sabotage in $sabotages) {
-              $target = if ($sabotage.SourcePath) { $sabotage.SourcePath } else { $defaultSourcePath }
-              Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New ([bool]$sabotage.Ignored)
+            $proved = 0
+            foreach ($target in $byFile.Keys) {
+              foreach ($sabotage in $byFile[$target]) {
+                Assert-GateRed $sabotage.Label $sabotage.Test $target $sabotage.Old $sabotage.New ([bool]$sabotage.Ignored)
+                $proved++
+              }
+            }
+            if ($proved -ne $sabotages.Count) {
+              throw "Sabotage proof ran $proved of the $($sabotages.Count) entries."
             }
             Write-Host "Sabotage proof: each of the $($sabotages.Count) Rust UI sabotages turned its own shipped-path gate red."
 
             $jsTarget = if ($comparatorInjectPath) { $comparatorInjectPath } else { $defaultSourcePath }
             $resolvedJs = (Resolve-Path -LiteralPath $jsTarget).Path
+            $originalJsBytes = [IO.File]::ReadAllBytes($resolvedJs)
+            $originalJsHash = (Get-FileHash -LiteralPath $resolvedJs -Algorithm SHA256).Hash
             $originalJs = [IO.File]::ReadAllText($resolvedJs, $utf8)
             $brokenJs = Replace-Exact $originalJs @'
           '#neuralia-comp-controls,#neuralia-palette,a[href],button,input,textarea,select,option,label,summary,[role="button"],[role="link"],[contenteditable="true"]'
@@ -587,14 +908,21 @@ jobs:
               Write-Host "Sabotage proof: removing the link guard turns the runtime routing gate red."
             }
             finally {
-              Write-Exact $resolvedJs $originalJs
+              Restore-Exact $resolvedJs $originalJsBytes $originalJsHash "double-click-link-guard"
             }
           }
           finally {
             git checkout -- crates/neural-app/src
           }
 
+          # The restored tree is built the way every other step of this job builds
+          # (non-incremental): its green owes nothing to the sabotages' incremental
+          # cache, and the steps after this one find its artifacts fresh.
+          $env:CARGO_INCREMENTAL = $jobIncremental
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo fmt is not clean on the restored source."
+          }
           $restored = Invoke-GateTest @()
           if ($restored.Code -ne 0) {
             throw "neural-app tests are not green on the restored source."
@@ -615,6 +943,9 @@ jobs:
             }
           }
           node scripts/test-link-routing.mjs
+          if ($LASTEXITCODE -ne 0) {
+            throw "The runtime routing gate is not green on the restored source."
+          }
           git diff --exit-code -- crates/neural-app/src
       # Window gates that take the foreground or the keyboard focus (the
       # activatable SecretPrompt of infra-settings-keys) never run in the local
@@ -673,8 +1004,13 @@ jobs:
             throw "The check cannot see test-stores even with dev-dependencies:`n$tests"
           }
           Write-Host "test-stores: off in the build graph of the published exe, on only for tests."
+      # Ordered by the app's own milestones (three columns built, the two
+      # no-input relayouts applied), not by a clock. The old fixed 12 s failed
+      # when column 0's WebView2 was still starting (runs 36169172174 and
+      # 36252161943). The script's 180 s only tells a slow start from a hang.
       - name: First comparator paint without mouse or keyboard
         shell: pwsh
+        timeout-minutes: 5
         run: ./scripts/test-comparator-first-paint.ps1 -ExePath target/release/NeuralIA.exe
       - name: Native Home performance regression gate
         shell: pwsh
@@ -750,6 +1086,18 @@ jobs:
         run: |
           ./scripts/test-downloads.ps1 -SelfTest
           ./scripts/test-downloads.ps1 -ExePath ci-tested/NeuralIA.exe
+      # Phase 0 of the private-mode E2E (infra-privacy-guard, 2.4): a scripted
+      # Normal session against a loopback fixture (scripts/private-mode-fixture.mjs)
+      # on the exact tested bytes, with a temporary NEURALIA_DATA_DIR hashed
+      # before and after. Every file the session created or changed must be a
+      # store of the SPEC-0006 table (the script's allowlist, printed in the
+      # log), and the session must have reached the history and the memory;
+      # later briefs extend that list with the Private-mode expectations. It
+      # opens the exe, so it never runs in the local suite.
+      - name: Private mode phase 0 on the tested exe (data dir writers enumerated)
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./scripts/test-private-mode.ps1 -ExePath ci-tested/NeuralIA.exe
       # Release contract of the CI-only accelerator spike (infra-accel-spike):
       # the exact bytes that release.yml packages were built without the spike
       # feature, so the spike marker is not in them. The spike itself runs in

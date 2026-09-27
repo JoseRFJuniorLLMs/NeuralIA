@@ -70,6 +70,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/adblock.rs"),
     "\n",
+    include_str!("../src/windows_app/distraction.rs"),
+    "\n",
     include_str!("../src/windows_app/bookmarks.rs"),
     "\n",
     include_str!("../src/windows_app/page_eval.rs"),
@@ -97,6 +99,10 @@ const ALL_SOURCES: &str = concat!(
     include_str!("../src/windows_app/app/tabs.rs"),
     "\n",
     include_str!("../src/windows_app/app/event_loop.rs"),
+    "\n",
+    // O portao da persistencia (infra-privacy-guard): dono do registo das
+    // lojas e da rota do historico, da memoria e das abas.
+    include_str!("../src/privacy.rs"),
     "\n",
     include_str!("../src/windows_app/tests.rs"),
 );
@@ -128,7 +134,12 @@ fn spec_0100_product_memory_is_worker_backed_reader_wired_and_private_safe() {
 
     let reader = between(APP, "fn capture_reader_memory", "fn reader_webview_builder");
     assert!(reader.contains("MemorySourceKind::Reader"));
-    assert!(reader.contains("self.memory.capture(document)"));
+    // Pelo portao da persistencia (infra-privacy-guard): e ele que decide,
+    // pelo modo, se a captura chega ao worker.
+    assert!(reader.contains("self.privacy.capture(document)"));
+    // "\n}" e nao "\n}\n": o checkout do CI em Windows tem CRLF.
+    let guard = between(APP, "impl PrivacyGuard {", "\n}");
+    assert!(guard.contains("self.memory.capture(document)"));
 
     // A regra "navegação privada nunca entra na memória semântica" deixou de
     // ser contada por ocorrências de `if !private` no texto: contar strings
@@ -152,8 +163,8 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
     // `windows_app::tests::each_translation_is_named_by_its_text_and_reopens_from_history`.
     assert!(APP.contains("ResearchSession::new(request.prompt.clone()).titled(&request.label)"));
     assert!(APP.contains("let (session, question_memory, reopen) = compare_records(&request);"));
-    assert!(APP.contains("self.memory.capture(question_memory);"));
-    assert!(APP.contains("self.memory.save_session(session.clone());"));
+    assert!(APP.contains("self.privacy.capture(question_memory);"));
+    assert!(APP.contains("self.privacy.save_session(session.clone());"));
     assert!(APP.contains("let facts = session.comparison(&ids);"));
     assert!(APP.contains("let snapshot = session.synthesize(&ids).clone();"));
     assert!(APP.contains("session.export_markdown()"));
@@ -261,7 +272,7 @@ fn spec_0106_roadmap_product_composition_is_wired_not_just_constructible() {
     assert!(APP.contains("match route_input(&input)"));
 
     assert!(APP.contains("ResearchSession::new(request.prompt.clone())"));
-    assert!(APP.contains("self.memory.capture(question_memory);"));
+    assert!(APP.contains("self.privacy.capture(question_memory);"));
     assert!(APP.contains("decide_agent_step("));
     assert!(APP.contains("function semanticAnchors()"));
     assert!(APP.contains("parse_ipc_message(request.body()"));

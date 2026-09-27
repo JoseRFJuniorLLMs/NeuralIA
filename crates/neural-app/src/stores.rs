@@ -6,17 +6,35 @@
 //! O gate `existing_stores_have_a_declared_kind` (em `windows_app/tests.rs`)
 //! percorre o codigo que embarca e falha se aparecer um `data_dir.join(...)`
 //! que nao esteja aqui: uma loja nova nasce com o seu tipo declarado. O
-//! registo das lojas so e cunhado no `App::new`; hoje abrem as suas por grant
-//! o cofre das chaves (`KEYS_STORE`, `LIVE_KEY_STORE`) e o portao de saida da
-//! IA (`AI_SETTINGS_STORE`, `AI_USAGE_STORE`, em `egress.rs`) e a Traducao
-//! (`TRANSLATE_STORE`, a loja «Sempre neste site»). Levar as outras
-//! para grants e o `no_raw_data_dir_write_outside_a_grant` do
-//! infra-privacy-guard.
+//! registo das lojas e cunhado uma vez, no `App::new`, e entregue ao
+//! `PrivacyGuard` (`crate::privacy`), que e quem passa os grants
+//! (`guard.store(spec)`): o cofre das chaves (`KEYS_STORE`,
+//! `LIVE_KEY_STORE`), o portao de saida da IA (`AI_SETTINGS_STORE`,
+//! `AI_USAGE_STORE`, em `egress.rs`), a Traducao (`TRANSLATE_STORE`), o
+//! bloqueio, os downloads e os favoritos abrem as suas por grant; o
+//! historico, a memoria e as abas (`HISTORY_STORE`, `MEMORY_STORE`,
+//! `TABS_STORE`) sao do proprio guard, que e o unico que as escreve. O que
+//! ainda escreve pelo caminho esta na tabela da fase 0 (SPEC-0006) e na
+//! lista do gate `no_raw_data_dir_write_outside_a_grant`.
 
 use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
 use neural_core::json_store::StoreShape::{Dir, File};
 use neural_core::json_store::StoreSpec;
 
+/// `<data_dir>/history.jsonl`: o historico cronologico, cada pagina aberta.
+/// Efeito lateral do uso: `Automatic`. So o `PrivacyGuard` o escreve
+/// (`record`), e no modo privado nao escreve.
+pub(crate) const HISTORY_STORE: StoreSpec = StoreSpec::new("history.jsonl", Automatic, File);
+/// `<data_dir>/memory`: a memoria semantica local, capturada ao ler
+/// (documentos, wiki, tombstones, o indice SQLite derivado e as sessoes de
+/// pesquisa em `sessions/`). `Automatic`: so o `PrivacyGuard` a escreve
+/// (`capture`, `save_session`), e no modo privado nao escreve.
+pub(crate) const MEMORY_STORE: StoreSpec = StoreSpec::new("memory", Automatic, Dir);
+/// `<data_dir>/tabs.json`: as abas e os grupos do comparador, gravados ao
+/// mudar. `Automatic`: so o `PrivacyGuard` os grava (`save_tabs`), e no
+/// modo privado nao grava. `tabs.lock` e `tabs.cleared` (o trinco da
+/// primeira janela e a geracao do "Apagar historico") vivem ao lado.
+pub(crate) const TABS_STORE: StoreSpec = StoreSpec::new("tabs.json", Automatic, File);
 /// `<data_dir>/keys/<slot>.key`: as chaves de API (`secrets::KeyVault`).
 /// O utilizador colou-as: `Explicit`. Nunca entram no Ctrl+Shift+Delete.
 pub(crate) const KEYS_STORE: StoreSpec = StoreSpec::new("keys", Explicit, Dir);
@@ -67,16 +85,14 @@ pub(crate) const DOWNLOADS_SETTINGS_STORE: StoreSpec =
 /// Tudo o que o produto guarda em `<data_dir>`, com o tipo. Um ficheiro, um
 /// tipo; a regra: `Setting` = escolha num menu ou definicao; `Explicit` =
 /// o utilizador pediu para guardar; `Automatic` = efeito lateral do uso.
-/// Hoje so o gate a le; o infra-privacy-guard abre cada loja por ela.
+/// So o gate a le; cada loja que abre por grant tem a sua constante acima.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const APP_STORES: &[StoreSpec] = &[
-    // O historico cronologico: cada pagina aberta.
-    StoreSpec::new("history.jsonl", Automatic, File),
-    // A memoria semantica local, capturada ao ler.
-    StoreSpec::new("memory", Automatic, Dir),
-    // As abas e os grupos do comparador, gravados ao mudar; o trinco da
-    // primeira janela e a geracao do "Apagar historico".
-    StoreSpec::new("tabs.json", Automatic, File),
+    HISTORY_STORE,
+    MEMORY_STORE,
+    // O trinco da primeira janela e a geracao do "Apagar historico", ao
+    // lado do `TABS_STORE`.
+    TABS_STORE,
     StoreSpec::new("tabs.lock", Automatic, File),
     StoreSpec::new("tabs.cleared", Automatic, File),
     // A largura escolhida para os paineis: geometria, mas escrita ao

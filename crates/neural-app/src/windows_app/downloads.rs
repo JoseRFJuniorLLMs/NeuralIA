@@ -9,7 +9,7 @@ use neural_core::downloads::{
     DownloadSettings, DownloadStart, LOG_MAX_BYTES, LOG_VERSION, ProgressThrottle,
     SETTINGS_MAX_BYTES, SETTINGS_VERSION, WebViewKey, finalize_download, unique_path,
 };
-use neural_core::json_store::{SaveOutcome, StoreMode, VersionedJsonStore};
+use neural_core::json_store::{SaveOutcome, StoreGrant, StoreSpec, VersionedJsonStore};
 
 use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 
@@ -31,7 +31,9 @@ use crate::stores::{DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE};
 // - `BytesReceivedChanged`: filtrado a 250 ms (`ProgressThrottle`) antes de
 //   sair do handler. `StateChanged`: o fim (acabado, cancelado,
 //   interrompido), que larga a operacao e, se acabou, corre o
-//   `finalize_download` (sniff, depois a marca da Web ou apagar).
+//   `finalize_download` (sniff e, num `.zip`, o diretorio central -- com
+//   «Permitir baixar programas» de quando acabou --, depois a marca da Web
+//   ou apagar).
 // - A WebView destruida: o handler do `DownloadStarting` guarda um
 //   `WebViewLife`; quando o WebView2 o larga, o gestor recebe `WebViewGone`
 //   e cancela e larga as operacoes dessa WebView.
@@ -626,10 +628,10 @@ pub(in crate::windows_app) fn erase_download_log(
     }
 }
 
-/// O modo do registo das lojas, como o gestor o precisa: `true` no Modo
-/// privado. Sem registo (nunca no produto) nada se grava de qualquer forma.
-pub(in crate::windows_app) fn downloads_private_mode(stores: Option<&StoreRegistry>) -> bool {
-    stores.is_some_and(|stores| stores.mode() == StoreMode::Private)
+/// O modo do `PrivacyGuard`, como o gestor o precisa: `true` no Modo
+/// privado.
+pub(in crate::windows_app) fn downloads_private_mode(mode: PrivacyMode) -> bool {
+    mode == PrivacyMode::Private
 }
 
 /// O estado da feature no `App`.
@@ -643,29 +645,28 @@ pub(in crate::windows_app) struct DownloadsState {
 }
 
 impl DownloadsState {
-    /// As definicoes e o registo, pelos grants do registo das lojas. Sem
-    /// registo (nunca no produto), vale tudo por omissao e nada se grava.
-    pub(in crate::windows_app) fn open(stores: Option<&StoreRegistry>) -> Self {
-        let mut settings_store = stores
-            .and_then(|stores| stores.grant(DOWNLOADS_SETTINGS_STORE).ok())
-            .and_then(|grant| {
-                VersionedJsonStore::<DownloadSettings>::open(
-                    grant,
-                    SETTINGS_VERSION,
-                    SETTINGS_MAX_BYTES,
-                )
-                .ok()
-            });
+    /// As definicoes e o registo, pelos grants que `grants` da (no produto,
+    /// `PrivacyGuard::store`). Sem grant (nunca no produto), vale tudo por
+    /// omissao e nada se grava.
+    pub(in crate::windows_app) fn open(
+        mut grants: impl FnMut(StoreSpec) -> Option<StoreGrant>,
+    ) -> Self {
+        let mut settings_store = grants(DOWNLOADS_SETTINGS_STORE).and_then(|grant| {
+            VersionedJsonStore::<DownloadSettings>::open(
+                grant,
+                SETTINGS_VERSION,
+                SETTINGS_MAX_BYTES,
+            )
+            .ok()
+        });
         let settings = settings_store
             .as_mut()
             .map(|store| store.load().into_value())
             .unwrap_or_default();
         let settings = checked_download_settings(settings, Path::is_dir);
-        let mut log_store = stores
-            .and_then(|stores| stores.grant(DOWNLOADS_LOG_STORE).ok())
-            .and_then(|grant| {
-                VersionedJsonStore::<DownloadLog>::open(grant, LOG_VERSION, LOG_MAX_BYTES).ok()
-            });
+        let mut log_store = grants(DOWNLOADS_LOG_STORE).and_then(|grant| {
+            VersionedJsonStore::<DownloadLog>::open(grant, LOG_VERSION, LOG_MAX_BYTES).ok()
+        });
         let log = log_store
             .as_mut()
             .map(|store| store.load().into_value())
@@ -748,8 +749,9 @@ pub(in crate::windows_app) fn download_app_step(
             id,
             path,
             confirmed_program,
+            allow_programs,
         } => {
-            let outcome = finalize_download(&path, confirmed_program);
+            let outcome = finalize_download(&path, confirmed_program, allow_programs);
             debug_log(format_args!("downloads: {} acabou ({outcome:?})", id.0));
             Some(DownloadEvent::Finalized { id, outcome })
         }
@@ -826,7 +828,7 @@ impl App {
     /// para as operacoes do WebView2, para o disco ou para o ecra
     /// (`downloads_ui_after`).
     pub(in crate::windows_app) fn download_event(&mut self, event: DownloadEvent) {
-        let private_mode = downloads_private_mode(self.stores.as_ref());
+        let private_mode = downloads_private_mode(self.privacy.mode());
         let run = self.downloads.run(private_mode, event);
         if let Some(error) = run.erase_error {
             self.show_splash(

@@ -63,7 +63,7 @@ impl ClearHistorySink for App {
     fn clear(&mut self, target: ClearTarget) {
         match target {
             ClearTarget::Tabs => self.forget_tab_session(),
-            ClearTarget::Memory => self.memory.clear(&mut self.current_research),
+            ClearTarget::Memory => self.privacy.clear_memory(&mut self.current_research),
             ClearTarget::EpubLibrary => {
                 // Na biblioteca de livros, some quando cada livro foi aberto
                 // ("Continuar lendo", recentes); posições e marcadores ficam.
@@ -81,7 +81,7 @@ impl ClearHistorySink for App {
             ClearTarget::Downloads => {
                 self.download_event(neural_core::downloads::DownloadEvent::ClearLog)
             }
-            ClearTarget::History => match self.history.clear() {
+            ClearTarget::History => match self.privacy.clear_history() {
                 None => {
                     self.show_home();
                     self.status = Some("A apagar o histórico local…".to_string());

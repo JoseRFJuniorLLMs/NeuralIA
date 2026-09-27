@@ -371,9 +371,9 @@ impl App {
                             Some(memory_id),
                             value,
                         );
-                        self.memory.save_session(session.clone());
+                        self.privacy.save_session(session.clone());
                     }
-                    self.memory.capture(document);
+                    self.privacy.capture(document);
                 }
 
                 let _ = webview.zoom(self.zoom);

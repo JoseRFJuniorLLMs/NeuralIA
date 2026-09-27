@@ -30,8 +30,10 @@ use crate::panel_chrome::{
     strip_buttons, strip_hit, wheel_message_params, wheel_route,
 };
 use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_color};
+use crate::privacy::{PrivacyGuard, PrivacyMode};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::secrets::redact_debug_secrets;
+use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::json_store::StoreRegistry;
 use neural_core::{
@@ -110,6 +112,9 @@ pub(in crate::windows_app) enum UserEvent {
     /// O bloqueio de anuncios (`adblock.rs`): os itens do menu e as threads
     /// que leem e baixam a lista.
     Adblock(AdblockEvent),
+    /// A anti-distracao (`distraction.rs`): a caixa «Ocultar distrações
+    /// neste site» do botao direito.
+    Distraction(DistractionEvent),
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
@@ -384,7 +389,7 @@ const MAX_VISIBLE_CONTEXT_TABS: usize = 3;
 /// Cada aba visivel pode arrastar consigo a pilula do seu grupo, e um grupo
 /// fechado ocupa um lugar sem mostrar abas nenhumas -- dai o dobro.
 const MAX_VISIBLE_TAB_SLOTS: usize = MAX_VISIBLE_CONTEXT_TABS * 2;
-const COMPARATOR_COLUMNS: usize = 3;
+pub(crate) const COMPARATOR_COLUMNS: usize = 3;
 /// Intervalo da rolagem automatica de leitura, do primeiro avanco ao ultimo.
 const AUTO_SCROLL_SECONDS: u64 = 30;
 /// Quanto tempo a pergunta fica no ecra antes de se dar por respondida com
@@ -2675,18 +2680,66 @@ enum HistoryCommand {
     Recent(usize),
 }
 
+/// Por onde os workers do historico e da memoria devolvem os seus eventos:
+/// no produto, o proxy do event loop; nos gates, um canal. E o que o
+/// `PrivacyGuard` (`crate::privacy`) recebe para os arrancar sem nunca ver
+/// um `UserEvent`.
 #[derive(Clone)]
-struct HistoryWriter {
+pub(crate) struct EventSink {
+    inner: SinkInner,
+}
+
+#[derive(Clone)]
+enum SinkInner {
+    Proxy(EventLoopProxy<UserEvent>),
+    #[cfg(test)]
+    Channel(Sender<UserEvent>),
+}
+
+impl EventSink {
+    pub(in crate::windows_app) fn proxy(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            inner: SinkInner::Proxy(proxy),
+        }
+    }
+
+    /// Os gates recebem os eventos por um canal.
+    #[cfg(test)]
+    pub(in crate::windows_app) fn channel(tx: Sender<UserEvent>) -> Self {
+        Self {
+            inner: SinkInner::Channel(tx),
+        }
+    }
+
+    /// Entrega o evento; um event loop que ja fechou (ou um canal sem
+    /// leitor) so faz o evento perder-se, como o `send_event` fazia.
+    fn send(&self, event: UserEvent) {
+        match &self.inner {
+            SinkInner::Proxy(proxy) => {
+                let _ = proxy.send_event(event);
+            }
+            #[cfg(test)]
+            SinkInner::Channel(tx) => {
+                let _ = tx.send(event);
+            }
+        }
+    }
+}
+
+/// O worker do historico (`history.jsonl`). So o `PrivacyGuard` o cria e o
+/// chama: e ele que decide, pelo modo, se uma entrada chega aqui.
+#[derive(Clone)]
+pub(crate) struct HistoryWriter {
     tx: SyncSender<HistoryCommand>,
     store: HistoryStore,
-    proxy: EventLoopProxy<UserEvent>,
+    sink: EventSink,
 }
 
 impl HistoryWriter {
-    fn new(store: HistoryStore, proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub(crate) fn new(store: HistoryStore, sink: EventSink) -> Self {
         let (tx, rx) = sync_channel::<HistoryCommand>(128);
         let worker_store = store.clone();
-        let worker_proxy = proxy.clone();
+        let worker_sink = sink.clone();
         let _ = thread::Builder::new()
             .name("neural-history".into())
             .spawn(move || {
@@ -2694,24 +2747,23 @@ impl HistoryWriter {
                     match command {
                         HistoryCommand::Append(entry) => {
                             if let Err(error) = worker_store.append(&entry) {
-                                let _ = worker_proxy
-                                    .send_event(UserEvent::HistoryWriteFailed(error.to_string()));
+                                worker_sink.send(UserEvent::HistoryWriteFailed(error.to_string()));
                             }
                         }
                         HistoryCommand::Clear => {
                             let result = worker_store.clear().map_err(|error| error.to_string());
-                            let _ = worker_proxy.send_event(UserEvent::HistoryCleared(result));
+                            worker_sink.send(UserEvent::HistoryCleared(result));
                         }
                         HistoryCommand::Recent(limit) => {
                             let result = worker_store
                                 .recent(limit)
                                 .map_err(|error| error.to_string());
-                            let _ = worker_proxy.send_event(UserEvent::HistoryLoaded(result));
+                            worker_sink.send(UserEvent::HistoryLoaded(result));
                         }
                     }
                 }
             });
-        Self { tx, store, proxy }
+        Self { tx, store, sink }
     }
 
     /// Ler o historico e lock + leitura do ficheiro inteiro: nao se faz no
@@ -2719,18 +2771,18 @@ impl HistoryWriter {
     /// utilizador esta a espera da caixa -- por isso, com o worker saturado,
     /// recorre-se a uma thread excepcional; so se essa tambem falhar e que o
     /// erro volta ja, para ser mostrado no lugar da lista.
-    fn recent(&self, limit: usize) -> Option<Result<Vec<HistoryEntry>, String>> {
+    pub(crate) fn recent(&self, limit: usize) -> Option<Result<Vec<HistoryEntry>, String>> {
         if self.tx.try_send(HistoryCommand::Recent(limit)).is_ok() {
             return None;
         }
 
         let store = self.store.clone();
-        let proxy = self.proxy.clone();
+        let sink = self.sink.clone();
         match thread::Builder::new()
             .name("neural-history-recent".into())
             .spawn(move || {
                 let result = store.recent(limit).map_err(|error| error.to_string());
-                let _ = proxy.send_event(UserEvent::HistoryLoaded(result));
+                sink.send(UserEvent::HistoryLoaded(result));
             }) {
             Ok(_) => None,
             Err(error) => Some(Err(format!(
@@ -2741,30 +2793,28 @@ impl HistoryWriter {
 
     /// Nunca faz I/O no event loop. Sob saturacao, perder uma entrada e menos
     /// grave do que congelar a interface com lock + fsync + rename.
-    fn append(&self, entry: HistoryEntry) {
+    pub(crate) fn append(&self, entry: HistoryEntry) {
         if self.tx.try_send(HistoryCommand::Append(entry)).is_err() {
             let message = "fila do histórico saturada; uma entrada não foi gravada".to_string();
             eprintln!("{message}");
-            let _ = self
-                .proxy
-                .send_event(UserEvent::HistoryWriteFailed(message));
+            self.sink.send(UserEvent::HistoryWriteFailed(message));
         }
     }
 
     /// A limpeza nao pode ser perdida. Se o worker estiver saturado, usa uma
     /// thread excepcional em vez de executar I/O sincrono na UI.
-    fn clear(&self) -> Option<Result<(), String>> {
+    pub(crate) fn clear(&self) -> Option<Result<(), String>> {
         if self.tx.try_send(HistoryCommand::Clear).is_ok() {
             return None;
         }
 
         let store = self.store.clone();
-        let proxy = self.proxy.clone();
+        let sink = self.sink.clone();
         match thread::Builder::new()
             .name("neural-history-clear".into())
             .spawn(move || {
                 let result = store.clear().map_err(|error| error.to_string());
-                let _ = proxy.send_event(UserEvent::HistoryCleared(result));
+                sink.send(UserEvent::HistoryCleared(result));
             }) {
             Ok(_) => None,
             Err(error) => Some(Err(format!(
@@ -2782,13 +2832,15 @@ enum MemoryCommand {
     Rebuild,
 }
 
+/// O worker da memoria semantica (`memory/`). So o `PrivacyGuard` o cria e
+/// o chama: e ele que decide, pelo modo, se uma captura chega aqui.
 #[derive(Clone)]
-struct MemoryWorker {
+pub(crate) struct MemoryWorker {
     tx: SyncSender<MemoryCommand>,
 }
 
 impl MemoryWorker {
-    fn new(root: std::path::PathBuf, proxy: EventLoopProxy<UserEvent>) -> Self {
+    pub(crate) fn new(root: std::path::PathBuf, sink: EventSink) -> Self {
         let (tx, rx) = sync_channel::<MemoryCommand>(128);
         let _ = thread::Builder::new()
             .name("neural-memory".into())
@@ -2800,15 +2852,13 @@ impl MemoryWorker {
                         while let Ok(command) = rx.recv() {
                             match command {
                                 MemoryCommand::Query(query) => {
-                                    let _ = proxy.send_event(UserEvent::MemoryQueryReady {
+                                    sink.send(UserEvent::MemoryQueryReady {
                                         query,
                                         result: Err(error.to_string()),
                                     });
                                 }
                                 MemoryCommand::Clear => {
-                                    let _ = proxy.send_event(UserEvent::MemoryCleared(Err(
-                                        error.to_string()
-                                    )));
+                                    sink.send(UserEvent::MemoryCleared(Err(error.to_string())));
                                 }
                                 _ => {}
                             }
@@ -2851,17 +2901,17 @@ impl MemoryWorker {
                                 store.query(&MemoryQuery::new(query.clone()))
                             }
                             .map_err(|error| error.to_string());
-                            let _ = proxy.send_event(UserEvent::MemoryQueryReady { query, result });
+                            sink.send(UserEvent::MemoryQueryReady { query, result });
                         }
                         MemoryCommand::Clear => {
                             let result = store
                                 .forget(neural_core::ForgetScope::All)
                                 .map(|_| ())
                                 .map_err(|error| error.to_string());
-                            let _ = proxy.send_event(UserEvent::MemoryCleared(result));
+                            sink.send(UserEvent::MemoryCleared(result));
                         }
                         MemoryCommand::SaveSession(session) => {
-                            if let Err(error) = session.save(store.root()) {
+                            if let Err(error) = store.save_session(&session) {
                                 eprintln!("research session save failed: {error}");
                             }
                         }
@@ -2876,13 +2926,13 @@ impl MemoryWorker {
         Self { tx }
     }
 
-    fn capture(&self, document: MemoryDocument) {
+    pub(crate) fn capture(&self, document: MemoryDocument) {
         if self.tx.try_send(MemoryCommand::Capture(document)).is_err() {
             eprintln!("memory queue saturated; dropping one capture");
         }
     }
 
-    fn query(&self, query: String) {
+    pub(crate) fn query(&self, query: String) {
         if self.tx.try_send(MemoryCommand::Query(query)).is_err() {
             eprintln!("memory queue saturated; query not scheduled");
         }
@@ -2893,14 +2943,14 @@ impl MemoryWorker {
     /// na app voltava ao disco no proximo save_session (com a pergunta ja
     /// apagada) e cada captura nova com esse id era recusada em silencio.
     /// Pedir a sessao aqui obriga quem apaga a larga-la.
-    fn clear(&self, current_research: &mut Option<ResearchSession>) {
+    pub(crate) fn clear(&self, current_research: &mut Option<ResearchSession>) {
         *current_research = None;
         if self.tx.try_send(MemoryCommand::Clear).is_err() {
             eprintln!("memory queue saturated; clear not scheduled");
         }
     }
 
-    fn save_session(&self, session: ResearchSession) {
+    pub(crate) fn save_session(&self, session: ResearchSession) {
         if self
             .tx
             .try_send(MemoryCommand::SaveSession(session))
@@ -2910,7 +2960,7 @@ impl MemoryWorker {
         }
     }
 
-    fn rebuild(&self) {
+    pub(crate) fn rebuild(&self) {
         if self.tx.try_send(MemoryCommand::Rebuild).is_err() {
             eprintln!("memory queue saturated; rebuild not scheduled");
         }
@@ -3108,8 +3158,12 @@ pub(in crate::windows_app) struct App {
     /// Estado nativo lido pela subclasse do EDIT da palette.
     pub(in crate::windows_app) palette_host: Box<PaletteHost>,
     pub(in crate::windows_app) config: CoreConfig,
-    pub(in crate::windows_app) history: HistoryWriter,
-    pub(in crate::windows_app) memory: MemoryWorker,
+    /// O portao da persistencia (`crate::privacy`): dono do registo das
+    /// lojas (a unica cunhagem do produto, feita no `App::new`) e dos
+    /// escritores automaticos -- o historico, a memoria semantica e as
+    /// abas. O App grava por ele (`record`, `capture`, `save_session`,
+    /// `save_tabs`) e pede-lhe os grants das lojas (`store`).
+    pub(in crate::windows_app) privacy: PrivacyGuard,
     /// Todos os prazos da interface (avisos, sondas, rolagem, barra) passam
     /// por aqui: uma thread para a aplicacao inteira.
     pub(in crate::windows_app) timers: Timers,
@@ -3159,9 +3213,6 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) panel_widths: PanelWidths,
     /// A pega de arrastar a borda esquerda do painel aberto.
     pub(in crate::windows_app) panel_handle: Option<HWND>,
-    /// Gravacao das abas e grupos do comparador em `tabs.json`. Aberta no
-    /// arranque: a primeira janela do NeuralIA fica com o `tabs.lock`.
-    pub(in crate::windows_app) tab_session: TabPersistence,
     /// Ferramentas: o botao da Home sob o rato (a barra usa `bar_hover`).
     pub(in crate::windows_app) home_tool_hover: Option<Tool>,
     /// Notas (Zettelkasten) em `<data_dir>/zettel`, lidas e gravadas fora do
@@ -3183,12 +3234,6 @@ pub(in crate::windows_app) struct App {
     /// Painel do Gemini Live, com o estado do olho da barra. Existir e estar
     /// ligado: fecha-lo desliga tudo.
     pub(in crate::windows_app) live_panel: LivePanel<WebView>,
-    /// O registo das lojas (`neural_core::json_store`), cunhado aqui -- a
-    /// unica cunhagem do produto. So ele passa os grants que abrem as lojas;
-    /// o infra-privacy-guard muda-o para o `PrivacyGuard`. `None` so se o
-    /// processo ja o tivesse cunhado, o que nao acontece: ha um `App` por
-    /// processo.
-    pub(in crate::windows_app) stores: Option<StoreRegistry>,
     /// O pedido de chave nativo e o cofre das chaves (`secret_prompt.rs`).
     pub(in crate::windows_app) keys: KeysState,
     /// O bloqueio de anuncios (`adblock.rs`): a escolha, a lista e o que os
@@ -3219,8 +3264,6 @@ pub(in crate::windows_app) struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let config = CoreConfig::default();
-        let history_store =
-            HistoryStore::with_limit(config.data_dir.join("history.jsonl"), config.history_limit);
         // A escolha de tema vale antes do primeiro desenho.
         ThemeChoice::load(&config.data_dir.join("theme")).apply();
         GMAIL_NOTIFICATIONS.store(
@@ -3230,8 +3273,16 @@ impl App {
         let pomodoro = PomodoroController::new(crate::pomodoro_ui::load_settings(
             &config.data_dir.join("pomodoro"),
         ));
-        let history = HistoryWriter::new(history_store, proxy.clone());
-        let memory = MemoryWorker::new(config.data_dir.join("memory"), proxy.clone());
+        // A unica cunhagem do registo das lojas no produto, entregue inteira
+        // ao portao da persistencia: e ele que passa os grants, arranca os
+        // workers do historico e da memoria e abre as abas (a primeira
+        // janela do NeuralIA fica com o `tabs.lock`). Nao toca no disco:
+        // so os grants, pedidos depois, dizem onde cada loja vive.
+        let privacy = PrivacyGuard::new(
+            StoreRegistry::mint(&config.data_dir),
+            &config,
+            EventSink::proxy(proxy.clone()),
+        );
         let notes = ZettelWorker::new(config.data_dir.join("zettel"), proxy.clone());
         let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
@@ -3259,14 +3310,14 @@ impl App {
             proxy.clone(),
             Arc::clone(&navigation_generation),
         );
-        let tab_session = TabPersistence::open(&config.data_dir);
-        // A unica cunhagem do registo das lojas no produto. Nao toca no
-        // disco: so os grants, pedidos depois, dizem onde cada loja vive.
-        let stores = StoreRegistry::mint(&config.data_dir).ok();
         let keys = KeysState::new(proxy.clone());
         // Desligado (quem nunca clicou em "Ativar"), so le a escolha.
-        let adblock = AdblockState::open(stores.as_ref(), &proxy);
-        let downloads = DownloadsState::open(stores.as_ref());
+        let adblock = AdblockState::open(
+            privacy.store(ADBLOCK_SETTINGS_STORE),
+            privacy.store(ADBLOCK_LIST_STORE),
+            &proxy,
+        );
+        let downloads = DownloadsState::open(|spec| privacy.store(spec));
         // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
         let translation = TranslationState::new(proxy.clone());
         let downloads_ui = DownloadsUiState::new(proxy.clone());
@@ -3315,8 +3366,7 @@ impl App {
             palette: None,
             palette_host,
             config,
-            history,
-            memory,
+            privacy,
             timers,
             current_research: None,
             active_agent: None,
@@ -3337,7 +3387,6 @@ impl App {
             column_hint: None,
             panel_widths,
             panel_handle: None,
-            tab_session,
             home_tool_hover: None,
             notes,
             page_source: None,
@@ -3345,7 +3394,6 @@ impl App {
             epub: None,
             pending_drops: Vec::new(),
             live_panel: LivePanel::off(),
-            stores,
             keys,
             adblock,
             egress: None,
@@ -3362,9 +3410,9 @@ impl App {
     /// registo das lojas. E a porta das features de IA; a Traducao
     /// (`translation.rs`) e a primeira a pedi-lo.
     pub(in crate::windows_app) fn egress_gate(&mut self) -> &mut crate::egress::EgressGate {
-        let stores = self.stores.as_ref();
+        let privacy = &self.privacy;
         self.egress
-            .get_or_insert_with(|| crate::egress::EgressGate::for_app(stores))
+            .get_or_insert_with(|| crate::egress::EgressGate::for_app(|spec| privacy.store(spec)))
     }
 }
 
@@ -3539,7 +3587,7 @@ impl App {
         if let Some(session) = &self.current_research {
             document = document.session(session.id.clone());
         }
-        self.memory.capture(document);
+        self.privacy.capture(document);
         if let Some(agent) = &mut self.active_agent {
             agent.trace.push(format!(
                 "extract {} chars from {}",
@@ -4167,10 +4215,12 @@ impl TabSessionSync {
 
 /// O que uma gravacao das abas fez, para o App dizer ao dono.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TabSave {
+pub(crate) enum TabSave {
     /// O disco ja tinha isto: nada escrito.
     Unchanged,
     Written,
+    /// Modo privado (`PrivacyGuard`): nada escrito, nem agendado.
+    SkippedPrivate,
     /// Outra janela do NeuralIA guarda as abas; esta nao escreve.
     NotWriter,
     /// O historico foi apagado noutra janela: as abas desta, de antes disso,
@@ -4184,13 +4234,15 @@ enum TabSave {
 /// apagar em "Apagar historico". Nada aqui toca em janelas: os gates
 /// conduzem isto contra um diretorio temporario, pelo mesmo caminho que o App
 /// usa. O App so passa o seu modelo e mostra o aviso.
-struct TabPersistence {
+pub(crate) struct TabPersistence {
     store: tab_session::SessionStore,
     sync: TabSessionSync,
 }
 
 impl TabPersistence {
-    fn open(data_dir: &std::path::Path) -> Self {
+    /// So o `PrivacyGuard` a abre (gate
+    /// `history_memory_and_tabs_are_written_only_through_the_privacy_guard`).
+    pub(crate) fn open(data_dir: &std::path::Path) -> Self {
         Self {
             store: tab_session::SessionStore::open(data_dir),
             sync: TabSessionSync::default(),
@@ -4214,9 +4266,22 @@ impl TabPersistence {
     /// estragado nao impede o comparador de abrir: fica em `tabs.json.bak` e
     /// a sessao comeca limpa; um que nao se leu fica copiado antes da
     /// primeira gravacao (`SessionStore`).
-    fn restore(&mut self) -> (RestoredTabs, Option<String>) {
+    pub(crate) fn restore(&mut self) -> (RestoredTabs, Option<String>) {
+        let loaded = self.store.load();
+        self.restore_from(loaded)
+    }
+
+    /// A mesma restauracao sem escrever na pasta de dados (o modo privado,
+    /// pelo `PrivacyGuard::restore_tabs`): um ficheiro estragado fica onde
+    /// esta em vez de ir para o `tabs.json.bak` (`SessionStore::peek`).
+    pub(crate) fn restore_read_only(&mut self) -> (RestoredTabs, Option<String>) {
+        let loaded = self.store.peek();
+        self.restore_from(loaded)
+    }
+
+    fn restore_from(&mut self, loaded: Loaded) -> (RestoredTabs, Option<String>) {
         let empty = TabSession::default();
-        let (mut restored, notice) = match self.store.load() {
+        let (mut restored, notice) = match loaded {
             Loaded::Restored(session) => (restore_tab_session(&session), None),
             Loaded::Missing => (restore_tab_session(&empty), None),
             Loaded::Quarantined(error) => {
@@ -4225,6 +4290,15 @@ impl TabPersistence {
                     restore_tab_session(&empty),
                     Some(format!(
                         "Abas anteriores não restauradas: {error}. Cópia em tabs.json.bak."
+                    )),
+                )
+            }
+            Loaded::Refused(error) => {
+                debug_log(format_args!("tabs.json recusado (sem copia): {error:?}"));
+                (
+                    restore_tab_session(&empty),
+                    Some(format!(
+                        "Abas anteriores não restauradas: {error}. O arquivo ficou como estava."
                     )),
                 )
             }
@@ -4261,7 +4335,7 @@ impl TabPersistence {
 
     /// O modelo depois de um lote de eventos: o bilhete da gravacao a
     /// agendar, se mudou.
-    fn observe(
+    pub(crate) fn observe(
         &mut self,
         contexts: &[Vec<ContextTab>; COMPARATOR_COLUMNS],
         groups: &[Vec<ContextGroup>; COMPARATOR_COLUMNS],
@@ -4276,7 +4350,7 @@ impl TabPersistence {
     /// `TAB_SESSION_DEBOUNCE` nao se perde. Se o historico foi apagado noutra
     /// janela, as abas de antes sao largadas do modelo (como o "Apagar
     /// historico" faz na propria janela) em vez de voltarem ao disco.
-    fn save_now(
+    pub(crate) fn save_now(
         &mut self,
         contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
         groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
@@ -4312,9 +4386,14 @@ impl TabPersistence {
         }
     }
 
+    /// O bilhete `token` ainda e o ultimo agendado?
+    pub(crate) fn save_due_token(&self, token: u64) -> bool {
+        token == self.sync.token
+    }
+
     /// O `SaveTabSession(token)` que o atraso entrega: so o ultimo agendado
     /// grava (`None` para um bilhete ultrapassado por outra mudanca).
-    fn save_due(
+    pub(crate) fn save_due(
         &mut self,
         token: u64,
         contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
@@ -4329,7 +4408,7 @@ impl TabPersistence {
     /// acabou de apagar -- e saem o ficheiro, a copia de um ficheiro recusado
     /// ou nao lido e os temporarios; a geracao sobe para outra janela aberta
     /// nao os escrever de volta.
-    fn forget(
+    pub(crate) fn forget(
         &mut self,
         contexts: &mut [Vec<ContextTab>; COMPARATOR_COLUMNS],
         groups: &mut [Vec<ContextGroup>; COMPARATOR_COLUMNS],
@@ -4431,7 +4510,7 @@ fn tab_session_fingerprint(
 }
 
 /// O modelo da barra reconstruido a partir do ficheiro.
-struct RestoredTabs {
+pub(crate) struct RestoredTabs {
     contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS],
     groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS],
     next_context_id: u64,
@@ -7071,6 +7150,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("keymap.rs", include_str!("windows_app/keymap.rs")),
     ("translation.rs", include_str!("windows_app/translation.rs")),
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
+    ("distraction.rs", include_str!("windows_app/distraction.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
@@ -7113,6 +7193,8 @@ pub(in crate::windows_app) use bar_layout::*;
 
 pub(in crate::windows_app) mod tab_row;
 pub(in crate::windows_app) use tab_row::*;
+// O `PrivacyGuard` (`crate::privacy`) grava as abas: ve o modelo da barra.
+pub(crate) use tab_row::{ContextGroup, ContextTab};
 
 pub(in crate::windows_app) mod native;
 pub(in crate::windows_app) use native::*;
@@ -7164,6 +7246,8 @@ pub(in crate::windows_app) mod translation;
 pub(in crate::windows_app) use translation::*;
 pub(in crate::windows_app) mod adblock;
 pub(in crate::windows_app) use adblock::*;
+pub(in crate::windows_app) mod distraction;
+pub(in crate::windows_app) use distraction::*;
 pub(in crate::windows_app) mod bookmarks;
 pub(in crate::windows_app) use bookmarks::*;
 

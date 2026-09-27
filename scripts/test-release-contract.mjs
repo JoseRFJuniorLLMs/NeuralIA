@@ -33,39 +33,17 @@ assert.doesNotMatch(
   /gh release create[^\n]*dist\/\*/,
   'stable release must not upload every internal CI artifact'
 );
-// Two release rhythms (AGENTS.md 2.1): X.0.Z is LTS (Latest), everything else
-// is a preview published as a pre-release. Run the shipped bash pattern on a
-// table of tags instead of trusting its text.
-const channelRule = workflow.match(
-  /if \[\[ "\$RELEASE_TAG" =~ (\S+) \]\]; then\s+channel_flag="--latest"\s+else\s+channel_flag="--prerelease"\s+fi/
-);
-assert.ok(channelRule, 'publish must pick --latest or --prerelease from the release tag');
-// The table below runs the pattern with JavaScript's engine, so pin the exact
-// bash text too: an edit both engines read differently (\d, classes) must fail
-// here, and nothing may change the flag after the if/else picks it.
-assert.equal(channelRule[1], '^v[0-9]+\\.0\\.[0-9]+$', 'the LTS pattern is exactly ^v[0-9]+\\.0\\.[0-9]+$');
-assert.equal((workflow.match(/channel_flag=/g) || []).length, 2, 'channel_flag is set only by the if/else');
-assert.equal((workflow.match(/--latest\b/g) || []).length, 1, '--latest appears only in the LTS branch');
-assert.equal((workflow.match(/--prerelease\b/g) || []).length, 1, '--prerelease appears only in the preview branch');
-const ltsTag = new RegExp(channelRule[1]);
-for (const [tag, lts] of [
-  ['v3.0.0', true],
-  ['v3.0.7', true],
-  ['v4.0.0', true],
-  ['v10.0.12', true],
-  ['v2.2.0', false],
-  ['v2.1.8', false],
-  ['v3.1.0', false],
-  ['v3.10.0', false],
-  ['v30.1.0', false],
-  ['v3.0.0-rc1', false],
-]) {
-  assert.equal(ltsTag.test(tag), lts, `${tag} must be ${lts ? 'LTS (Latest)' : 'a preview (pre-release)'}`);
-}
+// Every published version becomes Latest (AGENTS.md 2.1, owner decision
+// 26/09/2026): the two rhythms differ in what is verified before the bump,
+// not in the channel. A pre-release would hide the newest tools behind an
+// older Latest again.
+assert.equal((workflow.match(/--latest\b/g) || []).length, 1, 'publish passes --latest exactly once');
+assert.doesNotMatch(workflow, /--prerelease\b/, 'no published version is a pre-release');
+assert.doesNotMatch(workflow, /channel_flag/, 'nothing picks another channel from the tag');
 assert.match(
   workflow,
-  /gh release create "\$RELEASE_TAG"[^\n]*--generate-notes\s+"\$channel_flag"/,
-  'the release is created with the channel the tag picked'
+  /gh release create "\$RELEASE_TAG"[^\n]*--generate-notes\s+--latest\s*$/m,
+  'the release is created as Latest'
 );
 assert.doesNotMatch(
   workflow,
@@ -513,9 +491,11 @@ assert.equal(
   sabotages.length,
   'sabotage labels are unique'
 );
-// Every .rs of neural-app: a gate may be an inline #[cfg(test)] module of any
-// file (cargo test -p neural-app <name> finds it), but an Ignored gate runs
-// with --exact as windows_app::tests::<name>, so it must live in that module.
+// Every .rs of neural-app/src: a gate may be an inline #[cfg(test)] module of
+// any file (src/ is the NeuralIA bin, and the step builds and runs only that
+// bin's harness: cargo test -p neural-app --bin NeuralIA <name> finds it), but
+// an Ignored gate runs with --exact as windows_app::tests::<name>, so it must
+// live in that module.
 function rustFilesUnder(dir) {
   return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
     const path = `${dir}/${entry.name}`;

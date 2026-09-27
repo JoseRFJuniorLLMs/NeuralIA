@@ -33,6 +33,8 @@ pub(crate) struct RawEntry {
     pub size: u64,
     pub compressed: u64,
     pub extra: Vec<u8>,
+    /// Campo extra do cabeçalho local, antes do ZIP64 dele.
+    pub local_extra: Vec<u8>,
     pub comment: Vec<u8>,
     /// Offset do cabeçalho local escrito no diretório central (falsificado).
     pub offset: Option<u64>,
@@ -53,6 +55,7 @@ impl RawEntry {
             size: data.len() as u64,
             compressed: data.len() as u64,
             extra: Vec::new(),
+            local_extra: Vec::new(),
             comment: Vec::new(),
             offset: None,
             central_only: false,
@@ -178,16 +181,13 @@ impl ZipBuilder {
 fn local_record(entry: &RawEntry, zip64: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let local_name = entry.local_name.as_ref().unwrap_or(&entry.name);
-    let local_extra: Vec<u8> = if zip64 {
-        let mut extra = Vec::new();
-        push16(&mut extra, 1);
-        push16(&mut extra, 16);
-        push64(&mut extra, entry.size);
-        push64(&mut extra, entry.compressed);
-        extra
-    } else {
-        Vec::new()
-    };
+    let mut local_extra = entry.local_extra.clone();
+    if zip64 {
+        push16(&mut local_extra, 1);
+        push16(&mut local_extra, 16);
+        push64(&mut local_extra, entry.size);
+        push64(&mut local_extra, entry.compressed);
+    }
     push32(&mut out, 0x0403_4b50);
     push16(&mut out, if zip64 { 45 } else { 20 });
     push16(&mut out, entry.flags);
@@ -209,6 +209,138 @@ fn local_record(entry: &RawEntry, zip64: bool) -> Vec<u8> {
 /// dados de outra entrada.
 pub(crate) fn local_header(name: &str, data: &[u8]) -> Vec<u8> {
     local_record(&RawEntry::stored(name, data), false)
+}
+
+/// Um campo extra Info-ZIP Unicode Path (`0x7075`): versão 1, o CRC32 do
+/// nome cru e o nome em UTF-8 -- o nome com que o 7-Zip e o `tar.exe`
+/// extraem a entrada.
+pub(crate) fn unicode_path_extra(raw: &[u8], name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    push16(&mut out, 0x7075);
+    push16(&mut out, (5 + name.len()) as u16);
+    out.push(1);
+    push32(&mut out, crc32(raw));
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+/// Um registro de fim clássico.
+fn end_record(entries: u16, size: usize, offset: usize, comment_len: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    push32(&mut out, 0x0605_4b50);
+    push16(&mut out, 0);
+    push16(&mut out, 0);
+    push16(&mut out, entries);
+    push16(&mut out, entries);
+    push32(&mut out, size as u32);
+    push32(&mut out, offset as u32);
+    push16(&mut out, comment_len);
+    out
+}
+
+/// Um registro de fim ZIP64 (44 bytes depois dos 12 do começo).
+fn zip64_end_record(entries: u64, size: usize, offset: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    push32(&mut out, 0x0606_4b50);
+    push64(&mut out, 44);
+    push16(&mut out, 45);
+    push16(&mut out, 45);
+    push32(&mut out, 0);
+    push32(&mut out, 0);
+    push64(&mut out, entries);
+    push64(&mut out, entries);
+    push64(&mut out, size as u64);
+    push64(&mut out, offset as u64);
+    out
+}
+
+/// O localizador ZIP64, a apontar para `record`.
+fn zip64_locator(record: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    push32(&mut out, 0x0706_4b50);
+    push32(&mut out, 0);
+    push64(&mut out, record as u64);
+    push32(&mut out, 1);
+    out
+}
+
+/// A base dos ZIPs de diretório ambíguo (downloads-zip-inspect): o
+/// `LEIAME.txt` e um `setup.exe`, e onde está o diretório central inteiro
+/// e o tamanho do registro central do `LEIAME.txt` (o primeiro).
+fn ambiguous_base() -> (Vec<u8>, usize, usize, usize) {
+    let zip = ZipBuilder::new()
+        .stored("LEIAME.txt", b"ola")
+        .stored("setup.exe", b"MZ\x90\x00")
+        .build();
+    let eocd = zip.len() - 22;
+    let le16 = |at: usize| u16::from_le_bytes([zip[at], zip[at + 1]]) as usize;
+    let le32 =
+        |at: usize| u32::from_le_bytes([zip[at], zip[at + 1], zip[at + 2], zip[at + 3]]) as usize;
+    let (size, offset) = (le32(eocd + 12), le32(eocd + 16));
+    let first = 46 + le16(offset + 28) + le16(offset + 30) + le16(offset + 32);
+    (zip, offset, size, first)
+}
+
+/// Dois registros de fim: o que tem o comentário até ao fim do arquivo
+/// aponta para um diretório só com o `LEIAME.txt`; dentro do comentário
+/// dele está outro, a última assinatura do arquivo (acaba um byte antes do
+/// fim), que aponta para o diretório com o `setup.exe` -- o que o 7-Zip, o
+/// .NET e o bsdtar listam.
+pub(crate) fn two_end_records_zip() -> Vec<u8> {
+    let (zip, offset, size, first) = ambiguous_base();
+    let mut out = zip[..offset + size].to_vec();
+    let benign = out.len();
+    out.extend_from_slice(&zip[offset..offset + first]);
+    let hidden = end_record(2, size, offset, 0);
+    out.extend_from_slice(&end_record(1, first, benign, (hidden.len() + 1) as u16));
+    out.extend_from_slice(&hidden);
+    out.push(0);
+    out
+}
+
+/// O registro de fim declara uma entrada e o tamanho do registro central
+/// do `LEIAME.txt`; o do `setup.exe` fica entre o fim declarado do
+/// diretório e o registro de fim (o 7-Zip lista-o e extrai-o).
+pub(crate) fn directory_gap_zip() -> Vec<u8> {
+    let (mut zip, _, _, first) = ambiguous_base();
+    let eocd = zip.len() - 22;
+    zip[eocd + 8..eocd + 12].copy_from_slice(&[1, 0, 1, 0]);
+    zip[eocd + 12..eocd + 16].copy_from_slice(&(first as u32).to_le_bytes());
+    zip
+}
+
+/// O registro ZIP64 aponta para um diretório só com o `LEIAME.txt`; o
+/// registro de fim clássico, sem nenhum campo saturado, aponta para o
+/// diretório com o `setup.exe` (o que o .NET usa quando nada satura).
+pub(crate) fn classic_disagrees_with_zip64_zip() -> Vec<u8> {
+    let (zip, offset, size, first) = ambiguous_base();
+    let mut out = zip[..offset + size].to_vec();
+    let benign = out.len();
+    out.extend_from_slice(&zip[offset..offset + first]);
+    let record = out.len();
+    out.extend_from_slice(&zip64_end_record(1, first, benign));
+    out.extend_from_slice(&zip64_locator(record));
+    out.extend_from_slice(&end_record(2, size, offset, 0));
+    out
+}
+
+/// O localizador aponta para o registro ZIP64 de um diretório só com o
+/// `LEIAME.txt`; entre esse registro e o localizador está outro registro
+/// ZIP64, o do diretório com o `setup.exe` -- o 7-Zip lê primeiro o
+/// registro colado ao localizador.
+pub(crate) fn zip64_record_gap_zip() -> Vec<u8> {
+    let (zip, offset, size, first) = ambiguous_base();
+    let mut out = zip[..offset + size].to_vec();
+    let benign = out.len();
+    out.extend_from_slice(&zip[offset..offset + first]);
+    let record = out.len();
+    out.extend_from_slice(&zip64_end_record(1, first, benign));
+    out.extend_from_slice(&zip64_end_record(2, size, offset));
+    out.extend_from_slice(&zip64_locator(record));
+    let mut end = end_record(0xFFFF, 0, 0, 0);
+    end[12..20].copy_from_slice(&[0xFF; 8]);
+    out.extend_from_slice(&end);
+    out
 }
 
 fn sized(zip64: bool, value: u64) -> u32 {

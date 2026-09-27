@@ -6984,18 +6984,20 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
         "\"Apagar histórico\" must also forget tabs.json"
     );
     assert!(
-        sink.contains("ClearTarget::Memory => self.memory.clear(&mut self.current_research),"),
+        sink.contains(
+            "ClearTarget::Memory => self.privacy.clear_memory(&mut self.current_research),"
+        ),
         "\"Apagar histórico\" must also clear the semantic memory"
     );
     assert!(
-        sink.contains("ClearTarget::History => match self.history.clear() {"),
+        sink.contains("ClearTarget::History => match self.privacy.clear_history() {"),
         "\"Apagar histórico\" must also clear history.jsonl"
     );
     // O comportamento destes caminhos esta em
     // the_app_path_saves_restores_and_forgets_the_real_tabs_json (sobre o
     // `TabPersistence`); aqui so se prende que o App os chama.
     let forget_body = body("fn forget_tab_session", "fn context_tab_identity");
-    assert!(forget_body.contains(".forget(&mut comp.contexts, &mut comp.groups, split)"));
+    assert!(forget_body.contains(".forget_tabs(&mut comp.contexts, &mut comp.groups, split)"));
 
     // Sair do comparador (Home, Reader, Web) grava antes de o destruir, e
     // fechar a janela tambem.
@@ -7004,14 +7006,14 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     let exiting = body("fn exiting", "fn user_event");
     assert!(exiting.contains("self.save_tab_session()"));
     let save = body("fn save_tab_session", "fn save_due_tab_session");
-    assert!(save.contains(".save_now(&mut comp.contexts, &mut comp.groups, split)"));
+    assert!(save.contains(".save_tabs(&mut comp.contexts, &mut comp.groups, split)"));
 
     // O fim do atraso grava pelo bilhete.
     assert!(
         source.contains("UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),")
     );
     let due = body("fn save_due_tab_session", "fn forget_tab_session");
-    assert!(due.contains(".save_due(token, &mut comp.contexts, &mut comp.groups, split)"));
+    assert!(due.contains(".save_tabs_due(token, &mut comp.contexts, &mut comp.groups, split)"));
 
     // Depois de cada lote de eventos o modelo e observado: e so por aqui
     // que um arrasto largado, o x e o menu do grupo agendam a gravacao
@@ -7019,13 +7021,15 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
     let wait = body("fn about_to_wait", "fn exiting");
     assert!(wait.contains("self.observe_tab_session();"));
     let observe = body("fn observe_tab_session", "fn save_tab_session");
-    assert!(observe.contains(".observe(&comp.contexts, &comp.groups, comparator_split_key(comp))"));
+    assert!(
+        observe.contains(".observe_tabs(&comp.contexts, &comp.groups, comparator_split_key(comp))")
+    );
 
     // As duas entradas do comparador passam pelo mesmo modelo.
     // open_comparator vive em app/compare.rs e activate_comparator e o
     // metodo que se lhe segue. O observe_tab_session que fechava a regiao
     // no ficheiro unico esta em app/tabs.rs: com ele a regiao atravessava
-    // o resto de compare.rs e um `self.tab_session.restore()` em qualquer
+    // o resto de compare.rs e um `self.privacy.restore_tabs()` em qualquer
     // desses metodos (ou num comentario) mantinha o gate verde.
     let open = body("fn open_comparator", "fn activate_comparator");
     assert!(
@@ -7037,7 +7041,7 @@ fn the_shipped_paths_are_wired_to_the_tab_session() {
         .expect("reuse and fresh paths");
     assert!(reuse.contains("start_new_search("));
     assert!(!reuse.contains("comparator.groups = "));
-    assert!(fresh.contains("self.tab_session.restore()"));
+    assert!(fresh.contains("self.privacy.restore_tabs()"));
 
     // "Adicionar a um novo grupo" abre logo o menu do grupo (com as
     // cores) junto da pilula nova, como o editor do Chrome.
@@ -8315,22 +8319,28 @@ fn ai_columns_and_the_split_get_the_auto_scroll_menu_item() {
                 .map(|item| item.id)
                 .collect();
             // A rolagem primeiro; depois o bloqueio de anuncios (nao na
-            // fonte privada) e, no fim, «Traduzir página» (translation).
+            // fonte privada), «Traduzir página» (translation) e, no fim,
+            // «Ocultar distrações neste site» (anti-distracao).
             let mut expected = vec![COLUMN_MENU_AUTO_SCROLL];
             if !matches!(host, WebViewHost::PrivateSplit(_)) {
                 expected.extend([ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF]);
             }
-            expected.push(MENU_TRANSLATE_PAGE);
+            expected.extend([MENU_TRANSLATE_PAGE, DISTRACTION_MENU_SITE]);
             assert_eq!(ids, expected, "{host:?}");
             assert_eq!(webview_hooks(host).menu, ids, "{host:?}: a tabela diverge");
         }
     }
-    // A Web completa nao rola sozinha, mas tem o bloqueio de anuncios e
-    // traduz-se: sem o item de rolagem.
+    // A Web completa nao rola sozinha, mas tem o bloqueio de anuncios,
+    // traduz-se e tem a anti-distracao: sem o item de rolagem.
     assert_eq!(context_menu_column(WebViewHost::External), None);
     assert_eq!(
         webview_hooks(WebViewHost::External).menu,
-        [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE]
+        [
+            ADBLOCK_MENU_SITE,
+            ADBLOCK_MENU_OFF,
+            MENU_TRANSLATE_PAGE,
+            DISTRACTION_MENU_SITE
+        ]
     );
     for host in WebViewHost::ALL
         .into_iter()
@@ -8377,7 +8387,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             WebViewHost::PrivateSplit(col),
         ] {
             let flag = SharedFlag::default();
-            let respond = webview_menu_responder(host, flag.clone(), None);
+            let respond = webview_menu_responder(host, flag.clone(), None, None);
 
             let first = respond(7, None);
             assert_eq!(first.separator_at, Some(7), "{host:?}");
@@ -8423,7 +8433,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
             // A pilula usa o mesmo responder, sem itens nativos: o id que o
             // TrackPopupMenu devolve e o do comando, e so esse faz algo.
             flag.set(false);
-            let pill = webview_menu_responder(host, flag.clone(), None)(0, None);
+            let pill = webview_menu_responder(host, flag.clone(), None, None)(0, None);
             let item = pill
                 .item(COLUMN_MENU_AUTO_SCROLL)
                 .expect("o item da pilula");
@@ -8440,7 +8450,7 @@ fn each_right_click_reads_the_auto_scroll_state_and_routes_to_ctrl_r() {
     // Um hospedeiro que nao rola: nem separador nem itens, com nativos ou
     // sem eles -- o menu do WebView2 fica como veio.
     for host in [WebViewHost::SidePanel, WebViewHost::Reader] {
-        let respond = webview_menu_responder(host, SharedFlag::default(), None);
+        let respond = webview_menu_responder(host, SharedFlag::default(), None, None);
         for native in [0, 7] {
             let request = respond(native, None);
             assert_eq!(request.separator_at, None, "{host:?} {native}");
@@ -8481,6 +8491,8 @@ struct RecordingRegistrar {
     accelerators: Vec<WebViewHost>,
     downloads: Vec<WebViewHost>,
     gates: Vec<WebViewHost>,
+    /// O script contra distracoes pedido para cada hospedeiro.
+    distractions: Vec<(WebViewHost, &'static str)>,
     fail_menu: bool,
     fail_accelerators: bool,
     fail_downloads: bool,
@@ -8514,6 +8526,10 @@ impl HookRegistrar for RecordingRegistrar {
             return Err("add_WebResourceRequested falhou: E_FAIL".to_string());
         }
         self.gates.push(host);
+        Ok(())
+    }
+    fn distraction(&mut self, host: WebViewHost, script: &'static str) -> Result<(), String> {
+        self.distractions.push((host, script));
         Ok(())
     }
 }
@@ -8561,7 +8577,8 @@ impl HookedWebViewBuilder for RecordedHookedBuilder {
 /// Gmail recusam-nos. Cada hospedeiro tem a sua cadeia de navegacao, todos
 /// recebem o AcceleratorKeyPressed, o despachante de recursos e o do
 /// bloqueio de anuncios so nas colunas, na fonte ao lado (nao a privada) e
-/// na Web completa, e o slot das distracoes esta vazio.
+/// na Web completa, e o script contra distracoes (anti-distracao) so nas
+/// colunas, nas fontes ao lado (normal e privada) e na Web completa.
 #[test]
 fn the_webview_hooks_table() {
     use DownloadPolicy::{Deny, Managed};
@@ -8573,18 +8590,24 @@ fn the_webview_hooks_table() {
             resource_gate: gate,
             nav_gate: NavGate::Web,
             accelerators: true,
-            distraction: None,
+            distraction: Some(NEURALIA_DISTRACTION_SCRIPT),
         };
-    // A rolagem, o bloqueio de anuncios e «Traduzir página» (translation),
-    // pela ordem do registo.
+    // A rolagem, o bloqueio de anuncios, «Traduzir página» (translation) e
+    // «Ocultar distrações neste site», pela ordem do registo.
     let scroll_adblock_translate = [
         COLUMN_MENU_AUTO_SCROLL,
         ADBLOCK_MENU_SITE,
         ADBLOCK_MENU_OFF,
         MENU_TRANSLATE_PAGE,
+        DISTRACTION_MENU_SITE,
     ];
-    let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF];
-    let adblock_translate = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, MENU_TRANSLATE_PAGE];
+    let adblock = [ADBLOCK_MENU_SITE, ADBLOCK_MENU_OFF, DISTRACTION_MENU_SITE];
+    let adblock_translate = [
+        ADBLOCK_MENU_SITE,
+        ADBLOCK_MENU_OFF,
+        MENU_TRANSLATE_PAGE,
+        DISTRACTION_MENU_SITE,
+    ];
     for col in 0..COMPARATOR_COLUMNS {
         assert_eq!(
             webview_hooks(WebViewHost::Column(col)),
@@ -8597,7 +8620,11 @@ fn the_webview_hooks_table() {
         assert_eq!(
             webview_hooks(WebViewHost::PrivateSplit(col)),
             gated(
-                &[COLUMN_MENU_AUTO_SCROLL, MENU_TRANSLATE_PAGE],
+                &[
+                    COLUMN_MENU_AUTO_SCROLL,
+                    MENU_TRANSLATE_PAGE,
+                    DISTRACTION_MENU_SITE
+                ],
                 Managed,
                 Open
             )
@@ -8693,6 +8720,27 @@ fn every_webview_gets_the_hooks() {
         if context_menu_column(host).is_some() || host == WebViewHost::External {
             expected.push(MENU_TRANSLATE_PAGE);
         }
+        // A anti-distracao: o item do menu e o script, so nas colunas, nas
+        // fontes ao lado (normal e privada) e na Web completa.
+        let web = matches!(
+            host,
+            WebViewHost::Column(_)
+                | WebViewHost::Split(_)
+                | WebViewHost::PrivateSplit(_)
+                | WebViewHost::External
+        );
+        if web {
+            expected.push(DISTRACTION_MENU_SITE);
+        }
+        assert_eq!(
+            registrar.distractions,
+            if web {
+                vec![(host, NEURALIA_DISTRACTION_SCRIPT)]
+            } else {
+                vec![]
+            },
+            "{host:?}: o script contra distracoes"
+        );
         if expected.is_empty() {
             assert!(
                 registrar.menus.is_empty(),
@@ -9550,7 +9598,7 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
         blocked: Arc::clone(&blocked),
     };
     let host = WebViewHost::Column(1);
-    let respond = webview_menu_responder(host, SharedFlag::default(), Some(source));
+    let respond = webview_menu_responder(host, SharedFlag::default(), Some(source), None);
     let labels = |request: &MenuRequest| -> Vec<String> {
         request
             .items
@@ -9681,7 +9729,12 @@ fn the_adblock_menu_follows_the_page_and_the_state() {
     }
 
     // A fonte privada e os outros hospedeiros nao tem o bloqueio no menu.
-    let private = webview_menu_responder(WebViewHost::PrivateSplit(1), SharedFlag::default(), None);
+    let private = webview_menu_responder(
+        WebViewHost::PrivateSplit(1),
+        SharedFlag::default(),
+        None,
+        None,
+    );
     assert_eq!(
         labels(&private(0, Some("https://news.site.test/a"))),
         [LABEL_TURN_ON, TRANSLATE_PAGE_LABEL]
@@ -20344,6 +20397,8 @@ fn service_panels_never_reach_history_or_memory() {
         "history.append",
         "memory.capture",
         "save_session",
+        "privacy.record(",
+        "privacy.capture(",
         "with_ipc_handler",
         "with_initialization_script",
     ] {
@@ -23997,6 +24052,10 @@ fn ident_callers(code: &str, name: &str) -> std::collections::BTreeMap<String, u
 fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
     vec![
         (
+            "privacy.rs",
+            code_without_tests(include_str!("../privacy.rs")),
+        ),
+        (
             "tab_session.rs",
             code_without_tests(include_str!("../tab_session.rs")),
         ),
@@ -24043,8 +24102,8 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE, APP_STORES,
-        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, KEYS_STORE, LIVE_KEY_STORE,
-        TRANSLATE_STORE,
+        BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, HISTORY_STORE, KEYS_STORE,
+        LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24116,6 +24175,9 @@ fn existing_stores_have_a_declared_kind() {
         touched.insert(name);
     }
     let specs = [
+        ("HISTORY_STORE", HISTORY_STORE.name),
+        ("MEMORY_STORE", MEMORY_STORE.name),
+        ("TABS_STORE", TABS_STORE.name),
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
         ("ADBLOCK_SETTINGS_STORE", ADBLOCK_SETTINGS_STORE.name),
@@ -24127,8 +24189,26 @@ fn existing_stores_have_a_declared_kind() {
         ("TRANSLATE_STORE", TRANSLATE_STORE.name),
         ("BOOKMARKS_STORE", BOOKMARKS_STORE.name),
     ];
-    for part in compact.split(".grant(").skip(1) {
+    // Os grants: os do proprio `PrivacyGuard` (`.grant(...)` no registo que
+    // so ele tem; o `grant(spec)` de `PrivacyGuard::store` e a passagem), os
+    // que cada feature lhe pede (`privacy.store(...)`) e os que uma feature
+    // pede pela funcao `grants` que o App lhe passa (`grants(...)`, a
+    // palavra inteira: nao o `attach_site_grants(`).
+    let by_closure = compact.match_indices("grants(").filter_map(|(at, _)| {
+        let before = at.checked_sub(1).map(|index| compact.as_bytes()[index]);
+        let word_before = before.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        (!word_before).then(|| &compact[at + "grants(".len()..])
+    });
+    let grants = compact
+        .split(".grant(")
+        .skip(1)
+        .chain(compact.split("privacy.store(").skip(1))
+        .chain(by_closure);
+    for part in grants {
         let argument = part.split(')').next().unwrap_or_default();
+        if argument == "spec" {
+            continue;
+        }
         let name = specs
             .iter()
             .find(|(ident, _)| argument == *ident)
@@ -24153,27 +24233,1316 @@ fn existing_stores_have_a_declared_kind() {
     }
 }
 
-/// A unica cunhagem do registo das lojas no produto e a do `App::new`.
+// ===================== infra-privacy-guard: o portao da persistencia =====================
+
+/// O mesmo codigo sem os modulos `#[cfg(test)] mod x { ... }` escritos no
+/// meio do ficheiro (os `tab_session_gates` do `windows_app.rs`, por
+/// exemplo): um modulo fecha na linha que e so `}` com a indentacao da
+/// linha `mod` (rustfmt). O `mod tests {` do fim continua a cargo de
+/// `code_without_tests`.
+fn without_test_modules(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    let mut lines = code.lines().peekable();
+    while let Some(line) = lines.next() {
+        if line.trim() == "#[cfg(test)]"
+            && let Some(next) = lines.peek()
+            && next.trim_start().starts_with("mod ")
+            && next.trim_end().ends_with('{')
+        {
+            let indent: String = next.chars().take_while(|ch| ch.is_whitespace()).collect();
+            let closing = format!("{indent}}}");
+            for inner in lines.by_ref() {
+                if inner == closing {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Um bloco `impl X {` de topo, ate ao `}` na coluna 0 que o fecha.
+fn impl_block<'a>(code: &'a str, header: &str) -> &'a str {
+    code.split(header)
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .unwrap_or_else(|| panic!("{header} nao esta no codigo que embarca"))
+}
+
+/// O mesmo codigo sem esses blocos `impl`.
+fn without_impl_blocks(code: &str, headers: &[&str]) -> String {
+    let mut out = code.to_string();
+    for header in headers {
+        while let Some(start) = out.find(header) {
+            let end = out[start..]
+                .find("\n}\n")
+                .map(|at| start + at + 3)
+                .unwrap_or(out.len());
+            out.replace_range(start..end, "");
+        }
+    }
+    out
+}
+
+/// Uma `fn` de `code` (de `rust_code_only`), por `fn_items`.
+struct FnItem {
+    name: String,
+    /// De `fn` ate ao `{` (ou `;`) que a fecha fora de parenteses, sem
+    /// espacos nem a virgula antes do `)`: a mesma com qualquer formatacao.
+    signature: String,
+    /// Do `fn` ao `}` que fecha o corpo (a assinatura incluida).
+    span: std::ops::Range<usize>,
+}
+
+/// Cada `fn nome` de `code` (de `rust_code_only`: nenhuma chaveta num
+/// literal ou comentario), com a assinatura e o sitio. Os tipos `fn(..)` e
+/// os `Fn`/`FnOnce` nao contam.
+fn fn_items(code: &str) -> Vec<FnItem> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let mut out = Vec::new();
+    for (at, _) in code.match_indices("fn") {
+        if code[..at].chars().next_back().is_some_and(ident) {
+            continue;
+        }
+        let rest = &code[at + 2..];
+        let gap = rest.len() - rest.trim_start().len();
+        let name: String = rest[gap..].chars().take_while(|ch| ident(*ch)).collect();
+        if gap == 0 || name.is_empty() {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut open = None;
+        for (offset, ch) in rest.char_indices() {
+            match ch {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth -= 1,
+                '{' | ';' if depth == 0 => {
+                    open = Some((at + 2 + offset, ch));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some((open, opener)) = open else {
+            continue;
+        };
+        let signature = code[at..open]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect::<String>()
+            .replace(",)", ")");
+        let mut end = open + 1;
+        if opener == '{' {
+            let mut level = 0usize;
+            for (offset, ch) in code[open..].char_indices() {
+                match ch {
+                    '{' => level += 1,
+                    '}' => {
+                        level -= 1;
+                        if level == 0 {
+                            end = open + offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(FnItem {
+            name,
+            signature,
+            span: at..end,
+        });
+    }
+    out
+}
+
+/// Gate (critico, infra-privacy-guard): a unica cunhagem do registo das
+/// lojas no produto e a do `App::new`, e vai inteira para o
+/// `PrivacyGuard::new`. Nenhuma funcao devolve nem recebe o registo (as
+/// features pedem grants por `privacy.store(spec)`): em nenhum ficheiro que
+/// embarca uma assinatura o nomeia -- com qualquer tempo de vida
+/// (`&'_ StoreRegistry`), numa caixa, numa closure --, nenhum `type` nem
+/// `use ... as` lhe muda o nome e nenhum `impl` e dele (o `Self` de um
+/// metodo seria o registo); so os dois construtores do guard o recebem,
+/// por valor. Dentro do guard o campo so se usa em `mode` e `store`: nada
+/// empresta nem devolve `self.registry`. O registo e os workers sao campos
+/// privados do guard, o construtor de teste -- a unica porta para
+/// `Private` -- so existe em `cfg(test)`, e o `App` ja nao tem o registo,
+/// o historico, a memoria nem as abas.
+///
+/// Sabotagem (revisao F5): `pub(crate) fn registry(&self) -> &'_
+/// StoreRegistry { &self.registry }` no guard, usado pelo adblock como
+/// `self.privacy.registry().grant(ADBLOCK_LIST_STORE)` -> vermelho.
 #[test]
-fn the_store_registry_is_minted_once_in_app_new() {
-    let source = shipped_source();
+fn registry_is_minted_once_and_owned_by_the_guard() {
+    let app = without_comment_lines(&shipped_source());
+    let tops = shipped_top_level_sources();
+    let privacy = tops
+        .iter()
+        .find(|(name, _)| *name == "privacy.rs")
+        .map(|(_, source)| without_comment_lines(source))
+        .expect("privacy.rs nas fontes de topo");
+
+    // 1. Uma cunhagem so, no App::new, direta para o guard.
+    for (name, source) in &tops {
+        assert!(
+            !without_comment_lines(source).contains("StoreRegistry::mint("),
+            "{name} cunha o registo"
+        );
+    }
     assert_eq!(
-        source.matches("StoreRegistry::mint(").count(),
+        app.matches("StoreRegistry::mint(").count(),
         1,
         "o produto cunha o registo uma vez so"
     );
-    let app_new = source
+    let app_new = app
         .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
         .nth(1)
         .and_then(|rest| rest.split("\n}\n").next())
         .expect("App::new");
-    assert!(app_new.contains("let stores = StoreRegistry::mint(&config.data_dir).ok();"));
-    for (name, source) in shipped_top_level_sources() {
+    assert_eq!(app_new.matches("PrivacyGuard::new(").count(), 1);
+    let handed = app_new
+        .split("PrivacyGuard::new(")
+        .nth(1)
+        .and_then(|rest| rest.split(");").next())
+        .expect("PrivacyGuard::new no App::new");
+    assert!(
+        handed.contains("StoreRegistry::mint(&config.data_dir)"),
+        "a cunhagem nao vai direta para PrivacyGuard::new: {handed}"
+    );
+
+    // 2. Ninguem devolve nem recebe o registo: fora do guard o nome so
+    // aparece no `use` e na cunhagem do windows_app.rs.
+    assert!(
+        !app.contains("&StoreRegistry"),
+        "uma funcao do windows_app recebe ou devolve &StoreRegistry"
+    );
+    assert_eq!(
+        app.matches("StoreRegistry").count(),
+        2,
+        "windows_app: o registo so no use e na cunhagem"
+    );
+    for (name, source) in &tops {
+        if *name != "privacy.rs" {
+            assert!(
+                !without_comment_lines(source).contains("StoreRegistry"),
+                "{name} fala no registo: so o guard o tem"
+            );
+        }
+    }
+    assert!(
+        !privacy.contains("&StoreRegistry"),
+        "o guard empresta o registo"
+    );
+
+    // 3. O construtor de teste e a unica cunhagem de teste, e so em cfg(test).
+    assert_eq!(privacy.matches("StoreRegistry::mint_for_test(").count(), 1);
+    let before_for_test = privacy
+        .split("pub(crate) fn for_test(")
+        .next()
+        .expect("for_test");
+    assert!(
+        before_for_test.trim_end().ends_with("#[cfg(test)]"),
+        "PrivacyGuard::for_test sem #[cfg(test)]"
+    );
+    assert!(
+        privacy.contains("registry.set_mode(mode.into());"),
+        "for_test nao poe o modo pedido no registo"
+    );
+    let product_new = privacy
+        .split("pub(crate) fn new(")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    }\n").next())
+        .expect("PrivacyGuard::new");
+    assert!(
+        !product_new.contains("set_mode("),
+        "PrivacyGuard::new muda o modo: so o construtor de teste o faz"
+    );
+
+    // 4. Campos privados: o registo, os grants e os workers so pelos metodos.
+    let fields = privacy
+        .split("pub(crate) struct PrivacyGuard {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("struct PrivacyGuard");
+    assert!(
+        !fields.contains("pub"),
+        "o guard tem um campo publico:\n{fields}"
+    );
+    for field in [
+        "registry: StoreRegistry,",
+        "history: HistoryWriter,",
+        "memory: MemoryWorker,",
+        "tabs: TabPersistence,",
+    ] {
+        assert!(fields.contains(field), "o guard perdeu o campo {field}");
+    }
+
+    // 5. O App so tem o guard.
+    let app_struct = app
+        .split("pub(in crate::windows_app) struct App {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("struct App");
+    assert!(app_struct.contains("privacy: PrivacyGuard,"));
+    for gone in [
+        "HistoryWriter",
+        "MemoryWorker",
+        "TabPersistence",
+        "StoreRegistry",
+    ] {
+        assert!(!app_struct.contains(gone), "o App ainda tem {gone}");
+    }
+
+    // 6. Em TODOS os ficheiros que embarcam (a volta do `shipped_rust_files`,
+    // nao so a lista dos de topo): o registo so tem nome no windows_app.rs
+    // (o `use` e a cunhagem, contados em 2.) e no privacy.rs; nenhum `use`
+    // lhe muda o nome, nenhum `type` o esconde, nenhum `impl` e dele; e
+    // nenhuma assinatura o nomeia -- `&StoreRegistry`, `&'_ StoreRegistry`,
+    // `Box<StoreRegistry>`, `impl FnOnce(&StoreRegistry)` -- fora dos dois
+    // construtores do guard, que o recebem por valor e devolvem `Self`.
+    const OWNERS: [&str; 2] = ["neural-app/src/privacy.rs", "neural-app/src/windows_app.rs"];
+    const TAKE_IT_BY_VALUE: [&str; 2] = [
+        "neural-app/src/privacy.rs: fnnew(minted:Result<StoreRegistry,AlreadyMinted>,config:&CoreConfig,sink:EventSink)->Self",
+        "neural-app/src/privacy.rs: fnwith_registry(registry:StoreRegistry,config:&CoreConfig,sink:EventSink)->Self",
+    ];
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    let whole = |code: &str, at: usize, len: usize| {
+        !code[..at].chars().next_back().is_some_and(ident)
+            && !code[at + len..].chars().next().is_some_and(ident)
+    };
+    let files = shipped_rust_files("neural-app");
+    for owner in OWNERS {
         assert!(
-            !source.contains("StoreRegistry::mint("),
-            "{name} cunha o registo"
+            files.iter().any(|(name, _)| name == owner),
+            "{owner} fora da volta do gate"
         );
     }
+    let mut signatures = Vec::new();
+    for (name, code) in &files {
+        if !code.contains("StoreRegistry") {
+            continue;
+        }
+        assert!(
+            OWNERS.contains(&name.as_str()),
+            "{name} fala no registo: so o guard o tem"
+        );
+        for statement in use_statements(code) {
+            let words = use_words(&statement);
+            assert!(
+                !(words.contains(&"StoreRegistry") && words.contains(&"as")),
+                "{name}: o registo com outro nome: {statement}"
+            );
+        }
+        for keyword in ["type", "impl"] {
+            for (at, _) in code.match_indices(keyword) {
+                if !whole(code, at, keyword.len()) {
+                    continue;
+                }
+                let end = code[at..]
+                    .find([';', '{'])
+                    .map_or(code.len(), |offset| at + offset);
+                let head = code[at..end].split_whitespace().collect::<Vec<_>>();
+                assert!(
+                    !code[at..end].contains("StoreRegistry"),
+                    "{name}: `{}` da o registo por outro nome",
+                    head.join(" ")
+                );
+            }
+        }
+        signatures.extend(
+            fn_items(code)
+                .into_iter()
+                .filter(|item| item.signature.contains("StoreRegistry"))
+                .map(|item| format!("{name}: {}", item.signature)),
+        );
+    }
+    signatures.sort();
+    assert_eq!(
+        signatures, TAKE_IT_BY_VALUE,
+        "uma assinatura recebe ou devolve o registo: so os construtores do guard o recebem"
+    );
+
+    // 7. No guard, o campo so se usa como `self.registry.mode()` em `mode` e
+    // `self.registry.grant(spec)` em `store`; os construtores (`new`,
+    // `for_test`, `with_registry`) tem-no antes de o guard existir. Nada o
+    // empresta (`&self.registry`), devolve, tira nem desmonta.
+    let guard_code = &files
+        .iter()
+        .find(|(name, _)| name == OWNERS[0])
+        .expect("privacy.rs")
+        .1;
+    let items = fn_items(guard_code);
+    let fields_at = guard_code
+        .find("struct PrivacyGuard {")
+        .expect("struct PrivacyGuard");
+    let fields_span = fields_at
+        ..fields_at
+            + guard_code[fields_at..]
+                .find('}')
+                .expect("o fim do struct PrivacyGuard");
+    let mut lent = Vec::new();
+    for (at, word) in guard_code.match_indices("registry") {
+        if !whole(guard_code, at, word.len()) {
+            continue;
+        }
+        let owner = items
+            .iter()
+            .filter(|item| item.span.contains(&at))
+            .min_by_key(|item| item.span.len())
+            .map(|item| item.name.as_str());
+        let mut before: Vec<char> = guard_code[..at]
+            .chars()
+            .rev()
+            .filter(|ch| !ch.is_whitespace())
+            .take(5)
+            .collect();
+        before.reverse();
+        let before: String = before.into_iter().collect();
+        let after: String = guard_code[at + word.len()..]
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .take(20)
+            .collect();
+        let fine = match owner {
+            Some("new" | "for_test" | "with_registry") => true,
+            Some("mode") => before == "self." && after.starts_with(".mode()"),
+            Some("store") => before == "self." && after.starts_with(".grant(spec)"),
+            None => fields_span.contains(&at) && after.starts_with(":StoreRegistry,"),
+            Some(_) => false,
+        };
+        if !fine {
+            lent.push(format!(
+                "{before}registry{after} em {}",
+                owner.map_or("(fora de fn)".to_string(), |name| format!("fn {name}"))
+            ));
+        }
+    }
+    assert!(
+        lent.is_empty(),
+        "o guard empresta, devolve ou tira o registo: {lent:#?}"
+    );
+}
+
+/// Cada ficheiro `.rs` que embarca de `crates/<krate>/src` -- sem os
+/// `tests.rs`, as pastas `tests/` e o spike (`accel_spike*`, nunca no exe
+/// publicado) --, como `(caminho a partir de crates/, codigo)`: sem o
+/// `mod tests` do fim, sem os `#[cfg(test)] mod x { ... }` do meio e so com
+/// o que compila (`rust_code_only`: comentarios e literais em branco). E a
+/// volta aos ficheiros dos gates do portao: um ficheiro novo entra sozinho,
+/// sem lista a manter.
+fn shipped_rust_files(krate: &str) -> Vec<(String, String)> {
+    fn shipped(path: &std::path::Path) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let text = path.to_string_lossy().replace('\\', "/");
+        !(name.starts_with("test") || text.contains("/tests/") || name.starts_with("accel_spike"))
+    }
+    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("ler src") {
+            let path = entry.expect("entrada").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") && shipped(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    walk(&crates.join(krate).join("src"), &mut files);
+    files.sort();
+    assert!(files.len() >= 20, "{krate}: so {} ficheiros?", files.len());
+    files
+        .into_iter()
+        .map(|file| {
+            let text = std::fs::read_to_string(&file).expect("ler o ficheiro");
+            let relative = file
+                .strip_prefix(&crates)
+                .expect("dentro de crates/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let code = rust_code_only(&without_test_modules(&code_without_tests(&text)));
+            (relative, code)
+        })
+        .collect()
+}
+
+/// Os `use` de `code` (de `rust_code_only`), cada um numa linha so e com
+/// um espaco entre palavras: `use std::fs::{ self, File }`.
+fn use_statements(code: &str) -> Vec<String> {
+    let ident = |ch: char| ch.is_alphanumeric() || ch == '_';
+    code.split(';')
+        .filter_map(|segment| {
+            let at = segment
+                .match_indices("use")
+                .filter(|(at, _)| {
+                    !segment[..*at].chars().next_back().is_some_and(ident)
+                        && segment[at + 3..]
+                            .chars()
+                            .next()
+                            .is_some_and(char::is_whitespace)
+                })
+                .map(|(at, _)| at)
+                .last()?;
+            Some(
+                segment[at..]
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        })
+        .collect()
+}
+
+/// As palavras de um `use` (`as`, os caminhos, os nomes).
+fn use_words(statement: &str) -> Vec<&str> {
+    statement
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+        .filter(|word| !word.is_empty())
+        .collect()
+}
+
+/// Gate (critico, infra-privacy-guard; so de ausencia, §4.3): fora do
+/// `impl PrivacyGuard` (e dos proprios workers, onde as chamadas vivem)
+/// ninguem escreve o historico, a memoria nem as abas -- nem abre um
+/// `TabPersistence`, um `SessionStore`, um `HistoryWriter`, um
+/// `MemoryWorker`, um `HistoryStore` ou um `MemoryStore` novo para o fazer
+/// por fora, nem chama as funcoes soltas do `tab_session` que gravam, leem
+/// pondo de lado ou apagam o `tabs.json`. A sessao de pesquisa
+/// (`memory/sessions`) so se grava por `MemoryStore::save_session`
+/// (`ResearchSession::save` e do crate `neural-core`), e a `MemoryStore` so
+/// o worker da memoria a abre. Corre sobre TODOS os ficheiros que embarcam
+/// de `crates/neural-app/src` (a volta do `shipped_rust_files`), e recusa
+/// tambem um `use` que renomeie um destes escritores ou traga do
+/// `tab_session` um nome que escreve. E o guard olha para o modo
+/// (`writes_allowed`) antes de cada escrita automatica (o comportamento esta
+/// em `private_guard_turns_automatic_stores_into_noops`).
+#[test]
+fn history_memory_and_tabs_are_written_only_through_the_privacy_guard() {
+    let files = shipped_rust_files("neural-app");
+    // A volta ve os ficheiros de topo que a lista antiga deixava de fora.
+    for expected in [
+        "neural-app/src/main.rs",
+        "neural-app/src/notify.rs",
+        "neural-app/src/ipc.rs",
+        "neural-app/src/lazy_worker.rs",
+        "neural-app/src/privacy.rs",
+        "neural-app/src/tab_session.rs",
+        "neural-app/src/windows_app/app/tabs.rs",
+    ] {
+        assert!(
+            files.iter().any(|(name, _)| name == expected),
+            "{expected} fora da volta do gate"
+        );
+    }
+
+    const WRITERS: [&str; 7] = [
+        "HistoryStore",
+        "MemoryStore",
+        "TabPersistence",
+        "HistoryWriter",
+        "MemoryWorker",
+        "SessionStore",
+        "tab_session",
+    ];
+    let mut code = String::new();
+    let mut imports = Vec::new();
+    for (name, source) in &files {
+        code.push('\n');
+        code.push_str(source);
+        for statement in use_statements(source) {
+            let words = use_words(&statement);
+            let has = |word: &str| words.contains(&word);
+            let renamed = has("as") && WRITERS.iter().any(|writer| has(writer));
+            let from_tabs = has("tab_session")
+                && (statement.contains('*')
+                    || ["save", "clear", "load", "SessionStore"]
+                        .iter()
+                        .any(|item| has(item)));
+            if renamed || from_tabs {
+                imports.push(format!("{name}: {statement}"));
+            }
+        }
+    }
+    assert!(
+        imports.is_empty(),
+        "um use renomeia um escritor automatico ou traz do tab_session um nome que escreve \
+         (o gate so conta os nomes de sempre):\n{}",
+        imports.join("\n")
+    );
+
+    let outside = without_impl_blocks(
+        &code,
+        &[
+            "impl PrivacyGuard {",
+            "impl TabPersistence {",
+            "impl HistoryWriter {",
+            "impl MemoryWorker {",
+        ],
+    );
+    for forbidden in [
+        ".history.append(",
+        ".memory.capture(",
+        ".memory.save_session(",
+        ".memory.rebuild(",
+        ".tabs.save_now(",
+        ".save_now(",
+        ".save_due(",
+        ".restore_read_only(",
+        "TabPersistence::open(",
+        "SessionStore::open(",
+        "tab_session::save(",
+        "tab_session::clear(",
+        "tab_session::load(",
+        "HistoryWriter::new(",
+        "MemoryWorker::new(",
+        "HistoryStore::new(",
+        "HistoryStore::with_limit(",
+        "MemoryStore::new(",
+    ] {
+        assert!(
+            !outside.contains(forbidden),
+            "{forbidden} fora do impl PrivacyGuard: uma escrita automatica que o modo nao ve"
+        );
+    }
+
+    // A rota existe: o guard e quem abre e chama os tres.
+    let guard = impl_block(&code, "impl PrivacyGuard {");
+    for required in [
+        "HistoryWriter::new(history_store, sink.clone())",
+        "MemoryWorker::new(memory_grant.path().to_path_buf(), sink)",
+        "TabPersistence::open(&config.data_dir)",
+        "self.history.append(entry)",
+        "self.memory.capture(document)",
+        "self.memory.save_session(session)",
+        "self.memory.rebuild()",
+        "self.tabs.save_now(contexts, groups, split)",
+        "self.tabs.save_due(token, contexts, groups, split)",
+        "self.tabs.restore_read_only()",
+    ] {
+        assert!(guard.contains(required), "o guard perdeu {required}");
+    }
+    // ...e cada escrita automatica pergunta ao grant (o modo partilhado).
+    for (method, grant) in [
+        ("fn record(", "history_grant"),
+        ("fn capture(", "memory_grant"),
+        ("fn save_session(", "memory_grant"),
+        ("fn rebuild_memory(", "memory_grant"),
+        ("fn restore_tabs(", "tabs_grant"),
+        ("fn save_tabs(", "tabs_grant"),
+        ("fn save_tabs_due(", "tabs_grant"),
+    ] {
+        let body = guard
+            .split(method)
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .unwrap_or_else(|| panic!("{method} no guard"));
+        assert!(
+            body.contains(&format!("if !self.{grant}.writes_allowed() {{")),
+            "{method} nao olha para o modo antes de escrever"
+        );
+    }
+    // O worker da memoria grava a sessao pela porta da MemoryStore.
+    let worker = impl_block(&code, "impl MemoryWorker {");
+    assert!(worker.contains("store.save_session(&session)"));
+}
+
+/// Uma pasta de dados nova e vazia para um gate do portao.
+fn guard_gate_dir(label: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "neuralia-privacy-guard-{label}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("pasta temporaria");
+    dir
+}
+
+/// Cada ficheiro debaixo de `dir`, pelo caminho relativo com `/`, e o que
+/// `read` tira dele. As pastas vazias nao contam: nao guardam nada.
+fn guard_gate_files<T>(
+    dir: &std::path::Path,
+    read: &dyn Fn(&std::path::Path) -> T,
+) -> std::collections::BTreeMap<String, T> {
+    fn walk<T>(
+        root: &std::path::Path,
+        dir: &std::path::Path,
+        read: &dyn Fn(&std::path::Path) -> T,
+        out: &mut std::collections::BTreeMap<String, T>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, read, out);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("dentro da pasta")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(relative, read(&path));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, read, &mut out);
+    out
+}
+
+/// Os bytes de cada ficheiro debaixo de `dir`.
+fn guard_gate_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    guard_gate_files(dir, &|path| std::fs::read(path).unwrap_or_default())
+}
+
+/// A hora da ultima escrita de cada ficheiro debaixo de `dir`: um ficheiro
+/// reescrito com os mesmos bytes (um indice reconstruido no mesmo segundo)
+/// tambem conta como escrito.
+fn guard_gate_stamps(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<String, Option<std::time::SystemTime>> {
+    guard_gate_files(dir, &|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    })
+}
+
+/// O que nasceu, mudou ou desapareceu entre duas fotografias.
+fn guard_gate_changes<T: PartialEq>(
+    before: &std::collections::BTreeMap<String, T>,
+    after: &std::collections::BTreeMap<String, T>,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(path, value)| before.get(*path) != Some(*value))
+        .map(|(path, _)| path.clone())
+        .chain(
+            before
+                .keys()
+                .filter(|path| !after.contains_key(*path))
+                .cloned(),
+        )
+        .collect()
+}
+
+/// A resposta do worker do historico (`HistoryLoaded`) e a do da memoria a
+/// `query`, pela ordem que chegarem; os outros eventos passam.
+fn guard_gate_answers(
+    events: &std::sync::mpsc::Receiver<UserEvent>,
+    query: &str,
+) -> (
+    Result<Vec<HistoryEntry>, String>,
+    Result<Vec<MemoryHit>, String>,
+) {
+    let (mut history, mut memory) = (None, None);
+    while history.is_none() || memory.is_none() {
+        match events.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(UserEvent::HistoryLoaded(result)) if history.is_none() => history = Some(result),
+            Ok(UserEvent::MemoryQueryReady {
+                query: asked,
+                result,
+            }) if asked == query && memory.is_none() => memory = Some(result),
+            Ok(_) => {}
+            Err(error) => panic!("os workers nao responderam: {error}"),
+        }
+    }
+    (history.expect("historico"), memory.expect("memoria"))
+}
+
+/// Os workers do historico e da memoria acabaram tudo o que tinham antes:
+/// um `Recent` e uma pesquisa vazia voltam depois do que entrou antes deles
+/// (uma fila cada).
+fn guard_gate_settle(guard: &PrivacyGuard, events: &std::sync::mpsc::Receiver<UserEvent>) {
+    assert!(guard.recent_history(1).is_none());
+    guard.query_memory(String::new());
+    let _ = guard_gate_answers(events, "");
+}
+
+/// `count` abas soltas na coluna 0.
+fn guard_gate_tabs(
+    count: u64,
+) -> (
+    [Vec<ContextTab>; COMPARATOR_COLUMNS],
+    [Vec<ContextGroup>; COMPARATOR_COLUMNS],
+) {
+    let mut contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| Vec::new());
+    for id in 1..=count {
+        contexts[0].push(ContextTab {
+            id,
+            url: format!("https://exemplo.pt/aba-{id}"),
+            group: None,
+        });
+    }
+    (contexts, std::array::from_fn(|_| Vec::new()))
+}
+
+/// O que uma sessao conduzida pelo portao devolveu.
+struct GuardRun {
+    /// O aviso do `restore_tabs`.
+    notice: Option<String>,
+    /// O historico que o painel leu ao abrir.
+    history: Result<Vec<HistoryEntry>, String>,
+    /// O `SaveTabSession(token)` do fim do atraso.
+    due: Option<std::io::Result<TabSave>>,
+    /// O mesmo com um bilhete ja ultrapassado.
+    stale: Option<std::io::Result<TabSave>>,
+    /// A gravacao do fecho (`save_tabs`).
+    now: std::io::Result<TabSave>,
+    /// `memory:rebuild` agendado.
+    rebuilt: bool,
+}
+
+/// Tudo o que o App faz pelo portao numa sessao, pela ordem de quem usa:
+/// abre o comparador (`restore_tabs`) e o painel (`recent_history`,
+/// `query_memory`), navega (`record`, `capture`, `save_session`), muda as
+/// abas (o atraso: `observe_tabs` + `save_tabs_due`, e um bilhete
+/// ultrapassado que nao grava), fecha (`save_tabs`) e pede `memory:rebuild`.
+/// Volta depois de os workers acabarem tudo.
+fn drive_guard_session(
+    guard: &mut PrivacyGuard,
+    events: &std::sync::mpsc::Receiver<UserEvent>,
+) -> GuardRun {
+    let (_restored, notice) = guard.restore_tabs();
+    assert!(
+        guard.recent_history(10).is_none(),
+        "o historico foi lido no event loop"
+    );
+    guard.query_memory("pagina lida".to_string());
+    let (history, _) = guard_gate_answers(events, "pagina lida");
+
+    guard.record(HistoryEntry::now(
+        HistoryKind::Web,
+        "https://exemplo.pt/pagina",
+        "https://exemplo.pt/pagina",
+    ));
+    guard.capture(MemoryDocument::new(
+        MemoryKind::Source,
+        MemorySourceKind::Web,
+        "Uma pagina lida".to_string(),
+        Some("https://exemplo.pt/pagina".to_string()),
+        "O corpo de uma pagina lida, com texto que chegue para um documento da memoria."
+            .to_string(),
+    ));
+    guard.save_session(ResearchSession::new("uma pergunta"));
+
+    let (mut contexts, mut groups) = guard_gate_tabs(1);
+    let token = guard
+        .observe_tabs(&contexts, &groups, None)
+        .expect("o modelo mudou: a gravacao agenda-se");
+    let due = guard.save_tabs_due(token, &mut contexts, &mut groups, None);
+    let (mut contexts, mut groups) = guard_gate_tabs(2);
+    let newer = guard
+        .observe_tabs(&contexts, &groups, None)
+        .expect("mudou outra vez");
+    assert_ne!(newer, token);
+    let stale = guard.save_tabs_due(token, &mut contexts, &mut groups, None);
+    let now = guard.save_tabs(&mut contexts, &mut groups, None);
+    let rebuilt = guard.rebuild_memory();
+    guard_gate_settle(guard, events);
+    GuardRun {
+        notice,
+        history,
+        due,
+        stale,
+        now,
+        rebuilt,
+    }
+}
+
+/// Gate (critico, infra-privacy-guard): com o guard em `Private` (o
+/// construtor de teste, a unica porta), uma sessao inteira pelo portao --
+/// as leituras (`restore_tabs` com um `tabs.json` estragado,
+/// `recent_history`, `query_memory`), as escritas (`record`, `capture`,
+/// `save_session`, o atraso das abas `observe_tabs` + `save_tabs_due`, o
+/// fecho `save_tabs`) e `memory:rebuild` -- nao muda um byte nem reescreve
+/// um ficheiro (a hora da ultima escrita tambem conta) de uma pasta de
+/// dados que uma sessao `Normal` ja encheu, com a fotografia tirada ANTES de
+/// o guard nascer; numa pasta onde nunca correu uma sessao, o unico ficheiro
+/// que aparece e o `tabs.lock` vazio (o trinco da janela, SPEC-0006) --
+/// nem uma escolha «Ocultar distrações» do Split privado o muda. As
+/// lojas `Explicit` e `Setting` pedidas ao mesmo guard continuam a gravar e
+/// uma `Automatic` nao. Em `Normal`, o mesmo guard e as mesmas chamadas
+/// escrevem o `history.jsonl`, a `memory/` (documentos, sessao, o indice do
+/// rebuild) e o `tabs.json`, pelo atraso e pelo fecho -- o comportamento de
+/// sempre.
+#[test]
+fn private_guard_turns_automatic_stores_into_noops() {
+    use neural_core::json_store::{SaveOutcome, StoreKind, StoreShape, StoreSpec, TokenFile};
+    use std::sync::mpsc::channel;
+
+    const SETTING: StoreSpec = StoreSpec::new("gate-setting", StoreKind::Setting, StoreShape::File);
+    const EXPLICIT: StoreSpec =
+        StoreSpec::new("gate-explicit", StoreKind::Explicit, StoreShape::File);
+    const AUTOMATIC: StoreSpec =
+        StoreSpec::new("gate-automatic", StoreKind::Automatic, StoreShape::File);
+
+    // 1. Normal, numa pasta nova: as mesmas chamadas escrevem.
+    let dir = guard_gate_dir("noops");
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard = PrivacyGuard::for_test(&dir, PrivacyMode::Normal, EventSink::channel(tx));
+        assert_eq!(guard.mode(), PrivacyMode::Normal);
+        let run = drive_guard_session(&mut guard, &events);
+        let after = guard_gate_snapshot(&dir);
+        assert_eq!(run.notice, None);
+        assert_eq!(run.history.as_ref().map(Vec::len), Ok(0));
+        assert_eq!(
+            run.due.as_ref().map(|saved| saved.as_ref().ok()),
+            Some(Some(&TabSave::Written)),
+            "o fim do atraso nao gravou as abas"
+        );
+        assert!(run.stale.is_none(), "um bilhete ultrapassado gravou");
+        assert_eq!(run.now.as_ref().ok(), Some(&TabSave::Written));
+        assert!(run.rebuilt, "memory:rebuild nao se agendou");
+        let files: Vec<&String> = after.keys().collect();
+        assert!(
+            after
+                .get("history.jsonl")
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("exemplo.pt/pagina")),
+            "a entrada nao chegou ao history.jsonl: {files:?}"
+        );
+        assert!(
+            after
+                .get("tabs.json")
+                .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains("exemplo.pt/aba-2")),
+            "o fecho nao gravou o tabs.json: {files:?}"
+        );
+        for prefix in ["memory/documents/", "memory/sessions/"] {
+            assert!(
+                files.iter().any(|path| path.starts_with(prefix)),
+                "nada em {prefix}: {files:?}"
+            );
+        }
+        assert!(
+            after.contains_key("memory/db/index-manifest.json"),
+            "o rebuild nao escreveu o indice: {files:?}"
+        );
+        let file = TokenFile::open(guard.store(AUTOMATIC).expect("grant")).expect("loja");
+        assert_eq!(
+            file.write_token("ligado").expect("gravar"),
+            SaveOutcome::Written
+        );
+        std::fs::remove_file(file.path()).expect("tirar a loja do gate");
+    }
+
+    // 2. Private sobre a mesma pasta (um perfil com historico, memoria e
+    // abas), com o `tabs.json` estragado. A fotografia e tirada antes de o
+    // guard nascer: nenhuma leitura fica de fora.
+    std::fs::write(
+        dir.join("tabs.json"),
+        b"{ \"version\": 1, \"columns\": [ estragado",
+    )
+    .expect("tabs.json estragado");
+    let before = guard_gate_snapshot(&dir);
+    let stamps = guard_gate_stamps(&dir);
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard = PrivacyGuard::for_test(&dir, PrivacyMode::Private, EventSink::channel(tx));
+        assert_eq!(guard.mode(), PrivacyMode::Private);
+        let run = drive_guard_session(&mut guard, &events);
+        let mut changed = guard_gate_changes(&before, &guard_gate_snapshot(&dir));
+        changed.extend(
+            guard_gate_changes(&stamps, &guard_gate_stamps(&dir))
+                .into_iter()
+                .map(|path| format!("{path} (reescrito)")),
+        );
+        assert!(
+            changed.is_empty(),
+            "o modo privado escreveu na pasta de dados: {changed:?}"
+        );
+        // As leituras continuam a ler.
+        assert!(
+            run.history.as_ref().is_ok_and(|entries| entries
+                .iter()
+                .any(|entry| entry.target.contains("exemplo.pt/pagina"))),
+            "o modo privado deixou de ler o historico: {:?}",
+            run.history
+        );
+        let notice = run.notice.expect("o tabs.json estragado tem aviso");
+        assert!(
+            notice.contains("ficou como estava") && !notice.contains(".bak"),
+            "{notice}"
+        );
+        assert_eq!(
+            run.due.as_ref().map(|saved| saved.as_ref().ok()),
+            Some(Some(&TabSave::SkippedPrivate)),
+            "o fim do atraso das abas nao respeitou o modo"
+        );
+        assert!(run.stale.is_none(), "um bilhete ultrapassado respondeu");
+        assert_eq!(run.now.as_ref().ok(), Some(&TabSave::SkippedPrivate));
+        assert!(!run.rebuilt, "memory:rebuild agendou-se no modo privado");
+
+        // As lojas do mesmo guard: Explicit e Setting gravam, Automatic nao.
+        for (spec, expected) in [
+            (SETTING, SaveOutcome::Written),
+            (EXPLICIT, SaveOutcome::Written),
+            (AUTOMATIC, SaveOutcome::SkippedPrivate),
+        ] {
+            let file = TokenFile::open(guard.store(spec).expect("grant")).expect("loja");
+            assert_eq!(
+                file.write_token("ligado").expect("gravar"),
+                expected,
+                "{}",
+                spec.name
+            );
+            assert_eq!(
+                file.path().exists(),
+                expected == SaveOutcome::Written,
+                "{} no disco",
+                spec.name
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // 3. Private numa pasta onde nunca correu uma sessao: so o trinco vazio
+    // das abas, que o guard abre ao nascer em qualquer modo (e as pastas
+    // vazias da memoria, que nao guardam nada).
+    let fresh = guard_gate_dir("noops-fresh");
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard =
+            PrivacyGuard::for_test(&fresh, PrivacyMode::Private, EventSink::channel(tx));
+        let run = drive_guard_session(&mut guard, &events);
+        assert_eq!(run.notice, None);
+        assert_eq!(run.history.as_ref().map(Vec::len), Ok(0));
+        // A anti-distracao pelo grant `Setting` deste guard: a escolha do
+        // Split privado fica so em memoria, e o `adblock-settings.json`
+        // tambem nao nasce aqui.
+        let mut adblock = AdblockState::load(guard.store(crate::stores::ADBLOCK_SETTINGS_STORE));
+        assert_eq!(
+            adblock.set_distraction_site("private.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        let after: Vec<(String, Vec<u8>)> = guard_gate_snapshot(&fresh).into_iter().collect();
+        assert_eq!(
+            after,
+            vec![("tabs.lock".to_string(), Vec::new())],
+            "o modo privado numa pasta nova"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&fresh);
+}
+
+/// As linhas da lista do E2E do modo privado (`$allowlist` do
+/// `scripts/test-private-mode.ps1`): `(Path, Kind)`.
+fn e2e_allowlist_rows(script: &str) -> Vec<(String, String)> {
+    let list = script
+        .split("$allowlist = @(\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n)\n").next())
+        .expect("$allowlist = @( ... ) no test-private-mode.ps1");
+    list.lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+        .map(|line| {
+            let field = |name: &str| {
+                line.split(&format!("{name} = '"))
+                    .nth(1)
+                    .and_then(|rest| rest.split('\'').next())
+                    .unwrap_or_else(|| panic!("linha da lista sem {name}: {line}"))
+                    .to_string()
+            };
+            (field("Path"), field("Kind"))
+        })
+        .collect()
+}
+
+/// Gate (critico, infra-privacy-guard): a lista do E2E do modo privado
+/// (`scripts/test-private-mode.ps1`, so CI) cobre tudo o que uma sessao
+/// `Normal` do `PrivacyGuard` deixa na pasta de dados. A sessao e a do
+/// `drive_guard_session` (o historico, o trinco dele, a memoria, a sessao
+/// de pesquisa, o indice, as abas e o trinco delas); cada ficheiro tem de
+/// cair numa linha pela mesma regra do `Find-AllowlistRow` (um caminho com
+/// `/` no fim cobre a pasta; os outros sao exatos, sem maiusculas), e essa
+/// linha tem de ser `Automatic`. Cada linha da lista tem tambem o seu
+/// caminho na tabela da fase 0 da SPEC-0006. Sem isto, o passo do CI ficava
+/// sempre vermelho (o `history.jsonl.lock` nao tinha linha) sem nenhum teste
+/// local o ver.
+#[test]
+fn the_e2e_allowlist_covers_a_normal_guard_session() {
+    use std::sync::mpsc::channel;
+
+    let script = include_str!("../../../../scripts/test-private-mode.ps1").replace("\r\n", "\n");
+    let spec =
+        include_str!("../../../../docs/specs/SPEC-0006-security-privacy.md").replace("\r\n", "\n");
+    // A regra que aqui se repete e a do script.
+    for rule in [
+        "if ($row.Path.EndsWith('/')) {",
+        "if ($Relative.StartsWith($row.Path, [StringComparison]::OrdinalIgnoreCase)) { return $row }",
+        "} elseif ($Relative -ieq $row.Path) {",
+    ] {
+        assert!(script.contains(rule), "o Find-AllowlistRow mudou: {rule}");
+    }
+    let rows = e2e_allowlist_rows(&script);
+    assert!(rows.len() >= 20, "a lista do E2E encolheu: {rows:?}");
+    let phase0 = spec
+        .split("### Phase 0")
+        .nth(1)
+        .expect("a tabela da fase 0 na SPEC-0006");
+    for (path, kind) in &rows {
+        assert!(
+            ["Automatic", "Setting", "Explicit"].contains(&kind.as_str()),
+            "{path}: tipo {kind}"
+        );
+        let cited = if path.ends_with('/') {
+            format!("`{path}")
+        } else {
+            format!("`{path}`")
+        };
+        assert!(
+            phase0.contains(&cited),
+            "{path}: na lista do E2E mas nao na tabela da fase 0 da SPEC-0006"
+        );
+    }
+    let row_for = |relative: &str| {
+        rows.iter().find(|(path, _)| {
+            if path.ends_with('/') {
+                relative
+                    .to_ascii_lowercase()
+                    .starts_with(&path.to_ascii_lowercase())
+            } else {
+                relative.eq_ignore_ascii_case(path)
+            }
+        })
+    };
+
+    let dir = guard_gate_dir("e2e-allowlist");
+    {
+        let (tx, events) = channel::<UserEvent>();
+        let mut guard = PrivacyGuard::for_test(&dir, PrivacyMode::Normal, EventSink::channel(tx));
+        let run = drive_guard_session(&mut guard, &events);
+        assert_eq!(run.now.as_ref().ok(), Some(&TabSave::Written));
+    }
+    let files = guard_gate_snapshot(&dir);
+    for required in [
+        "history.jsonl",
+        "history.jsonl.lock",
+        "tabs.json",
+        "tabs.lock",
+    ] {
+        assert!(
+            files.contains_key(required),
+            "a sessao nao deixou {required}: {:?}",
+            files.keys().collect::<Vec<_>>()
+        );
+    }
+    assert!(files.keys().any(|path| path.starts_with("memory/")));
+    let mut uncovered = Vec::new();
+    for relative in files.keys() {
+        match row_for(relative) {
+            None => uncovered.push(relative.clone()),
+            Some((path, kind)) => assert_eq!(
+                kind, "Automatic",
+                "{relative} cai na linha {path}, que nao e Automatic"
+            ),
+        }
+    }
+    assert!(
+        uncovered.is_empty(),
+        "a sessao Normal deixou ficheiros sem linha na lista do E2E (o passo do CI fica \
+         vermelho com \"fora da lista\"): {uncovered:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Um `use` que importa uma escrita crua com um nome que o gate nao conta:
+/// uma funcao de `std::fs` solta (`use std::fs::write;` e depois
+/// `write(...)`) ou com outro nome, e um `File`, um `OpenOptions` ou uma
+/// `Connection` renomeados.
+fn evasive_write_import(statement: &str) -> bool {
+    let words = use_words(statement);
+    let has = |word: &str| words.contains(&word);
+    let renamed = has("as");
+    (has("fs") && (renamed || ["write", "rename", "copy"].iter().any(|word| has(word))))
+        || (renamed
+            && ["File", "OpenOptions", "Connection"]
+                .iter()
+                .any(|word| has(word)))
+}
+
+/// Gate (critico, infra-privacy-guard; so de ausencia): nenhum ficheiro
+/// que embarca escreve na pasta de dados por fora de um grant sem uma
+/// linha aqui com o porque -- a tabela da fase 0 (SPEC-0006, «Persistence
+/// chokepoint»). Conta `fs::write`, `File::create`, `OpenOptions::new`,
+/// `File::options` (o mesmo `OpenOptions`), `fs::rename`, `fs::copy` e
+/// `Connection::open*` (o SQLite) no codigo que embarca de
+/// `crates/neural-app/src` e `crates/neural-core/src` (a volta do
+/// `shipped_rust_files`: testes, comentarios e literais tirados), e recusa
+/// um `use` que traga uma dessas escritas com um nome que ele nao conta;
+/// `json_store.rs` e o mecanismo e fica de fora. Um ficheiro novo com uma
+/// escrita crua, ou um ja listado com mais uma, fica vermelho ate a tabela
+/// e esta lista dizerem porque (ou ate a escrita passar a um grant).
+#[test]
+fn no_raw_data_dir_write_outside_a_grant() {
+    use std::collections::BTreeMap;
+
+    const PATTERNS: [&str; 7] = [
+        "fs::write(",
+        "File::create(",
+        "OpenOptions::new(",
+        "File::options(",
+        "fs::rename(",
+        "fs::copy(",
+        "Connection::open",
+    ];
+    // (ficheiro, escritas cruas, porque) -- a mesma tabela da SPEC-0006.
+    const ALLOWLIST: &[(&str, usize, &str)] = &[
+        (
+            "neural-app/src/windows_app.rs",
+            1,
+            "finish_agent: o trace legado do agente em agent/ (Automatic); o int-agents-finish leva-o",
+        ),
+        (
+            "neural-app/src/windows_app/app/compare.rs",
+            1,
+            "research-exports (Explicit): o utilizador pediu «Exportar pesquisa»",
+        ),
+        (
+            "neural-app/src/windows_app/bookmarks.rs",
+            1,
+            "exportar favoritos para um caminho que o utilizador escolheu no dialogo, fora da pasta de dados",
+        ),
+        (
+            "neural-app/src/windows_app/search_card.rs",
+            1,
+            "NEURALIA_DEBUG_LOG: log de desenvolvimento, desligado por omissao, fora da pasta de dados",
+        ),
+        (
+            "neural-app/src/windows_app/services.rs",
+            2,
+            "gmail (Setting): uma escolha no menu; TokenFile = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/windows_app/theme.rs",
+            2,
+            "theme (Setting): uma escolha no menu; TokenFile = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/panel_chrome.rs",
+            2,
+            "panel-width.json (Automatic): geometria pelo seu helper atomico; grant = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/pomodoro_ui.rs",
+            2,
+            "pomodoro (Setting): uma escolha no menu; TokenFile = privacy-guard-retrofit",
+        ),
+        (
+            "neural-app/src/secrets.rs",
+            2,
+            "keys/ e gemini-live.key (Explicit): o cofre abre por grant; o blob DPAPI pelo seu helper atomico",
+        ),
+        (
+            "neural-app/src/tab_session.rs",
+            6,
+            "tabs.json/.lock/.cleared (Automatic): so o PrivacyGuard abre o TabPersistence e grava pelo modo",
+        ),
+        (
+            "neural-core/src/agent_security.rs",
+            3,
+            "agent/audit-*.json: a auditoria legada do agente; o int-agents-finish leva-a",
+        ),
+        (
+            "neural-core/src/downloads.rs",
+            1,
+            "a marca da Web no ficheiro baixado, na pasta de downloads do utilizador",
+        ),
+        (
+            "neural-core/src/history.rs",
+            3,
+            "history.jsonl e history.jsonl.lock (Automatic): o caminho vem do grant do guard e so PrivacyGuard::record escreve",
+        ),
+        (
+            "neural-core/src/library.rs",
+            10,
+            "library/ (Explicit; state/ Automatic): livros que o utilizador juntou; grant = privacy-guard-retrofit",
+        ),
+        (
+            "neural-core/src/local_intelligence.rs",
+            11,
+            "model packs: nao ligados ao produto (spec_0102); o local-model-packs traz o grant",
+        ),
+        (
+            "neural-core/src/memory.rs",
+            3,
+            "memory/ (Automatic): a raiz vem do grant do guard e so PrivacyGuard::capture/save_session escrevem",
+        ),
+        (
+            "neural-core/src/memory/sqlite_v01.rs",
+            5,
+            "memory/: o indice SQLite derivado dos documentos que o guard deixou entrar (Connection::open e os renames do rebuild)",
+        ),
+        (
+            "neural-core/src/research.rs",
+            2,
+            "memory/sessions (Automatic): so o worker da memoria, por PrivacyGuard::save_session",
+        ),
+        (
+            "neural-core/src/zettel.rs",
+            4,
+            "zettel/ (Explicit): notas que o utilizador escreveu; grant = privacy-guard-retrofit",
+        ),
+    ];
+
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    let mut problems = Vec::new();
+    for krate in ["neural-app", "neural-core"] {
+        for (relative, code) in shipped_rust_files(krate) {
+            for statement in use_statements(&code) {
+                if evasive_write_import(&statement) {
+                    problems.push(format!(
+                        "{relative}: `{statement}` traz uma escrita crua com um nome que o gate nao conta"
+                    ));
+                }
+            }
+            let writes: usize = PATTERNS
+                .iter()
+                .map(|pattern| code.matches(pattern).count())
+                .sum();
+            if writes > 0 {
+                found.insert(relative, writes);
+            }
+        }
+    }
+    assert!(
+        found
+            .remove("neural-core/src/json_store.rs")
+            .is_some_and(|n| n >= 3),
+        "json_store.rs deixou de ser o mecanismo que escreve"
+    );
+
+    for (file, writes) in &found {
+        match ALLOWLIST.iter().find(|(listed, _, _)| listed == file) {
+            None => problems.push(format!(
+                "{file}: {writes} escrita(s) crua(s) sem linha na lista (e na tabela da SPEC-0006)"
+            )),
+            Some((_, expected, _)) if expected != writes => problems.push(format!(
+                "{file}: {writes} escrita(s) crua(s), a lista diz {expected}"
+            )),
+            Some(_) => {}
+        }
+    }
+    for (file, _, why) in ALLOWLIST {
+        assert!(!why.trim().is_empty(), "{file}: sem porque");
+        if !found.contains_key(*file) {
+            problems.push(format!(
+                "{file}: na lista mas sem escrita crua: tirar a linha"
+            ));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "escritas cruas na pasta de dados fora de um grant:\n{}",
+        problems.join("\n")
+    );
 }
 
 // ===================== infra-egress: o portao de saida da IA =====================
@@ -24189,14 +25558,14 @@ fn app_new_starts_no_lazy_worker() {
     let dir = std::env::temp_dir().join(format!("neuralia-egress-app-new-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let registry = StoreRegistry::mint_for_test(&dir);
-    let gate = crate::egress::EgressGate::for_app(Some(&registry));
+    let gate = crate::egress::EgressGate::for_app(|spec| registry.grant(spec).ok());
     assert_eq!(
         gate.worker_threads_spawned(),
         0,
         "o portao nasceu com uma thread"
     );
     assert!(!dir.exists(), "criar o portao escreveu na pasta de dados");
-    let without_stores = crate::egress::EgressGate::for_app(None);
+    let without_stores = crate::egress::EgressGate::for_app(|_| None);
     assert_eq!(without_stores.worker_threads_spawned(), 0);
 
     // O `App::new` deixa o portao por nascer e nao pede trabalho a worker
@@ -24669,12 +26038,20 @@ mod downloads_gates {
             self.stores.as_ref().expect("registo").set_mode(mode);
         }
 
+        /// O modo como o App o passa ao gestor (PrivacyGuard::mode).
+        fn mode(&self) -> PrivacyMode {
+            self.stores
+                .as_ref()
+                .map_or(PrivacyMode::Normal, |stores| stores.mode().into())
+        }
+
         fn drive(&mut self, event: DownloadEvent) {
+            let private_mode = downloads_private_mode(self.mode());
             let run = run_download_event(
                 &mut self.manager,
                 &self.ops,
                 self.store.as_mut(),
-                downloads_private_mode(self.stores.as_ref()),
+                private_mode,
                 event,
             );
             assert_eq!(run.erase_error, None);
@@ -24813,7 +26190,10 @@ mod downloads_gates {
         assert_eq!(rig.ops.borrow().len(), 0, "a operacao acabada ficou viva");
         assert_eq!(
             rig.manager.entry(DownloadId(1)).expect("entrada").state,
-            DownloadState::Done(RecordOutcome::Completed { warn: false })
+            DownloadState::Done(RecordOutcome::Completed {
+                warn: false,
+                inspection: neural_core::downloads::Inspection::Checked,
+            })
         );
         let motw = read_motw(&pdf).expect("ler").expect("a marca da Web");
         assert_eq!(motw_zone_id(&motw), Some(3));
@@ -24875,6 +26255,220 @@ mod downloads_gates {
             vec![DownloadId(6)]
         );
         assert_eq!(rig.manager.active(), 1);
+    }
+
+    /// Um ZIP de entradas *stored* (o bastante para o diretorio central que
+    /// a inspecao le). `shared`: a segunda entrada aponta para o cabecalho
+    /// local da primeira -- a bomba de sobreposicao.
+    fn stored_zip(entries: &[(&str, &[u8])], shared: bool) -> Vec<u8> {
+        let push16 = |out: &mut Vec<u8>, value: u16| out.extend_from_slice(&value.to_le_bytes());
+        let push32 = |out: &mut Vec<u8>, value: u32| out.extend_from_slice(&value.to_le_bytes());
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (index, (name, data)) in entries.iter().enumerate() {
+            let mut crc = flate2::Crc::new();
+            crc.update(data);
+            let crc = crc.sum();
+            let offset = if shared && index > 0 {
+                0
+            } else {
+                out.len() as u32
+            };
+            if !(shared && index > 0) {
+                push32(&mut out, 0x0403_4b50);
+                for value in [20, 0, 0, 0, 0x21] {
+                    push16(&mut out, value);
+                }
+                push32(&mut out, crc);
+                push32(&mut out, data.len() as u32);
+                push32(&mut out, data.len() as u32);
+                push16(&mut out, name.len() as u16);
+                push16(&mut out, 0);
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(data);
+            }
+            push32(&mut central, 0x0201_4b50);
+            for value in [0x031E, 20, 0, 0, 0, 0x21] {
+                push16(&mut central, value);
+            }
+            push32(&mut central, crc);
+            push32(&mut central, data.len() as u32);
+            push32(&mut central, data.len() as u32);
+            for value in [name.len() as u16, 0, 0, 0, 0] {
+                push16(&mut central, value);
+            }
+            push32(&mut central, 0);
+            push32(&mut central, offset);
+            central.extend_from_slice(name.as_bytes());
+        }
+        let directory_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        push32(&mut out, 0x0605_4b50);
+        for value in [0, 0, entries.len() as u16, entries.len() as u16] {
+            push16(&mut out, value);
+        }
+        push32(&mut out, central.len() as u32);
+        push32(&mut out, directory_offset);
+        push16(&mut out, 0);
+        out
+    }
+
+    /// Gate critico (downloads-zip-inspect; sabotado: um arquivo nao
+    /// inspecionado mostrado como concluido sem mais nada), pela volta
+    /// inteira do `App` (`run_download_event`, com o `finalize_download` no
+    /// disco): o `pacote.zip` do E2E (setup.exe e run.bat) e apagado sem
+    /// «Permitir baixar programas», com o aviso e a linha a dizer porque, e
+    /// fica com ela, a dizer o que leva; um ZIP sobreposto e um 7z ficam
+    /// «nao inspecionado» (tom de aviso) na linha da sessao, na do
+    /// `downloads.json` e no toast; um ZIP limpo fica concluido.
+    #[test]
+    fn a_zip_download_is_inspected_and_not_inspected_is_shown() {
+        use neural_core::downloads::{FinalizeOutcome, Inspection};
+        use neural_core::file_risk::ZipEntryRisk;
+        let dir = Scratch::new("zip");
+        let pacote = stored_zip(
+            &[
+                ("setup.exe", &pe_bytes()),
+                ("run.bat", b"@echo off\r\necho oi\r\n"),
+            ],
+            false,
+        );
+        let finish = |rig: &mut Rig, id: u64, name: &str, bytes: &[u8]| {
+            let path = dir.0.join(name);
+            rig.begin(id, 1, WebViewHost::External, path.clone());
+            std::fs::write(&path, bytes).expect("download");
+            rig.complete(id, &path);
+            path
+        };
+        let rows =
+            |manager: &DownloadManager| DownloadRows::default().list(manager, &BTreeMap::new());
+        let row = |built: &[PanelRow], name: &str| {
+            built
+                .iter()
+                .find(|row| row.name == name)
+                .unwrap_or_else(|| panic!("{name}: {built:?}"))
+                .clone()
+        };
+
+        // Sem a definicao: apagado, com o aviso e a linha.
+        let mut rig = Rig::new(DownloadManager::default());
+        let path = finish(&mut rig, 1, "pacote.zip", &pacote);
+        assert!(!path.exists(), "o pacote.zip ficou no disco");
+        let reason = DeleteReason::ArchiveEntry(ZipEntryRisk::Blocked(BlockReason::Program));
+        let notice = DownloadNotice::Deleted {
+            id: DownloadId(1),
+            name: "pacote.zip".to_string(),
+            reason,
+        };
+        assert!(
+            rig.later.contains(&DownloadEffect::Notice(notice.clone())),
+            "{:?}",
+            rig.later
+        );
+        assert_eq!(
+            download_notice_text(&notice),
+            "Download apagado — pacote.zip tinha um programa dentro. O NeuralIA não baixa programas nem scripts (ajuste em Downloads)."
+        );
+        let deleted = row(&rows(&rig.manager), "pacote.zip");
+        assert_eq!(
+            deleted.status,
+            "Apagado — tinha um programa dentro · example.com"
+        );
+        assert_eq!(deleted.tone, "blocked");
+        assert!(!deleted.open && !deleted.show, "{deleted:?}");
+        // Outro arquivo compactado dentro, um disfarce dentro: os avisos.
+        for (risk, text) in [
+            (
+                ZipEntryRisk::NestedArchive,
+                "Download apagado — pacote.zip tinha outro arquivo compactado dentro, que o NeuralIA não inspeciona (ajuste em Downloads).",
+            ),
+            (
+                ZipEntryRisk::Blocked(BlockReason::Masquerade),
+                "Download apagado — pacote.zip tinha um programa disfarçado dentro.",
+            ),
+        ] {
+            assert_eq!(
+                download_notice_text(&DownloadNotice::Deleted {
+                    id: DownloadId(1),
+                    name: "pacote.zip".to_string(),
+                    reason: DeleteReason::ArchiveEntry(risk),
+                }),
+                text
+            );
+        }
+
+        // Com a definicao: fica, e a linha e o toast dizem o que leva.
+        let mut rig = Rig::new(DownloadManager::new(
+            DownloadSettings {
+                folder: None,
+                allow_programs: true,
+            },
+            DownloadLog::default(),
+        ));
+        let path = finish(&mut rig, 1, "pacote.zip", &pacote);
+        assert!(path.exists(), "com a definicao, o pacote.zip foi apagado");
+        let kept = row(&rows(&rig.manager), "pacote.zip");
+        assert_eq!(
+            kept.status,
+            "Concluído · 64 B · example.com · tem programas ou scripts dentro"
+        );
+        assert_eq!(kept.tone, "warn");
+        assert!(!kept.open && kept.show, "{kept:?}");
+
+        // Nao inspecionados: um ZIP sobreposto, um estragado e um 7z; e um
+        // limpo, lido.
+        let mut rig = Rig::new(DownloadManager::default());
+        let photos = [
+            ("fotos/a.jpg", &b"\xFF\xD8\xFF\xE0"[..]),
+            ("fotos/b.jpg", b"\xFF\xD8\xFF\xE0"),
+        ];
+        let overlap = finish(&mut rig, 2, "sobreposto.zip", &stored_zip(&photos, true));
+        let broken = finish(&mut rig, 3, "estragado.zip", &pacote[..pacote.len() - 30]);
+        let seven = finish(
+            &mut rig,
+            4,
+            "arquivo.7z",
+            &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4],
+        );
+        let clean = finish(&mut rig, 5, "fotos.zip", &stored_zip(&photos, false));
+        for path in [&overlap, &broken, &seven, &clean] {
+            assert!(path.exists(), "{}", path.display());
+        }
+        let built = rows(&rig.manager);
+        for name in ["sobreposto.zip", "estragado.zip", "arquivo.7z"] {
+            let shown = row(&built, name);
+            assert_eq!(
+                shown.status, "Concluído · 64 B · example.com · não inspecionado",
+                "{name}"
+            );
+            assert_eq!(shown.tone, "warn", "{name}");
+        }
+        let fine = row(&built, "fotos.zip");
+        assert_eq!(fine.status, "Concluído · 64 B · example.com");
+        assert_eq!(fine.tone, "done");
+        // O toast do acabado diz o mesmo.
+        let toast = completed_toast(rig.manager.entry(DownloadId(2)).expect("entrada"));
+        assert_eq!(
+            toast.body,
+            "sobreposto.zip · não inspecionado: o NeuralIA não conseguiu ver o que ele tem dentro"
+        );
+        assert_eq!(
+            completed_toast(rig.manager.entry(DownloadId(5)).expect("entrada")).body,
+            "fotos.zip"
+        );
+        // A linha do `downloads.json` de antes (outra sessao) tambem.
+        let reopened = DownloadManager::new(DownloadSettings::default(), rig.manager.log());
+        let record = row(&rows(&reopened), "sobreposto.zip");
+        assert_eq!(
+            record.status,
+            "Concluído · 64 B · example.com · não inspecionado"
+        );
+        assert_eq!(record.tone, "warn");
+        // E o `finalize_download` que o `App` corre devolve o mesmo.
+        assert!(matches!(
+            neural_core::downloads::finalize_download(&overlap, false, false),
+            FinalizeOutcome::Kept(_, Inspection::NotInspected)
+        ));
     }
 
     /// Gate critico: nada de uma pagina privada nem do Modo privado chega
@@ -25011,7 +26605,7 @@ mod downloads_gates {
         };
         let clear = |state: &mut DownloadsState, stores: &StoreRegistry| {
             let run = state.run(
-                downloads_private_mode(Some(stores)),
+                downloads_private_mode(stores.mode().into()),
                 DownloadEvent::ClearLog,
             );
             assert_eq!(run.erase_error, None);
@@ -25023,7 +26617,7 @@ mod downloads_gates {
             let dir = Scratch::new("clear");
             let file = file_with(&dir.0, LOG_VERSION, "segredo.pdf");
             let stores = StoreRegistry::mint_for_test(&dir.0);
-            let mut state = DownloadsState::open(Some(&stores));
+            let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
             assert_eq!(state.manager.log().entries.len(), 1);
             stores.set_mode(mode);
             clear(&mut state, &stores);
@@ -25048,7 +26642,7 @@ mod downloads_gates {
         let other = dir.0.join("tabs.json");
         std::fs::write(&other, b"{}").expect("outro");
         let stores = StoreRegistry::mint_for_test(&dir.0);
-        let mut state = DownloadsState::open(Some(&stores));
+        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
         assert!(
             state
                 .log_store
@@ -25066,7 +26660,7 @@ mod downloads_gates {
         assert!(other.exists(), "o apagar levou um ficheiro que nao e dele");
         // Sem ficheiro, a loja volta a gravar: o download seguinte fica.
         state.run(
-            downloads_private_mode(Some(&stores)),
+            downloads_private_mode(stores.mode().into()),
             DownloadEvent::Starting(DownloadStart {
                 id: DownloadId(1),
                 webview: WebViewKey(1),
@@ -25109,7 +26703,8 @@ mod downloads_gates {
             .expect("definicoes");
         };
         write_settings(&chosen, true);
-        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        let state =
+            DownloadsState::open(|spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok());
         assert_eq!(
             state.manager.settings().folder.as_deref(),
             Some(chosen.as_path())
@@ -25121,7 +26716,8 @@ mod downloads_gates {
         );
 
         write_settings(&dir.0.join("nao-existe"), false);
-        let state = DownloadsState::open(Some(&StoreRegistry::mint_for_test(&dir.0)));
+        let state =
+            DownloadsState::open(|spec| StoreRegistry::mint_for_test(&dir.0).grant(spec).ok());
         assert_eq!(state.manager.settings().folder, None);
         assert_eq!(
             state.shared.folder.borrow().as_deref(),
@@ -25130,7 +26726,7 @@ mod downloads_gates {
         );
 
         // Sem registo: tudo por omissao, nada gravado, a pasta do sistema.
-        let state = DownloadsState::open(None);
+        let state = DownloadsState::open(|_| None);
         assert_eq!(state.manager.settings(), &DownloadSettings::default());
         assert!(state.log_store.is_none());
         assert_eq!(
@@ -25303,7 +26899,7 @@ mod downloads_gates {
         let file = dir.0.join(DOWNLOADS_SETTINGS_STORE.name);
         std::fs::write(&file, serde_json::to_vec(&body).expect("json")).expect("definicoes");
         let stores = StoreRegistry::mint_for_test(&dir.0);
-        let mut state = DownloadsState::open(Some(&stores));
+        let mut state = DownloadsState::open(|spec| stores.grant(spec).ok());
         let start = |state: &mut DownloadsState, id: u64| {
             state
                 .run(
@@ -25348,7 +26944,7 @@ mod downloads_gates {
                 .any(|effect| matches!(effect, DownloadEffect::Ask { .. }))
         );
         // Sem loja (nunca no produto): nada muda.
-        let mut none = DownloadsState::open(None);
+        let mut none = DownloadsState::open(|_| None);
         assert!(none.set_allow_programs(true).is_err());
         assert!(!none.manager.settings().allow_programs);
     }
@@ -26070,6 +27666,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
                 id: DownloadId(id),
                 outcome: neural_core::downloads::FinalizeOutcome::Kept(
                     neural_core::downloads::MotwOutcome::Written,
+                    neural_core::downloads::Inspection::Checked,
                 ),
             });
         };
@@ -26295,6 +27892,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             id: DownloadId(1),
             outcome: neural_core::downloads::FinalizeOutcome::Kept(
                 neural_core::downloads::MotwOutcome::Written,
+                neural_core::downloads::Inspection::Checked,
             ),
         });
         let mut rows = DownloadRows::default();
@@ -27894,7 +29492,7 @@ fn translation_consent_table() {
     let registry = StoreRegistry::mint_for_test(&dir);
     let today = Day::today();
     let gate_for = || {
-        let mut gate = EgressGate::for_app(Some(&registry));
+        let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
         gate.attach_site_grants(
             crate::ai_settings::AiPurpose::Translation,
             registry.grant(TRANSLATE_STORE).expect("grant"),
@@ -28272,6 +29870,7 @@ fn translate_page_labels_are_not_the_selection_bar_translate() {
     let flags = MenuFlags {
         auto_scroll: true,
         adblock: AdblockMenu::Hidden,
+        distraction: None,
     };
     assert_eq!(
         (item.view)(WebViewHost::Column(0), &flags).map(|view| view.label),
@@ -28344,7 +29943,7 @@ fn translation_entry(node: u32, from: &str, to: &str) -> neural_core::translate:
 
 /// O portao da Traducao de um registo de teste, com o `translate.json`.
 fn translation_test_gate(registry: &StoreRegistry) -> crate::egress::EgressGate {
-    let mut gate = crate::egress::EgressGate::for_app(Some(registry));
+    let mut gate = crate::egress::EgressGate::for_app(|spec| registry.grant(spec).ok());
     gate.attach_site_grants(
         crate::ai_settings::AiPurpose::Translation,
         registry
@@ -29310,7 +30909,7 @@ mod bookmarks_gates {
             .expect("spawn_bookmarks_worker");
         assert!(worker.contains("BookmarkStore::open(grant)"));
         assert!(worker.contains(".name(\"neural-bookmarks\".into())"));
-        assert_eq!(code.matches(".grant(BOOKMARKS_STORE)").count(), 1);
+        assert_eq!(code.matches(".store(BOOKMARKS_STORE)").count(), 1);
         assert_eq!(code.matches("spawn_bookmarks_worker(").count(), 2);
         let new = code
             .split(
@@ -29571,5 +31170,2096 @@ mod bookmarks_gates {
                 "{hit:?}"
             );
         }
+    }
+}
+
+// ===================== anti-distracao (plano 2.4, §7) =====================
+
+mod distraction_gates {
+    use super::*;
+    use crate::stores::ADBLOCK_SETTINGS_STORE;
+    use neural_core::distraction::{
+        CMP_RULES, DistractionPolicy, DistractionSurface, SiteChange, distraction_config,
+    };
+    use neural_core::json_store::StoreRegistry;
+    use neural_core::search::{ProviderId, login_hosts};
+    use serde_json::{Value, json};
+
+    /// O DOM do harness da anti-distracao, criado DENTRO do contexto do
+    /// `node:vm` (os prototipos que a "pagina" envenena sao os dele):
+    /// elementos com atributos, `css` computado e `rect` da fixture, estilo
+    /// inline (`setProperty`), `innerText` visivel, shadow roots abertas,
+    /// um motor de seletores (`#id`, `.classe`, `tag`, `*`, `[a]`,
+    /// `[a="v"]`, `^=`, `*=`, `$=`, descendente e `>`), `NodeList`,
+    /// `DOMRect` com getters no prototipo, `MutationObserver` que so entrega
+    /// no `__flush`, temporizadores e `performance.now` num relogio virtual
+    /// (`styleCost` ms por leitura de estilo computado). O mock usa as suas
+    /// copias das primitivas: o que a pagina troca nao lhe muda nada.
+    const DISTRACTION_HARNESS: &str = r###"
+const vm = require('node:vm');
+function MOCK() {
+  var g = globalThis;
+  var U = Function.prototype.bind.bind(Function.prototype.call);
+  var $push = U(Array.prototype.push);
+  var $hasOwn = U(Object.prototype.hasOwnProperty);
+  var $slice = U(String.prototype.slice);
+  var $lower = U(String.prototype.toLowerCase);
+  var $indexOf = U(String.prototype.indexOf);
+  var $call = U(Function.prototype.call);
+  var $String = String;
+  var $assign = Object.assign;
+  var $stringify = JSON.stringify;
+  var log = { clicks: [], pageClicks: [], posted: [], errors: [], network: [], timersRun: 0, maxSpent: 0,
+    maxMutation: 0, docQueries: 0 };
+  var state = { clock: 0, styleCost: 0, qsaCost: 0, timers: [], observers: [] };
+  g.__log = log;
+  g.__state = state;
+  g.__push = $push;
+
+  function isIdent(ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+      ch === '-' || ch === '_';
+  }
+  function isSpace(ch) { return ch === ' ' || ch === '\n' || ch === '\t'; }
+  function parseCompound(text) {
+    var c = { tag: null, ids: [], classes: [], attrs: [] };
+    var i = 0, n = text.length;
+    while (i < n) {
+      var ch = text[i];
+      if (ch === '#' || ch === '.') {
+        var j = i + 1;
+        while (j < n && isIdent(text[j])) j++;
+        if (ch === '#') $push(c.ids, $slice(text, i + 1, j)); else $push(c.classes, $slice(text, i + 1, j));
+        i = j;
+      } else if (ch === '[') {
+        var end = $indexOf(text, ']', i);
+        if (end < 0) throw new SyntaxError('seletor: ' + text);
+        var body = $slice(text, i + 1, end);
+        var k = 0;
+        while (k < body.length && isIdent(body[k])) k++;
+        var attr = { name: $slice(body, 0, k), op: null, value: null };
+        if (k < body.length) {
+          var op = body[k] === '=' ? '=' : $slice(body, k, k + 2);
+          if (op !== '=' && op !== '^=' && op !== '*=' && op !== '$=') throw new SyntaxError('operador: ' + text);
+          var rest = $slice(body, k + op.length);
+          var quote = rest[0];
+          attr.op = op;
+          if (quote === '"' || quote === "'") {
+            // `[a*="v" i]`: sem olhar a maiusculas.
+            var close = $indexOf(rest, quote, 1);
+            attr.value = $slice(rest, 1, close);
+            var flag = $slice(rest, close + 1), f = 0;
+            while (f < flag.length && isSpace(flag[f])) f++;
+            flag = $slice(flag, f);
+            if (flag === 'i') attr.i = true;
+            else if (flag.length) throw new SyntaxError('flag: ' + text);
+          } else {
+            attr.value = rest;
+          }
+        }
+        $push(c.attrs, attr);
+        i = end + 1;
+      } else if (ch === '*') {
+        c.tag = '*';
+        i++;
+      } else if (isIdent(ch)) {
+        var t = i;
+        while (t < n && isIdent(text[t])) t++;
+        c.tag = $lower($slice(text, i, t));
+        i = t;
+      } else {
+        throw new SyntaxError('seletor nao suportado: ' + text);
+      }
+    }
+    return c;
+  }
+  function parseSelector(selector) {
+    var parts = [], depth = 0, quote = null, start = 0, i;
+    for (i = 0; i < selector.length; i++) {
+      var ch = selector[i];
+      if (quote) { if (ch === quote) quote = null; continue; }
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (ch === '[') depth++;
+      else if (ch === ']') depth--;
+      else if (ch === ',' && depth === 0) { $push(parts, $slice(selector, start, i)); start = i + 1; }
+    }
+    $push(parts, $slice(selector, start));
+    var out = [];
+    for (var p = 0; p < parts.length; p++) {
+      var st = { seq: [], cur: '', pending: null };
+      var text = parts[p], dep = 0, qt = null;
+      var end = function () {
+        if (!st.cur.length) return;
+        $push(st.seq, { comb: st.seq.length ? (st.pending || ' ') : null, c: parseCompound(st.cur) });
+        st.cur = '';
+        st.pending = null;
+      };
+      for (i = 0; i < text.length; i++) {
+        var c2 = text[i];
+        if (qt) { st.cur += c2; if (c2 === qt) qt = null; continue; }
+        if (c2 === '"' || c2 === "'") { qt = c2; st.cur += c2; continue; }
+        if (dep === 0 && isSpace(c2)) { end(); continue; }
+        if (dep === 0 && c2 === '>') { end(); st.pending = '>'; continue; }
+        if (c2 === '[') dep++;
+        if (c2 === ']') dep--;
+        st.cur += c2;
+      }
+      end();
+      if (!st.seq.length) throw new SyntaxError('seletor vazio: ' + selector);
+      $push(out, st.seq);
+    }
+    return out;
+  }
+  function attrOf(el, name) {
+    return $hasOwn(el.__attrs, name) ? $String(el.__attrs[name]) : null;
+  }
+  function hasClass(cls, name) {
+    var i = 0;
+    while (i < cls.length) {
+      while (i < cls.length && cls[i] === ' ') i++;
+      var j = i;
+      while (j < cls.length && cls[j] !== ' ') j++;
+      if (j > i && $slice(cls, i, j) === name) return true;
+      i = j;
+    }
+    return false;
+  }
+  function matchCompound(el, c) {
+    if (!el || el.__type !== 1) return false;
+    if (c.tag && c.tag !== '*' && el.__tag !== c.tag) return false;
+    var i;
+    for (i = 0; i < c.ids.length; i++) if (attrOf(el, 'id') !== c.ids[i]) return false;
+    var cls = attrOf(el, 'class');
+    for (i = 0; i < c.classes.length; i++) if (cls === null || !hasClass(cls, c.classes[i])) return false;
+    for (i = 0; i < c.attrs.length; i++) {
+      var a = c.attrs[i], v = attrOf(el, a.name), want = a.value;
+      if (v === null) return false;
+      if (a.i) { v = $lower(v); want = $lower(want); }
+      if (a.op === '=' && v !== want) return false;
+      if (a.op === '^=' && !(want.length && $indexOf(v, want) === 0)) return false;
+      if (a.op === '*=' && !(want.length && $indexOf(v, want) >= 0)) return false;
+      if (a.op === '$=' && !(want.length && v.length >= want.length &&
+          $slice(v, v.length - want.length) === want)) return false;
+    }
+    return true;
+  }
+  function matchSeq(el, seq, index) {
+    if (!matchCompound(el, seq[index].c)) return false;
+    if (index === 0) return true;
+    var parent = el.__parent;
+    if (seq[index].comb === '>') return !!parent && parent.__type === 1 && matchSeq(parent, seq, index - 1);
+    for (var a = parent; a && a.__type === 1; a = a.__parent) if (matchSeq(a, seq, index - 1)) return true;
+    return false;
+  }
+  function qsa(root, selector) {
+    var seqs = parseSelector($String(selector));
+    var items = [];
+    var walk = function (node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.__type !== 1) continue;
+        state.clock += state.qsaCost;
+        for (var s = 0; s < seqs.length; s++) {
+          if (matchSeq(child, seqs[s], seqs[s].length - 1)) { $push(items, child); break; }
+        }
+        walk(child);
+      }
+    };
+    walk(root);
+    return new g.NodeList(items);
+  }
+  var DEFAULTS = { position: 'static', display: 'block', visibility: 'visible', overflow: 'visible',
+    'overflow-y': 'visible', 'z-index': 'auto' };
+  function computedValue(el, name) {
+    if ($hasOwn(el.__inline, name)) return el.__inline[name];
+    if ($hasOwn(el.__css, name)) return $String(el.__css[name]);
+    if (name === 'overflow-y' && $hasOwn(el.__css, 'overflow')) return $String(el.__css.overflow);
+    return $hasOwn(DEFAULTS, name) ? DEFAULTS[name] : '';
+  }
+  function text(node) {
+    var out = '';
+    for (var i = 0; i < node.childNodes.length; i++) {
+      var child = node.childNodes[i];
+      if (child.__type === 3) out += child.data;
+      else if (child.__type === 1 && computedValue(child, 'display') !== 'none') {
+        var inner = text(child);
+        if (inner.length) out += (out.length ? ' ' : '') + inner;
+      }
+    }
+    return out;
+  }
+  function nameOf(el) {
+    return attrOf(el, 'data-fixture') || attrOf(el, 'id') || attrOf(el, 'class') || el.__tag;
+  }
+  function mutated(parent, child) {
+    for (var o = 0; o < state.observers.length; o++) {
+      var obs = state.observers[o];
+      for (var t = 0; t < obs.__targets.length; t++) {
+        var target = obs.__targets[t], hit = target.target === parent;
+        if (!hit && target.subtree) {
+          for (var a = parent; a; a = a.__parent) if (a === target.target) { hit = true; break; }
+        }
+        if (hit) { $push(obs.__pending, new g.MutationRecord(parent, [child])); break; }
+      }
+    }
+  }
+
+  g.EventTarget = class EventTarget {
+    addEventListener(type, handler) {
+      if (!this.__listeners) this.__listeners = [];
+      $push(this.__listeners, { type: $String(type), handler: handler });
+    }
+    removeEventListener() {}
+  };
+  g.Node = class Node extends g.EventTarget {
+    constructor() { super(); this.__parent = null; this.childNodes = []; }
+    get nodeType() { return this.__type; }
+    get parentNode() { return this.__parent; }
+    contains(other) {
+      for (var n = other; n; n = n.__parent) if (n === this) return true;
+      return false;
+    }
+    appendChild(child) {
+      child.__parent = this;
+      $push(this.childNodes, child);
+      mutated(this, child);
+      return child;
+    }
+  };
+  g.Text = class Text extends g.Node {
+    constructor(value) { super(); this.__type = 3; this.data = $String(value); }
+  };
+  g.Element = class Element extends g.Node {
+    constructor(tag, attrs) {
+      super();
+      this.__type = 1;
+      this.__tag = tag;
+      this.__attrs = attrs || {};
+      this.__css = {};
+      this.__inline = {};
+      this.__priority = {};
+      this.__rect = null;
+      this.__shadow = null;
+      this.__scrollHeight = 0;
+      this.__clientHeight = 0;
+      this.__clientWidth = 0;
+    }
+    get localName() { return this.__tag; }
+    getAttribute(name) { return attrOf(this, $String(name)); }
+    querySelectorAll(selector) { return qsa(this, selector); }
+    get firstElementChild() {
+      for (var i = 0; i < this.childNodes.length; i++) if (this.childNodes[i].__type === 1) return this.childNodes[i];
+      return null;
+    }
+    get nextElementSibling() {
+      var parent = this.__parent, after = false;
+      if (!parent) return null;
+      for (var i = 0; i < parent.childNodes.length; i++) {
+        var node = parent.childNodes[i];
+        if (after && node.__type === 1) return node;
+        if (node === this) after = true;
+      }
+      return null;
+    }
+    // Como o navegador: sem caixa quando ele ou um antepassado (tambem
+    // pelo anfitriao de uma shadow root) tem `display: none`; sem `rect`
+    // na fixture, uma caixa pequena no topo.
+    getBoundingClientRect() {
+      for (var a = this; a; a = a.__type === 11 ? a.host : a.__parent) {
+        if (a.__type === 1 && computedValue(a, 'display') === 'none') return new g.DOMRect(0, 0, 0, 0);
+      }
+      var r = this.__rect || [0, 0, 100, 20];
+      return new g.DOMRect(r[0], r[1], r[2], r[3]);
+    }
+    get shadowRoot() { return this.__shadow && this.__shadow.__open ? this.__shadow : null; }
+    get scrollHeight() { return this.__scrollHeight; }
+    get clientHeight() { return this.__clientHeight; }
+    get clientWidth() { return this.__clientWidth; }
+  };
+  g.HTMLElement = class HTMLElement extends g.Element {
+    get style() {
+      if (!this.__styleDecl) this.__styleDecl = new g.CSSStyleDeclaration(this, true);
+      return this.__styleDecl;
+    }
+    get innerText() { return text(this); }
+    click() { $push(log.clicks, nameOf(this)); }
+  };
+  g.CSSStyleDeclaration = class CSSStyleDeclaration {
+    constructor(el, inline) { this.__el = el; this.__isInline = inline; }
+    setProperty(name, value, priority) {
+      if (!this.__isInline) throw new Error('estilo computado e so leitura');
+      this.__el.__inline[$String(name)] = $String(value);
+      this.__el.__priority[$String(name)] = $String(priority || '');
+    }
+    getPropertyValue(name) {
+      name = $String(name);
+      if (this.__isInline) return $hasOwn(this.__el.__inline, name) ? this.__el.__inline[name] : '';
+      state.clock += state.styleCost;
+      return computedValue(this.__el, name);
+    }
+    getPropertyPriority(name) {
+      name = $String(name);
+      return this.__isInline && $hasOwn(this.__el.__priority, name) ? this.__el.__priority[name] : '';
+    }
+    removeProperty(name) {
+      if (!this.__isInline) throw new Error('estilo computado e so leitura');
+      name = $String(name);
+      var old = $hasOwn(this.__el.__inline, name) ? this.__el.__inline[name] : '';
+      delete this.__el.__inline[name];
+      delete this.__el.__priority[name];
+      return old;
+    }
+  };
+  g.DocumentFragment = class DocumentFragment extends g.Node {
+    querySelectorAll(selector) { return qsa(this, selector); }
+  };
+  g.ShadowRoot = class ShadowRoot extends g.DocumentFragment {
+    constructor(host, open) { super(); this.__type = 11; this.host = host; this.__open = open; }
+  };
+  g.Document = class Document extends g.Node {
+    constructor() { super(); this.__type = 9; this.__ready = 'loading'; this.__active = null; }
+    get documentElement() {
+      for (var i = 0; i < this.childNodes.length; i++) if (this.childNodes[i].__type === 1) return this.childNodes[i];
+      return null;
+    }
+    get body() {
+      var de = this.documentElement;
+      if (!de) return null;
+      for (var i = 0; i < de.childNodes.length; i++) if (de.childNodes[i].__tag === 'body') return de.childNodes[i];
+      return null;
+    }
+    get readyState() { return this.__ready; }
+    get activeElement() { return this.__active || this.body; }
+    querySelectorAll(selector) { log.docQueries++; return qsa(this, selector); }
+  };
+  g.NodeList = class NodeList {
+    constructor(items) { this.__items = items; }
+    get length() { return this.__items.length; }
+    item(index) { return index < this.__items.length ? this.__items[index] : null; }
+  };
+  g.DOMRectReadOnly = class DOMRectReadOnly {
+    constructor(x, y, w, h) { this.__x = x; this.__y = y; this.__w = w; this.__h = h; }
+    get top() { return this.__y; }
+    get bottom() { return this.__y + this.__h; }
+    get left() { return this.__x; }
+    get right() { return this.__x + this.__w; }
+    get width() { return this.__w; }
+    get height() { return this.__h; }
+  };
+  g.DOMRect = class DOMRect extends g.DOMRectReadOnly {};
+  g.MutationRecord = class MutationRecord {
+    constructor(target, added) { this.__target = target; this.__added = added; }
+    get addedNodes() { return new g.NodeList(this.__added); }
+  };
+  g.MutationObserver = class MutationObserver {
+    constructor(callback) {
+      this.__cb = callback;
+      this.__targets = [];
+      this.__pending = [];
+      $push(state.observers, this);
+    }
+    observe(target, init) {
+      // Como o WebIDL: le cada membro do dicionario, herdado ou nao.
+      void init.attributes;
+      if (!init.childList) throw new TypeError('childList');
+      $push(this.__targets, { target: target, subtree: !!init.subtree });
+    }
+    disconnect() { this.__targets = []; this.__pending = []; }
+  };
+  g.Performance = class Performance { now() { return state.clock; } };
+  g.performance = new g.Performance();
+  g.getComputedStyle = function (el) { return new g.CSSStyleDeclaration(el, false); };
+  g.setTimeout = function (fn, ms) {
+    $push(state.timers, { fn: fn, at: state.clock + (+ms || 0), done: false });
+    return state.timers.length;
+  };
+  g.clearTimeout = function () {};
+  g.window = g;
+  g.top = g;
+  g.document = new g.Document();
+  g.chrome = { webview: { postMessage: function (message) { $push(log.posted, $String(message)); } } };
+  g.fetch = function (url) { $push(log.network, $String(url)); };
+
+  function build(spec) {
+    if (typeof spec === 'string') return new g.Text(spec);
+    var el = new g.HTMLElement(spec.tag, $assign({}, spec.attrs || {}));
+    el.__css = $assign({}, spec.css || {});
+    el.__rect = spec.rect || null;
+    var kids = spec.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var child = build(kids[i]);
+      child.__parent = el;
+      $push(el.childNodes, child);
+    }
+    if (spec.shadow) {
+      var root = new g.ShadowRoot(el, spec.shadow.open !== false);
+      var inner = spec.shadow.children || [];
+      for (var j = 0; j < inner.length; j++) {
+        var node = build(inner[j]);
+        node.__parent = root;
+        $push(root.childNodes, node);
+      }
+      el.__shadow = root;
+    }
+    return el;
+  }
+  function find(node, name) {
+    for (var i = 0; i < node.childNodes.length; i++) {
+      var child = node.childNodes[i];
+      if (child.__type !== 1) continue;
+      if (nameOf(child) === name) return child;
+      var hit = find(child, name);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  g.__mount = function (spec, viewport, scrollHeight) {
+    var html = build(spec);
+    html.__clientWidth = viewport[0];
+    html.__clientHeight = viewport[1];
+    html.__scrollHeight = scrollHeight;
+    html.__parent = g.document;
+    $push(g.document.childNodes, html);
+    var body = g.document.body;
+    if (body) body.__scrollHeight = scrollHeight;
+  };
+  g.__add = function (parent, spec) {
+    var target = parent === 'body' ? g.document.body : find(g.document, parent);
+    target.appendChild(build(spec));
+  };
+  g.__focus = function (name) { g.document.__active = find(g.document, name); };
+  function timed(fn, self, arg) {
+    var before = state.clock;
+    try { $call(fn, self, arg); } catch (e) { $push(log.errors, $String(e && e.message)); }
+    var spent = state.clock - before;
+    if (spent > log.maxSpent) log.maxSpent = spent;
+  }
+  g.__fire = function (type) {
+    var listeners = g.document.__listeners || [];
+    for (var i = 0; i < listeners.length; i++) {
+      if (listeners[i].type === type) timed(listeners[i].handler, g.document, { type: type });
+    }
+  };
+  g.__fireWindow = function (type) {
+    var listeners = g.__listeners || [];
+    for (var i = 0; i < listeners.length; i++) {
+      if (listeners[i].type === type) timed(listeners[i].handler, g, { type: type, isTrusted: true });
+    }
+  };
+  g.__flush = function () {
+    for (var o = 0; o < state.observers.length; o++) {
+      var obs = state.observers[o];
+      if (!obs.__pending.length) continue;
+      var records = obs.__pending;
+      obs.__pending = [];
+      var before = state.clock;
+      timed(obs.__cb, obs, records);
+      if (state.clock - before > log.maxMutation) log.maxMutation = state.clock - before;
+    }
+  };
+  g.__runUntil = function (until) {
+    for (var guard = 0; guard < 20000; guard++) {
+      var next = null;
+      for (var i = 0; i < state.timers.length; i++) {
+        var t = state.timers[i];
+        if (!t.done && t.at <= until && (!next || t.at < next.at)) next = t;
+      }
+      if (!next) break;
+      next.done = true;
+      if (next.at > state.clock) state.clock = next.at;
+      log.timersRun++;
+      timed(next.fn, g, undefined);
+    }
+    if (until > state.clock) state.clock = until;
+  };
+  g.__collect = function () {
+    var hidden = [];
+    var walk = function (node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.__type !== 1) continue;
+        if ($hasOwn(child.__inline, 'display') && child.__inline.display === 'none') {
+          $push(hidden, nameOf(child));
+        }
+        walk(child);
+        if (child.__shadow) walk(child.__shadow);
+      }
+    };
+    walk(g.document);
+    var de = g.document.documentElement, body = g.document.body, observing = 0;
+    for (var o = 0; o < state.observers.length; o++) observing += state.observers[o].__targets.length;
+    var overflow = function (el) {
+      return el && $hasOwn(el.__inline, 'overflow-y') ? el.__inline['overflow-y'] : null;
+    };
+    return $stringify({
+      clicks: log.clicks, pageClicks: log.pageClicks, posted: log.posted, errors: log.errors,
+      network: log.network, hidden: hidden, timersRun: log.timersRun, maxSpent: log.maxSpent,
+      maxMutation: log.maxMutation, docQueries: log.docQueries,
+      listeners: (g.document.__listeners || []).length + (g.__listeners || []).length,
+      observers: state.observers.length, observing: observing,
+      htmlOverflow: overflow(de), bodyOverflow: overflow(body)
+    });
+  };
+}
+// A pagina, depois do script (que ja capturou o que usa): troca cada
+// primitiva que ele usa por uma que mente, conta ou rebenta.
+function POISON() {
+  var g = globalThis;
+  var push = g.__push;
+  var empty = function () { return new g.NodeList([]); };
+  var boom = function () { throw new Error('envenenado'); };
+  g.Document.prototype.querySelectorAll = empty;
+  g.document.querySelectorAll = empty;
+  g.Element.prototype.querySelectorAll = empty;
+  g.DocumentFragment.prototype.querySelectorAll = empty;
+  g.HTMLElement.prototype.click = function () { push(g.__log.pageClicks, 'pagina'); };
+  Object.defineProperty(g.HTMLElement.prototype, 'innerText', { configurable: true, get: function () { return 'Aceitar todos'; } });
+  Object.defineProperty(g.HTMLElement.prototype, 'style', { configurable: true, get: function () { return { setProperty: function () {} }; } });
+  Object.defineProperty(g.NodeList.prototype, 'length', { configurable: true, get: function () { return 0; } });
+  g.NodeList.prototype.item = function () { return null; };
+  g.Element.prototype.getAttribute = function () { return 'aceitar'; };
+  Object.defineProperty(g.Element.prototype, 'shadowRoot', { configurable: true, get: function () { return null; } });
+  Object.defineProperty(g.Element.prototype, 'clientHeight', { configurable: true, get: function () { return 0; } });
+  Object.defineProperty(g.Node.prototype, 'parentNode', { configurable: true, get: function () { return null; } });
+  Object.defineProperty(g.Element.prototype, 'firstElementChild', { configurable: true, get: function () { return null; } });
+  Object.defineProperty(g.Element.prototype, 'nextElementSibling', { configurable: true, get: boom });
+  ['top', 'bottom', 'left', 'right', 'width', 'height'].forEach(function (name) {
+    Object.defineProperty(g.DOMRectReadOnly.prototype, name, { configurable: true, get: function () { return 0; } });
+  });
+  g.CSSStyleDeclaration.prototype.setProperty = function () {};
+  g.CSSStyleDeclaration.prototype.getPropertyValue = function () { return 'static'; };
+  g.CSSStyleDeclaration.prototype.getPropertyPriority = boom;
+  g.CSSStyleDeclaration.prototype.removeProperty = boom;
+  g.getComputedStyle = boom;
+  g.Node.prototype.contains = function () { return true; };
+  Object.defineProperty(g.MutationRecord.prototype, 'addedNodes', { configurable: true, get: empty });
+  g.MutationObserver = function () { throw new Error('envenenado'); };
+  g.setTimeout = boom;
+  g.Performance.prototype.now = function () { return 1e15; };
+  WeakSet.prototype.has = function () { return true; };
+  WeakSet.prototype.add = boom;
+  String.prototype.toLowerCase = function () { return 'aceitar todos'; };
+  String.prototype.toUpperCase = function () { return 'aceitar todos'; };
+  String.prototype.indexOf = function () { return 0; };
+  String.prototype.slice = function () { return ''; };
+  Object.getOwnPropertyDescriptor = boom;
+  Object.create = boom;
+  Object.defineProperty(Object.prototype, 'attributes', { configurable: true, get: boom });
+  ['onetrust', 'cookiebot', 'didomi', 'n'].forEach(function (name) {
+    Object.defineProperty(Object.prototype, name, { configurable: true, get: function () { return undefined; }, set: boom });
+  });
+  Array.prototype.push = boom;
+  Function.prototype.call = boom;
+  Function.prototype.apply = boom;
+  Function.prototype.bind = boom;
+}
+const results = [];
+for (const c of INPUT.cases) {
+  const context = vm.createContext({ URLSearchParams });
+  vm.runInContext('(' + MOCK.toString() + ')();', context);
+  const url = new URL(c.href);
+  context.__loc = { href: c.href, protocol: url.protocol, hostname: url.hostname, search: url.search };
+  vm.runInContext('location = __loc;', context);
+  if (c.child) vm.runInContext('top = {};', context);
+  context.__state.styleCost = c.styleCost || 0;
+  context.__state.qsaCost = c.qsaCost || 0;
+  const errors = [];
+  try {
+    vm.runInContext(c.script, context, { filename: 'distraction.js' });
+  } catch (e) {
+    errors.push('script: ' + e.message);
+  }
+  context.__spec = c.page;
+  context.__viewport = c.viewport || [1200, 800];
+  context.__scroll = c.scrollHeight === undefined ? 5000 : c.scrollHeight;
+  vm.runInContext('__mount(__spec, __viewport, __scroll); document.__ready = "interactive";', context);
+  if (c.focus) { context.__name = c.focus; vm.runInContext('__focus(__name)', context); }
+  if (c.poison) vm.runInContext('(' + POISON.toString() + ')();', context);
+  vm.runInContext('__fire("DOMContentLoaded"); __runUntil(__state.clock + 1000);', context);
+  for (const step of c.steps || []) {
+    if (step.add) {
+      context.__parent = step.add[0];
+      context.__node = step.add[1];
+      vm.runInContext('__add(__parent, __node); __flush(); __runUntil(__state.clock + 1000);', context);
+    } else if (step.advance) {
+      context.__ms = step.advance;
+      vm.runInContext('__runUntil(__state.clock + __ms);', context);
+    } else if (step.burst) {
+      // Uma pagina que nao para: `count` elementos pequenos, um a cada `every` ms.
+      context.__parent = step.burst[0];
+      context.__ms = step.burst[2];
+      for (let b = 0; b < step.burst[1]; b++) {
+        context.__node = { tag: 'span', children: ['x'] };
+        vm.runInContext('__add(__parent, __node); __flush(); __runUntil(__state.clock + __ms);', context);
+      }
+    } else if (step.input) {
+      context.__type = step.input;
+      vm.runInContext('__fireWindow(__type);', context);
+    }
+  }
+  const out = JSON.parse(vm.runInContext('__collect()', context));
+  out.name = c.name;
+  out.errors = errors.concat(out.errors);
+  results.push(out);
+}
+process.stdout.write(JSON.stringify(results));
+"###;
+
+    /// Corre os casos (`{name, href, script, page, ...}`) e devolve o que
+    /// cada um viu, pela ordem.
+    fn run_distraction(cases: &[Value]) -> Vec<Value> {
+        let program = format!(
+            "const INPUT = {};\n{DISTRACTION_HARNESS}",
+            json!({ "cases": cases })
+        );
+        let results: Vec<Value> =
+            serde_json::from_str(&run_node_program(&program)).expect("JSON do harness");
+        assert_eq!(results.len(), cases.len());
+        results
+    }
+
+    fn strings(value: &Value) -> Vec<String> {
+        value
+            .as_array()
+            .unwrap_or_else(|| panic!("lista: {value}"))
+            .iter()
+            .map(|item| item.as_str().expect("texto").to_string())
+            .collect()
+    }
+
+    /// Uma pagina com um artigo e, no fim do corpo, `extra`.
+    fn page(extra: Vec<Value>) -> Value {
+        page_with(json!({}), json!({}), extra)
+    }
+
+    /// `page`, com o `css` do `<html>` e do `<body>`.
+    fn page_with(html_css: Value, body_css: Value, extra: Vec<Value>) -> Value {
+        let mut children = vec![json!({ "tag": "main", "children": [
+            { "tag": "p", "children": ["Texto do artigo, que o leitor veio ler."] }
+        ] })];
+        children.extend(extra);
+        json!({ "tag": "html", "css": html_css, "children": [
+            { "tag": "head", "children": [] },
+            { "tag": "body", "css": body_css, "children": children }
+        ] })
+    }
+
+    fn button(attrs: Value, label: &str) -> Value {
+        json!({ "tag": "button", "attrs": attrs, "children": [label] })
+    }
+
+    fn case(name: &str, href: &str, script: &str, page: Value) -> Value {
+        json!({ "name": name, "href": href, "script": script, "page": page })
+    }
+
+    const NEWS: &str = "https://news.example.com/artigo";
+
+    /// Uma fixture por linha de `CMP_RULES`: o aviso como o CMP o poe no
+    /// DOM, com o botao de recusa (`data-fixture=reject`, texto `reject`), o
+    /// de aceitar (`accept`) e o que se esconde (`banner`), e a pagina onde
+    /// ele aparece (o consent.google.com e a propria pagina do aviso).
+    fn cmp_fixture(rule: &str, reject: &str) -> Option<(&'static str, Vec<Value>)> {
+        Some(match rule {
+            "onetrust" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "onetrust-consent-sdk" }, "children": [
+                { "tag": "div", "attrs": { "id": "onetrust-banner-sdk", "data-fixture": "banner" },
+                  "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                    { "tag": "p", "children": ["Usamos cookies para melhorar a sua experiência."] },
+                    button(json!({ "id": "onetrust-accept-btn-handler", "data-fixture": "accept" }), "Aceitar todos os cookies"),
+                    button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), reject)
+                ] },
+                { "tag": "div", "attrs": { "class": "onetrust-pc-dark-filter", "data-fixture": "backdrop" },
+                  "css": { "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800] }
+            ] }),
+                ],
+            ),
+            "cookiebot" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "CybotCookiebotDialog", "data-fixture": "banner" },
+                "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                    button(json!({ "id": "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "data-fixture": "accept" }), "Permitir todos"),
+                    button(json!({ "id": "CybotCookiebotDialogBodyButtonDecline", "data-fixture": "reject" }), reject)
+                ] }),
+                ],
+            ),
+            "didomi" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "didomi-host" }, "children": [
+                { "tag": "div", "attrs": { "id": "didomi-notice", "data-fixture": "banner" }, "css": { "position": "fixed" }, "rect": [0, 700, 1200, 100], "children": [
+                    button(json!({ "id": "didomi-notice-agree-button", "data-fixture": "accept" }), "Concordar e fechar"),
+                    button(json!({ "id": "didomi-notice-disagree-button", "data-fixture": "reject" }), reject)
+                ] }
+            ] }),
+                ],
+            ),
+            "usercentrics" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "usercentrics-root" },
+                "shadow": { "open": true, "children": [
+                    { "tag": "div", "attrs": { "class": "sc-dialog" }, "children": [
+                        button(json!({ "data-testid": "uc-accept-all-button", "data-fixture": "accept" }), "Aceitar todos"),
+                        button(json!({ "data-testid": "uc-deny-all-button", "data-fixture": "reject" }), reject)
+                    ] }
+                ] } }),
+                ],
+            ),
+            "quantcast" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "qc-cmp2-container", "class": "qc-cmp2-container", "data-fixture": "banner" }, "children": [
+                { "tag": "div", "attrs": { "id": "qc-cmp2-ui" }, "children": [
+                    { "tag": "div", "attrs": { "class": "qc-cmp2-summary-buttons" }, "children": [
+                        button(json!({ "mode": "secondary", "data-fixture": "reject" }), reject),
+                        button(json!({ "mode": "primary", "data-fixture": "accept" }), "ACEITO")
+                    ] }
+                ] }
+            ] }),
+                ],
+            ),
+            "cookieyes" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "cky-consent-container", "data-fixture": "banner" },
+                    "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                        button(json!({ "class": "cky-btn cky-btn-accept", "data-fixture": "accept" }), "Aceitar tudo"),
+                        button(json!({ "class": "cky-btn cky-btn-reject", "data-fixture": "reject" }), reject)
+                    ] }),
+                    json!({ "tag": "div", "attrs": { "class": "cky-overlay", "data-fixture": "banner" } }),
+                ],
+            ),
+            "complianz" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "cmplz-cookiebanner-container", "data-fixture": "banner" }, "children": [
+                { "tag": "div", "attrs": { "class": "cmplz-cookiebanner", "data-fixture": "banner" }, "children": [
+                    button(json!({ "class": "cmplz-btn cmplz-accept", "data-fixture": "accept" }), "Aceitar"),
+                    button(json!({ "class": "cmplz-btn cmplz-deny", "data-fixture": "reject" }), reject)
+                ] }
+            ] }),
+                ],
+            ),
+            "iubenda" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "iubenda-cs-banner", "data-fixture": "banner" }, "children": [
+                button(json!({ "class": "iubenda-cs-accept-btn", "data-fixture": "accept" }), "Accetta"),
+                button(json!({ "class": "iubenda-cs-reject-btn", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "osano" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "osano-cm-window", "data-fixture": "banner" }, "children": [
+                button(json!({ "class": "osano-cm-accept-all osano-cm-button", "data-fixture": "accept" }), "Accept all"),
+                button(json!({ "class": "osano-cm-denyAll osano-cm-button", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "axeptio" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "axeptio_overlay", "data-fixture": "banner" }, "children": [
+                button(json!({ "id": "axeptio_btn_acceptAll", "data-fixture": "accept" }), "OK pour moi"),
+                button(json!({ "id": "axeptio_btn_dismiss", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "termly" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "termly-code-snippet-support", "data-fixture": "banner" }, "children": [
+                button(json!({ "data-tid": "banner-accept", "data-fixture": "accept" }), "Accept"),
+                button(json!({ "data-tid": "banner-decline", "data-fixture": "reject" }), reject)
+            ] }),
+                ],
+            ),
+            "google-consent" => (
+                "https://consent.google.com/ml?continue=https://www.google.com/",
+                vec![
+                    json!({ "tag": "form", "attrs": { "action": "https://consent.google.com/save", "method": "POST" }, "children": [
+                    { "tag": "input", "attrs": { "type": "hidden", "name": "set_eom", "value": "true" } },
+                    button(json!({ "data-fixture": "reject" }), reject)
+                ] }),
+                    json!({ "tag": "form", "attrs": { "action": "https://consent.google.com/save", "method": "POST" }, "children": [
+                    { "tag": "input", "attrs": { "type": "hidden", "name": "set_eom", "value": "false" } },
+                    button(json!({ "data-fixture": "accept" }), "Aceitar tudo")
+                ] }),
+                ],
+            ),
+            "sourcepoint" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "id": "sp_message_container_1234", "data-fixture": "banner" },
+                "css": { "position": "fixed", "z-index": "2147483647" }, "rect": [0, 650, 1200, 150], "children": [
+                    { "tag": "iframe", "attrs": { "id": "sp_message_iframe_1234", "src": "https://cdn.privacy-mgmt.com/index.html" } }
+                ] }),
+                ],
+            ),
+            "trustarc" => (
+                NEWS,
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "truste_box_overlay", "data-fixture": "banner" }, "children": [
+                    { "tag": "iframe", "attrs": { "src": "https://consent-pref.trustarc.com/?type=x" } }
+                ] }),
+                    json!({ "tag": "div", "attrs": { "class": "truste_overlay", "data-fixture": "banner" } }),
+                ],
+            ),
+            _ => return None,
+        })
+    }
+
+    /// Quantos elementos a fixture marca como `banner`.
+    fn banner_count(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                let own = usize::from(
+                    map.get("attrs").and_then(|attrs| attrs.get("data-fixture"))
+                        == Some(&json!("banner")),
+                );
+                own + map.values().map(banner_count).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(banner_count).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Os `data-fixture` da fixture que estao em `wanted`, pela ordem do
+    /// documento (a do `__collect`: o elemento, os filhos, a shadow root).
+    fn fixture_names(value: &Value, wanted: &[&str], out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(name) = map
+                    .get("attrs")
+                    .and_then(|attrs| attrs.get("data-fixture"))
+                    .and_then(Value::as_str)
+                    .filter(|name| wanted.contains(name))
+                {
+                    out.push(name.to_string());
+                }
+                if let Some(children) = map.get("children") {
+                    fixture_names(children, wanted, out);
+                }
+                if let Some(shadow) = map.get("shadow") {
+                    fixture_names(shadow, wanted, out);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    fixture_names(item, wanted, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Gate (critico, script injetado; anti-distracao): o script que
+    /// embarca, com a fixture de cada linha de `CMP_RULES`, clica SO na
+    /// recusa e so quando o texto dela e de recusa (pt, en, es, fr, de,
+    /// it). Com «Aceitar todos», «Concordo» ou «Rejeitar e aceitar» no
+    /// botao de recusa -- e com os aceitar de cada lingua -- nenhum clique:
+    /// o aviso so e escondido. O botao de aceitar nunca e clicado; as
+    /// molduras de outra origem nunca; o consent.google.com nunca e
+    /// escondido. Cada linha tem a sua fixture.
+    ///
+    /// Sabotagem: tirar o `!hasAccept(padded)` do `safeReject` ->
+    /// «Rejeitar e aceitar» e clicado -> vermelho.
+    #[test]
+    fn distraction_never_clicks_accept() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let labels: [(&str, bool); 16] = [
+            ("Rejeitar tudo", true),
+            ("Aceitar todos", false),
+            ("Concordo", false),
+            ("Rejeitar e aceitar", false),
+            ("Só necessários", true),
+            ("Reject all", true),
+            ("Rechazar todo", true),
+            ("Tout refuser", true),
+            ("Alle ablehnen", true),
+            ("Rifiuta tutto", true),
+            ("Accept all", false),
+            ("Continuar sem aceitar", false),
+            ("J'accepte", false),
+            ("Alle akzeptieren", false),
+            ("Rechazar y aceptar", false),
+            ("OK", false),
+        ];
+        let mut cases = Vec::new();
+        let mut expected = Vec::new();
+        for rule in CMP_RULES {
+            for (label, clicks) in labels {
+                let (href, body) = cmp_fixture(rule.id, label)
+                    .unwrap_or_else(|| panic!("a regra {} nao tem fixture", rule.id));
+                let banners = banner_count(&json!(body));
+                assert_eq!(
+                    rule.banner.is_some(),
+                    banners > 0,
+                    "{}: a fixture e a regra discordam do que se esconde",
+                    rule.id
+                );
+                // O aviso e, ao lado dele, o fundo vazio (o do OneTrust).
+                let mut hides = Vec::new();
+                fixture_names(&json!(body), &["banner", "backdrop"], &mut hides);
+                cases.push(case(
+                    &format!("{} / {label}", rule.id),
+                    href,
+                    &script,
+                    page(body),
+                ));
+                let clicks = clicks && rule.reject.is_some() && !rule.frame_only;
+                expected.push((clicks, hides));
+            }
+        }
+        let results = run_distraction(&cases);
+        for (result, (clicks, hides)) in results.iter().zip(expected) {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(
+                strings(&result["clicks"]),
+                if clicks {
+                    vec!["reject".to_string()]
+                } else {
+                    vec![]
+                },
+                "{name}"
+            );
+            assert_eq!(
+                strings(&result["hidden"]),
+                hides,
+                "{name}: o que se escondeu"
+            );
+            assert_eq!(strings(&result["posted"]), Vec::<String>::new(), "{name}");
+        }
+    }
+
+    /// Os enderecos da decisao por pagina: cada regra do registo dos
+    /// provedores, cada login, as nossas origens, os parecidos e os sites
+    /// normais.
+    fn decision_urls() -> Vec<String> {
+        let mut urls = Vec::new();
+        for provider in ProviderId::all() {
+            for rule in provider.hosts() {
+                let with_udm = |host: &str| {
+                    if rule.require_udm50 {
+                        format!("https://{host}/search?q=x&udm=50")
+                    } else {
+                        format!("https://{host}/")
+                    }
+                };
+                urls.push(with_udm(rule.host));
+                if rule.subdomains {
+                    urls.push(with_udm(&format!("chat.{}", rule.host)));
+                }
+            }
+        }
+        for host in login_hosts() {
+            urls.push(format!("https://{host}/signin"));
+        }
+        for url in [
+            "https://chatgpt.com./c/1",
+            "https://CLAUDE.AI/new",
+            "https://chatgpt.com.evil.io/",
+            "https://evilclaude.ai/",
+            "https://www.google.com/search?q=x",
+            "https://www.google.com/search?udm=14&udm=50",
+            "https://consent.google.com/ml",
+            "https://news.example.com/a",
+            "https://www.example.com/",
+            "http://example.org/x",
+            "http://neuralia-pdf.localhost/viewer.html",
+            "http://neuralia-epub.localhost/library.html",
+            "http://localhost:8080/",
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://192.168.0.10/",
+            "http://intranet/",
+            "file:///C:/x.html",
+        ] {
+            urls.push(url.to_string());
+        }
+        urls
+    }
+
+    /// Gate (critico, script injetado): nunca nas paginas das IAs. O script
+    /// que embarca, em cada endereco de `decision_urls` com o aviso do
+    /// OneTrust, age exatamente quando `distraction_config` diz que sim:
+    /// nas IAs (cada regra do registo), nos logins e nas nossas origens nao
+    /// regista nada (nem ouvinte nem observador), e nos parecidos age.
+    ///
+    /// Sabotagem: tirar o ciclo `C.never` do script -> as IAs recebem o
+    /// clique -> vermelho.
+    #[test]
+    fn distraction_leaves_ai_provider_pages_untouched() {
+        let policy = DistractionPolicy::default();
+        let script = distraction_script(&policy);
+        let (_, body) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        let urls = decision_urls();
+        let cases: Vec<Value> = urls
+            .iter()
+            .map(|url| case(url, url, &script, page(body.clone())))
+            .collect();
+        let results = run_distraction(&cases);
+        let mut acted_on = 0;
+        for (url, result) in urls.iter().zip(&results) {
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{url}");
+            let expected = Url::parse(url)
+                .ok()
+                .and_then(|parsed| distraction_config(&parsed, &policy, DistractionSurface::Web))
+                .is_some();
+            let acted = result["listeners"].as_u64() != Some(0)
+                || !strings(&result["clicks"]).is_empty()
+                || !strings(&result["hidden"]).is_empty();
+            assert_eq!(acted, expected, "{url}: o script e o nucleo discordam");
+            if expected {
+                acted_on += 1;
+                assert_eq!(strings(&result["clicks"]), ["reject"], "{url}");
+            } else {
+                assert_eq!(result["observers"], 0, "{url}");
+            }
+        }
+        // O controlo: os parecidos e os sites normais recebem o script.
+        assert!(acted_on >= 7, "{acted_on}");
+    }
+
+    /// Um aviso de cookies generico (fixo, `cookie` na classe), no fundo.
+    fn cookie_bar() -> Value {
+        json!({ "tag": "div", "attrs": { "class": "cookie-bar", "data-fixture": "cookie" },
+            "css": { "position": "fixed" }, "rect": [0, 740, 1200, 60], "children": ["Usamos cookies."] })
+    }
+
+    /// Uma moldura do Sourcepoint que tapa a janela: o "pague ou aceite"
+    /// (pur abo, contentpass) vive dentro dela, onde o script nao le.
+    fn sourcepoint_wall() -> Value {
+        json!({ "tag": "div", "attrs": { "id": "sp_message_container_999", "data-fixture": "sp-wall" },
+            "css": { "position": "fixed", "z-index": "2147483647" }, "rect": [0, 0, 1200, 800], "children": [
+                { "tag": "iframe", "attrs": { "id": "sp_message_iframe_999", "src": "https://cdn.privacy-mgmt.com/index.html" } }
+            ] })
+    }
+
+    /// Gate (critico, script injetado): um paywall fica intocado, e com um
+    /// na pagina a rolagem e os fundos ficam como a pagina os pos.
+    ///
+    /// Intocados (nada escondido, nada clicado, a rolagem presa fica presa):
+    /// um modal do Piano que tambem fala de newsletter, uma barra de paywall
+    /// com 30% da altura, um aviso de CMP com um marcador de "pague ou
+    /// aceite" (contentpass), as molduras do Sourcepoint e do TrustArc que
+    /// tapam a janela, presa ou nao (o "pague ou aceite" esta dentro delas,
+    /// onde o script nao le -- F1), e a pequena numa pagina presa.
+    ///
+    /// Com o aviso de cookies escondido ao lado de um paywall (F2): um
+    /// paywall so pelo texto («Assine para continuar»), um `PaywallModal`
+    /// (maiusculas), o fundo sem marcador de um paywall do Piano, e a
+    /// moldura do Sourcepoint com uma newsletter: sai so o aviso (ou a
+    /// newsletter), o paywall e o fundo ficam, e a rolagem nunca volta. Um
+    /// paywall que chega DEPOIS de a rolagem ter voltado desfaz a volta.
+    ///
+    /// O controlo: o mesmo modal sem o marcador (newsletter) sai, com o
+    /// fundo, e a rolagem volta.
+    ///
+    /// Sabotagens: o `hasMarker(..., C.paywall)` a devolver sempre `false`;
+    /// a `frameOnly` a esconder tambem a moldura que tapa; o `walled = true`
+    /// do `examine` retirado -> vermelho.
+    #[test]
+    fn paywall_overlays_are_never_touched() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let locked = json!({ "overflow": "hidden" });
+        let backdrop = json!({ "tag": "div", "attrs": { "data-fixture": "backdrop" },
+            "css": { "position": "fixed", "z-index": "90" }, "rect": [0, 0, 1200, 800] });
+        let piano = json!({ "tag": "div", "attrs": { "class": "tp-modal", "role": "dialog", "data-fixture": "paywall" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Assine para continuar lendo. Receba também a nossa newsletter."
+            ] });
+        let bar = json!({ "tag": "div", "attrs": { "class": "paywall-bar", "data-fixture": "paywall" },
+            "css": { "position": "fixed" }, "rect": [0, 560, 1200, 240], "children": ["Leia sem limites"] });
+        let pay_or_ok = json!({ "tag": "div", "attrs": { "id": "onetrust-consent-sdk" }, "children": [
+            { "tag": "div", "attrs": { "id": "onetrust-banner-sdk", "class": "contentpass-layer", "data-fixture": "paywall" },
+              "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), "Rejeitar tudo")
+            ] }
+        ] });
+        let trustarc_wall = json!({ "tag": "div", "attrs": { "class": "truste_box_overlay", "data-fixture": "ta-wall" },
+            "css": { "position": "fixed", "z-index": "1000" }, "rect": [0, 0, 1200, 800], "children": [
+                { "tag": "iframe", "attrs": { "src": "https://consent-pref.trustarc.com/?type=x" } }
+            ] });
+        let newsletter = || {
+            json!({ "tag": "div", "attrs": { "class": "newsletter-modal", "role": "dialog", "data-fixture": "newsletter" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Receba a nossa newsletter toda semana."
+            ] })
+        };
+        let text_sheet = json!({ "tag": "div", "attrs": { "data-fixture": "paywall" },
+            "css": { "position": "fixed", "z-index": "50" }, "rect": [0, 400, 1200, 400], "children": [
+                "Assine para continuar lendo esta matéria."
+            ] });
+        let camel = json!({ "tag": "div", "attrs": { "class": "PaywallModal", "role": "dialog", "data-fixture": "paywall" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Leia sem limites por R$ 1,90."
+            ] });
+        let untouched = [
+            case(
+                "piano",
+                NEWS,
+                &script,
+                page_with(
+                    json!({}),
+                    locked.clone(),
+                    vec![piano.clone(), backdrop.clone()],
+                ),
+            ),
+            case(
+                "barra",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![bar]),
+            ),
+            case(
+                "pague ou aceite",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![pay_or_ok]),
+            ),
+            case(
+                "sourcepoint pague ou aceite",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![sourcepoint_wall()]),
+            ),
+            case(
+                "trustarc que tapa",
+                NEWS,
+                &script,
+                page_with(json!({}), locked.clone(), vec![trustarc_wall]),
+            ),
+            // A que tapa sem prender a rolagem tambem fica: o tamanho basta.
+            case(
+                "sourcepoint que tapa sem prender",
+                NEWS,
+                &script,
+                page(vec![sourcepoint_wall()]),
+            ),
+            // A pequena numa pagina presa fica (escondida, nao havia saida).
+            case(
+                "sourcepoint pequena numa pagina presa",
+                NEWS,
+                &script,
+                page_with(
+                    json!({}),
+                    locked.clone(),
+                    cmp_fixture("sourcepoint", "x").expect("sourcepoint").1,
+                ),
+            ),
+        ];
+        // O aviso sai; o paywall, o fundo dele e a rolagem presa ficam.
+        let beside = [
+            (
+                case(
+                    "paywall pelo texto",
+                    NEWS,
+                    &script,
+                    page_with(json!({}), locked.clone(), vec![text_sheet, cookie_bar()]),
+                ),
+                vec!["cookie"],
+            ),
+            (
+                case(
+                    "PaywallModal",
+                    NEWS,
+                    &script,
+                    page_with(json!({}), locked.clone(), vec![camel, cookie_bar()]),
+                ),
+                vec!["cookie"],
+            ),
+            (
+                case(
+                    "fundo do paywall",
+                    NEWS,
+                    &script,
+                    page_with(
+                        json!({}),
+                        locked.clone(),
+                        vec![piano, backdrop.clone(), cookie_bar()],
+                    ),
+                ),
+                vec!["cookie"],
+            ),
+            (
+                case(
+                    "sourcepoint e newsletter",
+                    NEWS,
+                    &script,
+                    page_with(
+                        json!({}),
+                        locked.clone(),
+                        vec![sourcepoint_wall(), newsletter(), backdrop.clone()],
+                    ),
+                ),
+                vec!["newsletter"],
+            ),
+        ];
+        let mut late = case(
+            "paywall tardio",
+            NEWS,
+            &script,
+            page_with(json!({}), locked.clone(), vec![cookie_bar()]),
+        );
+        late["steps"] = json!([
+            { "advance": 2000 },
+            { "add": ["body", { "tag": "div", "attrs": { "class": "paywall-modal", "role": "dialog", "data-fixture": "paywall" },
+                "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400],
+                "children": ["Leia sem limites"] }] }
+        ]);
+        let mut restored_before = late.clone();
+        restored_before["steps"] = json!([{ "advance": 2000 }]);
+        // Um molde de paywall escondido no documento (de quem ja assina):
+        // a newsletter e o fundo dela saem, mas a rolagem fica presa.
+        let template = case(
+            "molde escondido",
+            NEWS,
+            &script,
+            page_with(
+                json!({}),
+                locked.clone(),
+                vec![
+                    json!({ "tag": "div", "attrs": { "class": "paywall-template" }, "css": { "display": "none" },
+                        "children": ["Assine para continuar"] }),
+                    newsletter(),
+                    backdrop.clone(),
+                ],
+            ),
+        );
+        let control = case(
+            "newsletter",
+            NEWS,
+            &script,
+            page_with(json!({}), locked, vec![newsletter(), backdrop]),
+        );
+
+        let mut cases: Vec<Value> = untouched.to_vec();
+        cases.extend(beside.iter().map(|(case, _)| case.clone()));
+        cases.extend([late, restored_before, template, control]);
+        let results = run_distraction(&cases);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{name}");
+        }
+        let (untouched_results, rest) = results.split_at(untouched.len());
+        for result in untouched_results {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(
+                strings(&result["hidden"]),
+                Vec::<String>::new(),
+                "{name}: tocou no paywall: {result}"
+            );
+            assert_eq!(
+                result["bodyOverflow"],
+                Value::Null,
+                "{name}: devolveu a rolagem"
+            );
+        }
+        let (beside_results, rest) = rest.split_at(beside.len());
+        for (result, (_, hidden)) in beside_results.iter().zip(&beside) {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(
+                strings(&result["hidden"]),
+                *hidden,
+                "{name}: o paywall ou o fundo dele saiu: {result}"
+            );
+            assert_eq!(
+                result["bodyOverflow"],
+                Value::Null,
+                "{name}: devolveu a rolagem com um paywall na pagina: {result}"
+            );
+        }
+        let (late, restored_before, template, control) = (&rest[0], &rest[1], &rest[2], &rest[3]);
+        assert_eq!(
+            strings(&template["hidden"]),
+            ["newsletter", "backdrop"],
+            "{template}"
+        );
+        assert_eq!(template["bodyOverflow"], Value::Null, "{template}");
+        assert_eq!(strings(&late["hidden"]), ["cookie"], "{late}");
+        assert_eq!(
+            late["bodyOverflow"],
+            Value::Null,
+            "a rolagem devolvida antes do paywall ficou: {late}"
+        );
+        assert_eq!(
+            restored_before["bodyOverflow"], "auto",
+            "o controlo do paywall tardio: {restored_before}"
+        );
+        assert_eq!(
+            strings(&control["hidden"]),
+            ["newsletter", "backdrop"],
+            "{control}"
+        );
+        assert_eq!(control["bodyOverflow"], "auto", "{control}");
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "neuralia-distraction-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("pasta temporaria");
+        dir
+    }
+
+    /// Gate (critico, dados do utilizador + script injetado): desligar um
+    /// site pelo caminho que embarca (`AdblockState::set_distraction_site`,
+    /// a loja `Setting` pelo grant) grava `sites[host] = false`;
+    /// `distraction_config` da `None` nesse site; o script ligado de novo
+    /// com a politica publicada (o `fill_distraction_script` que o
+    /// `distraction_rebind` usa) nao regista nada nesse host -- nem
+    /// ouvinte, nem observador, nem um clique -- e continua a agir nos
+    /// outros. A ligacao nova tira a anterior, mesmo a que ainda estava a
+    /// registar.
+    ///
+    /// Sabotagem: o script a ignorar `C.sites` -> vermelho.
+    #[test]
+    fn per_site_toggle_off_injects_nothing() {
+        let dir = temp_dir("toggle");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        let mut state = AdblockState::load(registry.grant(ADBLOCK_SETTINGS_STORE).ok());
+        assert_eq!(
+            state.set_distraction_site("www.example.com", false, false),
+            DistractionToggle::Saved
+        );
+        let saved =
+            std::fs::read_to_string(dir.join(ADBLOCK_SETTINGS_STORE.name)).expect("gravado");
+        assert!(saved.contains("\"example.com\": false"), "{saved}");
+        let reloaded = AdblockState::load(registry.grant(ADBLOCK_SETTINGS_STORE).ok());
+        assert_eq!(reloaded.distraction_policy(), state.distraction_policy());
+        let policy = state.distraction.policy_for(WebViewHost::External);
+        for url in ["https://example.com/", "https://www.example.com/a"] {
+            assert_eq!(
+                distraction_config(
+                    &Url::parse(url).expect("url"),
+                    &policy,
+                    DistractionSurface::Web
+                ),
+                None,
+                "{url}"
+            );
+        }
+        let rebound = fill_distraction_script(NEURALIA_DISTRACTION_SCRIPT, &policy);
+        let (_, body) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        let results = run_distraction(&[
+            case(
+                "desligado",
+                "https://www.example.com/a",
+                &rebound,
+                page(body.clone()),
+            ),
+            case(
+                "outro site",
+                "https://news.example.org/",
+                &rebound,
+                page(body),
+            ),
+        ]);
+        let off = &results[0];
+        assert_eq!(off["listeners"], 0, "{off}");
+        assert_eq!(off["observers"], 0, "{off}");
+        assert_eq!(strings(&off["clicks"]), Vec::<String>::new(), "{off}");
+        assert_eq!(strings(&off["hidden"]), Vec::<String>::new(), "{off}");
+        assert_eq!(strings(&results[1]["clicks"]), ["reject"], "{}", results[1]);
+
+        // Ligar de novo tira a escolha propria.
+        assert_eq!(
+            state.set_distraction_site("example.com", true, false),
+            DistractionToggle::Saved
+        );
+        assert!(state.distraction_policy().sites.is_empty());
+        assert_eq!(
+            state.set_distraction_site("example.com", true, false),
+            DistractionToggle::Unchanged
+        );
+        assert_eq!(
+            state.set_distraction_site("127.0.0.1", false, false),
+            DistractionToggle::Refused
+        );
+
+        // A ligacao: a nova tira a anterior; um registo que acaba depois de
+        // outro ter sido pedido sai logo.
+        let slot = DistractionSlot::default();
+        let (first, previous) = slot.begin();
+        assert_eq!(previous, None);
+        assert_eq!(slot.complete(first, "id-1".into()), SlotCompletion::Keep);
+        let (second, previous) = slot.begin();
+        assert_eq!(
+            previous.as_deref(),
+            Some("id-1"),
+            "a ligacao anterior tem de sair"
+        );
+        let (third, previous) = slot.begin();
+        assert_eq!(previous, None, "a segunda ainda nao acabou");
+        assert_eq!(
+            slot.complete(second, "id-2".into()),
+            SlotCompletion::Remove("id-2".into()),
+            "um script de uma politica velha nunca fica"
+        );
+        assert_eq!(slot.complete(third, "id-3".into()), SlotCompletion::Keep);
+        assert_eq!(slot.bound_id().as_deref(), Some("id-3"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (critico, modo privado + dados do utilizador): uma escolha feita
+    /// no Split privado vale so la e so em memoria -- o
+    /// `adblock-settings.json` nao nasce nem muda. A escolha normal grava;
+    /// as privadas seguintes deixam o ficheiro byte a byte igual.
+    ///
+    /// Sabotagem: gravar tambem a escolha privada -> vermelho.
+    #[test]
+    fn a_toggle_in_private_is_never_written() {
+        let dir = temp_dir("private");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        let file = dir.join(ADBLOCK_SETTINGS_STORE.name);
+        let mut state = AdblockState::load(registry.grant(ADBLOCK_SETTINGS_STORE).ok());
+        assert_eq!(
+            state.set_distraction_site("private.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        assert!(!file.exists(), "a escolha privada criou o ficheiro");
+        assert_eq!(state.distraction_policy(), &DistractionPolicy::default());
+        let private = state.distraction.policy_for(WebViewHost::PrivateSplit(0));
+        let normal = state.distraction.policy_for(WebViewHost::Split(0));
+        assert!(!private.site_on("private.example.com"));
+        assert!(
+            normal.site_on("private.example.com"),
+            "a escolha privada vazou"
+        );
+        assert_eq!(
+            state.set_distraction_site("private.example.com", false, true),
+            DistractionToggle::Unchanged
+        );
+
+        assert_eq!(
+            state.set_distraction_site("normal.example.com", false, false),
+            DistractionToggle::Saved
+        );
+        let before = std::fs::read(&file).expect("gravado");
+        assert!(!String::from_utf8_lossy(&before).contains("private.example.com"));
+        assert_eq!(
+            state.set_distraction_site("other.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        assert_eq!(
+            state.set_distraction_site("normal.example.com", true, true),
+            DistractionToggle::MemoryOnly
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("ficheiro"),
+            before,
+            "o ficheiro mudou"
+        );
+        let reloaded = AdblockState::load(registry.grant(ADBLOCK_SETTINGS_STORE).ok());
+        let saved = reloaded.distraction_policy();
+        assert!(!saved.site_on("normal.example.com"));
+        assert!(saved.site_on("other.example.com"));
+        assert!(saved.site_on("private.example.com"));
+        // No Split privado a escolha privada ganha a gravada.
+        assert!(
+            state
+                .distraction
+                .policy_for(WebViewHost::PrivateSplit(1))
+                .site_on("normal.example.com")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (critico, script injetado): o script nunca usa o canal (nem o
+    /// `postMessage` nem a capability), so corre no documento de topo e
+    /// aguenta uma pagina que, depois do document-created, troca cada
+    /// primitiva que ele usa (querySelectorAll, click, innerText, style,
+    /// NodeList, getComputedStyle, DOMRect, MutationObserver, setTimeout,
+    /// performance, WeakSet, String, Object, Array, Function): recusa o
+    /// OneTrust do inicio e o Cookiebot que chega depois, esconde a
+    /// newsletter e o fundo, devolve a rolagem, e a pagina nao ve um clique
+    /// nem uma mensagem.
+    ///
+    /// Sabotagem: `document.querySelectorAll(selector)` direto no `query`
+    /// -> vermelho.
+    #[test]
+    fn distraction_script_posts_nothing_and_survives_a_poisoned_page() {
+        for forbidden in [
+            "postMessage",
+            "chrome.webview",
+            "__NEURALIA_CAP__",
+            "fetch(",
+            "XMLHttpRequest",
+            "location.replace",
+            "location.href =",
+        ] {
+            assert!(
+                !NEURALIA_DISTRACTION_SCRIPT.contains(forbidden),
+                "o script usa {forbidden}"
+            );
+        }
+        assert_eq!(
+            NEURALIA_DISTRACTION_SCRIPT
+                .matches(DISTRACTION_CONFIG_PLACEHOLDER)
+                .count(),
+            1
+        );
+        let script = distraction_script(&DistractionPolicy::default());
+        assert!(!script.contains(DISTRACTION_CONFIG_PLACEHOLDER));
+
+        let (_, mut body) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        body.push(json!({ "tag": "div", "attrs": { "class": "newsletter-modal", "role": "dialog", "data-fixture": "newsletter" },
+            "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 200, 600, 400], "children": [
+                "Receba a nossa newsletter."
+            ] }));
+        body.push(
+            json!({ "tag": "div", "attrs": { "data-fixture": "backdrop" },
+            "css": { "position": "fixed", "z-index": "90" }, "rect": [0, 0, 1200, 800] }),
+        );
+        let late = json!({ "tag": "div", "attrs": { "id": "CybotCookiebotDialog", "data-fixture": "late-banner" },
+            "css": { "position": "fixed" }, "rect": [0, 680, 1200, 120], "children": [
+                button(json!({ "id": "CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll", "data-fixture": "late-accept" }), "Permitir todos"),
+                button(json!({ "id": "CybotCookiebotDialogBodyButtonDecline", "data-fixture": "late-reject" }), "Recusar")
+            ] });
+        let full = page_with(json!({}), json!({ "overflow": "hidden" }), body);
+        let mut poisoned = case("envenenada", NEWS, &script, full.clone());
+        poisoned["poison"] = json!(true);
+        poisoned["steps"] = json!([{ "add": ["body", late] }]);
+        let mut child = case("moldura", NEWS, &script, full);
+        child["child"] = json!(true);
+        let results = run_distraction(&[poisoned, child]);
+
+        let poisoned = &results[0];
+        assert_eq!(
+            strings(&poisoned["errors"]),
+            Vec::<String>::new(),
+            "{poisoned}"
+        );
+        assert_eq!(
+            strings(&poisoned["clicks"]),
+            ["reject", "late-reject"],
+            "{poisoned}"
+        );
+        assert_eq!(
+            strings(&poisoned["pageClicks"]),
+            Vec::<String>::new(),
+            "{poisoned}"
+        );
+        let hidden = strings(&poisoned["hidden"]);
+        for name in ["banner", "newsletter", "backdrop", "late-banner"] {
+            assert!(
+                hidden.contains(&name.to_string()),
+                "{name} ficou: {hidden:?}"
+            );
+        }
+        assert_eq!(poisoned["bodyOverflow"], "auto", "{poisoned}");
+        assert_eq!(strings(&poisoned["posted"]), Vec::<String>::new());
+        assert_eq!(strings(&poisoned["network"]), Vec::<String>::new());
+
+        let child = &results[1];
+        assert_eq!(child["listeners"], 0, "{child}");
+        assert_eq!(child["observers"], 0, "{child}");
+        assert_eq!(strings(&child["hidden"]), Vec::<String>::new());
+        assert_eq!(strings(&child["clicks"]), Vec::<String>::new());
+    }
+
+    /// Gate (amostrado): a rolagem so volta quando o script escondeu a
+    /// causa e o documento rola mesmo. Um aviso escondido numa pagina que
+    /// cabe na janela nao mexe na rolagem; uma rolagem presa pela propria
+    /// pagina (um visualizador de imagem, sem aviso) tambem nao.
+    #[test]
+    fn scroll_is_restored_only_when_we_hid_the_cause() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let (_, onetrust) = cmp_fixture("onetrust", "Aceitar todos").expect("onetrust");
+        let lightbox = json!({ "tag": "div", "attrs": { "class": "lightbox", "data-fixture": "lightbox" },
+            "css": { "position": "fixed" }, "rect": [100, 100, 400, 300], "children": ["Foto 1 de 12"] });
+        let locked = || json!({ "overflow": "hidden" });
+        let mut short = case(
+            "curta",
+            NEWS,
+            &script,
+            page_with(locked(), locked(), onetrust.clone()),
+        );
+        short["scrollHeight"] = json!(800);
+        let results = run_distraction(&[
+            case(
+                "longa",
+                NEWS,
+                &script,
+                page_with(locked(), locked(), onetrust),
+            ),
+            short,
+            case(
+                "lightbox",
+                NEWS,
+                &script,
+                page_with(json!({}), locked(), vec![lightbox]),
+            ),
+        ]);
+        assert_eq!(results[0]["htmlOverflow"], "auto", "{}", results[0]);
+        assert_eq!(results[0]["bodyOverflow"], "auto", "{}", results[0]);
+        assert_eq!(results[1]["bodyOverflow"], Value::Null, "{}", results[1]);
+        assert_eq!(strings(&results[1]["hidden"]), ["banner", "backdrop"]);
+        assert_eq!(strings(&results[2]["hidden"]), Vec::<String>::new());
+        assert_eq!(results[2]["bodyOverflow"], Value::Null, "{}", results[2]);
+    }
+
+    /// Gate (amostrado): o limiar das barras fixas. Na janela, encostada ao
+    /// topo ou ao fundo, com pelo menos metade da largura: 20% da altura
+    /// fica, 25% e 30% saem; um layout fixo da pagina inteira fica; uma
+    /// barra estreita ou no meio da janela fica; a que tem o foco (o
+    /// utilizador escreve nela) fica; fora da janela -- uma seccao presa
+    /// mais abaixo, um menu arrumado abaixo do fundo ou acima do topo --
+    /// fica (F5).
+    ///
+    /// Sabotagem (amostra da tarefa): `stickyMin` a 0.1 -> a barra de 20%
+    /// sai -> vermelho.
+    #[test]
+    fn the_sticky_threshold_is_25_percent() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let bar = |name: &str, position: &str, rect: [u32; 4]| {
+            json!({ "tag": "div", "attrs": { "data-fixture": name }, "css": { "position": position },
+                "rect": rect, "children": [format!("barra {name}")] })
+        };
+        let body = vec![
+            bar("top-20", "fixed", [0, 0, 1200, 160]),
+            bar("bottom-25", "fixed", [0, 600, 1200, 200]),
+            bar("top-30", "sticky", [0, 0, 1200, 240]),
+            bar("layout", "fixed", [0, 0, 1200, 800]),
+            bar("narrow", "fixed", [0, 0, 400, 400]),
+            bar("middle", "fixed", [0, 200, 1200, 300]),
+            // Fora da janela (F5): uma seccao presa mais abaixo na pagina, um
+            // menu arrumado logo abaixo do fundo e outro acima do topo.
+            bar("section-below", "sticky", [0, 2400, 1200, 400]),
+            bar("parked-sheet", "fixed", [0, 800, 1200, 480]),
+            json!({ "tag": "div", "attrs": { "data-fixture": "parked-above" }, "css": { "position": "fixed" },
+                "rect": [0, -600, 1200, 300], "children": ["menu"] }),
+            json!({ "tag": "div", "attrs": { "data-fixture": "chat" }, "css": { "position": "fixed" },
+                "rect": [0, 500, 1200, 300], "children": [
+                    { "tag": "textarea", "attrs": { "data-fixture": "typing" } }
+                ] }),
+        ];
+        let mut focused = case("barras", NEWS, &script, page(body));
+        focused["focus"] = json!("typing");
+        let results = run_distraction(&[focused]);
+        assert_eq!(strings(&results[0]["errors"]), Vec::<String>::new());
+        assert_eq!(
+            strings(&results[0]["hidden"]),
+            ["bottom-25", "top-30"],
+            "{}",
+            results[0]
+        );
+    }
+
+    /// Gate (amostrado): o ritmo. Com cada leitura de estilo a custar 1 ms
+    /// (relogio virtual), o exame cede a vez depois de 8 ms e acaba o
+    /// trabalho em varias vezes; depois de 30 s sem mudancas deixa de
+    /// observar a pagina (um aviso que chega depois fica), antes disso
+    /// ainda o apanha. Uma insercao de 3000 elementos nao e copiada pelo
+    /// observador, e a procura dos CMPs corre no maximo a cada 250 ms.
+    #[test]
+    fn the_script_yields_after_8_ms_and_stops_after_30_s_idle() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let mut body: Vec<Value> = (0..40)
+            .map(|index| {
+                json!({ "tag": "div", "attrs": { "data-fixture": format!("c{index}") },
+                    "css": { "position": "fixed" }, "rect": [0, 300, 100, 20], "children": ["x"] })
+            })
+            .collect();
+        body.push(
+            json!({ "tag": "div", "attrs": { "data-fixture": "last-bar" },
+            "css": { "position": "fixed" }, "rect": [0, 560, 1200, 240], "children": ["y"] }),
+        );
+        let mut slow = case("lento", NEWS, &script, page(body));
+        slow["styleCost"] = json!(1);
+        let late = |name: &str| {
+            json!({ "tag": "div", "attrs": { "class": "cookie-notice", "data-fixture": name },
+                "css": { "position": "fixed" }, "rect": [0, 700, 1200, 100], "children": ["Cookies"] })
+        };
+        let mut idle = case("parado", NEWS, &script, page(vec![]));
+        idle["steps"] = json!([{ "advance": 31000 }, { "add": ["body", late("too-late")] }]);
+        let mut busy = case("a tempo", NEWS, &script, page(vec![]));
+        busy["steps"] = json!([{ "advance": 20000 }, { "add": ["body", late("in-time")] }]);
+        // F7: uma insercao grande nao e copiada inteira (cada no visitado
+        // por uma consulta custa 0,01 ms), e numa pagina que muda a cada
+        // 40 ms durante 3 s a procura dos CMPs corre no maximo a cada 250 ms.
+        let spans: Vec<Value> = (0..3000)
+            .map(|_| json!({ "tag": "span", "children": ["x"] }))
+            .collect();
+        let mut big = case("arvore grande", NEWS, &script, page(vec![]));
+        big["qsaCost"] = json!(0.01);
+        big["steps"] = json!([{ "add": ["body", { "tag": "div", "children": spans }] }]);
+        let mut restless = case("sem parar", NEWS, &script, page(vec![]));
+        restless["steps"] = json!([{ "burst": ["body", 75, 40] }]);
+        let results = run_distraction(&[slow, idle, busy, big, restless]);
+        let slow = &results[0];
+        assert_eq!(strings(&slow["hidden"]), ["last-bar"], "{slow}");
+        assert!(slow["timersRun"].as_u64().unwrap_or(0) >= 5, "{slow}");
+        assert!(slow["maxSpent"].as_u64().unwrap_or(99) <= 12, "{slow}");
+        assert_eq!(
+            strings(&results[1]["hidden"]),
+            Vec::<String>::new(),
+            "{}",
+            results[1]
+        );
+        assert_eq!(results[1]["observing"], 0, "{}", results[1]);
+        assert_eq!(
+            strings(&results[2]["hidden"]),
+            ["in-time"],
+            "{}",
+            results[2]
+        );
+        let big = &results[3];
+        assert_eq!(strings(&big["errors"]), Vec::<String>::new(), "{big}");
+        assert!(
+            big["maxMutation"].as_f64().unwrap_or(99.0) < 1.0,
+            "o observador copiou a insercao inteira: {big}"
+        );
+        // Uma procura = uma consulta ao documento por regra; mais a do
+        // inicio. 3 s a cada 250 ms: 12 procuras, e a do inicio.
+        let restless = &results[4];
+        let searches = restless["docQueries"].as_u64().unwrap_or(u64::MAX) / CMP_RULES.len() as u64;
+        assert!(
+            (3..=15).contains(&searches),
+            "{searches} procuras dos CMPs em 3 s: {restless}"
+        );
+    }
+
+    /// O item do botao direito: «Ocultar distrações neste site» marcado
+    /// numa pagina normal, escolhido desliga ESTE site com o hospedeiro de
+    /// onde veio; nada nas IAs nem fora da web; no Split privado le a
+    /// escolha privada; e o aviso diz quando a escolha nao e guardada.
+    #[test]
+    fn the_distraction_menu_follows_the_page_and_the_private_overlay() {
+        let dir = temp_dir("menu");
+        let registry = StoreRegistry::mint_for_test(&dir);
+        let mut state = AdblockState::load(registry.grant(ADBLOCK_SETTINGS_STORE).ok());
+        let shared = Arc::clone(&state.distraction);
+        let item = |host: WebViewHost, page: Option<&str>| {
+            webview_menu_responder(host, SharedFlag::default(), None, Some(Arc::clone(&shared)))(
+                0, page,
+            )
+            .item(DISTRACTION_MENU_SITE)
+            .cloned()
+        };
+
+        let on = item(
+            WebViewHost::External,
+            Some("https://www.news.example.com/a"),
+        )
+        .expect("item");
+        assert_eq!(on.label, LABEL_DISTRACTION_SITE);
+        assert_eq!(on.checked, Some(true));
+        match on.selected() {
+            Some(UserEvent::Distraction(DistractionEvent::SetSite { host, site, on })) => {
+                assert_eq!(host, WebViewHost::External);
+                assert_eq!(site, "news.example.com");
+                assert!(!on);
+            }
+            other => panic!("o item fez {other:?}"),
+        }
+        for page in [
+            Some("https://chatgpt.com/"),
+            Some("https://claude.ai/new"),
+            Some("http://neuralia-pdf.localhost/v.html"),
+            Some("about:blank"),
+            None,
+        ] {
+            assert!(item(WebViewHost::External, page).is_none(), "{page:?}");
+        }
+        assert!(item(WebViewHost::Reader, Some("https://news.example.com/")).is_none());
+
+        assert_eq!(
+            state.set_distraction_site("news.example.com", false, true),
+            DistractionToggle::MemoryOnly
+        );
+        let private = item(
+            WebViewHost::PrivateSplit(0),
+            Some("https://news.example.com/"),
+        )
+        .expect("privado");
+        assert_eq!(private.checked, Some(false));
+        let normal =
+            item(WebViewHost::Split(0), Some("https://news.example.com/")).expect("normal");
+        assert_eq!(normal.checked, Some(true));
+
+        assert_eq!(
+            distraction_toggle_message(true, false),
+            "Distrações ocultas neste site"
+        );
+        assert_eq!(
+            distraction_toggle_message(false, true),
+            "Distrações visíveis neste site · Modo privado: esta escolha não é guardada."
+        );
+        assert_eq!(
+            DistractionPolicy::default().set_site("x", true),
+            SiteChange::Refused
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gate (amostrado): o que o utilizador acabou de abrir fica. Uma barra
+    /// grande e as definicoes do OneTrust que aparecem logo depois de um
+    /// clique ficam (nem escondidas nem clicadas), e ficam depois disso; a
+    /// mesma barra que chega 3 s depois do clique sai. Um dialogo de login
+    /// que fala de newsletter (tem um campo de senha) nunca sai.
+    ///
+    /// Sabotagem (amostra): `justOpened` sempre `false` -> vermelho.
+    #[test]
+    fn what_the_user_just_opened_stays() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let bar = |name: &str| {
+            json!({ "tag": "div", "attrs": { "data-fixture": name }, "css": { "position": "fixed" },
+                "rect": [0, 0, 1200, 300], "children": [format!("pesquisa {name}")] })
+        };
+        let (_, onetrust) = cmp_fixture("onetrust", "Rejeitar tudo").expect("onetrust");
+        let login = json!({ "tag": "div", "attrs": { "role": "dialog", "data-fixture": "login" },
+            "css": { "position": "fixed" }, "rect": [300, 200, 600, 400], "children": [
+                "Entrar e receber a nossa newsletter",
+                { "tag": "input", "attrs": { "type": "password" } }
+            ] });
+        let mut opened = case("aberto", NEWS, &script, page(vec![login]));
+        opened["steps"] = json!([
+            { "input": "pointerdown" },
+            { "add": ["body", bar("opened-bar")] },
+            { "input": "keydown" },
+            { "add": ["body", onetrust[0].clone()] },
+            { "advance": 3000 },
+            { "add": ["body", bar("later-bar")] }
+        ]);
+        let results = run_distraction(&[opened]);
+        let result = &results[0];
+        assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{result}");
+        assert_eq!(strings(&result["hidden"]), ["later-bar"], "{result}");
+        assert_eq!(strings(&result["clicks"]), Vec::<String>::new(), "{result}");
+    }
+
+    /// Gate (critico, script injetado; F3, SPEC-0114 «as definicoes de
+    /// cookies do rodape ficam»): um CMP sem aviso visivel -- de quem ja
+    /// respondeu -- nao recebe clique nem fica escondido. O OneTrust com o
+    /// aviso e o centro de preferencias escondidos (com «Rejeitar tudo» la
+    /// dentro), o Cookiebot escondido e o Usercentrics com o aviso fechado
+    /// na shadow root: zero cliques, nada escondido. O `#didomi-host`
+    /// (vazio, depois da resposta) nunca sai, e as preferencias que o
+    /// utilizador abre nele ficam visiveis.
+    ///
+    /// Sabotagem: o `visible(...)` dos candidatos do `runCmps` a devolver
+    /// sempre `true` -> vermelho.
+    #[test]
+    fn cmp_settings_the_user_opens_stay() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let gone = json!({ "display": "none" });
+        let onetrust = json!({ "tag": "div", "attrs": { "id": "onetrust-consent-sdk" }, "children": [
+            { "tag": "div", "attrs": { "id": "onetrust-banner-sdk" }, "css": gone.clone(), "children": [
+                button(json!({ "id": "onetrust-reject-all-handler", "data-fixture": "reject" }), "Rejeitar tudo")
+            ] },
+            { "tag": "div", "attrs": { "id": "onetrust-pc-sdk" }, "css": gone.clone(), "children": [
+                button(json!({ "class": "ot-pc-refuse-all-handler", "data-fixture": "pc-reject" }), "Rejeitar tudo")
+            ] },
+            { "tag": "div", "attrs": { "class": "onetrust-pc-dark-filter" },
+              "css": { "display": "none", "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800] }
+        ] });
+        let cookiebot = json!({ "tag": "div", "attrs": { "id": "CybotCookiebotDialog" }, "css": gone.clone(),
+            "rect": [0, 680, 1200, 120], "children": [
+                button(json!({ "id": "CybotCookiebotDialogBodyButtonDecline", "data-fixture": "cb-reject" }), "Recusar")
+            ] });
+        let usercentrics = json!({ "tag": "div", "attrs": { "id": "usercentrics-root" },
+            "shadow": { "open": true, "children": [
+                { "tag": "div", "attrs": { "class": "sc-dialog" }, "css": gone, "children": [
+                    button(json!({ "data-testid": "uc-deny-all-button", "data-fixture": "uc-reject" }), "Rejeitar")
+                ] }
+            ] } });
+        let mut didomi = case(
+            "didomi respondido",
+            NEWS,
+            &script,
+            page(vec![
+                json!({ "tag": "div", "attrs": { "id": "didomi-host" } }),
+            ]),
+        );
+        didomi["steps"] = json!([
+            { "advance": 5000 },
+            { "input": "pointerdown" },
+            { "add": ["didomi-host", { "tag": "div", "attrs": { "class": "didomi-popup-backdrop", "data-fixture": "preferences" },
+                "css": { "position": "fixed", "z-index": "100" }, "rect": [0, 0, 1200, 800], "children": [
+                    "Preferências de privacidade",
+                    button(json!({ "id": "didomi-notice-disagree-button" }), "Rejeitar tudo")
+                ] }] }
+        ]);
+        let results = run_distraction(&[
+            case("onetrust respondido", NEWS, &script, page(vec![onetrust])),
+            case("cookiebot respondido", NEWS, &script, page(vec![cookiebot])),
+            case(
+                "usercentrics fechado",
+                NEWS,
+                &script,
+                page(vec![usercentrics]),
+            ),
+            didomi,
+        ]);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(
+                strings(&result["clicks"]),
+                Vec::<String>::new(),
+                "{name}: clicou sem aviso visivel: {result}"
+            );
+            assert_eq!(
+                strings(&result["hidden"]),
+                Vec::<String>::new(),
+                "{name}: escondeu o que o utilizador abre depois: {result}"
+            );
+        }
+    }
+
+    /// Gate (amostrado; F4): um fundo de ecra inteiro so sai quando esta
+    /// vazio e ao lado do que escondemos. A app da pagina numa moldura de
+    /// ecra inteiro, um canvas e um video fixos, um fundo vazio longe do
+    /// aviso e uma camada com filhos ficam quando o aviso de cookies sai;
+    /// o fundo vazio irmao do aviso sai com ele.
+    ///
+    /// Sabotagem (amostra da tarefa): o `nextToCause` a devolver sempre
+    /// `true` -> vermelho.
+    #[test]
+    fn only_an_empty_backdrop_next_to_what_we_hid_goes() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let layer = |tag: &str, name: &str, z: &str| {
+            json!({ "tag": tag, "attrs": { "data-fixture": name },
+                "css": { "position": "fixed", "z-index": z }, "rect": [0, 0, 1200, 800] })
+        };
+        let far = json!({ "tag": "div", "attrs": { "id": "wrap" }, "children": [
+            { "tag": "div", "attrs": { "id": "inner" }, "children": [layer("div", "far-layer", "5")] }
+        ] });
+        let busy_layer = json!({ "tag": "div", "attrs": { "data-fixture": "with-children" },
+            "css": { "position": "fixed", "z-index": "5" }, "rect": [0, 0, 1200, 800],
+            "children": [{ "tag": "div", "attrs": { "class": "spinner" } }] });
+        let results = run_distraction(&[
+            case(
+                "a app numa moldura",
+                NEWS,
+                &script,
+                page(vec![layer("iframe", "app-iframe", "1"), cookie_bar()]),
+            ),
+            case(
+                "canvas e video",
+                NEWS,
+                &script,
+                page(vec![
+                    layer("canvas", "canvas", "1"),
+                    layer("video", "video", "2"),
+                    cookie_bar(),
+                ]),
+            ),
+            case(
+                "longe",
+                NEWS,
+                &script,
+                page(vec![far, busy_layer, cookie_bar()]),
+            ),
+            case(
+                "ao lado",
+                NEWS,
+                &script,
+                page(vec![layer("div", "backdrop", "5"), cookie_bar()]),
+            ),
+        ]);
+        for result in &results[..3] {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+            assert_eq!(strings(&result["hidden"]), ["cookie"], "{name}: {result}");
+        }
+        assert_eq!(
+            strings(&results[3]["hidden"]),
+            ["backdrop", "cookie"],
+            "{}",
+            results[3]
+        );
+    }
+
+    /// Gate (amostrado; F6): um dialogo que so FALA de newsletter fica,
+    /// salvo quando o unico campo dele e um e-mail. Um checkout que abre 2 s
+    /// depois do clique com a caixa «Quero receber a newsletter» (com ou sem
+    /// outros campos) e o dialogo do boletim de ocorrencia ficam; a janela
+    /// de newsletter so com o e-mail sai.
+    #[test]
+    fn a_dialog_that_only_mentions_a_newsletter_stays() {
+        let script = distraction_script(&DistractionPolicy::default());
+        let dialog = |name: &str, children: Value| {
+            json!({ "tag": "div", "attrs": { "role": "dialog", "data-fixture": name },
+                "css": { "position": "fixed", "z-index": "100" }, "rect": [300, 150, 600, 500],
+                "children": children })
+        };
+        let input = |kind: &str, field: &str| json!({ "tag": "input", "attrs": { "type": kind, "name": field } });
+        let checkout = dialog(
+            "checkout",
+            json!([
+                "Finalizar compra",
+                input("text", "nome"),
+                input("email", "email"),
+                input("checkbox", "optin"),
+                "Quero receber a newsletter"
+            ]),
+        );
+        let guest = dialog(
+            "guest-checkout",
+            json!([
+                "Continuar como convidado",
+                input("email", "email"),
+                input("checkbox", "optin"),
+                "Assinar a newsletter"
+            ]),
+        );
+        let police = dialog(
+            "boletim",
+            json!([
+                "Registre o seu boletim de ocorrência online",
+                input("text", "protocolo")
+            ]),
+        );
+        let signup = dialog(
+            "signup",
+            json!([
+                "Assine a nossa newsletter e receba as novidades",
+                input("email", "email"),
+                input("submit", "ok")
+            ]),
+        );
+        let mut late = case("checkout tardio", NEWS, &script, page(vec![]));
+        late["steps"] = json!([
+            { "input": "pointerdown" },
+            { "advance": 2000 },
+            { "add": ["body", checkout] },
+            { "add": ["body", guest] }
+        ]);
+        let results = run_distraction(&[
+            late,
+            case("boletim", NEWS, &script, page(vec![police])),
+            case("newsletter", NEWS, &script, page(vec![signup])),
+        ]);
+        for result in &results {
+            let name = result["name"].as_str().unwrap_or_default();
+            assert_eq!(strings(&result["errors"]), Vec::<String>::new(), "{name}");
+        }
+        assert_eq!(
+            strings(&results[0]["hidden"]),
+            Vec::<String>::new(),
+            "{}",
+            results[0]
+        );
+        assert_eq!(
+            strings(&results[1]["hidden"]),
+            Vec::<String>::new(),
+            "{}",
+            results[1]
+        );
+        assert_eq!(strings(&results[2]["hidden"]), ["signup"], "{}", results[2]);
     }
 }
