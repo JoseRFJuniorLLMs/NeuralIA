@@ -1828,14 +1828,18 @@ pub(crate) mod tests {
     }
 
     /// Gate crítico: apagar o histórico não pode ser desfeito por uma
-    /// pergunta que já estava pendente. O cartão continua vivo em memória e
-    /// o agente ainda recebe a resposta, mas nem a resposta nem o fecho da
-    /// pergunta podem recriar a conversa que o utilizador acabou de apagar.
+    /// pergunta que já estava pendente. Os cartões continuam vivos em memória
+    /// e o agente recebe cada desfecho, mas resposta, dismiss, cancel e timeout
+    /// nunca podem recriar a conversa que o utilizador acabou de apagar.
     #[test]
     fn clearing_history_with_a_pending_question_never_recreates_the_conversation() {
         let f = fixture("clear-pending");
         let claude = f.hub.connect("claude").unwrap();
-        let question = ask(&f.hub, claude, 600).unwrap();
+        let answered = ask(&f.hub, claude, 600).unwrap();
+        let dismissed = ask(&f.hub, claude, 600).unwrap();
+        let cancelled = ask(&f.hub, claude, 600).unwrap();
+        let timed_out = ask(&f.hub, claude, ASK_TIMEOUT_MIN_SECS).unwrap();
+
         let agents_dir = f.dir.0.join("agents");
         let conversation = agents_dir.join("claude.jsonl");
         let state_file = agents_dir.join("state.json");
@@ -1844,26 +1848,59 @@ pub(crate) mod tests {
         f.hub.clear_conversations().unwrap();
         assert!(!conversation.exists());
         assert!(!state_file.exists());
-        assert_eq!(f.hub.pending_questions().len(), 1);
+        assert_eq!(f.hub.pending_questions().len(), 4);
+
+        let still_cleared = || {
+            assert!(f.hub.conversation("claude").is_empty());
+            assert!(
+                !conversation.exists(),
+                "um desfecho apagado ressuscitou claude.jsonl"
+            );
+            assert!(
+                !state_file.exists(),
+                "um desfecho apagado ressuscitou state.json"
+            );
+        };
 
         f.hub
-            .answer_question(question, QuestionAnswer::Button(0))
+            .answer_question(answered, QuestionAnswer::Button(0))
             .unwrap();
         assert_eq!(
             f.hub
-                .wait_question(claude, question, Duration::from_millis(1))
+                .wait_question(claude, answered, Duration::from_millis(1))
                 .unwrap(),
             json!({"state":"answered","answer":"Sim","via":"button"})
         );
-        assert!(f.hub.conversation("claude").is_empty());
-        assert!(
-            !conversation.exists(),
-            "responder a pergunta apagada ressuscitou claude.jsonl"
+        still_cleared();
+
+        f.hub.dismiss_question(dismissed).unwrap();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, dismissed, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"dismissed"})
         );
+        still_cleared();
+
+        f.hub.cancel_question(claude, cancelled);
         assert!(
-            !state_file.exists(),
-            "responder a pergunta apagada ressuscitou state.json"
+            f.hub
+                .wait_question(claude, cancelled, Duration::from_millis(1))
+                .is_err()
         );
+        still_cleared();
+
+        f.clock
+            .advance(Duration::from_secs(u64::from(ASK_TIMEOUT_MIN_SECS) + 1));
+        f.hub.sweep();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, timed_out, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"timed_out"})
+        );
+        still_cleared();
+        assert!(f.hub.pending_questions().is_empty());
     }
 
     #[test]
