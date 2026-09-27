@@ -18,7 +18,7 @@ param(
 #   seguintes estendem com o que o modo privado NAO pode tocar);
 # - faz o hash de cada ficheiro debaixo de uma NEURALIA_DATA_DIR temporaria
 #   antes e depois de uma sessao Normal guiada: o exe abre a pagina da
-#   fixture de 127.0.0.1 (scripts/private-mode-fixture.mjs) na Web completa,
+#   fixture de 127.0.0.1 (scripts/private-mode-fixture.mjs) no Reader (`read:`),
 #   assenta uns segundos e fecha;
 # - lista o que a sessao criou ou mudou, agrupado pela linha da lista que o
 #   cobre, e falha se algum caminho nao tiver linha nenhuma;
@@ -140,8 +140,9 @@ try {
     $env:NEURALIA_DEBUG_LOG = $log
     # `read:` abre a pagina no Reader, que a grava no historico
     # (PrivacyGuard::record) e a captura na memoria (PrivacyGuard::capture,
-    # capture_reader_memory). A Web completa (`web:`) so chega ao historico:
-    # a primeira corrida no CI mostrou-o.
+    # capture_reader_memory). A Web completa (`web:`) nao serve aqui: o
+    # open_external nao captura na memoria uma origem local (a fixture de
+    # 127.0.0.1), por isso a primeira corrida no CI so chegou ao historico.
     $env:NEURALIA_STARTUP_INPUT = "read:$url"
     $env:NEURALIA_NO_GMAIL = "1"
     $env:NEURALIA_REDUCE_MOTION = "1"
