@@ -1,0 +1,34 @@
+# Fixture do estimador de tokens (context-budget, plano 2.5).
+# Colunas separadas por TAB: o200k<TAB>llama3<TAB>texto (o texto vai ate ao fim
+# da linha; "\n" e "\t" no texto sao escapes).
+#
+# PROVENIENCIA (nao verificada por tokenizador): as contagens foram derivadas a
+# mao das regras de pre-tokenizacao do o200k_base e do tokenizador do Llama 3
+# (palavra com o espaco a frente = 1 token quando e comum, digitos em grupos de
+# ate 3 -- `\p{N}{1,3}` --, pontuacao ASCII um token cada, um espaco isolado
+# antes de um numero e um token), e ARREDONDADAS PARA CIMA onde uma palavra
+# pode partir-se (portugues, palavras raras, URLs). Sem Internet e sem crate de
+# tokenizador na maquina onde este ficheiro nasceu, nada aqui foi confirmado
+# com o tiktoken ou o tokenizer.json do Llama 3. O gate exige que a estimativa
+# fique >= AMBAS as colunas; quando a fixture puder ser medida, as colunas
+# descem para os valores reais e o gate fica mais apertado, nunca mais largo.
+2	2	Hello world
+4	4	Hello, world!
+10	10	The quick brown fox jumps over the lazy dog.
+6	6	2026-09-26
+5	5	3.5 GHz
+8	8	a b c d e f g h
+3	3	\n\n\n
+13	13	O Dr. Silva mediu 3.5 GHz.
+18	20	A otimização vetorial do processador reduz o consumo de energia.
+12	12	let x = foo(bar, 42);
+4	4	🙂
+6	9	日本語
+6	8	Привет мир
+20	22	https://exemplo.com/artigos/2026/09/26?id=42
+3	3	a    b
+70	76	NeuralIA is a desktop browser that keeps the user in control: pages are data, never instructions, and nothing leaves the machine without an explicit budget. The context pack is built locally, deduplicated and fenced before any provider sees a single byte of it.
+72	80	O NeuralIA é um navegador de mesa que mantém o usuário no controle: as páginas são dados, nunca instruções, e nada sai do computador sem um orçamento explícito. O pacote de contexto é montado localmente, deduplicado e cercado antes de qualquer provedor ver um único byte.
+6	6	Authorization: Bearer abc123
+15	15	«≈ 3 200 tokens · 4 fontes»
+24	24	[1] página: Artigo — https://a.b/c (p. 3)

@@ -8,6 +8,7 @@ pub mod agent_security;
 pub mod ai_policy;
 pub mod bookmarks;
 pub mod config;
+pub mod context_budget;
 pub mod distraction;
 pub mod domains;
 pub mod downloads;
@@ -68,9 +69,10 @@ pub use agent_security::{
     PolicyDecision, redact_sensitive_text,
 };
 pub use local_intelligence::{
-    ActiveModelPack, EMBEDDING_DIM, HashingLocalIntelligence, IntentClass, LocalBenchmark,
-    LocalIntelligence, ModelPackActivation, ModelPackManager, ModelPackManifest,
-    ModelPackSelection, benchmark_local_intelligence, cosine_similarity, hashed_embedding,
+    ActiveModelPack, EMBEDDING_DIM, Embedder, HashingEmbedder, HashingLocalIntelligence,
+    IntentClass, LocalBenchmark, LocalIntelligence, ModelPackActivation, ModelPackManager,
+    ModelPackManifest, ModelPackSelection, benchmark_local_intelligence, cosine_similarity,
+    hashed_embedding,
 };
 pub use memory::{
     CaptureOutcome, ForgetReport, ForgetScope, MemoryDoctorReport, MemoryDocument, MemoryHit,
