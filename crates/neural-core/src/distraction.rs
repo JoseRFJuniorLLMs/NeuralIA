@@ -77,7 +77,8 @@ pub struct CmpRule {
 /// texto delas. Um CMP muda o DOM sem aviso: um seletor que deixa de casar
 /// faz o script so esconder (ou nada), nunca clicar noutro botao, porque o
 /// clique pede tambem o texto certo. Cada linha tem uma fixture nos gates
-/// do app (`every_cmp_rule_has_a_fixture`); os seletores usam so `#id`,
+/// do app (conferido dentro de `distraction_never_clicks_accept`); os
+/// seletores usam so `#id`,
 /// `.classe`, `tag`, `[a]`, `[a="v"]`, `[a^="v"]`, `[a*="v"]`, `[a$="v"]`,
 /// o descendente e o `>` (o que o DOM falso dos gates entende).
 pub const CMP_RULES: &[CmpRule] = &[
