@@ -290,9 +290,13 @@ fn every_neuralia_webview_keeps_app_mouse_zoom_and_enables_native_pinch() {
 
 #[test]
 fn docked_panel_resize_handle_is_forced_visible_above_service_webviews() {
-    assert!(APP.contains("handle,\n                HWND_TOP,"));
-    assert!(APP.contains("SWP_NOACTIVATE | SWP_SHOWWINDOW"));
-    assert!(APP.contains("CreateSolidBrush(rgb3(theme.accent))"));
+    let panels = include_str!("../src/windows_app/app/panels.rs");
+    let native = include_str!("../src/windows_app/native.rs");
+
+    assert!(panels.contains("HWND_TOP"));
+    assert!(panels.contains("SetWindowPos("));
+    assert!(panels.contains("SWP_NOACTIVATE | SWP_SHOWWINDOW"));
+    assert!(native.contains("CreateSolidBrush(rgb3(theme.accent))"));
 }
 
 #[test]
