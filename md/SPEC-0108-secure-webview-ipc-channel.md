@@ -70,10 +70,10 @@ Uma string JSON, sempre com estes quatro campos e nenhum outro:
   `autoscroll`, `zoomin`, `zoomout`, `zoomreset`, `reload`, `print`, `omnibox`,
   `history`, `clearhistory`, `fullscreen`, `devtools`, `viewsource`, `newtab`,
   `expand`, `shortcut-expand`, `minimize`, `split`, `link`, `ask`, `search`, `split-close`, `split-expand`, `palette`,
-  `gmail-state`, `research-answer`, `agent-observation`, `hint`, `note`). Nome fora da lista →
+  `gmail-state`, `research-answer`, `pdf-page-text`, `agent-observation`, `hint`, `note`). Nome fora da lista →
   ignorado.
 - `args` — objeto com os parâmetros exatos da ação (`col`, `url`, `aside`, `count`,
-  `sender`, `subject`, `key`, `text`, `data`, `id`, `intent`, `via`). Campos extras ou tipos errados
+  `sender`, `subject`, `key`, `text`, `data`, `id`, `intent`, `via`, `page`). Campos extras ou tipos errados
   são rejeitados; os nomes fechados também: `search` leva `text` e `intent`, que é
   exatamente `ask` (Mandar para IA) ou `translate` (Traduzir) — sem `intent`, ou com
   outro nome, maiúsculas ou outro tipo, é recusado, nunca lido como `ask`; `note` vai
@@ -156,7 +156,7 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 
 1. Teste unitário do parser de mensagens: rejeita corpo > 8 KiB, `v != 1`,
    `cap` ausente/errado/com comprimento diferente, `action` fora da lista,
-   `args` com tipos errados; aceita cada uma das 31 ações com `args` válidos e o conjunto aceite é
+   `args` com tipos errados; aceita cada uma das 32 ações com `args` válidos e o conjunto aceite é
    exatamente o publicado na SPEC-0005 e nesta lista (`protocol_accepts_exactly_the_published_actions`,
    com a contagem na constante `PUBLISHED_ACTION_COUNT`).
 2. Teste: nenhuma constante de script injetado contém `location.href = 'neuralia:`
