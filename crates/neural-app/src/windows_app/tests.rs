@@ -28100,6 +28100,25 @@ mod downloads_gates {
                     &[4, 5, 6]
                 )
             );
+            // Dois acabados a verificar nao contam nem se cancelam: o cartao
+            // diz que ficam.
+            for id in [10, 11] {
+                start(&mut manager, id, &format!("v{id}.zip"), None);
+                manager.on_event(DownloadEvent::Ended {
+                    id: DownloadId(id),
+                    end: DownloadEnd::Completed {
+                        path: PathBuf::from(format!(r"C:\Baixados\v{id}.zip")),
+                    },
+                });
+            }
+            assert_eq!(
+                leave_decision(kind, &manager),
+                ask(
+                    "3 downloads em andamento (setup.exe e mais 2).",
+                    &format!("{body_many} Os 2 arquivos em verificação não são cancelados."),
+                    &[4, 5, 6]
+                )
+            );
             // Um nome com bidi aparece marcado, nunca a trocar o texto.
             let mut manager = DownloadManager::default();
             start(&mut manager, 8, "fotoexe.png", Some(10));
