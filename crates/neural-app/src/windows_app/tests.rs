@@ -24110,11 +24110,11 @@ fn existing_stores_have_a_declared_kind() {
         AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
         HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
-    use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
+    use neural_core::json_store::StoreKind::{Automatic, Explicit, GuardedAutomatic, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
     let mut expected = vec![
         ("history.jsonl", Automatic, File),
-        ("downloads.json", Automatic, File),
+        ("downloads.json", GuardedAutomatic, File),
         ("downloads-settings.json", Setting, File),
         ("memory", Automatic, Dir),
         ("tabs.json", Automatic, File),
@@ -26083,7 +26083,7 @@ mod downloads_gates {
         fn with_disk(manager: DownloadManager, dir: &Path) -> Self {
             let stores = StoreRegistry::mint_for_test(dir);
             let grant = stores.grant(DOWNLOADS_LOG_STORE).expect("grant");
-            assert_eq!(grant.kind(), StoreKind::Automatic);
+            assert_eq!(grant.kind(), StoreKind::GuardedAutomatic);
             let store = VersionedJsonStore::<DownloadLog>::open(grant, LOG_VERSION, LOG_MAX_BYTES)
                 .expect("loja");
             Self {
@@ -27714,7 +27714,7 @@ mod downloads_gates {
     #[test]
     fn downloads_state_opens_through_grants_and_checks_the_folder() {
         assert_eq!(DOWNLOADS_SETTINGS_STORE.kind, StoreKind::Setting);
-        assert_eq!(DOWNLOADS_LOG_STORE.kind, StoreKind::Automatic);
+        assert_eq!(DOWNLOADS_LOG_STORE.kind, StoreKind::GuardedAutomatic);
         let system = user_downloads_folder().expect("a pasta Transferencias do utilizador");
         assert!(system.is_absolute(), "{}", system.display());
         let dir = Scratch::new("state");
