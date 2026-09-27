@@ -270,6 +270,35 @@ struct Question {
     outcome_storage: QuestionOutcomeStorage,
 }
 
+#[derive(Debug, Clone)]
+struct MarksSnapshot {
+    generation: u64,
+    marks: BTreeMap<String, AgentMarks>,
+}
+
+#[derive(Debug, Default)]
+struct MarksWriter {
+    persisted_generation: u64,
+}
+
+impl MarksWriter {
+    /// Serializa as escritas de state.json e recusa snapshots antigos que
+    /// chegaram depois de um mais novo. Uma falha nao avanca a geracao:
+    /// exatamente o mesmo snapshot pode ser repetido.
+    fn persist(
+        &mut self,
+        snapshot: &MarksSnapshot,
+        write: impl FnOnce(&BTreeMap<String, AgentMarks>) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        if snapshot.generation <= self.persisted_generation {
+            return Ok(false);
+        }
+        write(&snapshot.marks)?;
+        self.persisted_generation = snapshot.generation;
+        Ok(true)
+    }
+}
+
 struct HubState {
     agents: BTreeMap<String, AgentEntry>,
     questions: BTreeMap<u64, Question>,
@@ -279,10 +308,14 @@ struct HubState {
     server: HubServerState,
     loaded: bool,
     store_error: Option<String>,
+    marks_generation: u64,
 }
 
 struct HubInner {
     state: Mutex<HubState>,
+    /// Serializa state.json fora do lock principal sem deixar um snapshot
+    /// antigo sobrescrever outro mais novo.
+    marks_writer: Mutex<MarksWriter>,
     /// Acorda quem espera por uma resposta.
     changed: Condvar,
     store: ConversationStore,
@@ -327,7 +360,9 @@ impl AgentHub {
                     server: HubServerState::Starting,
                     loaded: false,
                     store_error: None,
+                    marks_generation: 0,
                 }),
+                marks_writer: Mutex::new(MarksWriter::default()),
                 changed: Condvar::new(),
                 store,
                 notify,
@@ -788,7 +823,8 @@ impl AgentHub {
             // Quem escreve ja leu o que estava acima.
             entry.marks.read_up_to = record.id;
             append(state, &store, agent, record.clone());
-            Ok::<_, String>((record, all_marks(state)))
+            let marks = changed_marks_snapshot(state);
+            Ok::<_, String>((record, marks))
         })?;
         self.save_marks(&marks);
         Ok(record)
@@ -799,19 +835,27 @@ impl AgentHub {
         let marks = self.with_state(|state, _| {
             let entry = state.agents.get_mut(agent)?;
             let last = entry.conversation.last_id();
-            if entry.marks.read_up_to == last {
-                return None;
+            if entry.marks.read_up_to != last {
+                entry.marks.read_up_to = last;
+                state.marks_generation = state.marks_generation.saturating_add(1);
             }
-            entry.marks.read_up_to = last;
-            Some(all_marks(state))
+            Some(marks_snapshot(state))
         });
         if let Some(marks) = marks {
             self.save_marks(&marks);
         }
     }
 
-    fn save_marks(&self, marks: &BTreeMap<String, AgentMarks>) {
-        if let Err(error) = self.inner.store.save_marks(marks) {
+    fn save_marks(&self, snapshot: &MarksSnapshot) {
+        let result = {
+            let mut writer = self
+                .inner
+                .marks_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            writer.persist(snapshot, |marks| self.inner.store.save_marks(marks))
+        };
+        if let Err(error) = result {
             let message = format!("Não foi possível gravar o estado dos agentes: {error}");
             eprintln!("[agents] {message}");
             self.lock().store_error = Some(message);
@@ -1018,6 +1062,18 @@ fn ensure_agent(state: &mut HubState, agent: &str) -> Result<(), String> {
         AgentEntry::new(Conversation::default(), AgentMarks::default()),
     );
     Ok(())
+}
+
+fn marks_snapshot(state: &HubState) -> MarksSnapshot {
+    MarksSnapshot {
+        generation: state.marks_generation,
+        marks: all_marks(state),
+    }
+}
+
+fn changed_marks_snapshot(state: &mut HubState) -> MarksSnapshot {
+    state.marks_generation = state.marks_generation.saturating_add(1);
+    marks_snapshot(state)
 }
 
 fn all_marks(state: &HubState) -> BTreeMap<String, AgentMarks> {
