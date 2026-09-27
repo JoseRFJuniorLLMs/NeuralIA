@@ -272,6 +272,25 @@ fn spec_0103_product_gate_targets_the_shipped_javascript_timeline() {
 }
 
 #[test]
+fn every_neuralia_webview_uses_native_pinch_zoom_without_the_old_double_handler() {
+    assert!(
+        APP.contains(".with_hotkeys_zoom(true)"),
+        "the shared WebView factory must enable native hotkey/gesture zoom"
+    );
+    assert!(
+        !APP.contains("function wheelZoomAction("),
+        "the injected ctrl+wheel zoom handler would double-fire with native WebView2 pinch"
+    );
+}
+
+#[test]
+fn docked_panel_resize_handle_is_forced_visible_above_service_webviews() {
+    assert!(APP.contains("handle,\n                HWND_TOP,"));
+    assert!(APP.contains("SWP_NOACTIVATE | SWP_SHOWWINDOW"));
+    assert!(APP.contains("CreateSolidBrush(rgb3(theme.accent))"));
+}
+
+#[test]
 fn spec_0104_product_agent_reaches_the_native_permission_policy() {
     let start = between(APP, "fn start_browser_agent", "fn handle_agent_observation");
     assert!(start.contains("is_local_network_target(&valid)"));
