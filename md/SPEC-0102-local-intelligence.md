@@ -149,6 +149,54 @@ intelligence is shipped; optional pack lifecycle is library infrastructure only.
 The acceptance criteria below that mention enabling/uninstalling a pack remain
 open product criteria, not claims about the current browser.
 
+## 8.2. Context budget (library-only)
+
+`neural_core::context_budget` decides what enters a prompt before any call is
+made, without I/O or network. `build_context(question, sources, spec, embedder)`
+takes `ContextSource`s (id `[A-Za-z0-9_-]{1,16}`, label, kind
+`Answer|Page|Reader|Pdf|Epub|Transcript|Note|Memory|Selection|ChatTurn|Tab`,
+locator `Block|PdfPage|Epub{spine,block}|Time(secs)`, url, text, priority,
+private flag) and a `BudgetSpec` (`max_input`, `reserve_output`, per-source
+floor, ~160-token chunks, `Destination::Local` or `Destination::Remote { host }`)
+and returns a `ContextPack` whose fields are private: it is read through
+`rendered()`, `est_tokens()`, `sources()` (byte spans of every header and
+passage), `duplicates()` (kept/dropped provenance and similarity) and
+`dropped()`, and cannot be built or mutated from outside (`compile_fail`
+doctests). The pipeline: sanitize through `untrusted` (a remote destination goes
+through the existing `agent_security::redact_sensitive_text` and `redact_url`;
+a private source never goes to a remote destination —
+«Modo privado: este conteúdo não pode sair do computador.»), chunk on sentence
+boundaries (`Dr. Silva` and `3.5 GHz` stay whole), dedupe (exact SHA-256, then
+SimHash filtered and Jaccard ≥ 0.8 confirmed, both from `untrusted::Shingles`),
+score 0.5 BM25-lite + 0.4 `Embedder` cosine + 0.1 priority, per-source floors,
+greedy allocation with extractive compression, and the `untrusted` nonce fence.
+`estimate_tokens` is a per-character-class table × 1.10 (+4 per message);
+`TokenCalibration` is an EWMA of real/estimated clamped to [0.6, 2.0];
+`fit_conversation` drops the oldest turns and never starts on an orphan answer;
+`split_for_map_reduce` cuts a long text into pieces that fit one at a time. The
+`Embedder` trait and the deterministic `HashingEmbedder` live in
+`local_intelligence.rs`. Summary line: «≈ 3 200 tokens · 4 fontes · 2 trechos
+repetidos removidos».
+
+Gates in `crates/neural-core/src/context_budget/tests.rs` (Windows and Linux):
+`budget_is_never_exceeded_over_200_seeded_cases`,
+`estimator_is_conservative_against_the_token_fixture`,
+`near_duplicates_are_removed_once_with_provenance`,
+`the_relevant_passage_survives_the_cut`, `every_source_keeps_its_floor`,
+`remote_destination_redacts_secrets_and_refuses_private_sources`,
+`the_pack_is_deterministic_for_the_same_inputs`,
+`the_fence_is_the_untrusted_one_and_spans_point_at_the_passages`, and the
+`compile_fail` doctests on `ContextPack`. The token fixture
+(`context_budget/token_fixture.tsv`) was derived by hand from the o200k and
+Llama 3 pre-tokenization rules and rounded up, not measured with a tokenizer;
+the gate only requires the estimator to be at or above both columns.
+
+`neural_core::context_budget` is **not wired into the product yet**: no file
+under `crates/neural-app/src` calls `build_context` (gate
+`context_budget_is_core_library_only_until_consensus_wires_it` in
+`crates/neural-app/tests/spec_product_wiring.rs`). The 2.5 consensus work is
+its first caller; whoever wires it updates this section and that gate.
+
 ## 9. Acceptance criteria
 
 1. NeuralIA launches normally with no model installed;
