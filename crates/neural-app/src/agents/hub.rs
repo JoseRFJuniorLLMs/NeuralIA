@@ -1869,6 +1869,78 @@ pub(crate) mod tests {
         );
     }
 
+    /// Gate crítico: o `last_id` que um agente recebeu no modo privado
+    /// pode ser maior do que o último id persistido, porque o privado não
+    /// grava nem a conversa nem `next_id`. Se o NeuralIA reiniciar, esse id
+    /// pode ser reutilizado por uma mensagem normal. O cursor antigo não pode
+    /// esconder a mensagem nova: uma ligação recém-aberta só confia até ao
+    /// maior cursor que este hub já entregou.
+    #[test]
+    fn a_private_cursor_cannot_hide_a_reused_normal_id_after_restart() {
+        let f = fixture("private-cursor-restart");
+        let claude = f.hub.connect("claude").unwrap();
+
+        let persisted = f.hub.user_message("claude", "persistido").unwrap();
+        assert_eq!(persisted.id, 1);
+        let first = f
+            .hub
+            .call(claude, ToolCall::GetUserMessages { since_id: None })
+            .unwrap();
+        assert_eq!(first["last_id"], 1);
+
+        f.registry.set_mode(StoreMode::Private);
+        let private = f.hub.user_message("claude", "segredo privado").unwrap();
+        assert_eq!(private.id, 2);
+        let private_page = f
+            .hub
+            .call(
+                claude,
+                ToolCall::GetUserMessages {
+                    since_id: Some(persisted.id),
+                },
+            )
+            .unwrap();
+        assert_eq!(private_page["messages"][0]["text"], "segredo privado");
+        let stale_cursor = private_page["last_id"].as_u64().unwrap();
+        assert_eq!(stale_cursor, private.id);
+
+        // O privado não deixou o id 2 em nenhum dos dois ficheiros.
+        let agents_dir = f.dir.0.join("agents");
+        assert!(
+            !std::fs::read_to_string(agents_dir.join("claude.jsonl"))
+                .unwrap()
+                .contains("segredo privado")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &std::fs::read_to_string(agents_dir.join("state.json")).unwrap()
+            )
+            .unwrap()["agents"]["claude"]["next"],
+            2
+        );
+
+        // Reinício normal: o disco só conhece até ao id 1, logo a primeira
+        // mensagem nova reutiliza 2. O agente ainda traz o cursor privado 2.
+        f.registry.set_mode(StoreMode::Normal);
+        let reopened = reopen(&f);
+        reopened.load();
+        let connection = reopened.connect("claude").unwrap();
+        let normal = reopened.user_message("claude", "normal depois").unwrap();
+        assert_eq!(normal.id, stale_cursor);
+
+        let page = reopened
+            .call(
+                connection,
+                ToolCall::GetUserMessages {
+                    since_id: Some(stale_cursor),
+                },
+            )
+            .unwrap();
+        assert_eq!(page["messages"].as_array().unwrap().len(), 1, "{page}");
+        assert_eq!(page["messages"][0]["text"], "normal depois");
+        assert_eq!(page["last_id"], normal.id);
+    }
+
     #[test]
     fn too_many_agent_names_are_refused() {
         let f = fixture("many");
