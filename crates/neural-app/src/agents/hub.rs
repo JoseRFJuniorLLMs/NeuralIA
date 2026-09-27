@@ -945,6 +945,11 @@ fn all_marks(state: &HubState) -> BTreeMap<String, AgentMarks> {
     state
         .agents
         .iter()
+        // Depois de "Apagar histórico", os AgentEntry continuam vivos para
+        // ligações/perguntas da sessão. Isso não lhes dá direito a reaparecer
+        // em state.json: só volta a persistir o agente que voltou a ter uma
+        // conversa nova.
+        .filter(|(_, entry)| !entry.conversation.records.is_empty())
         .map(|(agent, entry)| (agent.clone(), entry.marks))
         .collect()
 }
@@ -1910,6 +1915,56 @@ pub(crate) mod tests {
         );
         still_cleared();
         assert!(f.hub.pending_questions().is_empty());
+    }
+
+    /// Gate crítico: atividade nova depois de limpar o histórico só pode
+    /// recriar metadata do agente que voltou a ter conversa. Um agente antigo
+    /// ainda ligado em memória não pode reaparecer em state.json por tabela.
+    #[test]
+    fn activity_after_clear_does_not_resurrect_other_agent_metadata() {
+        let f = fixture("clear-metadata");
+        let claude = f.hub.connect("claude").unwrap();
+        let codex = f.hub.connect("codex").unwrap();
+        send(&f.hub, claude, "antes claude").unwrap();
+        send(&f.hub, codex, "antes codex").unwrap();
+        f.hub.mark_read("claude");
+        f.hub.mark_read("codex");
+
+        let agents_dir = f.dir.0.join("agents");
+        let state_file = agents_dir.join("state.json");
+        assert!(agents_dir.join("claude.jsonl").exists());
+        assert!(agents_dir.join("codex.jsonl").exists());
+        assert!(state_file.exists());
+
+        f.hub.clear_conversations().unwrap();
+        assert!(!agents_dir.join("claude.jsonl").exists());
+        assert!(!agents_dir.join("codex.jsonl").exists());
+        assert!(!state_file.exists());
+
+        // Só Claude voltou a produzir história depois do gesto.
+        f.hub.user_message("claude", "novo claude").unwrap();
+        assert!(agents_dir.join("claude.jsonl").exists());
+        assert!(!agents_dir.join("codex.jsonl").exists());
+
+        let state: Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_file).expect("state recriado pelo novo Claude"),
+        )
+        .expect("state json");
+        let agents = state["agents"].as_object().expect("agents");
+        assert_eq!(agents.len(), 1, "{state}");
+        assert!(agents.contains_key("claude"), "{state}");
+        assert!(!agents.contains_key("codex"), "{state}");
+
+        // Um processo novo também não redescobre Codex só por metadata antiga.
+        let reopened = reopen(&f);
+        reopened.load();
+        let names: Vec<String> = reopened
+            .snapshot()
+            .agents
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect();
+        assert_eq!(names, vec!["claude".to_string()]);
     }
 
     #[test]
