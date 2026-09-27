@@ -26955,7 +26955,8 @@ mod downloads_gates {
     /// acaba no Modo privado nunca chega ao ficheiro, mesmo com o modo de
     /// volta ao normal antes de o veredito chegar; um que acaba no normal
     /// deixa o pendente no disco logo no fim, e o veredito que cai no Modo
-    /// privado troca-o pelo desfecho na gravacao seguinte, ja no normal.
+    /// privado troca-o imediatamente pelo desfecho: downloads.json e a unica
+    /// loja GuardedAutomatic, mas o gestor ja excluiu conteudo privado.
     #[test]
     fn a_download_that_ends_in_private_mode_is_never_recorded_after_its_verdict() {
         let dir = Scratch::new("private-end");
@@ -27011,23 +27012,19 @@ mod downloads_gates {
             log_on_disk(&file),
             disk(&[("acaba-normal.pdf", "pending", false)])
         );
-        // O veredito cai no Modo privado: a loja nao escreve; de volta ao
-        // normal, a gravacao seguinte leva o desfecho.
+        // O veredito cai no Modo privado, mas o download acabou no normal:
+        // GuardedAutomatic deixa substituir o pending imediatamente.
         rig.set_mode(StoreMode::Private);
         gate.release();
         verdict(&mut rig);
         assert_eq!(
             log_on_disk(&file),
-            disk(&[("acaba-normal.pdf", "pending", false)])
+            disk(&[("acaba-normal.pdf", "completed", false)])
         );
         rig.set_mode(StoreMode::Normal);
-        rig.begin(90, 90, WebViewHost::External, dir.0.join("normal.exe"));
         assert_eq!(
             log_on_disk(&file),
-            disk(&[
-                ("normal.exe", "blocked", false),
-                ("acaba-normal.pdf", "completed", false),
-            ])
+            disk(&[("acaba-normal.pdf", "completed", false)])
         );
         let text = std::fs::read_to_string(&file).expect("downloads.json");
         assert!(!text.contains("comecou-antes"), "{text}");
