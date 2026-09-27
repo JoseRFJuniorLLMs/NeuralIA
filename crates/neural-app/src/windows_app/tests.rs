@@ -25327,7 +25327,7 @@ fn the_e2e_allowlist_covers_a_normal_guard_session() {
         .expect("a tabela da fase 0 na SPEC-0006");
     for (path, kind) in &rows {
         assert!(
-            ["Automatic", "Setting", "Explicit"].contains(&kind.as_str()),
+            ["Automatic", "GuardedAutomatic", "Setting", "Explicit"].contains(&kind.as_str()),
             "{path}: tipo {kind}"
         );
         let cited = if path.ends_with('/') {
