@@ -845,18 +845,10 @@ jobs:
               Test = "download_finalize_runs_on_the_lazy_fifo_worker"
               SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
               Old = @'
-                      if finalizer.enqueue(id, path, confirmed_program, allow_programs) {
-                          None
-                      } else {
-                          debug_log(format_args!("downloads: {} sem worker de inspecao", id.0));
-                          Some(DownloadEvent::CancelRequested { id })
-                      }
+                      if finalizer.enqueue(id, path.clone(), confirmed_program) {
           '@
               New = @'
-                      Some(DownloadEvent::Finalized {
-                          id,
-                          outcome: neural_core::downloads::finalize_download(&path, confirmed_program, allow_programs),
-                      })
+                      if false && finalizer.enqueue(id, path.clone(), confirmed_program) {
           '@
             },
             @{
@@ -871,14 +863,100 @@ jobs:
           '@
             },
             @{
-              Label = "download-cancel-still-commits"
-              Test = "cancelled_or_removed_download_discards_late_verdict"
-              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Label = "download-verification-cancelled"
+              Test = "cancel_or_leave_during_verification_still_commits_the_verdict"
+              SourcePath = "crates/neural-core/src/downloads.rs"
               Old = @'
-                                      (!*cancelled).then(|| apply_finalize_download(&job.path, action))
+                          Some(DownloadState::Running) => vec![DownloadEffect::CancelRunning(id)],
           '@
               New = @'
-                                      true.then(|| apply_finalize_download(&job.path, action))
+                          Some(DownloadState::Running) => vec![DownloadEffect::CancelRunning(id)],
+                          Some(DownloadState::Finalizing) => {
+                              self.entries.get_mut(&id).expect("entry").state =
+                                  DownloadState::Done(RecordOutcome::Cancelled);
+                              vec![DownloadEffect::Changed(id)]
+                          }
+          '@
+            },
+            @{
+              Label = "download-leave-card-cancels-verification"
+              Test = "cancel_or_leave_during_verification_still_commits_the_verdict"
+              SourcePath = "crates/neural-app/src/windows_app/downloads_ui.rs"
+              Old = @'
+                  .filter(|e| matches!(e.state, DownloadState::Running | DownloadState::Asking(_)))
+          '@
+              New = @'
+                  .filter(|e| e.is_active())
+          '@
+            },
+            @{
+              Label = "download-private-end-forgotten"
+              Test = "a_download_that_ends_in_private_mode_is_never_recorded_after_its_verdict"
+              SourcePath = "crates/neural-core/src/downloads.rs"
+              Old = @'
+                          entry.private |= self.private_mode;
+          '@
+              New = @'
+                          let _ = self.private_mode;
+          '@
+            },
+            @{
+              Label = "download-lost-worker-cancels"
+              Test = "a_lost_finalize_worker_falls_back_to_the_ui_thread"
+              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Old = @'
+                      Some(DownloadEvent::Finalized {
+                          id,
+                          outcome: finalize_download(&path, confirmed_program, allow_programs),
+                      })
+          '@
+              New = @'
+                      Some(DownloadEvent::CancelRequested { id })
+          '@
+            },
+            @{
+              Label = "download-no-pending-record"
+              Test = "exit_during_verification_finishes_the_verdict_before_leaving"
+              SourcePath = "crates/neural-core/src/downloads.rs"
+              Old = @'
+                          // O rasto de um fim sem veredito, antes de ele correr.
+                          effects.extend(self.record(id));
+          '@
+              New = @'
+                          // O rasto de um fim sem veredito, antes de ele correr.
+          '@
+            },
+            @{
+              Label = "download-exit-skips-verdicts"
+              Test = "exit_during_verification_finishes_the_verdict_before_leaving"
+              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Old = @'
+                  for event in self.finalizer.settle(wait) {
+          '@
+              New = @'
+                  for event in self.finalizer.settle(Duration::ZERO.min(wait)) {
+          '@
+            },
+            @{
+              Label = "download-pending-not-resumed"
+              Test = "a_verification_cut_short_is_resumed_at_the_next_start"
+              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Old = @'
+                  state.resume_pending();
+          '@
+              New = @'
+                  let _ = &mut state;
+          '@
+            },
+            @{
+              Label = "download-allow-programs-frozen"
+              Test = "allow_programs_is_read_when_the_verdict_is_committed"
+              SourcePath = "crates/neural-app/src/windows_app/downloads.rs"
+              Old = @'
+                  self.finalizer.set_allow_programs(on);
+          '@
+              New = @'
+                  let _ = on;
           '@
             },
             @{
