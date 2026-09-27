@@ -347,7 +347,7 @@ impl AgentPermissionPolicy {
         if let Some(initial) = &self.initial_origin {
             hash.update(initial.as_bytes());
         }
-        format!("{:x}", hash.finalize())
+        hash.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>()
     }
 }
 
