@@ -132,10 +132,16 @@ impl ThemeChoice {
     }
 }
 
-/// Um WebViewBuilder que ja nasce com o tema escolhido nas paginas.
+/// Um WebViewBuilder que ja nasce com o tema escolhido nas paginas e com o
+/// zoom do WebView2 ligado. No Windows, `with_hotkeys_zoom(true)` habilita
+/// tanto os atalhos quanto os gestos nativos, incluindo a pinça de dois dedos
+/// do precision touchpad. Como todas as WebViews da app nascem por esta fabrica,
+/// o gesto vale para paginas remotas, IAs, Split, servicos e paginas internas.
 pub(in crate::windows_app) fn themed_webview_builder<'a>() -> WebViewBuilder<'a> {
     use wry::WebViewBuilderExtWindows;
-    WebViewBuilder::new().with_theme(ThemeChoice::current().webview_theme())
+    WebViewBuilder::new()
+        .with_theme(ThemeChoice::current().webview_theme())
+        .with_hotkeys_zoom(true)
 }
 
 pub(in crate::windows_app) fn system_dark_mode() -> bool {
