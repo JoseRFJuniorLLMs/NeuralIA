@@ -67,7 +67,10 @@ fn vendored_pdfjs_files_match_the_recorded_hashes() {
     for name in ["pdf.mjs", "pdf.worker.mjs", "LICENSE"] {
         let path = repo_root().join("assets/pdfjs").join(name);
         let bytes = fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let digest = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         assert!(
             upstream.contains(&digest),
             "{name} tem SHA-256 {digest}, que não está em UPSTREAM.md"

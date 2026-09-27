@@ -39,7 +39,10 @@ fn io_error(error: impl std::fmt::Display) -> io::Error {
 }
 
 fn schema_hash() -> String {
-    format!("{:x}", Sha256::digest(SCHEMA_V01.as_bytes()))
+    Sha256::digest(SCHEMA_V01.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 pub(super) fn remove_sqlite_sidecars(path: &Path) {
@@ -362,7 +365,11 @@ fn embedding_bytes(values: &[f32]) -> Vec<u8> {
 
 fn entity_id(normalized: &str, entity_type: &str) -> String {
     let material = format!("entity\0{normalized}\0{entity_type}");
-    format!("{:x}", Sha256::digest(material.as_bytes()))[..24].to_string()
+    Sha256::digest(material.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..24]
+        .to_string()
 }
 
 fn upsert_page_base(transaction: &Transaction<'_>, document: &MemoryDocument) -> io::Result<()> {
@@ -961,7 +968,10 @@ mod tests {
         assert_eq!(fts_count(&path, "cafe").unwrap(), 1);
 
         first.body = "python novo outro corpus".into();
-        first.content_hash = format!("{:x}", Sha256::digest(first.body.as_bytes()));
+        first.content_hash = Sha256::digest(first.body.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         first.last_seen_at = first.last_seen_at.saturating_add(1);
         upsert(&path, &first, None).unwrap();
         assert_eq!(fts_count(&path, "cafe").unwrap(), 0);
