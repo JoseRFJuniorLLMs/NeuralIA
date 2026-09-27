@@ -34046,7 +34046,9 @@ function matchesGroup(el, compounds) {
   return at < 0;
 }
 function matches(el, selector) {
-  return selector.split(',').some((group) => matchesGroup(el, group.trim().split(/\s+/).map(parseCompound)));
+  // Um composto e uma sequencia de partes fora de `[...]` ou de `[...]`
+  // inteiros: o espaco DENTRO de um valor entre aspas nao separa.
+  return selector.split(',').some((group) => matchesGroup(el, (group.trim().match(/(?:\[[^\]]*\]|[^\s\[])+/g) || []).map(parseCompound)));
 }
 function all(root, selector, out) {
   for (const child of root.childNodes) {

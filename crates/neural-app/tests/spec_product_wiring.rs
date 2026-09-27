@@ -164,10 +164,14 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
     // comportamento em
     // `windows_app::tests::each_translation_is_named_by_its_text_and_reopens_from_history`.
     assert!(APP.contains("ResearchSession::new(request.prompt.clone()).titled(&request.label)"));
-    assert!(APP.contains("let (session, question_memory, reopen) = compare_records(&request);"));
+    // Desde a 2.5 a sessao nasce com o turno 1 (`begin_turn`) e a
+    // comparacao corre na thread `neural-consensus` sobre as respostas lidas
+    // do turno (consensus-reader-turns; `windows_app/consensus.rs`).
+    assert!(APP.contains("let (mut session, question_memory, reopen) = compare_records(&request);"));
     assert!(APP.contains("self.privacy.capture(question_memory);"));
     assert!(APP.contains("self.privacy.save_session(session.clone());"));
-    assert!(APP.contains("let facts = session.comparison(&ids);"));
+    assert!(APP.contains("session.comparison(&item_ids)"));
+    assert!(APP.contains("session.begin_turn("));
     assert!(APP.contains("let snapshot = session.synthesize(&ids).clone();"));
     assert!(APP.contains("session.export_markdown()"));
     assert!(APP.contains("IpcAction::ResearchAnswer"));
