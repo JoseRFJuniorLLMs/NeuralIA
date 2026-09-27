@@ -134,8 +134,6 @@ pub(in crate::windows_app) fn service_transition_input(
 ) -> Option<ServiceInput> {
     if service == Service::YouTube {
         (!state.minimized()).then_some(ServiceInput::Minimize)
-    } else if state.minimized() {
-        None
     } else {
         Some(ServiceInput::Close)
     }
