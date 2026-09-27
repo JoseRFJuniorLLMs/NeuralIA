@@ -1427,5 +1427,4 @@ mod recovery_regression_tests {
         assert!(manager.log().entries.is_empty());
         assert_eq!(manager.entries().count(), 0);
     }
-
 }
