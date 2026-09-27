@@ -851,16 +851,12 @@ impl PipeLink {
 impl HubLink for PipeLink {
     fn exchange(&mut self, request: &Value) -> Result<Value, LinkError> {
         self.ensure_connected()?;
-        let sent = self.conn.as_mut().expect("connected").send(request);
-        if sent.is_err() {
-            // A escrita falhou: o pedido nao saiu (o NeuralIA reiniciou, por
-            // exemplo). Repete-se uma vez numa ligacao nova.
+        // Uma falha de escrita pode acontecer depois de alguns ou de todos os
+        // bytes terem chegado ao hub. Repetir automaticamente um pedido com
+        // efeito colateral (send_message/ask_user) criaria duplicados.
+        if let Err(error) = self.conn.as_mut().expect("connected").send(request) {
             self.conn = None;
-            self.ensure_connected()?;
-            if let Err(error) = self.conn.as_mut().expect("connected").send(request) {
-                self.conn = None;
-                return Err(LinkError::Broken(error.to_string()));
-            }
+            return Err(LinkError::Broken(error.to_string()));
         }
         match self.conn.as_mut().expect("connected").receive() {
             Ok(reply) => Ok(reply),
