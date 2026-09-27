@@ -401,7 +401,7 @@ impl App {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.caption_reveal.reset();
         self.close_side_panel(PanelExit::Home);
-        self.close_service_panel();
+        self.service_panel_for_transition();
         self.close_live_panel();
         self.next_generation();
         self.surface = Surface::Home;
