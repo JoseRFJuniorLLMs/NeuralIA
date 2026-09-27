@@ -199,6 +199,11 @@ impl RateWindow {
 struct AgentEntry {
     conversation: Conversation,
     marks: AgentMarks,
+    /// Maior cursor que este processo ja entregou legitimamente ao agente.
+    /// Nasce do que veio do disco, nao de um `since_id` trazido pelo cliente:
+    /// assim um cursor de uma sessao privada anterior nao pode saltar por cima
+    /// de um id que o reinicio reutilizou.
+    delivered_up_to: u64,
     connections: BTreeSet<ConnectionId>,
     status: Option<AgentStatusLine>,
     messages: RateWindow,
@@ -208,9 +213,11 @@ struct AgentEntry {
 
 impl AgentEntry {
     fn new(conversation: Conversation, marks: AgentMarks) -> Self {
+        let delivered_up_to = conversation.last_id();
         Self {
             conversation,
             marks,
+            delivered_up_to,
             connections: BTreeSet::new(),
             status: None,
             messages: RateWindow::new(MESSAGES_PER_MINUTE),
@@ -530,7 +537,19 @@ impl AgentHub {
                 ToolCall::GetUserMessages { since_id } => {
                     let entry = state.agents.get_mut(&agent).expect("connected agent");
                     entry.polls.try_hit(now).map_err(rate_error)?;
-                    Ok(user_messages_page(&entry.conversation, since_id))
+                    // O cliente pode sobreviver ao processo do NeuralIA e
+                    // trazer um last_id de uma mensagem privada que nunca foi
+                    // ao disco. Depois do reinicio esse numero pode ser
+                    // reutilizado. So se confia ate ao maior cursor que este
+                    // processo ja entregou; o resto ancora nesse teto e e
+                    // reaprendido pela pagina devolvida.
+                    let trusted_since =
+                        since_id.map(|since| since.min(entry.delivered_up_to));
+                    let page = user_messages_page(&entry.conversation, trusted_since);
+                    if let Some(last_id) = page.get("last_id").and_then(Value::as_u64) {
+                        entry.delivered_up_to = entry.delivered_up_to.max(last_id);
+                    }
+                    Ok(page)
                 }
                 ToolCall::SetStatus { text, progress } => {
                     let entry = state.agents.get_mut(&agent).expect("connected agent");
