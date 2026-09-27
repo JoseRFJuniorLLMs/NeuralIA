@@ -5,9 +5,8 @@
 //!   seguinte.
 //! - Criado com `FILE_FLAG_FIRST_PIPE_INSTANCE` (se o nome ja existir, o hub
 //!   nao arranca em vez de partilhar o canal) e `PIPE_REJECT_REMOTE_CLIENTS`.
-//! - Descritor de seguranca: dono = o utilizador atual; DACL protegida com
-//!   duas entradas so, o utilizador atual e o SYSTEM
-//!   (`O:<sid>D:P(A;;FA;;;SY)(A;;FA;;;<sid>)`). Outros utilizadores da mesma
+//! - Descritor de seguranca: dono = o utilizador atual; DACL protegida com uma entrada so, o utilizador atual
+//!   (`O:<sid>D:P(A;;FA;;;<sid>)`). Outros utilizadores da mesma
 //!   maquina nem abrem o canal.
 //! - A primeira linha de cada ligacao tem de trazer o token de 256 bits de
 //!   `<data_dir>/agents/token`; sem ele a ligacao fecha
@@ -272,9 +271,9 @@ impl Drop for SecurityDescriptor {
     }
 }
 
-/// O SDDL do canal e dos ficheiros: dono e DACL so para `sid` e o SYSTEM.
+/// O SDDL do canal e dos ficheiros: dono e DACL somente para `sid`.
 pub(crate) fn user_only_sddl(sid: &str) -> String {
-    format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;{sid})")
+    format!("O:{sid}D:P(A;;FA;;;{sid})")
 }
 
 fn user_only_descriptor(sid: &str) -> Result<SecurityDescriptor, String> {
@@ -965,7 +964,7 @@ mod tests {
         assert_eq!(full_sid("SY"), "S-1-5-18");
         assert_eq!(
             user_only_sddl(&me),
-            format!("O:{me}D:P(A;;FA;;;SY)(A;;FA;;;{me})")
+            format!("O:{me}D:P(A;;FA;;;{me})")
         );
         // O que um cliente ve ao abrir o canal.
         let client = open_client(server.pipe_name()).unwrap_or_else(|e| panic!("{e:?}"));
