@@ -42,8 +42,9 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    SetFileSecurityW, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
@@ -278,8 +279,8 @@ pub(crate) fn user_only_sddl(sid: &str) -> String {
     format!("O:{sid}D:P(A;;FA;;;{sid})")
 }
 
-fn user_only_descriptor(sid: &str) -> Result<SecurityDescriptor, String> {
-    let sddl = wide_null(&user_only_sddl(sid));
+fn descriptor_from_sddl(sddl: &str) -> Result<SecurityDescriptor, String> {
+    let sddl = wide_null(sddl);
     let mut descriptor: PSECURITY_DESCRIPTOR = core::ptr::null_mut();
     // SAFETY: SDDL terminado em zero; o descritor e libertado no Drop.
     let ok = unsafe {
@@ -296,6 +297,40 @@ fn user_only_descriptor(sid: &str) -> Result<SecurityDescriptor, String> {
         ));
     }
     Ok(SecurityDescriptor(descriptor))
+}
+
+fn user_only_descriptor(sid: &str) -> Result<SecurityDescriptor, String> {
+    descriptor_from_sddl(&user_only_sddl(sid))
+}
+
+fn user_only_directory_sddl(sid: &str) -> String {
+    format!("O:{sid}D:P(A;OICI;FA;;;{sid})")
+}
+
+fn set_private_security(path: &Path, descriptor: &SecurityDescriptor) -> Result<(), String> {
+    let wide = wide_path(path);
+    let info =
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    // SAFETY: caminho terminado em zero; descriptor permanece vivo durante a chamada.
+    if unsafe { SetFileSecurityW(wide.as_ptr(), info, descriptor.0) } == 0 {
+        return Err(last_error("SetFileSecurityW"));
+    }
+    Ok(())
+}
+
+fn protect_agents_directory(dir: &Path, sid: &str) -> Result<(), String> {
+    let directory = descriptor_from_sddl(&user_only_directory_sddl(sid))?;
+    set_private_security(dir, &directory)?;
+    // Corrige tambem ficheiros de uma versao anterior que nasceram antes da
+    // pasta passar a ter DACL herdavel.
+    let file_descriptor = user_only_descriptor(sid)?;
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if entry.file_type().map_err(|error| error.to_string())?.is_file() {
+            set_private_security(&entry.path(), &file_descriptor)?;
+        }
+    }
+    Ok(())
 }
 
 fn attributes(descriptor: &SecurityDescriptor) -> SECURITY_ATTRIBUTES {
@@ -580,6 +615,8 @@ impl HubServer {
     /// Cria o canal e escreve `token` e `pipe` em `dir`.
     pub(crate) fn bind(dir: &Path) -> Result<Self, String> {
         fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+        let sid = current_user_sid()?;
+        protect_agents_directory(dir, &sid)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -594,7 +631,6 @@ impl HubServer {
                     format!("hub.lock: {error}")
                 }
             })?;
-        let sid = current_user_sid()?;
         let descriptor = user_only_descriptor(&sid)?;
         let id = random_hex(PIPE_ID_HEX_LEN / 2)?;
         let token = random_hex(TOKEN_HEX_LEN / 2)?;
@@ -986,7 +1022,9 @@ mod tests {
     #[test]
     fn hub_pipe_and_token_files_are_owned_by_and_open_only_to_this_user() {
         let dir = TempDir::new("pipe-dacl");
+        fs::write(dir.0.join("legacy.jsonl"), b"old").unwrap();
         let server = HubServer::bind(&dir.0).unwrap();
+        fs::write(dir.0.join("new-state.json"), b"new").unwrap();
         let me = current_user_sid().unwrap();
         assert!(me.starts_with("S-1-"), "{me}");
         // A abreviatura do SDDL volta ao SID completo (o runner do CI corre
@@ -1015,7 +1053,7 @@ mod tests {
                 .all(|b| b.is_ascii_hexdigit())
         );
         assert_eq!(server.pipe_name(), format!("{PIPE_PREFIX}{id}"));
-        for name in [TOKEN_FILE, PIPE_FILE] {
+        for name in [TOKEN_FILE, PIPE_FILE, "legacy.jsonl", "new-state.json"] {
             let file = File::open(dir.0.join(name)).unwrap();
             let sddl = handle_sddl(file.as_raw_handle(), SE_FILE_OBJECT).unwrap();
             assert_user_only(&sddl, &me);
