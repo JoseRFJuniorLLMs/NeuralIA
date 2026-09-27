@@ -56,7 +56,9 @@ embarca?” está em
   `neural-app` wiring are both gated.
 - **SPEC-0102:** partial. Deterministic local semantics/embeddings are integrated;
   model-pack install/verify/benchmark/explicit-activation/fallback lifecycle is
-  covered in `neural-core`, but no model backend or product UI/startup wiring ships.
+  covered in `neural-core`, but no model backend or product UI/startup wiring ships;
+  the context budget (`neural_core::context_budget`) is library-only until the
+  2.5 consensus wires it (§8.2).
 - **SPEC-0103:** implemented. The shipped JavaScript rails have provider fixtures,
   paired-ratio performance gates and deliberate sabotage proofs in CI; the Rust
   parser remains a reference path, not a substitute for the shipped JS gate.

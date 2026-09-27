@@ -11,6 +11,7 @@ const THREAT: &str = include_str!("../../../docs/specs/SPEC-0015-threat-model.md
 const ROADMAP: &str = include_str!("../../../docs/specs/SPEC-0016-roadmap.md");
 const TESTING_CI: &str = include_str!("../../../docs/specs/SPEC-0012-testing-ci.md");
 const LOCAL_AI_SPEC: &str = include_str!("../../../md/SPEC-0102-local-intelligence.md");
+const SPEC_INDEX: &str = include_str!("../../../md/README.md");
 
 fn workspace_version() -> &'static str {
     CARGO_ROOT
@@ -55,6 +56,20 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
 fn model_pack_docs_do_not_claim_product_wiring() {
     assert!(LOCAL_AI_SPEC.contains("not a NeuralIA product feature"));
     assert!(README.contains("ainda não está ligada ao produto"));
+}
+
+/// O orcamento de contexto (`neural_core::context_budget`) existe e tem gates
+/// no core; a spec e o indice das specs dizem que o produto ainda nao o
+/// chama, e o gate `context_budget_is_core_library_only_until_consensus_wires_it`
+/// em `spec_product_wiring.rs` guarda a ausencia. Quem o ligar muda os dois.
+#[test]
+fn context_budget_docs_do_not_claim_product_wiring() {
+    assert!(LOCAL_AI_SPEC.contains("## 8.2. Context budget (library-only)"));
+    assert!(LOCAL_AI_SPEC.contains("is **not wired into the product yet**"));
+    assert!(LOCAL_AI_SPEC.contains("budget_is_never_exceeded_over_200_seeded_cases"));
+    assert!(
+        SPEC_INDEX.contains("the context budget (`neural_core::context_budget`) is library-only")
+    );
 }
 
 #[test]
