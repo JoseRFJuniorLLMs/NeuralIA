@@ -896,7 +896,7 @@ mod tests {
                     // fica com ela): nunca a anterior.
                     let last: String = document
                         .select(&selector)
-                        .last()
+                        .next_back()
                         .map(|element| element.text().collect())
                         .unwrap_or_default();
                     assert!(

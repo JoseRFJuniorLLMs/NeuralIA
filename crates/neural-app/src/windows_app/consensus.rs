@@ -882,7 +882,9 @@ impl ConsensusState {
         id
     }
 
-    /// O run `id`, se ainda e o de agora.
+    /// O run `id`, se ainda e o de agora (os gates; a sonda vai pelo campo
+    /// porque precisa de `reads` ao mesmo tempo).
+    #[cfg(test)]
     pub(in crate::windows_app) fn run_mut(&mut self, id: u64) -> Option<&mut ConsensusRun> {
         self.run.as_mut().filter(|run| run.id == id)
     }
@@ -942,12 +944,14 @@ impl App {
         let hosts: Vec<(WebViewHost, u64)> = match (&self.surface, &self.comparator) {
             (Surface::Comparator, Some(comp)) => (0..comp.views.len())
                 .map(|index| {
-                    let host = WebViewHost::Column(index);
+                    // `column`, nao `host`: o gate `every_webview_gets_the_hooks`
+                    // prende o nome `host` ao sitio de nascimento da fonte ao lado.
+                    let column = WebViewHost::Column(index);
                     let generation = self
                         .translation
-                        .epoch(host)
+                        .epoch(column)
                         .map_or(0, |epoch| epoch.current());
-                    (host, generation)
+                    (column, generation)
                 })
                 .collect(),
             _ => Vec::new(),
@@ -991,6 +995,8 @@ impl App {
             self.consensus.abandon();
             return;
         };
+        // Pelo campo, nao por `run_mut`: a sonda precisa de `reads` ao
+        // mesmo tempo que do run.
         let Some(run) = self.consensus.run.as_mut().filter(|run| run.id == id) else {
             return;
         };

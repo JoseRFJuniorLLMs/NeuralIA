@@ -167,7 +167,9 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
     // Desde a 2.5 a sessao nasce com o turno 1 (`begin_turn`) e a
     // comparacao corre na thread `neural-consensus` sobre as respostas lidas
     // do turno (consensus-reader-turns; `windows_app/consensus.rs`).
-    assert!(APP.contains("let (mut session, question_memory, reopen) = compare_records(&request);"));
+    assert!(
+        APP.contains("let (mut session, question_memory, reopen) = compare_records(&request);")
+    );
     assert!(APP.contains("self.privacy.capture(question_memory);"));
     assert!(APP.contains("self.privacy.save_session(session.clone());"));
     assert!(APP.contains("session.comparison(&item_ids)"));
