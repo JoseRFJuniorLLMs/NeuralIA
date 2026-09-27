@@ -741,7 +741,6 @@ pub(in crate::windows_app) fn gmail_is_new_mail(
         && previous_key.is_some_and(|previous| !previous.is_empty() && previous != key)
 }
 
-
 #[cfg(test)]
 mod youtube_timeline_tests {
     use super::*;
@@ -752,7 +751,12 @@ mod youtube_timeline_tests {
             service_init_script(Service::YouTube),
             Some(super::page_scripts::SPLIT_SCROLL_RAIL_SCRIPT)
         );
-        for service in [Service::Meet, Service::WhatsApp, Service::Gmail, Service::Breath] {
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::Gmail,
+            Service::Breath,
+        ] {
             assert_eq!(
                 service_init_script(service),
                 None,
