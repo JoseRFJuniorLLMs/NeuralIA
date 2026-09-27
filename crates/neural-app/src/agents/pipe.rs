@@ -962,10 +962,7 @@ mod tests {
             "{admin}"
         );
         assert_eq!(full_sid("SY"), "S-1-5-18");
-        assert_eq!(
-            user_only_sddl(&me),
-            format!("O:{me}D:P(A;;FA;;;{me})")
-        );
+        assert_eq!(user_only_sddl(&me), format!("O:{me}D:P(A;;FA;;;{me})"));
         // O que um cliente ve ao abrir o canal.
         let client = open_client(server.pipe_name()).unwrap_or_else(|e| panic!("{e:?}"));
         let sddl = handle_sddl(client.raw(), SE_KERNEL_OBJECT).unwrap();
