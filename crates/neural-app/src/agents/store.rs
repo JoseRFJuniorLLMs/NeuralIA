@@ -744,9 +744,9 @@ impl ConversationStore {
         let mut first_error = None;
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if (name.ends_with(".jsonl") || name.ends_with(".jsonl.tmp"))
-                && let Err(error) = fs::remove_file(entry.path())
-            {
+            let conversation = name.ends_with(".jsonl") || name.ends_with(".jsonl.tmp");
+            let state = name == STATE_FILE || name == format!("{STATE_FILE}.tmp");
+            if (conversation || state) && let Err(error) = fs::remove_file(entry.path()) {
                 first_error.get_or_insert(error);
             }
         }
@@ -916,6 +916,7 @@ pub(crate) mod tests {
         registry.set_mode(StoreMode::Private);
         store.clear().unwrap();
         assert!(!path.exists());
+        assert!(!store.dir().join(STATE_FILE).exists());
     }
 
     /// Gate (critico: dados do utilizador, modo privado). Uma reescrita que
