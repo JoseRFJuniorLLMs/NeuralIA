@@ -971,6 +971,17 @@ jobs:
           '@
             },
             @{
+              Label = "download-clear-history-keeps-backup"
+              Test = "clear_history_during_verification_preserves_recovery_without_restoring_history"
+              SourcePath = "crates/neural-core/src/downloads.rs"
+              Old = @'
+                    vec![DownloadEffect::EraseLog, DownloadEffect::Persist]
+          '@
+              New = @'
+                    vec![DownloadEffect::Persist]
+          '@
+            },
+            @{
               Label = "download-private-verdict-not-persisted"
               Test = "normal_download_verdict_persists_even_if_global_mode_turns_private"
               SourcePath = "crates/neural-app/src/stores.rs"
