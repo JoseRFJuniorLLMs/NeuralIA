@@ -257,6 +257,10 @@ struct Question {
     view: QuestionView,
     connection: ConnectionId,
     state: QuestionState,
+    /// O desfecho ainda pertence ao historico persistente. O
+    /// Ctrl+Shift+Delete desliga isto para perguntas que continuam vivas em
+    /// memoria, para a resposta/timeout posterior nao recriar a conversa.
+    persist_outcome: bool,
 }
 
 struct HubState {
@@ -438,6 +442,7 @@ impl AgentHub {
                         events,
                         &question.view,
                         QuestionOutcome::Closed(CloseReason::Cancelled),
+                        question.persist_outcome,
                     );
                 }
             }
@@ -529,6 +534,7 @@ impl AgentHub {
                             view: view.clone(),
                             connection,
                             state: QuestionState::Pending,
+                            persist_outcome: true,
                         },
                     );
                     events.push(AgentEvent::Question(view));
@@ -588,12 +594,14 @@ impl AgentHub {
             }
             if matches!(question.state, QuestionState::Pending) && now >= question.view.deadline {
                 let view = question.view.clone();
+                let persist_outcome = question.persist_outcome;
                 close_question(
                     &mut state,
                     &store,
                     &mut events,
                     &view,
                     QuestionOutcome::Closed(CloseReason::TimedOut),
+                    persist_outcome,
                 );
                 if let Some(question) = state.questions.get_mut(&question_id) {
                     question.state =
@@ -644,6 +652,7 @@ impl AgentHub {
                     events,
                     &question.view,
                     QuestionOutcome::Closed(CloseReason::Cancelled),
+                    question.persist_outcome,
                 );
             }
         });
@@ -689,8 +698,16 @@ impl AgentHub {
                 }
             };
             let view = question.view.clone();
+            let persist_outcome = question.persist_outcome;
             let outcome = QuestionOutcome::Answered { answer: text, via };
-            close_question(state, &store, events, &view, outcome.clone());
+            close_question(
+                state,
+                &store,
+                events,
+                &view,
+                outcome.clone(),
+                persist_outcome,
+            );
             if let Some(question) = state.questions.get_mut(&question_id) {
                 question.state = QuestionState::Done(outcome);
             }
@@ -702,14 +719,21 @@ impl AgentHub {
     pub(crate) fn dismiss_question(&self, question_id: u64) -> Result<(), String> {
         let store = self.inner.store.clone();
         self.with_state(|state, events| {
-            let view = state
+            let (view, persist_outcome) = state
                 .questions
                 .get(&question_id)
                 .filter(|q| matches!(q.state, QuestionState::Pending))
-                .map(|q| q.view.clone())
+                .map(|q| (q.view.clone(), q.persist_outcome))
                 .ok_or_else(|| "Esta pergunta já não está à espera de resposta.".to_string())?;
             let outcome = QuestionOutcome::Closed(CloseReason::Dismissed);
-            close_question(state, &store, events, &view, outcome.clone());
+            close_question(
+                state,
+                &store,
+                events,
+                &view,
+                outcome.clone(),
+                persist_outcome,
+            );
             if let Some(question) = state.questions.get_mut(&question_id) {
                 question.state = QuestionState::Done(outcome);
             }
@@ -846,15 +870,22 @@ impl AgentHub {
         let now = self.now();
         let store = self.inner.store.clone();
         self.with_state(|state, events| {
-            let expired: Vec<QuestionView> = state
+            let expired: Vec<(QuestionView, bool)> = state
                 .questions
                 .values()
                 .filter(|q| matches!(q.state, QuestionState::Pending) && now >= q.view.deadline)
-                .map(|q| q.view.clone())
+                .map(|q| (q.view.clone(), q.persist_outcome))
                 .collect();
-            for view in expired {
+            for (view, persist_outcome) in expired {
                 let outcome = QuestionOutcome::Closed(CloseReason::TimedOut);
-                close_question(state, &store, events, &view, outcome.clone());
+                close_question(
+                    state,
+                    &store,
+                    events,
+                    &view,
+                    outcome.clone(),
+                    persist_outcome,
+                );
                 if let Some(question) = state.questions.get_mut(&view.id) {
                     question.state = QuestionState::Done(outcome);
                 }
@@ -865,7 +896,8 @@ impl AgentHub {
     /// Ctrl+Shift+Delete: apaga as conversas do disco e da memoria, debaixo
     /// do lock (uma ponte que escreva entretanto nao ressuscita o ficheiro
     /// a meio). As perguntas pendentes continuam (o agente esta a espera
-    /// delas).
+    /// delas), mas o desfecho delas passa a ser so de memoria: responder,
+    /// cancelar ou expirar depois do clear nao recria a conversa apagada.
     pub(crate) fn clear_conversations(&self) -> Result<(), String> {
         let store = self.inner.store.clone();
         let mut result = Ok(());
@@ -876,6 +908,11 @@ impl AgentHub {
                 entry.marks.next_id = entry.marks.next_id.max(last + 1);
                 entry.marks.read_up_to = entry.marks.next_id.saturating_sub(1);
                 entry.conversation = Conversation::default();
+            }
+            for question in state.questions.values_mut() {
+                if matches!(question.state, QuestionState::Pending) {
+                    question.persist_outcome = false;
+                }
             }
             if result.is_ok() {
                 state.store_error = None;
@@ -908,6 +945,11 @@ fn all_marks(state: &HubState) -> BTreeMap<String, AgentMarks> {
     state
         .agents
         .iter()
+        // Depois de "Apagar histórico", os AgentEntry continuam vivos para
+        // ligações/perguntas da sessão. Isso não lhes dá direito a reaparecer
+        // em state.json: só volta a persistir o agente que voltou a ter uma
+        // conversa nova.
+        .filter(|(_, entry)| entry.conversation.has_persistent_records())
         .map(|(agent, entry)| (agent.clone(), entry.marks))
         .collect()
 }
@@ -931,6 +973,7 @@ fn close_question(
     events: &mut Vec<AgentEvent>,
     view: &QuestionView,
     outcome: QuestionOutcome,
+    persist_outcome: bool,
 ) {
     let body = match &outcome {
         QuestionOutcome::Answered { answer, via } => RecordBody::UserAnswer {
@@ -943,7 +986,7 @@ fn close_question(
             reason: *reason,
         },
     };
-    if let Some(entry) = state.agents.get_mut(&view.agent) {
+    if persist_outcome && let Some(entry) = state.agents.get_mut(&view.agent) {
         let record = AgentRecord {
             id: entry.next_id(),
             ts_ms: now_ms(),
@@ -1785,6 +1828,153 @@ pub(crate) mod tests {
         let next = reopened.user_message("claude", "novo").unwrap();
         assert_eq!(next.id, 5);
         assert_eq!(reopened.total_unread(), 0);
+    }
+
+    /// Gate crítico: apagar o histórico não pode ser desfeito por uma
+    /// pergunta que já estava pendente. Os cartões continuam vivos em memória
+    /// e o agente recebe cada desfecho, mas resposta, dismiss, cancel e timeout
+    /// nunca podem recriar a conversa que o utilizador acabou de apagar.
+    #[test]
+    fn clearing_history_with_a_pending_question_never_recreates_the_conversation() {
+        let f = fixture("clear-pending");
+        let claude = f.hub.connect("claude").unwrap();
+        let drop_connection = f.hub.connect("claude").unwrap();
+        let answered = ask(&f.hub, claude, 600).unwrap();
+        let dismissed = ask(&f.hub, claude, 600).unwrap();
+        let cancelled = ask(&f.hub, claude, 600).unwrap();
+        let timed_out = ask(&f.hub, claude, ASK_TIMEOUT_MIN_SECS).unwrap();
+        let disconnected = ask(&f.hub, drop_connection, 600).unwrap();
+
+        let agents_dir = f.dir.0.join("agents");
+        let conversation = agents_dir.join("claude.jsonl");
+        let state_file = agents_dir.join("state.json");
+        assert!(conversation.exists());
+
+        f.hub.clear_conversations().unwrap();
+        assert!(!conversation.exists());
+        assert!(!state_file.exists());
+        assert_eq!(f.hub.pending_questions().len(), 5);
+
+        let still_cleared = || {
+            assert!(f.hub.conversation("claude").is_empty());
+            assert!(
+                !conversation.exists(),
+                "um desfecho apagado ressuscitou claude.jsonl"
+            );
+            assert!(
+                !state_file.exists(),
+                "um desfecho apagado ressuscitou state.json"
+            );
+        };
+
+        f.hub
+            .answer_question(answered, QuestionAnswer::Button(0))
+            .unwrap();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, answered, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"answered","answer":"Sim","via":"button"})
+        );
+        still_cleared();
+
+        f.hub.dismiss_question(dismissed).unwrap();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, dismissed, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"dismissed"})
+        );
+        still_cleared();
+
+        f.hub.cancel_question(claude, cancelled);
+        assert!(
+            f.hub
+                .wait_question(claude, cancelled, Duration::from_millis(1))
+                .is_err()
+        );
+        still_cleared();
+
+        f.clock
+            .advance(Duration::from_secs(u64::from(ASK_TIMEOUT_MIN_SECS) + 1));
+        f.hub.sweep();
+        assert_eq!(
+            f.hub
+                .wait_question(claude, timed_out, Duration::from_millis(1))
+                .unwrap(),
+            json!({"state":"timed_out"})
+        );
+        still_cleared();
+
+        f.hub.disconnect(drop_connection);
+        assert!(
+            f.hub
+                .pending_questions()
+                .iter()
+                .all(|question| question.id != disconnected)
+        );
+        still_cleared();
+        assert!(f.hub.pending_questions().is_empty());
+    }
+
+    /// Gate crítico: atividade nova depois de limpar o histórico só pode
+    /// recriar metadata do agente que voltou a ter conversa. Um agente antigo
+    /// ainda ligado em memória não pode reaparecer em state.json por tabela.
+    #[test]
+    fn activity_after_clear_does_not_resurrect_other_agent_metadata() {
+        let f = fixture("clear-metadata");
+        let claude = f.hub.connect("claude").unwrap();
+        let codex = f.hub.connect("codex").unwrap();
+        send(&f.hub, claude, "antes claude").unwrap();
+        send(&f.hub, codex, "antes codex").unwrap();
+        f.hub.mark_read("claude");
+        f.hub.mark_read("codex");
+
+        let agents_dir = f.dir.0.join("agents");
+        let state_file = agents_dir.join("state.json");
+        assert!(agents_dir.join("claude.jsonl").exists());
+        assert!(agents_dir.join("codex.jsonl").exists());
+        assert!(state_file.exists());
+
+        f.hub.clear_conversations().unwrap();
+        assert!(!agents_dir.join("claude.jsonl").exists());
+        assert!(!agents_dir.join("codex.jsonl").exists());
+        assert!(!state_file.exists());
+
+        // Codex volta a falar so em Private: fica na memoria, mas isso nao
+        // lhe da direito a reaparecer quando outra atividade normal grava
+        // state.json mais tarde.
+        f.registry.set_mode(StoreMode::Private);
+        send(&f.hub, codex, "privado codex").unwrap();
+        assert_eq!(f.hub.conversation("codex").len(), 1);
+        assert!(!agents_dir.join("codex.jsonl").exists());
+        assert!(!state_file.exists());
+
+        // So Claude voltou a produzir historia persistivel depois do gesto.
+        f.registry.set_mode(StoreMode::Normal);
+        f.hub.user_message("claude", "novo claude").unwrap();
+        assert!(agents_dir.join("claude.jsonl").exists());
+        assert!(!agents_dir.join("codex.jsonl").exists());
+
+        let state: Value = serde_json::from_str(
+            &std::fs::read_to_string(&state_file).expect("state recriado pelo novo Claude"),
+        )
+        .expect("state json");
+        let agents = state["agents"].as_object().expect("agents");
+        assert_eq!(agents.len(), 1, "{state}");
+        assert!(agents.contains_key("claude"), "{state}");
+        assert!(!agents.contains_key("codex"), "{state}");
+
+        // Um processo novo também não redescobre Codex só por metadata antiga.
+        let reopened = reopen(&f);
+        reopened.load();
+        let names: Vec<String> = reopened
+            .snapshot()
+            .agents
+            .into_iter()
+            .map(|agent| agent.name)
+            .collect();
+        assert_eq!(names, vec!["claude".to_string()]);
     }
 
     #[test]

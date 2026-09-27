@@ -453,6 +453,15 @@ impl Conversation {
         self.records.back().map_or(0, |record| record.id)
     }
 
+    /// Ha pelo menos um registo que pertence ao historico persistente.
+    /// Registos `unsaved` nasceram enquanto a loja estava em Private e
+    /// nunca autorizam que o nome/marks do agente reaparecam em state.json.
+    pub(crate) fn has_persistent_records(&self) -> bool {
+        self.records
+            .iter()
+            .any(|record| !self.unsaved.contains(&record.id))
+    }
+
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
