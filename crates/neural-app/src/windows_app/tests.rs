@@ -24106,10 +24106,9 @@ fn shipped_top_level_sources() -> Vec<(&'static str, String)> {
 #[test]
 fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
-        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE, AI_USAGE_STORE,
-        APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE, HISTORY_STORE,
-        KEYS_STORE,
-        LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
+        ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE,
+        AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
+        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
