@@ -165,14 +165,15 @@ mod tests {
     /// de teste; este prova que o produto o recebe do registo.
     #[test]
     fn the_shipped_hub_lives_in_the_registry_agents_store_and_obeys_private_mode() {
-        use crate::agents::store::tests::TempDir;
+        use crate::agents::store::tests::{TempDir, open_store};
         use crate::agents::tools::ToolCall;
+        use crate::stores::AGENTS_STORE;
         use neural_core::json_store::StoreMode;
 
         assert!(open_agents_hub(None, |_| {}).is_none());
 
         let root = TempDir::new("shipped-hub");
-        let registry = StoreRegistry::mint_for_test(&root.0);
+        let (registry, _store) = open_store(&root.0);
         let seen: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
         let hub = open_agents_hub(registry.grant(AGENTS_STORE).ok(), move |event| {
