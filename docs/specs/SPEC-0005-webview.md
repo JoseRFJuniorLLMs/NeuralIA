@@ -588,9 +588,13 @@ that file again once, in a new row «Verificando o arquivo…», with
 "Permitir baixar programas" as it is then; a file that is gone by then
 counts as deleted («não deu para verificar»). The `resumed` mark is
 written before that verification runs, so one that stops NeuralIA again
-is not retried: its row then says «Não verificado — a NeuralIA fechou
-durante a verificação», in the warning tone, with no «Abrir» or «Mostrar
-na pasta». The path comes from `downloads.json` in the data folder, which
+is not retried. A normal visible pending record then says «Não verificado —
+a NeuralIA fechou durante a verificação», in the warning tone, with no
+«Abrir» or «Mostrar na pasta». A `recovery_only` record exists only because
+the user already cleared history: after its single resumed attempt has
+started, a later startup purges that hidden record instead of retaining its
+path indefinitely; a hidden pending whose path could not be stored is
+purged for the same reason. The path comes from `downloads.json` in the data folder, which
 NeuralIA trusts as it trusts its other stores.
 
 Nothing from the private split or an InPrivate service panel is
@@ -651,7 +655,8 @@ shows the real outcome),
 `a_verification_cut_short_is_resumed_at_the_next_start`,
 `allow_programs_is_read_when_the_verdict_is_committed`,
 `clear_history_during_verification_preserves_recovery_without_restoring_history`,
-`normal_download_verdict_persists_even_if_global_mode_turns_private`, with
+`normal_download_verdict_persists_even_if_global_mode_turns_private`,
+`exhausted_hidden_recovery_is_purged_after_its_single_retry`, with
 `every_webview_gets_the_hooks` requiring the manager on every `Managed` host
 and on no `Deny` host. The CI-only `scripts/test-downloads.ps1` runs the
 tested exe against a 127.0.0.1 fixture: a `setup.exe` is refused; a PDF
