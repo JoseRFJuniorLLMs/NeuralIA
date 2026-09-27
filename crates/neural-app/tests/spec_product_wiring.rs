@@ -272,15 +272,20 @@ fn spec_0103_product_gate_targets_the_shipped_javascript_timeline() {
 }
 
 #[test]
-fn every_neuralia_webview_uses_native_pinch_zoom_without_the_old_double_handler() {
+fn every_neuralia_webview_keeps_app_mouse_zoom_and_enables_native_pinch() {
+    assert!(APP.contains("enable_native_pinch_zoom(webview)"));
+    assert!(APP.contains("ICoreWebView2Settings5"));
+    assert!(APP.contains("SetIsPinchZoomEnabled(true)"));
     assert!(
-        APP.contains(".with_hotkeys_zoom(true)"),
-        "the shared WebView factory must enable native hotkey/gesture zoom"
+        !APP.contains("SetIsZoomControlEnabled(true)"),
+        "native browser zoom would duplicate NeuralIA mouse zoom"
     );
     assert!(
-        !APP.contains("function wheelZoomAction("),
-        "the injected ctrl+wheel zoom handler would double-fire with native WebView2 pinch"
+        APP.contains("function wheelZoomAction("),
+        "Ctrl+wheel must keep updating NeuralIA shared zoom ladder"
     );
+    assert!(APP.contains("install_service_visual_script(webview, host)"));
+    assert!(APP.contains("AddScriptToExecuteOnDocumentCreated"));
 }
 
 #[test]
