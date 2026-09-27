@@ -921,19 +921,80 @@ impl AgentHub {
         let mut result = Ok(());
         self.with_state(|state, events| {
             result = clear(&store).map_err(|error| error.to_string());
-            for entry in state.agents.values_mut() {
-                let last = entry.conversation.last_id();
-                entry.marks.next_id = entry.marks.next_id.max(last + 1);
-                entry.marks.read_up_to = entry.marks.next_id.saturating_sub(1);
-                entry.conversation = Conversation::default();
+
+            if result.is_ok() {
+                for entry in state.agents.values_mut() {
+                    let last = entry.conversation.last_id();
+                    entry.marks.next_id = entry.marks.next_id.max(last + 1);
+                    entry.marks.read_up_to = entry.marks.next_id.saturating_sub(1);
+                    entry.conversation = Conversation::default();
+                    entry.delivered_up_to = 0;
+                }
+                state.store_error = None;
+            } else {
+                // Um clear pode ter removido apenas parte dos ficheiros antes
+                // de falhar. A RAM passa a refletir o que realmente sobrou no
+                // disco, em vez de mostrar uma falsa tela vazia que volta no
+                // proximo arranque.
+                let mut loaded = store.load();
+                for (agent, entry) in state.agents.iter_mut() {
+                    let old_next = entry
+                        .marks
+                        .next_id
+                        .max(entry.conversation.last_id().saturating_add(1))
+                        .max(1);
+                    let conversation = loaded.conversations.remove(agent).unwrap_or_default();
+                    let disk_mark = loaded.marks.remove(agent);
+                    let survived = !conversation.records.is_empty() || disk_mark.is_some();
+                    if survived {
+                        let mut mark = disk_mark.unwrap_or_default();
+                        mark.next_id = mark
+                            .next_id
+                            .max(conversation.last_id().saturating_add(1))
+                            .max(old_next);
+                        entry.conversation = conversation;
+                        entry.marks = mark;
+                        entry.delivered_up_to = entry.conversation.last_id();
+                    } else {
+                        entry.conversation = Conversation::default();
+                        entry.marks.next_id = old_next;
+                        entry.marks.read_up_to = old_next.saturating_sub(1);
+                        entry.delivered_up_to = 0;
+                    }
+                }
+
+                // Normalmente todos os ficheiros ja tinham AgentEntry porque
+                // load() correu no arranque. Ainda assim, se apareceu algum
+                // sobrevivente desconhecido, nao o escondemos.
+                for (agent, conversation) in loaded.conversations {
+                    if state.agents.len() >= MAX_AGENTS {
+                        break;
+                    }
+                    let mark = loaded.marks.remove(&agent).unwrap_or_default();
+                    state
+                        .agents
+                        .entry(agent)
+                        .or_insert_with(|| AgentEntry::new(conversation, mark));
+                }
+                for (agent, mark) in loaded.marks {
+                    if state.agents.len() >= MAX_AGENTS {
+                        break;
+                    }
+                    state
+                        .agents
+                        .entry(agent)
+                        .or_insert_with(|| AgentEntry::new(Conversation::default(), mark));
+                }
+                state.store_error = result.clone().err();
             }
+
+            // O gesto de apagar ocorreu mesmo se o filesystem so conseguiu
+            // cumprir parte dele. Uma pergunta pendente nao pode recriar
+            // historia depois dessa tentativa.
             for question in state.questions.values_mut() {
                 if matches!(question.state, QuestionState::Pending) {
                     question.outcome_storage = QuestionOutcomeStorage::Discard;
                 }
-            }
-            if result.is_ok() {
-                state.store_error = None;
             }
             events.push(AgentEvent::Changed);
         });
