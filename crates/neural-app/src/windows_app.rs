@@ -3324,7 +3324,13 @@ impl App {
             privacy.store(ADBLOCK_LIST_STORE),
             &proxy,
         );
-        let downloads = DownloadsState::open(|spec| privacy.store(spec));
+        let download_proxy = proxy.clone();
+        let downloads = DownloadsState::open(
+            |spec| privacy.store(spec),
+            move |event| {
+                let _ = download_proxy.send_event(UserEvent::Download(event));
+            },
+        );
         // Sem thread nem disco: a `neural-translate` so nasce no 1.o clique.
         let translation = TranslationState::new(proxy.clone());
         let downloads_ui = DownloadsUiState::new(proxy.clone());
