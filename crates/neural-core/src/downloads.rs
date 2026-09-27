@@ -1148,6 +1148,7 @@ impl DownloadManager {
             .filter(|path| path.as_os_str().len() <= MAX_RECORD_PATH_BYTES);
         let pending = self.log.iter().position(|record| {
             matches!(record.outcome, RecordOutcome::Pending { .. })
+                && record.recovery_only == !entry.history_visible
                 && record.name == wanted.name
                 && record.host == wanted.host
                 && record.at == wanted.at
@@ -2624,12 +2625,30 @@ mod tests {
         ));
         assert!(!m.entry(DownloadId(2)).expect("verificacao").history_visible);
 
+        // Um download novo com a mesma identidade textual nao pode roubar
+        // o pending oculto: recovery_only faz parte da identidade do journal.
+        m.on_event(start(3, "pacote.zip", false));
+        m.on_event(DownloadEvent::Ended {
+            id: DownloadId(3),
+            end: DownloadEnd::Completed {
+                path: verify_path.clone(),
+            },
+        });
+        assert_eq!(m.log().entries.len(), 2);
+        assert!(!m.log().entries[0].recovery_only);
+        assert!(m.log().entries[1].recovery_only);
+
         let effects = m.on_event(DownloadEvent::Finalized {
             id: DownloadId(2),
             outcome: FinalizeOutcome::Deleted(DeleteReason::DangerousContent),
         });
         assert!(effects.contains(&DownloadEffect::Persist), "{effects:?}");
-        assert!(m.log().entries.is_empty());
+        assert_eq!(m.log().entries.len(), 1);
+        assert!(!m.log().entries[0].recovery_only);
+        assert!(matches!(
+            m.log().entries[0].outcome,
+            RecordOutcome::Pending { .. }
+        ));
 
         let mut restarted = DownloadManager::new(DownloadSettings::default(), after_clear);
         let effects = restarted.resume_pending(|| DownloadId(9));
