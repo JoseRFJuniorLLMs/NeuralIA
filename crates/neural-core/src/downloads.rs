@@ -1139,8 +1139,8 @@ impl DownloadManager {
         // O registo pendente (o do fim) da lugar ao desfecho. Quem vai para o
         // registo decidiu-se quando o download acabou (`ended`): o modo de
         // agora nao conta, e um que acabou no normal nao some do registo por
-        // o veredito cair no Modo privado (a loja nao escreve nesse modo; a
-        // gravacao seguinte no normal leva-o).
+        // o veredito cair no Modo privado. No produto a loja e
+        // GuardedAutomatic justamente para esse commit tardio.
         // O pendente como foi gravado (dentro dos tectos: um nome cortado,
         // um caminho grande demais largado).
         let wanted = record_of(entry, RecordOutcome::Cancelled);
