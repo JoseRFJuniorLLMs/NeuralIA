@@ -42,7 +42,6 @@ use crate::windows_app::{
         raise_webview_host, register_service_panel_events, service_event_is_current,
         service_init_script, service_panel_permission,
     },
-    show_popup_without_activation,
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
         history_panel_items, memory_panel_items, panel_bounds, panel_html, panel_render_script,
