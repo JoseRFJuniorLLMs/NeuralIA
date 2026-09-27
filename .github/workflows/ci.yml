@@ -923,10 +923,25 @@ jobs:
               Test = "clearing_history_with_a_pending_question_never_recreates_the_conversation"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
               Old = @'
-                    question.persist_outcome = false;
+                    question.outcome_storage = QuestionOutcomeStorage::Discard;
           '@
               New = @'
-                    question.persist_outcome = true;
+                    question.outcome_storage = QuestionOutcomeStorage::Persist;
+          '@
+            },
+            @{
+              Label = "agents-private-question-outcome-persists-after-mode-change"
+              Test = "a_private_origin_question_stays_memory_only_after_returning_to_normal"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                            outcome_storage: if store.writes_allowed() {
+                                QuestionOutcomeStorage::Persist
+                            } else {
+                                QuestionOutcomeStorage::MemoryOnly
+                            },
+          '@
+              New = @'
+                            outcome_storage: QuestionOutcomeStorage::Persist,
           '@
             },
             @{
