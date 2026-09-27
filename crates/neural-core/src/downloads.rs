@@ -2635,7 +2635,10 @@ mod tests {
         let effects = restarted.resume_pending(|| DownloadId(9));
         assert!(effects.iter().any(|effect| matches!(
             effect,
-            DownloadEffect::Finalize { id: DownloadId(9), .. }
+            DownloadEffect::Finalize {
+                id: DownloadId(9),
+                ..
+            }
         )));
         let resumed = restarted.entry(DownloadId(9)).expect("retomado");
         assert!(!resumed.history_visible);
