@@ -207,14 +207,34 @@ impl App {
         }
     }
 
-    /// Fecha o painel de servicos so se ele estiver a vista.
+    /// Uma transicao interna (Ctrl+H, Home, nova pesquisa, outra superficie)
+    /// nunca mata o YouTube: ele vira uma "aba de fundo" minimizada e a mesma
+    /// WebView continua viva. Os outros servicos mantem o comportamento antigo.
+    ///
+    /// Fechamento explicito continua por `close_service_panel` / ServiceInput::Close
+    /// ou pelo clique no proprio icone quando o painel esta aberto.
+    pub(in crate::windows_app) fn service_panel_for_transition(&mut self) {
+        let Some(panel) = self.service_panel.as_ref() else {
+            return;
+        };
+        if panel.service == Service::YouTube {
+            if !panel.state.minimized() {
+                self.service_input(ServiceInput::Minimize);
+            }
+            return;
+        }
+        self.close_service_panel();
+    }
+
+    /// Outro painel da direita precisa do espaco. YouTube minimiza; os demais
+    /// servicos fecham como antes.
     pub(in crate::windows_app) fn close_docked_service_panel(&mut self) {
         if self
             .service_panel
             .as_ref()
             .is_some_and(|panel| !panel.state.minimized())
         {
-            self.close_service_panel();
+            self.service_panel_for_transition();
         }
     }
 
