@@ -3,6 +3,8 @@
 //! (split-windows-app-c).
 use crate::windows_app::*;
 
+use neural_core::{ProviderId, TurnOrigin};
+
 impl App {
     fn current_research_item_ids(&self) -> Vec<String> {
         self.current_research
@@ -23,34 +25,12 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub(in crate::windows_app) fn compare_current_research(&self) {
-        let Some(session) = &self.current_research else {
-            self.show_native_text(
-                "NeuralIA — Research Session",
-                "Nenhuma sessão de pesquisa está ativa.",
-            );
-            return;
-        };
-        let ids = self.current_research_item_ids();
-        let facts = session.comparison(&ids);
-        let text = if facts.is_empty() {
-            "Ainda não há fontes/respostas suficientes para comparar.".to_string()
-        } else {
-            facts
-                .into_iter()
-                .map(|fact| {
-                    format!(
-                        "{}\nEntidades: {}\nNúmeros: {}\nDatas: {}",
-                        fact.source,
-                        fact.entities.join(", "),
-                        fact.numbers.join(", "),
-                        fact.dates.join(", ")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\r\n\r\n")
-        };
-        self.show_native_text("NeuralIA — Comparação da pesquisa", &text);
+    /// `research:compare`: o leitor nativo de respostas (`consensus.rs`) le
+    /// as colunas do turno de agora e mostra o relatorio quando elas
+    /// assentam. A caixa com as entidades das respostas empurradas pela
+    /// pagina deu o lugar a esta leitura (consensus-reader-turns).
+    pub(in crate::windows_app) fn compare_current_research(&mut self) {
+        self.read_consensus();
     }
 
     pub(in crate::windows_app) fn synthesize_current_research(&mut self) {
@@ -127,7 +107,20 @@ impl App {
     pub(in crate::windows_app) fn compare(&mut self, request: CompareRequest) {
         self.next_generation();
 
-        let (session, question_memory, reopen) = compare_records(&request);
+        let (mut session, question_memory, reopen) = compare_records(&request);
+        // O turno 1 da sessao: a pergunta as tres, na ordem das colunas
+        // (consensus-reader-turns; rascunho da Chat Surface, OQ11).
+        let turn = begin_question_turn(
+            &mut session,
+            TurnOrigin::Compare,
+            None,
+            &request.prompt,
+            0,
+            &ProviderId::default_slots(),
+        );
+        // Um run do Consenso que ainda lia a pergunta anterior acaba aqui e
+        // grava-se na sessao DELA, antes de esta tomar o lugar.
+        self.consensus_turn_begun(&session.id, turn);
         self.privacy.capture(question_memory);
         self.privacy.save_session(session.clone());
         self.current_research = Some(session);
@@ -845,6 +838,17 @@ impl App {
             urls.len(),
             text.chars().count()
         ));
+        // O turno da pergunta, ANTES de as colunas navegarem: a chave leva
+        // a geracao de navegacao da coluna de origem, por isso o mesmo
+        // Enter repetido e a mesma operacao (consensus-reader-turns). A
+        // coluna de origem entra primeiro: ela responde a mesma pergunta.
+        let providers = ask_turn_providers(source_index, urls.iter().map(|(index, _)| *index));
+        self.consensus_begin_turn(
+            TurnOrigin::AskOtherColumns,
+            Some(source_index),
+            &text,
+            &providers,
+        );
         if let Some(comp) = &self.comparator {
             for (index, url) in &urls {
                 if let Some(view) = comp.views.get(*index) {

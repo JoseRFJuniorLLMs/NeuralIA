@@ -33502,3 +33502,2341 @@ process.stdout.write(JSON.stringify(results));
         assert_eq!(strings(&results[2]["hidden"]), ["signup"], "{}", results[2]);
     }
 }
+
+// ===================== consensus: o leitor de respostas e os turnos =====================
+
+use neural_core::search::ProviderId;
+use neural_core::{AttemptStatus, SnapshotAnswer};
+
+/// Um JSON valido do `ANSWER_READ_SCRIPT`, com as sete chaves.
+fn answer_json(host: &str, text: &str, links: &[&str]) -> String {
+    serde_json::json!({
+        "v": 1, "ok": true, "host": host, "busy": false, "cut": false,
+        "text": text, "links": links,
+    })
+    .to_string()
+}
+
+fn answer_read_of(host: &str, text: &str, links: &[&str]) -> AnswerRead {
+    AnswerRead {
+        ok: true,
+        host: host.to_string(),
+        busy: false,
+        cut: false,
+        text: text.to_string(),
+        links: links.iter().map(|link| link.to_string()).collect(),
+        dropped_links: 0,
+    }
+}
+
+/// Os tres hospedeiros das colunas, cada um na geracao 0.
+fn three_columns() -> Vec<(WebViewHost, u64)> {
+    (0..COMPARATOR_COLUMNS)
+        .map(|index| (WebViewHost::Column(index), 0))
+        .collect()
+}
+
+/// Gate (critico, entrada nao confiavel; consensus): `parse_answer_read`
+/// le a resposta do script como dado da pagina -- o tecto de 512 KiB
+/// conferido ANTES do serde (um texto acima do tecto e recusado sem ser
+/// lido, valha ou nao como JSON), as sete chaves exatas e nenhuma outra,
+/// `v` = 1, cada campo com o seu tipo, o texto dentro dos 24 000
+/// caracteres, no maximo 60 ligacoes (cada uma que nao vale cai sozinha:
+/// `answer_read_drops_only_the_invalid_link`), e cada marcador de citacao a
+/// apontar para uma ligacao que existe. Sabotagem: tirar o tecto cru (o
+/// JSON gigante passa a ser lido), aceitar chaves a mais.
+#[test]
+fn answer_read_parse_caps_raw_and_requires_exact_keys() {
+    let valid = answer_json(
+        "chatgpt.com",
+        "Olá \u{E000}0\u{E001} e \u{E000}1\u{E001}.",
+        &["https://example.com/a", "http://example.org/b?x=1"],
+    );
+    let read = parse_answer_read(&valid, "chatgpt.com").expect("a resposta vale");
+    assert_eq!(
+        read,
+        AnswerRead {
+            ok: true,
+            host: "chatgpt.com".into(),
+            busy: false,
+            cut: false,
+            text: "Olá \u{E000}0\u{E001} e \u{E000}1\u{E001}.".into(),
+            links: vec![
+                "https://example.com/a".into(),
+                "http://example.org/b?x=1".into()
+            ],
+            dropped_links: 0,
+        }
+    );
+
+    // O tecto cru vem antes do serde: um JSON valido acima dele cai como
+    // `OverCap`, e lixo acima dele tambem (nunca `NotJson`: nao se leu).
+    let huge = answer_json("chatgpt.com", &"a".repeat(ANSWER_READ_MAX_RAW_BYTES), &[]);
+    assert!(huge.len() > ANSWER_READ_MAX_RAW_BYTES);
+    assert_eq!(
+        parse_answer_read(&huge, "chatgpt.com"),
+        Err(AnswerReadError::OverCap { bytes: huge.len() })
+    );
+    let garbage = "{".repeat(ANSWER_READ_MAX_RAW_BYTES + 1);
+    assert_eq!(
+        parse_answer_read(&garbage, "chatgpt.com"),
+        Err(AnswerReadError::OverCap {
+            bytes: ANSWER_READ_MAX_RAW_BYTES + 1
+        })
+    );
+    // Dentro do tecto cru mas acima do tecto do texto: o serde correu, o
+    // texto e que nao cabe.
+    let long = answer_json("chatgpt.com", &"é".repeat(ANSWER_READ_MAX_CHARS + 1), &[]);
+    assert!(long.len() <= ANSWER_READ_MAX_RAW_BYTES);
+    assert_eq!(
+        parse_answer_read(&long, "chatgpt.com"),
+        Err(AnswerReadError::TooLong {
+            chars: ANSWER_READ_MAX_CHARS + 1
+        })
+    );
+    let exact = answer_json("chatgpt.com", &"é".repeat(ANSWER_READ_MAX_CHARS), &[]);
+    assert!(parse_answer_read(&exact, "chatgpt.com").is_ok());
+
+    // Nao e JSON; nao e um objeto.
+    assert_eq!(
+        parse_answer_read("{v:1", "chatgpt.com"),
+        Err(AnswerReadError::NotJson)
+    );
+    assert_eq!(
+        parse_answer_read("[1]", "chatgpt.com"),
+        Err(AnswerReadError::NotAnObject)
+    );
+    assert_eq!(
+        parse_answer_read("\"texto\"", "chatgpt.com"),
+        Err(AnswerReadError::NotAnObject)
+    );
+
+    // As chaves exatas: uma a menos, uma a mais, uma trocada.
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&valid).expect("objeto");
+    let mut missing = object.clone();
+    missing.remove("busy");
+    assert!(matches!(
+        parse_answer_read(
+            &serde_json::Value::Object(missing).to_string(),
+            "chatgpt.com"
+        ),
+        Err(AnswerReadError::Keys(_))
+    ));
+    let mut extra = object.clone();
+    extra.insert("__proto__".into(), serde_json::json!({}));
+    assert!(matches!(
+        parse_answer_read(&serde_json::Value::Object(extra).to_string(), "chatgpt.com"),
+        Err(AnswerReadError::Keys(_))
+    ));
+    let mut renamed = object.clone();
+    let text = renamed.remove("text").expect("text");
+    renamed.insert("Text".into(), text);
+    assert!(matches!(
+        parse_answer_read(
+            &serde_json::Value::Object(renamed).to_string(),
+            "chatgpt.com"
+        ),
+        Err(AnswerReadError::Keys(_))
+    ));
+
+    // A versao e os tipos.
+    let with = |key: &str, value: serde_json::Value| {
+        let mut changed = object.clone();
+        changed.insert(key.to_string(), value);
+        serde_json::Value::Object(changed).to_string()
+    };
+    assert_eq!(
+        parse_answer_read(&with("v", serde_json::json!(2)), "chatgpt.com"),
+        Err(AnswerReadError::Version)
+    );
+    assert_eq!(
+        parse_answer_read(&with("v", serde_json::json!("1")), "chatgpt.com"),
+        Err(AnswerReadError::Version)
+    );
+    assert_eq!(
+        parse_answer_read(&with("ok", serde_json::json!("yes")), "chatgpt.com"),
+        Err(AnswerReadError::Type("ok"))
+    );
+    assert_eq!(
+        parse_answer_read(&with("busy", serde_json::json!(0)), "chatgpt.com"),
+        Err(AnswerReadError::Type("busy"))
+    );
+    assert_eq!(
+        parse_answer_read(&with("cut", serde_json::json!(null)), "chatgpt.com"),
+        Err(AnswerReadError::Type("cut"))
+    );
+    assert_eq!(
+        parse_answer_read(
+            &with("host", serde_json::json!(["chatgpt.com"])),
+            "chatgpt.com"
+        ),
+        Err(AnswerReadError::Type("host"))
+    );
+    assert_eq!(
+        parse_answer_read(&with("text", serde_json::json!(["x"])), "chatgpt.com"),
+        Err(AnswerReadError::Type("text"))
+    );
+    assert_eq!(
+        parse_answer_read(&with("links", serde_json::json!("x")), "chatgpt.com"),
+        Err(AnswerReadError::Type("links"))
+    );
+
+    // No maximo 60 ligacoes (cada uma que nao vale cai sozinha: gate
+    // `answer_read_drops_only_the_invalid_link`).
+    object.insert("text".into(), serde_json::json!("sem marcadores"));
+    let links = |list: Vec<String>| {
+        let mut changed = object.clone();
+        changed.insert("links".into(), serde_json::json!(list));
+        serde_json::Value::Object(changed).to_string()
+    };
+    let many: Vec<String> = (0..=ANSWER_READ_MAX_LINKS)
+        .map(|index| format!("https://example.com/{index}"))
+        .collect();
+    assert_eq!(
+        parse_answer_read(&links(many.clone()), "chatgpt.com"),
+        Err(AnswerReadError::TooManyLinks {
+            count: ANSWER_READ_MAX_LINKS + 1
+        })
+    );
+    assert!(
+        parse_answer_read(
+            &links(many[..ANSWER_READ_MAX_LINKS].to_vec()),
+            "chatgpt.com"
+        )
+        .is_ok()
+    );
+
+    // Os marcadores de citacao: cada um aponta para uma ligacao que existe;
+    // um sem fecho, sem numero, com lixo ou solto recusa a leitura.
+    let cite = |text: &str, count: usize| {
+        let mut changed = object.clone();
+        changed.insert("text".into(), serde_json::json!(text));
+        changed.insert(
+            "links".into(),
+            serde_json::json!(
+                (0..count)
+                    .map(|index| format!("https://example.com/{index}"))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        parse_answer_read(
+            &serde_json::Value::Object(changed).to_string(),
+            "chatgpt.com",
+        )
+    };
+    assert!(cite("a \u{E000}0\u{E001} b \u{E000}1\u{E001}", 2).is_ok());
+    assert_eq!(
+        cite("a \u{E000}2\u{E001}", 2),
+        Err(AnswerReadError::Citation { at: 2 })
+    );
+    assert_eq!(
+        cite("a \u{E000}0", 1),
+        Err(AnswerReadError::Citation { at: 2 })
+    );
+    assert_eq!(
+        cite("a \u{E000}\u{E001}", 1),
+        Err(AnswerReadError::Citation { at: 2 })
+    );
+    assert_eq!(
+        cite("a \u{E000}x\u{E001}", 1),
+        Err(AnswerReadError::Citation { at: 2 })
+    );
+    // O `at` e um deslocamento em bytes: "a " + U+E000 (3) + "0" + U+E001 (3)
+    // + " b " = 12.
+    assert_eq!(
+        cite("a \u{E000}0\u{E001} b \u{E001}", 1),
+        Err(AnswerReadError::Citation { at: 12 })
+    );
+    assert_eq!(
+        cite("\u{E000}0\u{E001}", 0),
+        Err(AnswerReadError::Citation { at: 0 })
+    );
+}
+
+/// Gate (critico, entrada nao confiavel; consensus, RT-5): uma ligacao que
+/// nao vale cai SOZINHA -- nunca entra em `links` (so texto, http(s), com
+/// host e dentro dos 2 048 bytes), os marcadores dela saem do texto, os das
+/// outras passam a apontar para o indice novo e `dropped_links` conta-a --
+/// e a leitura vale com as outras: uma ligacao de 5 000 caracteres ou uma
+/// `javascript:` ja nao deixam a coluna «sem leitura». Os marcadores
+/// continuam estritos: um que aponta para fora da lista da leitura, sem
+/// fecho, sem algarismos (ou com sinal, ou com mais de tres) ou um fecho
+/// solto -- tambem ANTES de uma abertura -- recusa a leitura (o script troca
+/// os da pagina por U+FFFD: gate
+/// `answer_read_script_neutralizes_page_markers_and_long_links`).
+/// Sabotagens: recusar a leitura inteira por uma ligacao
+/// (`answer-read-refuses-for-one-link`); guardar a ligacao que nao vale.
+#[test]
+fn answer_read_drops_only_the_invalid_link() {
+    const BASE: &str = "https://example.com/";
+    let long = format!("{BASE}{}", "x".repeat(5_000 - BASE.len()));
+    assert_eq!(long.len(), 5_000);
+    let edge = format!("{BASE}{}", "a".repeat(ANSWER_LINK_MAX_LEN - BASE.len()));
+    assert_eq!(edge.len(), ANSWER_LINK_MAX_LEN);
+    let over = format!("{edge}a");
+    let answer = |text: &str, links: serde_json::Value| {
+        serde_json::json!({
+            "v": 1, "ok": true, "host": "chatgpt.com", "busy": false, "cut": false,
+            "text": text, "links": links,
+        })
+        .to_string()
+    };
+
+    // Tres que caem entre duas que valem: as validas ficam, renumeradas.
+    let read = parse_answer_read(
+        &answer(
+            "a\u{E000}0\u{E001} b\u{E000}1\u{E001} c\u{E000}2\u{E001} \
+             d\u{E000}3\u{E001} e\u{E000}4\u{E001} f\u{E000}1\u{E001}",
+            serde_json::json!([
+                "https://example.com/a",
+                long,
+                "javascript:alert(1)",
+                "https://example.org/b",
+                7
+            ]),
+        ),
+        "chatgpt.com",
+    )
+    .expect("a leitura vale sem as ligacoes que caem");
+    assert_eq!(
+        read.links,
+        ["https://example.com/a", "https://example.org/b"]
+    );
+    assert_eq!(read.text, "a\u{E000}0\u{E001} b c d\u{E000}1\u{E001} e f");
+    assert_eq!(read.dropped_links, 3);
+    assert!(read.ok);
+
+    // Cada forma que nao vale, sozinha ao lado de uma que vale.
+    for bad in [
+        serde_json::json!("javascript:alert(1)"),
+        serde_json::json!("file:///C:/x"),
+        serde_json::json!("ftp://example.com/x"),
+        serde_json::json!("data:text/html,x"),
+        serde_json::json!("mailto:a@b.c"),
+        serde_json::json!("nem url"),
+        serde_json::json!("https://"),
+        serde_json::json!(""),
+        serde_json::json!(over),
+        serde_json::json!(long),
+        serde_json::json!(1),
+        serde_json::json!(null),
+        serde_json::json!({ "href": "https://example.com/" }),
+        serde_json::json!(["https://example.com/"]),
+    ] {
+        let read = parse_answer_read(
+            &answer(
+                "ok\u{E000}0\u{E001} mau\u{E000}1\u{E001}",
+                serde_json::json!(["https://ok.example/", bad]),
+            ),
+            "chatgpt.com",
+        )
+        .unwrap_or_else(|error| panic!("{bad}: {}", error.describe()));
+        assert_eq!(read.links, ["https://ok.example/"], "{bad}");
+        assert_eq!(read.text, "ok\u{E000}0\u{E001} mau", "{bad}");
+        assert_eq!(read.dropped_links, 1, "{bad}");
+    }
+    // A razao de cada uma, pelo `validate_answer_link`.
+    for (bad, reason) in [
+        ("javascript:alert(1)", "só http(s)"),
+        ("file:///C:/x", "só http(s)"),
+        ("ftp://example.com/x", "só http(s)"),
+        ("data:text/html,x", "só http(s)"),
+        ("mailto:a@b.c", "só http(s)"),
+        ("nem url", "não é um URL"),
+        ("https://", "não é um URL"),
+        ("", "não é um URL"),
+        (over.as_str(), "grande demais"),
+        (long.as_str(), "grande demais"),
+    ] {
+        assert_eq!(validate_answer_link(bad), Err(reason), "{bad}");
+    }
+    // No tecto exato, fica.
+    let read = parse_answer_read(
+        &answer("borda\u{E000}0\u{E001}", serde_json::json!([edge])),
+        "chatgpt.com",
+    )
+    .expect("a ligacao no tecto vale");
+    assert_eq!(read.links, [edge.as_str()]);
+    assert_eq!(read.dropped_links, 0);
+    // Todas caem: o texto fica sem marcadores, e a leitura vale.
+    let read = parse_answer_read(
+        &answer(
+            "so texto\u{E000}0\u{E001}\u{E000}1\u{E001}.",
+            serde_json::json!([long, "javascript:x"]),
+        ),
+        "chatgpt.com",
+    )
+    .expect("sem ligacoes validas a leitura vale");
+    assert!(read.links.is_empty());
+    assert_eq!(read.text, "so texto.");
+    assert_eq!(read.dropped_links, 2);
+
+    // Os marcadores continuam estritos, mesmo quando uma ligacao caiu.
+    let cite = |text: &str| {
+        parse_answer_read(
+            &answer(
+                text,
+                serde_json::json!(["https://ok.example/", "javascript:x"]),
+            ),
+            "chatgpt.com",
+        )
+    };
+    assert!(cite("a \u{E000}0\u{E001} b \u{E000}1\u{E001}").is_ok());
+    for text in [
+        "a \u{E000}2\u{E001}",
+        "a \u{E000}+1\u{E001}",
+        "a \u{E000}0000\u{E001}",
+        "a \u{E000} 0\u{E001}",
+        "a \u{E000}\u{E001}",
+        "a \u{E000}0",
+        "a \u{E001} \u{E000}0\u{E001}",
+    ] {
+        assert_eq!(
+            cite(text),
+            Err(AnswerReadError::Citation { at: 2 }),
+            "{text:?}"
+        );
+    }
+}
+
+/// Gate (critico, entrada nao confiavel; consensus): `parse_answer_read`
+/// confere o `host` que o script devolve contra o host esperado -- um
+/// parecido, outro provedor ou lado nenhum nao passa; a comparacao ignora
+/// maiusculas e nunca aceita um host esperado vazio. No produto o esperado
+/// vem de `provider_page_host` (a pagina tem de ser do provedor da coluna:
+/// gate `consensus_reads_only_the_columns_provider_page`), por isso esta
+/// conferencia e a segunda linha, nao a que recusa a pagina de login.
+/// Sabotagem: `parse_answer_read` sem a conferencia do host.
+#[test]
+fn answer_read_refuses_a_host_mismatch() {
+    let login = answer_json("accounts.google.com", "Entre na sua conta", &[]);
+    assert_eq!(
+        parse_answer_read(&login, "www.google.com"),
+        Err(AnswerReadError::HostMismatch {
+            expected: "www.google.com".into(),
+            got: "accounts.google.com".into(),
+        })
+    );
+    for (page, column) in [
+        ("chatgpt.com.evil.io", "chatgpt.com"),
+        ("evilchatgpt.com", "chatgpt.com"),
+        ("claude.ai", "chatgpt.com"),
+        ("", "chatgpt.com"),
+        ("chatgpt.com", ""),
+        ("", ""),
+        ("chatgpt.com", "  "),
+    ] {
+        assert!(
+            matches!(
+                parse_answer_read(&answer_json(page, "Olá", &[]), column),
+                Err(AnswerReadError::HostMismatch { .. })
+            ),
+            "{page:?} passou por {column:?}"
+        );
+    }
+    // O mesmo host, com maiusculas de um lado ou do outro, passa.
+    assert!(parse_answer_read(&answer_json("ChatGPT.com", "Olá", &[]), "chatgpt.com").is_ok());
+    assert!(parse_answer_read(&answer_json("chatgpt.com", "Olá", &[]), "CHATGPT.COM").is_ok());
+    assert_eq!(
+        parse_answer_read(&answer_json("Claude.AI", "Olá", &[]), "claude.ai")
+            .expect("vale")
+            .host,
+        "claude.ai"
+    );
+}
+
+/// Gate (critico, seguranca; consensus): o leitor le SO as colunas do
+/// comparador (`comp.views[col]`): nunca a fonte ao lado, nunca a fonte
+/// privada, nunca a Web completa nem um painel -- `consensus_readable`
+/// recusa-os, e um run so guarda colunas por muito que a lista traga.
+/// Sabotagem: `consensus_readable` a aceitar `Split`.
+#[test]
+fn consensus_reads_only_the_columns_never_the_split() {
+    for host in WebViewHost::ALL {
+        assert_eq!(
+            consensus_readable(host),
+            matches!(host, WebViewHost::Column(_)),
+            "{host:?}"
+        );
+    }
+    for index in 0..COMPARATOR_COLUMNS {
+        assert!(consensus_readable(WebViewHost::Column(index)));
+        assert!(
+            !consensus_readable(WebViewHost::Split(index)),
+            "fonte {index}"
+        );
+        assert!(
+            !consensus_readable(WebViewHost::PrivateSplit(index)),
+            "fonte privada {index}"
+        );
+    }
+    assert!(!consensus_readable(WebViewHost::Column(COMPARATOR_COLUMNS)));
+
+    let hosts = [
+        (WebViewHost::Split(0), 5),
+        (WebViewHost::Column(0), 1),
+        (WebViewHost::PrivateSplit(1), 5),
+        (WebViewHost::Column(1), 2),
+        (WebViewHost::External, 0),
+        (WebViewHost::SidePanel, 0),
+        (WebViewHost::Column(2), 3),
+        (WebViewHost::Column(COMPARATOR_COLUMNS), 0),
+    ];
+    let run = ConsensusRun::begin(1, "sessao", 1, Instant::now(), hosts);
+    assert_eq!(
+        run.columns
+            .iter()
+            .map(|column| (column.host, column.generation))
+            .collect::<Vec<_>>(),
+        [
+            (WebViewHost::Column(0), 1),
+            (WebViewHost::Column(1), 2),
+            (WebViewHost::Column(2), 3)
+        ]
+    );
+    assert_eq!(
+        run.columns
+            .iter()
+            .map(|column| column.provider)
+            .collect::<Vec<_>>(),
+        ProviderId::default_slots()
+    );
+    let mut state = ConsensusState::new();
+    let id = state.begin_run("sessao", 1, Instant::now(), hosts);
+    let run = state.run_mut(id).expect("o run de agora");
+    assert!(
+        run.columns
+            .iter()
+            .all(|column| consensus_readable(column.host))
+    );
+    assert_eq!(run.columns.len(), COMPARATOR_COLUMNS);
+    // A leitura em si vai a `comp.views[col]` (`consensus_poll`): a fonte
+    // ao lado nunca esta ao alcance do run.
+    let source = code_without_tests(include_str!("consensus.rs"));
+    let poll = source
+        .split("fn consensus_poll(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn consensus_page_event(").next())
+        .expect("consensus_poll");
+    assert!(poll.contains("comp.views.get(index)"));
+    for forbidden in [".split", "SplitView", "PrivateSplit", "self.webview"] {
+        assert!(
+            !poll.contains(forbidden),
+            "consensus_poll toca em {forbidden}"
+        );
+    }
+}
+
+/// Gate (critico, dados do utilizador; consensus, critica C9): uma coluna
+/// traduzida -- desde o `TRANSLATE_APPLY` ate o `TRANSLATE_RESTORE`
+/// (`column_translated`) -- NUNCA se le nem se compara: a sonda espera o
+/// original voltar; no prazo, ou quando so ela falta, sai como «traduzida
+/// — não comparada», sem texto na leitura guardada. Sabotagem:
+/// `decide_column_poll` sem o `translated`.
+#[test]
+fn consensus_never_compares_a_translated_column() {
+    let mut run = ConsensusRun::begin(1, "sessao", 1, Instant::now(), three_columns());
+    let read = answer_read_of("chatgpt.com", "Olá", &[]);
+    assert_eq!(
+        decide_column_poll(&run.columns[1], false, false, Duration::ZERO),
+        PollAction::Read
+    );
+    assert_eq!(
+        decide_column_poll(&run.columns[1], true, false, Duration::ZERO),
+        PollAction::Wait,
+        "uma coluna traduzida foi lida"
+    );
+    assert_eq!(
+        decide_column_poll(
+            &run.columns[1],
+            true,
+            false,
+            CONSENSUS_MAX_WAIT - Duration::from_millis(1)
+        ),
+        PollAction::Wait
+    );
+    // No prazo: `Translated`, nunca `MaybeIncomplete` -- mesmo com uma
+    // leitura de antes da traducao guardada.
+    assert_eq!(
+        decide_column_poll(&run.columns[1], true, false, CONSENSUS_MAX_WAIT),
+        PollAction::Finish(ColumnOutcome::Translated)
+    );
+    run.columns[1].last = Some(read.clone());
+    assert_eq!(
+        decide_column_poll(&run.columns[1], true, false, CONSENSUS_MAX_WAIT),
+        PollAction::Finish(ColumnOutcome::Translated)
+    );
+    assert_eq!(
+        decide_column_poll(&run.columns[1], false, false, CONSENSUS_MAX_WAIT),
+        PollAction::Finish(ColumnOutcome::MaybeIncomplete(Some(read.clone())))
+    );
+    // O original voltou antes do prazo: le-se outra vez.
+    assert_eq!(
+        decide_column_poll(&run.columns[1], false, false, Duration::from_secs(30)),
+        PollAction::Read
+    );
+
+    // Quando so a coluna traduzida falta, o run fecha-a como traduzida em
+    // vez de esperar 120 s; enquanto outra ainda le, nao.
+    run.columns[0].outcome = Some(ColumnOutcome::Read(read.clone()));
+    run.settle_translated_stragglers(|index| index == 1);
+    assert_eq!(
+        run.columns[1].outcome, None,
+        "fechou com a coluna 2 por ler"
+    );
+    assert!(!run.finished());
+    run.columns[2].outcome = Some(ColumnOutcome::OtherQuestion);
+    run.settle_translated_stragglers(|index| index == 1);
+    assert_eq!(run.columns[1].outcome, Some(ColumnOutcome::Translated));
+    assert!(run.finished());
+    assert_eq!(ColumnOutcome::Translated.label(), CONSENSUS_TRANSLATED);
+    assert_eq!(
+        ColumnOutcome::Translated.status(),
+        AttemptStatus::Translated
+    );
+    assert_eq!(ColumnOutcome::Translated.read(), None);
+    assert_eq!(
+        attempt_label(AttemptStatus::Translated),
+        CONSENSUS_TRANSLATED
+    );
+
+    // O `column_translated` da Traducao e o que a sonda pergunta: a
+    // coluna com blocos a ir conta, a que espera o cartao nao.
+    let mut translation = TranslationState::with_sink(Box::new(|_| {}));
+    assert!(!translation.column_translated(1));
+    let asking = translation.run_for_test(WebViewHost::Column(1), false);
+    assert!(!translation.column_translated(1));
+    translation.drop_for_test(asking);
+    let translating = translation.run_for_test(WebViewHost::Column(1), true);
+    assert!(translation.column_translated(1));
+    translation.drop_for_test(translating);
+    assert!(!translation.column_translated(1));
+    let poll = code_without_tests(include_str!("consensus.rs"));
+    assert!(
+        poll.contains("self.translation.column_translated(index)"),
+        "a sonda nao pergunta a Traducao"
+    );
+}
+
+/// Gate (consensus): a sonda de 1,5 s le cada coluna ate a resposta
+/// ASSENTAR (duas leituras iguais, sem o botao de parar), ate a coluna
+/// navegar (`OtherQuestion`) ou ate 120 s (`MaybeIncomplete` com a ultima
+/// leitura); uma leitura em voo espera; um provedor sem seletor sai como
+/// «não lida»; tres leituras invalidas seguidas fecham a coluna.
+#[test]
+fn consensus_polls_until_settled_other_question_or_timeout() {
+    assert_eq!(CONSENSUS_POLL_INTERVAL, Duration::from_millis(1500));
+    assert_eq!(CONSENSUS_MAX_WAIT, Duration::from_secs(120));
+    let mut run = ConsensusRun::begin(1, "sessao", 1, Instant::now(), three_columns());
+    let column = &mut run.columns[1];
+
+    // A escrever: nada assenta, mas a leitura fica guardada; a escrever
+    // outra vez com o mesmo texto tambem nao (o botao de parar ainda la
+    // esta).
+    let mut busy = answer_read_of("chatgpt.com", "Olá", &[]);
+    busy.busy = true;
+    assert_eq!(column.observe(busy.clone()), None);
+    assert_eq!(column.last.as_ref(), Some(&busy));
+    assert_eq!(
+        column.observe(busy.clone()),
+        None,
+        "assentou com o botao de parar"
+    );
+    // O texto mudou (ja sem o botao): continua.
+    let longer = answer_read_of("chatgpt.com", "Olá mundo", &["https://example.com/"]);
+    assert_eq!(column.observe(longer.clone()), None);
+    assert_eq!(column.last.as_ref(), Some(&longer));
+    // As ligacoes mudaram com o mesmo texto: continua.
+    let relinked = answer_read_of("chatgpt.com", "Olá mundo", &["https://example.org/"]);
+    assert_eq!(column.observe(relinked.clone()), None);
+    // Igual a anterior: assentou.
+    assert_eq!(
+        column.observe(relinked.clone()),
+        Some(&ColumnOutcome::Read(relinked.clone()))
+    );
+    assert_eq!(
+        decide_column_poll(column, false, false, Duration::from_secs(3)),
+        PollAction::Wait
+    );
+    // Uma leitura sem mensagem (`ok: false`) nao conta como ultima.
+    let column = &mut run.columns[0];
+    let mut none = answer_read_of("www.google.com", "", &[]);
+    none.ok = false;
+    assert_eq!(column.observe(none.clone()), None);
+    assert_eq!(column.last, None);
+    assert_eq!(column.observe(none), None);
+    assert_eq!(column.outcome, None, "duas leituras vazias assentaram");
+    // Duas vazias com `ok` tambem nao: sem texto nao ha resposta.
+    let empty = answer_read_of("www.google.com", "", &[]);
+    assert_eq!(column.observe(empty.clone()), None);
+    assert_eq!(column.observe(empty), None);
+
+    // A coluna navegou: outra pergunta, mesmo com uma leitura em voo.
+    let column = &mut run.columns[2];
+    assert_eq!(
+        decide_column_poll(column, false, true, Duration::from_secs(1)),
+        PollAction::Finish(ColumnOutcome::OtherQuestion)
+    );
+    // O prazo: o que se leu por ultimo, ou nada.
+    assert_eq!(
+        decide_column_poll(column, false, false, CONSENSUS_MAX_WAIT),
+        PollAction::Finish(ColumnOutcome::MaybeIncomplete(None))
+    );
+    let partial = answer_read_of("claude.ai", "Parcial", &[]);
+    column.last = Some(partial.clone());
+    assert_eq!(
+        decide_column_poll(
+            column,
+            false,
+            false,
+            CONSENSUS_MAX_WAIT + Duration::from_secs(1)
+        ),
+        PollAction::Finish(ColumnOutcome::MaybeIncomplete(Some(partial)))
+    );
+    // Um provedor sem seletor: «não lida», antes de tudo.
+    let unreadable = ColumnRead {
+        host: WebViewHost::Column(0),
+        provider: ProviderId::Perplexity,
+        generation: 0,
+        last: None,
+        pending: None,
+        failures: 0,
+        outcome: None,
+    };
+    assert!(unreadable.provider.is_unreadable());
+    assert_eq!(
+        decide_column_poll(&unreadable, false, false, Duration::ZERO),
+        PollAction::Finish(ColumnOutcome::Unreadable)
+    );
+    assert_eq!(ColumnOutcome::Unreadable.label(), CONSENSUS_UNREADABLE);
+    // Tres leituras invalidas seguidas fecham a coluna; uma valida no meio
+    // recomeca a conta.
+    let column = &mut run.columns[2];
+    assert_eq!(column.refuse("host".into()), None);
+    assert_eq!(column.refuse("host".into()), None);
+    assert_eq!(column.observe(answer_read_of("claude.ai", "x", &[])), None);
+    assert_eq!(column.refuse("host".into()), None);
+    assert_eq!(column.refuse("host".into()), None);
+    assert_eq!(
+        column.refuse("host".into()),
+        Some(&ColumnOutcome::Failed("host".into()))
+    );
+    assert_eq!(
+        ColumnOutcome::Failed("host".into()).label(),
+        CONSENSUS_FAILED
+    );
+}
+
+/// Gate (critico, entrada nao confiavel; consensus): uma leitura que
+/// chega tarde cai (`PageReads`, o prazo do `Timers`), e uma que chega de
+/// um run que ja acabou -- o token ja nao e de nenhuma coluna -- cai
+/// tambem: o run novo nao herda leituras do anterior. Sabotagem:
+/// `begin_run` sem o `cancel_all`.
+#[test]
+fn consensus_drops_a_late_or_foreign_read() {
+    use std::sync::mpsc::channel;
+    let view = FakeEvalView::at("https://chatgpt.com/c/1");
+    let epoch = NavEpoch::default();
+    let selector = ProviderId::ChatGpt.answer_read().expect("seletor");
+    let mut state = ConsensusState::new();
+    let now = Instant::now();
+    let first = state.begin_run("sessao", 1, now, [(WebViewHost::Column(1), 0)]);
+    let (tx, rx) = channel::<PageEvalEvent>();
+    let mut scheduled = Vec::new();
+    let token = state
+        .reads
+        .read_with_arg(
+            &view,
+            answer_read_spec(),
+            &answer_read_config(selector),
+            &epoch,
+            now,
+            move |event| {
+                let _ = tx.send(event);
+            },
+            |delay, event| scheduled.push((delay, event)),
+        )
+        .expect("a leitura comeca");
+    assert_eq!(
+        scheduled,
+        vec![(ANSWER_READ_DEADLINE, PageEvalEvent::Expired(token))]
+    );
+    state.run_mut(first).expect("run").columns[0].pending = Some(token);
+    assert!(
+        state
+            .run_mut(first)
+            .expect("run")
+            .column_by_token(token)
+            .is_some()
+    );
+    // O script corrido e o registado, com a configuracao como argumento.
+    let call = script_call(&ANSWER_READ, Some(&answer_read_config(selector))).expect("chamada");
+    assert_eq!(view.asked.borrow()[0].0, call);
+    assert!(call.contains(&serde_json::to_string(selector.answer).expect("json")));
+    assert!(call.starts_with(&format!("({ANSWER_READ_SCRIPT})(")));
+
+    // Tarde: o prazo chega primeiro; a resposta que vem depois e de ninguem.
+    assert_eq!(
+        state.reads.settle(
+            PageEvalEvent::Expired(token),
+            || view.page_url(),
+            now + ANSWER_READ_DEADLINE
+        ),
+        PageEvalOutcome::Dropped {
+            token,
+            reason: PageEvalDrop::Late
+        }
+    );
+    view.answer(0, &answer_json("chatgpt.com", "Olá", &[]));
+    let late = rx.try_recv().expect("o callback entregou");
+    assert_eq!(
+        state
+            .reads
+            .settle(late, || view.page_url(), now + ANSWER_READ_DEADLINE),
+        PageEvalOutcome::Stale(token)
+    );
+
+    // De outro run: a leitura do run anterior cai com ele.
+    let (tx, rx) = channel::<PageEvalEvent>();
+    let token = state
+        .reads
+        .read_with_arg(
+            &view,
+            answer_read_spec(),
+            &answer_read_config(selector),
+            &epoch,
+            now,
+            move |event| {
+                let _ = tx.send(event);
+            },
+            |_, _| {},
+        )
+        .expect("a leitura comeca");
+    state.run_mut(first).expect("run").columns[0].pending = Some(token);
+    assert_eq!(state.reads.in_flight(), 1);
+    let second = state.begin_run("sessao", 2, now, [(WebViewHost::Column(1), 1)]);
+    assert_ne!(first, second);
+    assert_eq!(state.reads.in_flight(), 0, "o run novo herdou leituras");
+    assert!(state.run_mut(first).is_none());
+    assert!(
+        state
+            .run_mut(second)
+            .expect("run")
+            .column_by_token(token)
+            .is_none()
+    );
+    view.answer(1, &answer_json("chatgpt.com", "Olá", &[]));
+    let foreign = rx.try_recv().expect("o callback entregou");
+    assert_eq!(
+        state
+            .reads
+            .settle(foreign, || view.page_url(), now + Duration::from_secs(1)),
+        PageEvalOutcome::Stale(token)
+    );
+    assert_eq!(
+        state.worker_threads_spawned(),
+        0,
+        "o estado nasceu com thread"
+    );
+}
+
+/// O DOM do harness do leitor: elementos com `localName`, atributos,
+/// `childNodes` e `parentNode`; nos de texto com `nodeValue`; e um
+/// `querySelectorAll` com os seletores que o registo usa (tag, `#id`,
+/// `.classe`, `[atributo]`, `[atributo="valor"]`, grupos por virgula e o
+/// combinador descendente). Corre o script QUE EMBARCA com a chamada que
+/// o `page_eval` monta, num contexto `node:vm`.
+const ANSWER_READ_HARNESS: &str = r##"
+const vm = require('node:vm');
+const INPUT = JSON.parse(process.argv[2]);
+function build(spec, parent) {
+  if (typeof spec === 'string') return { nodeType: 3, nodeValue: spec, parentNode: parent, childNodes: [] };
+  const el = {
+    nodeType: 1, localName: spec.tag, nodeName: spec.tag.toUpperCase(), attrs: spec.attrs || {},
+    parentNode: parent, childNodes: [],
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? String(this.attrs[name]) : null; },
+  };
+  for (const child of spec.children || []) el.childNodes.push(build(child, el));
+  return el;
+}
+function parseCompound(text) {
+  const out = { tag: null, id: null, classes: [], attrs: [] };
+  let rest = text;
+  const tag = rest.match(/^[a-zA-Z][\w-]*/);
+  if (tag) { out.tag = tag[0].toLowerCase(); rest = rest.slice(tag[0].length); }
+  while (rest.length) {
+    let m;
+    if ((m = rest.match(/^#([\w-]+)/))) { out.id = m[1]; }
+    else if ((m = rest.match(/^\.([\w-]+)/))) { out.classes.push(m[1]); }
+    else if ((m = rest.match(/^\[([\w-]+)(?:(\*?=)"([^"]*)")?\]/))) { out.attrs.push({ name: m[1], op: m[2] || null, value: m[3] }); }
+    else throw new Error('seletor nao suportado pelo harness: ' + text);
+    rest = rest.slice(m[0].length);
+  }
+  return out;
+}
+function matchesCompound(el, c) {
+  if (el.nodeType !== 1) return false;
+  if (c.tag && el.localName !== c.tag) return false;
+  if (c.id && el.getAttribute('id') !== c.id) return false;
+  const classes = String(el.getAttribute('class') || '').split(/\s+/);
+  for (const name of c.classes) if (!classes.includes(name)) return false;
+  for (const attr of c.attrs) {
+    const value = el.getAttribute(attr.name);
+    if (value === null) return false;
+    if (attr.op === '=' && value !== attr.value) return false;
+    if (attr.op === '*=' && !value.includes(attr.value)) return false;
+  }
+  return true;
+}
+function matchesGroup(el, compounds) {
+  if (!matchesCompound(el, compounds[compounds.length - 1])) return false;
+  let at = compounds.length - 2;
+  let node = el.parentNode;
+  while (at >= 0 && node) {
+    if (matchesCompound(node, compounds[at])) at--;
+    node = node.parentNode;
+  }
+  return at < 0;
+}
+function matches(el, selector) {
+  // Um composto e uma sequencia de partes fora de `[...]` ou de `[...]`
+  // inteiros: o espaco DENTRO de um valor entre aspas nao separa.
+  return selector.split(',').some((group) => matchesGroup(el, (group.trim().match(/(?:\[[^\]]*\]|[^\s\[])+/g) || []).map(parseCompound)));
+}
+function all(root, selector, out) {
+  for (const child of root.childNodes) {
+    if (child.nodeType === 1) { if (matches(child, selector)) out.push(child); all(child, selector, out); }
+  }
+  return out;
+}
+const results = [];
+for (const c of INPUT.cases) {
+  const root = build(c.page, null);
+  const document = {
+    querySelectorAll(selector) { return all(root, selector, []); },
+    querySelector(selector) { return all(root, selector, [])[0] || null; },
+  };
+  const context = vm.createContext({ document, location: { hostname: c.host } });
+  let value;
+  try { value = vm.runInContext(c.call, context, { filename: c.name }); }
+  catch (e) { value = { error: String(e && e.message) }; }
+  results.push({ name: c.name, raw: JSON.stringify(value) });
+}
+process.stdout.write(JSON.stringify(results));
+"##;
+
+/// Corre o `ANSWER_READ_SCRIPT` que embarca, com a chamada exata do
+/// `page_eval` (`script_call`), sobre cada pagina; devolve o JSON cru que
+/// o WebView2 devolveria.
+fn run_answer_read_harness(cases: &[(&str, &str, ProviderId, serde_json::Value)]) -> Vec<String> {
+    let cases: Vec<serde_json::Value> = cases
+        .iter()
+        .map(|(name, host, provider, page)| {
+            let selector = provider.answer_read().expect("seletor");
+            let call =
+                script_call(&ANSWER_READ, Some(&answer_read_config(selector))).expect("chamada");
+            serde_json::json!({ "name": name, "host": host, "page": page, "call": call })
+        })
+        .collect();
+    let input = serde_json::json!({ "cases": cases }).to_string();
+    let program = format!(
+        "process.argv[2] = {};\n{ANSWER_READ_HARNESS}",
+        serde_json::to_string(&input).expect("input")
+    );
+    let results: serde_json::Value =
+        serde_json::from_str(&run_node_program(&program)).expect("JSON do harness");
+    results
+        .as_array()
+        .expect("resultados")
+        .iter()
+        .map(|result| result["raw"].as_str().expect("raw").to_string())
+        .collect()
+}
+
+fn el(tag: &str, children: Vec<serde_json::Value>) -> serde_json::Value {
+    serde_json::json!({ "tag": tag, "children": children })
+}
+
+fn el_with(
+    tag: &str,
+    attrs: serde_json::Value,
+    children: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({ "tag": tag, "attrs": attrs, "children": children })
+}
+
+fn t(text: &str) -> serde_json::Value {
+    serde_json::json!(text)
+}
+
+/// A resposta de agora, com de tudo: um titulo, negrito, codigo, uma lista
+/// com uma ligacao, uma ligacao `javascript:` (fica so texto), um script
+/// e um botao (saltados) e um dos nossos controlos (saltado).
+fn rich_answer(provider: &str) -> Vec<serde_json::Value> {
+    vec![
+        el("h3", vec![t("Título")]),
+        el(
+            "p",
+            vec![
+                t(&format!("RESPOSTA do {provider} com ")),
+                el("strong", vec![t("negrito")]),
+                t(" e "),
+                el("code", vec![t("código")]),
+                t("."),
+            ],
+        ),
+        el(
+            "ul",
+            vec![
+                el(
+                    "li",
+                    vec![
+                        t("item "),
+                        el_with(
+                            "a",
+                            serde_json::json!({ "href": "https://example.com/a" }),
+                            vec![t("fonte")],
+                        ),
+                    ],
+                ),
+                el("li", vec![t("segundo")]),
+            ],
+        ),
+        el(
+            "ol",
+            vec![
+                el("li", vec![t("primeiro")]),
+                el(
+                    "li",
+                    vec![el_with(
+                        "a",
+                        serde_json::json!({ "href": "javascript:alert(1)" }),
+                        vec![t("perigosa")],
+                    )],
+                ),
+            ],
+        ),
+        el("pre", vec![el("code", vec![t("let x = 1;\n  let y = 2;")])]),
+        el("script", vec![t("var segredo = 1;")]),
+        el("button", vec![t("Copiar")]),
+        el_with(
+            "div",
+            serde_json::json!({ "id": "neuralia-comp-controls" }),
+            vec![t("Expandir")],
+        ),
+        el_with(
+            "div",
+            serde_json::json!({ "aria-hidden": "true" }),
+            vec![t("escondido")],
+        ),
+    ]
+}
+
+fn chat_page(
+    role_attr: &str,
+    answer: Vec<serde_json::Value>,
+    extra: Vec<serde_json::Value>,
+) -> serde_json::Value {
+    let mut main = vec![
+        el_with(
+            "div",
+            serde_json::json!({ role_attr: "user" }),
+            vec![el("p", vec![t("PERGUNTA anterior")])],
+        ),
+        el_with(
+            "div",
+            serde_json::json!({ role_attr: "assistant" }),
+            vec![el("p", vec![t("ANTIGA resposta")])],
+        ),
+        el_with(
+            "div",
+            serde_json::json!({ role_attr: "user" }),
+            vec![el("p", vec![t("PERGUNTA sobre Raft")])],
+        ),
+        el_with(
+            "div",
+            serde_json::json!({ role_attr: "assistant" }),
+            vec![el_with(
+                "div",
+                serde_json::json!({ "class": "markdown" }),
+                answer,
+            )],
+        ),
+        el("form", vec![el("textarea", vec![t("PERGUNTA seguinte")])]),
+    ];
+    main.extend(extra);
+    el("html", vec![el("body", vec![el("main", main)])])
+}
+
+/// Gate (critico, entrada nao confiavel, §7; consensus): o
+/// `ANSWER_READ_SCRIPT` que embarca, no DOM do harness e com a chamada
+/// exata do `page_eval`, por seletor do registo (ChatGPT fundado; Claude
+/// e Modo IA assumidos, fixados aqui): le a ULTIMA mensagem do assistente
+/// -- nunca a pergunta, nunca a anterior --, em Markdown (titulo, negrito,
+/// codigo, listas, bloco de codigo), com cada ligacao http(s) como
+/// marcador de citacao para `links` e uma `javascript:` so como texto;
+/// salta script, botoes, `aria-hidden` e os nossos controlos; diz `busy`
+/// pelo botao de parar; corta em 24 000 caracteres e fica com 60
+/// ligacoes; sem mensagem, `ok: false`; e tudo o que devolve passa em
+/// `parse_answer_read` contra o host da pagina. Sabotagens: ler a
+/// primeira ocorrencia (a ANTIGA aparece), tirar o corte (o texto passa o
+/// tecto), citar `javascript:` (o parser recusa).
+#[test]
+fn answer_read_script_reads_the_last_assistant_message_per_selector() {
+    let role = "data-message-author-role";
+    let stop_chatgpt = el_with(
+        "button",
+        serde_json::json!({ "data-testid": "stop-button" }),
+        vec![t("Parar")],
+    );
+    let stop_claude = el_with(
+        "button",
+        serde_json::json!({ "aria-label": "Stop response" }),
+        vec![t("Parar")],
+    );
+    let google = |answer: Vec<serde_json::Value>| {
+        el(
+            "html",
+            vec![el(
+                "body",
+                vec![
+                    el_with(
+                        "form",
+                        serde_json::json!({ "role": "search" }),
+                        vec![el("textarea", vec![t("PERGUNTA sobre Raft")])],
+                    ),
+                    el(
+                        "main",
+                        vec![
+                            el_with(
+                                "div",
+                                serde_json::json!({ "role": "article" }),
+                                vec![el("p", vec![t("ANTIGA resposta do Modo IA")])],
+                            ),
+                            el_with("div", serde_json::json!({ "role": "article" }), answer),
+                        ],
+                    ),
+                ],
+            )],
+        )
+    };
+    // Muitas ligacoes primeiro (curtas), depois um texto acima do tecto.
+    let mut flood = Vec::new();
+    for index in 0..(ANSWER_READ_MAX_LINKS + 10) {
+        flood.push(el_with(
+            "a",
+            serde_json::json!({ "href": format!("https://example.com/{index}") }),
+            vec![t(&format!("l{index}"))],
+        ));
+        flood.push(t(" "));
+    }
+    let long = "palavra ".repeat(ANSWER_READ_MAX_CHARS / 4);
+    let flooded = vec![el("p", flood), el("p", vec![t(&long)])];
+    let raws = run_answer_read_harness(&[
+        (
+            "chatgpt",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "claude",
+            "claude.ai",
+            ProviderId::Claude,
+            chat_page(role, rich_answer("Claude"), vec![]),
+        ),
+        (
+            "google",
+            "www.google.com",
+            ProviderId::GoogleAi,
+            google(rich_answer("Modo IA")),
+        ),
+        (
+            "chatgpt-busy",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![stop_chatgpt]),
+        ),
+        (
+            "claude-busy",
+            "claude.ai",
+            ProviderId::Claude,
+            chat_page(role, rich_answer("Claude"), vec![stop_claude]),
+        ),
+        (
+            "flood",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, flooded, vec![]),
+        ),
+        (
+            "empty",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            el(
+                "html",
+                vec![el(
+                    "body",
+                    vec![el("main", vec![el("p", vec![t("Sem resposta ainda")])])],
+                )],
+            ),
+        ),
+        // A pagina de login: o host que o script devolve nao e o da coluna.
+        (
+            "login",
+            "auth.openai.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+    ]);
+    assert_eq!(raws.len(), 8);
+    for raw in &raws {
+        assert!(raw.len() <= ANSWER_READ_MAX_RAW_BYTES, "{}", raw.len());
+        assert!(!raw.contains("\"error\""), "o script falhou: {raw}");
+    }
+
+    for (index, provider, host) in [
+        (0, "ChatGPT", "chatgpt.com"),
+        (1, "Claude", "claude.ai"),
+        (2, "Modo IA", "www.google.com"),
+    ] {
+        let read = parse_answer_read(&raws[index], host)
+            .unwrap_or_else(|error| panic!("{provider}: {}: {}", error.describe(), raws[index]));
+        assert!(read.ok, "{provider}");
+        assert!(!read.busy, "{provider}");
+        assert!(!read.cut, "{provider}");
+        assert_eq!(read.host, host);
+        let text = &read.text;
+        assert!(
+            text.contains(&format!(
+                "RESPOSTA do {provider} com **negrito** e `código`."
+            )),
+            "{provider}: {text:?}"
+        );
+        assert!(text.contains("### Título"), "{provider}: {text:?}");
+        assert!(
+            text.contains("\n\n- item fonte\u{E000}0\u{E001}\n- segundo\n\n"),
+            "{provider}: {text:?}"
+        );
+        assert!(
+            text.contains("\n\n1. primeiro\n2. perigosa\n\n"),
+            "{provider}: {text:?}"
+        );
+        // O bloco de codigo guarda a indentacao.
+        assert!(
+            text.contains("```\nlet x = 1;\n  let y = 2;\n```"),
+            "{provider}: {text:?}"
+        );
+        assert!(!text.contains("\n\n\n"), "{provider}: {text:?}");
+        // Fora dos blocos de codigo, nenhuma linha comeca por um espaco.
+        for (index, prose) in text.split("```").enumerate() {
+            if index % 2 == 0 {
+                assert!(
+                    !prose.contains("\n "),
+                    "{provider}: linha com espaco a frente: {prose:?}"
+                );
+            }
+        }
+        for absent in [
+            "ANTIGA",
+            "PERGUNTA",
+            "segredo",
+            "Copiar",
+            "Expandir",
+            "escondido",
+            "javascript",
+            "\u{E000}1\u{E001}",
+        ] {
+            assert!(!text.contains(absent), "{provider}: {absent} em {text:?}");
+        }
+        assert_eq!(read.links, ["https://example.com/a"], "{provider}");
+    }
+    for (index, host) in [(3, "chatgpt.com"), (4, "claude.ai")] {
+        let read = parse_answer_read(&raws[index], host).expect("a leitura a escrever vale");
+        assert!(read.busy, "{host}: sem o botao de parar");
+        assert!(read.text.contains("RESPOSTA"));
+    }
+    let flood = parse_answer_read(&raws[5], "chatgpt.com").expect("a leitura cortada vale");
+    assert!(flood.cut);
+    assert!(flood.text.chars().count() <= ANSWER_READ_MAX_CHARS);
+    assert!(
+        flood.text.chars().count() > ANSWER_READ_MAX_CHARS - 64,
+        "cortou de mais: {}",
+        flood.text.chars().count()
+    );
+    assert_eq!(flood.links.len(), ANSWER_READ_MAX_LINKS);
+    assert!(
+        flood
+            .text
+            .contains(&format!("l59\u{E000}{}\u{E001}", ANSWER_READ_MAX_LINKS - 1))
+    );
+    assert!(flood.text.contains("l60 l61"), "{:?}", &flood.text[..400]);
+    assert!(
+        !flood
+            .text
+            .contains(&format!("\u{E000}{}\u{E001}", ANSWER_READ_MAX_LINKS))
+    );
+    assert!(flood.text.contains("palavra palavra"));
+    let empty = parse_answer_read(&raws[6], "chatgpt.com").expect("a leitura vazia vale");
+    assert!(!empty.ok);
+    assert_eq!(empty.text, "");
+    assert!(empty.links.is_empty());
+    assert!(matches!(
+        parse_answer_read(&raws[7], "chatgpt.com"),
+        Err(AnswerReadError::HostMismatch { .. })
+    ));
+    // Todas as sete chaves, sempre, e nenhuma outra (a forma que o parser
+    // exige).
+    for raw in &raws {
+        let object: serde_json::Value = serde_json::from_str(raw).expect("JSON");
+        let mut keys: Vec<&str> = object
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["busy", "cut", "host", "links", "ok", "text", "v"]);
+        assert_eq!(object["v"], 1);
+    }
+    // O script esta na lista de so-leitura, com argumento, e a
+    // configuracao leva o seletor do registo, os marcadores e os tectos.
+    assert!(
+        READ_ONLY_SCRIPTS
+            .iter()
+            .any(|script| std::ptr::eq(*script, &ANSWER_READ))
+    );
+    assert_eq!(ANSWER_READ.arg(), ScriptArg::Json);
+    assert_eq!(ANSWER_READ.source(), ANSWER_READ_SCRIPT);
+    let config = answer_read_config(ProviderId::ChatGpt.answer_read().expect("seletor"));
+    assert_eq!(
+        config["selector"],
+        r#"[data-message-author-role="assistant"]"#
+    );
+    assert_eq!(config["busy"], r#"button[data-testid="stop-button"]"#);
+    assert_eq!(
+        config["markers"],
+        serde_json::json!(["\u{E000}", "\u{E001}"])
+    );
+    assert_eq!(config["max"], ANSWER_READ_MAX_CHARS);
+    assert_eq!(config["maxLinks"], ANSWER_READ_MAX_LINKS);
+    assert_eq!(config["maxLink"], ANSWER_LINK_MAX_LEN);
+    assert_eq!(
+        answer_read_config(ProviderId::GoogleAi.answer_read().expect("seletor"))["busy"],
+        serde_json::Value::Null
+    );
+    // Nem escuta nem publica: o unico caminho de volta e o callback.
+    for forbidden in [
+        "postMessage",
+        "addEventListener",
+        "MutationObserver",
+        "setTimeout",
+        "chrome",
+    ] {
+        assert!(!ANSWER_READ_SCRIPT.contains(forbidden), "{forbidden}");
+    }
+}
+
+fn anchor(href: &str, text: &str) -> serde_json::Value {
+    el_with("a", serde_json::json!({ "href": href }), vec![t(text)])
+}
+
+/// Gate (critico, entrada nao confiavel, §7; consensus, RT-5): o
+/// `ANSWER_READ_SCRIPT` que embarca, no DOM do harness e com a chamada
+/// exata do `page_eval`, lido pelo `column_answer_read` do produto: um
+/// U+E000 ou U+E001 que a pagina traga no texto (um marcador forjado a citar
+/// a ligacao 0, um fecho e uma abertura soltos, e dentro de um bloco de
+/// codigo) vira U+FFFD, os unicos marcadores sao os do script e a coluna le;
+/// uma ligacao de 5 000 caracteres entre ligacoes validas vai VAZIA no JSON
+/// do script (o JSON nao a carrega), cai sozinha no parser, contada, e a
+/// leitura vale com as validas -- tambem com uma de 600 000, que sem o tecto
+/// do script levava o JSON cru acima dos 512 KiB e a coluna inteira com ela;
+/// e o tecto do script conta os bytes UTF-8 como o parser (2 048 com `é` ou
+/// com um emoji, par de substitutos, fica; 2 049 vai vazia). Sabotagens:
+/// tirar a troca dos marcadores da pagina (`answer-read-keeps-page-markers`),
+/// tirar o tecto do script (`answer-read-script-skips-the-link-cap`).
+#[test]
+fn answer_read_script_neutralizes_page_markers_and_long_links() {
+    let role = "data-message-author-role";
+    let page = "https://chatgpt.com/c/abc";
+    let long = format!("https://example.com/{}", "x".repeat(5_000 - 20));
+    assert_eq!(long.chars().count(), 5_000);
+    let huge = format!("https://example.com/{}", "x".repeat(600_000));
+    let accent_ok = format!("https://example.com/{}", "é".repeat(1_014));
+    let accent_over = format!("https://example.net/{}a", "é".repeat(1_014));
+    let emoji_ok = format!("https://example.com/{}", "\u{1F600}".repeat(507));
+    let emoji_over = format!("https://example.net/{}a", "\u{1F600}".repeat(507));
+    assert_eq!(accent_ok.len(), ANSWER_LINK_MAX_LEN);
+    assert_eq!(accent_over.len(), ANSWER_LINK_MAX_LEN + 1);
+    assert_eq!(emoji_ok.len(), ANSWER_LINK_MAX_LEN);
+    assert_eq!(emoji_over.len(), ANSWER_LINK_MAX_LEN + 1);
+    let between = |href: &str| {
+        vec![el(
+            "p",
+            vec![
+                t("antes "),
+                anchor("https://example.com/a", "um"),
+                t(", longa "),
+                anchor(href, "dois"),
+                t(" e depois "),
+                anchor("https://example.org/b", "tres"),
+                t("."),
+            ],
+        )]
+    };
+    let markers = vec![
+        el(
+            "p",
+            vec![
+                t("forjada \u{E000}0\u{E001}, solta \u{E001} e aberta \u{E000} antes da "),
+                anchor("https://example.com/a", "fonte"),
+                t("."),
+            ],
+        ),
+        el("pre", vec![el("code", vec![t("x\u{E000}1\u{E001}y")])]),
+    ];
+    let edges = vec![el(
+        "p",
+        vec![
+            anchor(&accent_ok, "a"),
+            t(" "),
+            anchor(&accent_over, "b"),
+            t(" "),
+            anchor(&emoji_ok, "c"),
+            t(" "),
+            anchor(&emoji_over, "d"),
+        ],
+    )];
+    let raws = run_answer_read_harness(&[
+        (
+            "markers",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, markers, vec![]),
+        ),
+        (
+            "long",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, between(&long), vec![]),
+        ),
+        (
+            "huge",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, between(&huge), vec![]),
+        ),
+        (
+            "edges",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, edges, vec![]),
+        ),
+    ]);
+    assert_eq!(raws.len(), 4);
+    for raw in &raws {
+        assert!(!raw.contains("\"error\""), "o script falhou: {raw}");
+    }
+    let parse_case = |index: usize| {
+        column_answer_read(ProviderId::ChatGpt, Some(page), &raws[index]).unwrap_or_else(|error| {
+            panic!(
+                "caso {index}: {} ({} bytes)",
+                error.describe(),
+                raws[index].len()
+            )
+        })
+    };
+
+    // Os marcadores da pagina viram U+FFFD; o unico marcador e o do script.
+    let marked = parse_case(0);
+    assert_eq!(
+        marked.text,
+        "forjada \u{FFFD}0\u{FFFD}, solta \u{FFFD} e aberta \u{FFFD} antes da \
+         fonte\u{E000}0\u{E001}.\n\n```\nx\u{FFFD}1\u{FFFD}y\n```"
+    );
+    assert_eq!(marked.text.matches(CITATION_OPEN).count(), 1);
+    assert_eq!(marked.text.matches(CITATION_CLOSE).count(), 1);
+    assert_eq!(marked.links, ["https://example.com/a"]);
+    assert_eq!(marked.dropped_links, 0);
+
+    // A ligacao longa vai vazia no JSON do script e cai sozinha no parser.
+    for (index, href) in [(1, &long), (2, &huge)] {
+        let raw: serde_json::Value = serde_json::from_str(&raws[index]).expect("JSON");
+        assert_eq!(
+            raw["links"],
+            serde_json::json!(["https://example.com/a", "", "https://example.org/b"]),
+            "caso {index}"
+        );
+        assert!(!raws[index].contains(href.as_str()), "caso {index}");
+        assert!(
+            raws[index].len() < 1_024,
+            "caso {index}: {}",
+            raws[index].len()
+        );
+        let read = parse_case(index);
+        assert!(read.ok);
+        assert_eq!(
+            read.text,
+            "antes um\u{E000}0\u{E001}, longa dois e depois tres\u{E000}1\u{E001}."
+        );
+        assert_eq!(
+            read.links,
+            ["https://example.com/a", "https://example.org/b"]
+        );
+        assert_eq!(read.dropped_links, 1, "caso {index}");
+    }
+
+    // O tecto do script conta os bytes UTF-8 como o parser.
+    let raw: serde_json::Value = serde_json::from_str(&raws[3]).expect("JSON");
+    assert_eq!(
+        raw["links"],
+        serde_json::json!([accent_ok, "", emoji_ok, ""])
+    );
+    let edged = parse_case(3);
+    assert_eq!(
+        edged.links,
+        [
+            validate_answer_link(&accent_ok).expect("no tecto"),
+            validate_answer_link(&emoji_ok).expect("no tecto"),
+        ]
+    );
+    assert_eq!(edged.text, "a\u{E000}0\u{E001} b c\u{E000}1\u{E001} d");
+    assert_eq!(edged.dropped_links, 2);
+}
+
+/// O relatorio: uma linha por provedor com o estado e os numeros, e as
+/// entidades de cada resposta lida; a coluna traduzida aparece como
+/// «traduzida — não comparada» sem numeros.
+#[test]
+fn consensus_report_lists_each_provider_status() {
+    let report = ConsensusReport {
+        turn: 2,
+        answers: vec![
+            SnapshotAnswer {
+                provider: "Google IA".into(),
+                status: AttemptStatus::Read,
+                text: "Raft elege um líder \u{E000}0\u{E001}".into(),
+                links: vec!["https://example.com/raft".into()],
+                cut: false,
+            },
+            SnapshotAnswer {
+                provider: "ChatGPT".into(),
+                status: AttemptStatus::MaybeIncomplete,
+                text: "Raft".into(),
+                links: vec![],
+                cut: true,
+            },
+            SnapshotAnswer {
+                provider: "Claude".into(),
+                status: AttemptStatus::Translated,
+                text: String::new(),
+                links: vec![],
+                cut: false,
+            },
+        ],
+        facts: vec![neural_core::ComparisonFact {
+            item_id: "i".into(),
+            source: "Google IA".into(),
+            entities: vec!["Raft".into()],
+            numbers: vec!["2024".into()],
+            dates: vec!["2024".into()],
+        }],
+    };
+    let text = consensus_report_text(&report);
+    assert!(text.starts_with("Turno 2\r\n"));
+    assert!(
+        text.contains("Google IA: lida (23 caracteres, 1 ligação(ões))\r\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("ChatGPT: talvez incompleta (4 caracteres, 0 ligação(ões), cortada)\r\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("Claude: {CONSENSUS_TRANSLATED}\r\n")),
+        "{text}"
+    );
+    assert!(text.contains("Entidades: Raft"), "{text}");
+    let none = consensus_report_text(&ConsensusReport {
+        turn: 1,
+        answers: vec![],
+        facts: vec![],
+    });
+    assert!(none.contains("Nenhuma resposta lida para comparar."));
+}
+
+/// Verificacao de FIACAO (texto-fonte; AGENTS §4.3: nao e um gate de
+/// comportamento, so prende a presenca e a ordem das chamadas): os turnos
+/// abrem-se onde a pergunta parte (`compare`, `ask_other_columns` e o
+/// `LoadProvider` da palette), pelo `begin_question_turn`; um turno novo
+/// acaba o run do anterior (`consensus_turn_begun`), no `compare` ANTES de
+/// a sessao nova tomar o lugar; e o `research:compare` le pelo
+/// `read_consensus` -- nunca pela caixa das respostas empurradas. O
+/// `App::new` nao cria a thread do Consenso. O comportamento destas pecas
+/// esta nos gates `consensus_turn_key_is_anchored_to_the_latest_turn`,
+/// `consensus_run_never_writes_into_another_session` e
+/// `a_new_turn_supersedes_the_running_read`.
+#[test]
+fn consensus_turns_open_at_every_question_source() {
+    let compare = code_without_tests(include_str!("app/compare.rs"));
+    let compare_fn = compare
+        .split("pub(in crate::windows_app) fn compare(&mut self, request: CompareRequest)")
+        .nth(1)
+        .and_then(|rest| rest.split("fn open_comparator(").next())
+        .expect("compare()");
+    assert!(
+        compare_fn.contains("begin_question_turn("),
+        "compare() sem turno"
+    );
+    assert!(compare_fn.contains("TurnOrigin::Compare"));
+    let begun = compare_fn
+        .find("self.consensus_turn_begun(&session.id, turn);")
+        .expect("compare() nao acaba o run da pergunta anterior");
+    let swapped = compare_fn
+        .find("self.current_research = Some(session);")
+        .expect("compare() troca a sessao");
+    assert!(
+        begun < swapped,
+        "o run anterior acaba depois de a sessao nova tomar o lugar"
+    );
+    let consensus = code_without_tests(include_str!("consensus.rs"));
+    let begin_turn = consensus
+        .split("pub(in crate::windows_app) fn consensus_begin_turn(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(in crate::windows_app) fn consensus_turn_begun(")
+                .next()
+        })
+        .expect("consensus_begin_turn()");
+    assert!(
+        begin_turn.contains("begin_question_turn(session, origin, source, text, epoch, providers)")
+    );
+    assert!(begin_turn.contains("self.consensus_turn_begun(&session_id, turn);"));
+    let ask = compare
+        .split("pub(in crate::windows_app) fn ask_other_columns(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(in crate::windows_app) fn provider_query_url(")
+                .next()
+        })
+        .expect("ask_other_columns()");
+    assert!(
+        ask.contains("self.consensus_begin_turn("),
+        "ask_other_columns() sem turno"
+    );
+    assert!(ask.contains("ask_turn_providers(source_index,"));
+    assert!(ask.contains("TurnOrigin::AskOtherColumns"));
+    // Antes de as colunas navegarem: a chave leva a geracao de agora.
+    let turn_at = ask.find("self.consensus_begin_turn(").expect("turno");
+    let load_at = ask.find(".load_url(").expect("navega");
+    assert!(
+        turn_at < load_at,
+        "o turno abre depois de as colunas navegarem"
+    );
+    let research = compare
+        .split("pub(in crate::windows_app) fn compare_current_research(&mut self)")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("pub(in crate::windows_app) fn synthesize_current_research(")
+                .next()
+        })
+        .expect("compare_current_research()");
+    assert!(research.contains("self.read_consensus()"));
+    assert!(
+        !research.contains("show_native_text"),
+        "a caixa das respostas empurradas voltou"
+    );
+    let navigation = code_without_tests(include_str!("app/navigation.rs"));
+    let load = navigation
+        .split("PaletteRoute::LoadProvider { query } => {")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("Err(error) => self.show_splash(error.to_string(), 3),")
+                .next()
+        })
+        .expect("LoadProvider");
+    assert!(
+        load.contains("self.consensus_begin_turn("),
+        "LoadProvider sem turno"
+    );
+    assert!(load.contains("TurnOrigin::LoadProvider"));
+    assert!(
+        load.find("consensus_begin_turn(").expect("turno")
+            < load.find(".load_url(").expect("navega")
+    );
+
+    // O braco no event loop e o campo no App.
+    let event_loop = code_without_tests(include_str!("app/event_loop.rs"));
+    assert!(event_loop.contains("UserEvent::Consensus(event) => self.consensus_event(event),"));
+    let root = shipped_source();
+    assert!(root.contains("consensus: ConsensusState::new(),"));
+    let app_new = root
+        .split("impl App {\n    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("App::new");
+    assert!(!app_new.contains("CONSENSUS_WORKER_NAME"));
+    let state = ConsensusState::new();
+    assert_eq!(state.worker_threads_spawned(), 0);
+}
+
+// ===================== consensus: a revisao RT-1..RT-4 =====================
+
+/// A pagina de login da Google com um `<main>`: o seletor do Modo IA
+/// (`main, ...`) apanha-o.
+fn google_login_page() -> serde_json::Value {
+    el(
+        "html",
+        vec![el(
+            "body",
+            vec![el(
+                "main",
+                vec![
+                    el("h1", vec![t("Fazer login")]),
+                    el("p", vec![t("Use sua Conta do Google")]),
+                ],
+            )],
+        )],
+    )
+}
+
+/// Gate (critico, entrada nao confiavel; consensus, RT-2): o que o
+/// `consensus_page_event` decide sobre uma leitura (`column_answer_read`)
+/// exige que a pagina da coluna SEJA do provedor dela pelas regras de host
+/// do registo -- nao basta o `host` da resposta bater com o da pagina,
+/// porque o script le `location.hostname` dessa mesma pagina. O script que
+/// embarca, corrido no login da Google com um `<main>` e o seletor do Modo
+/// IA, devolve `ok: true` com o texto do login, e o `PageReads` entrega-o
+/// (o URL nao mudou); a decisao recusa-o. Recusa tambem o Google sem o
+/// Modo IA (`udm` diferente de 50), o login da OpenAI na coluna do
+/// ChatGPT, a pagina de outro provedor, um parecido, uma coluna sem URL e
+/// cada host de login do registo; aceita a pagina do proprio provedor.
+/// Sabotagem: `provider_page_host` sem a conferencia do provedor (o login
+/// passa por resposta).
+#[test]
+fn consensus_reads_only_the_columns_provider_page() {
+    use neural_core::search::login_hosts;
+    let role = "data-message-author-role";
+    let raws = run_answer_read_harness(&[
+        (
+            "login-google",
+            "accounts.google.com",
+            ProviderId::GoogleAi,
+            google_login_page(),
+        ),
+        (
+            "google-sem-modo-ia",
+            "www.google.com",
+            ProviderId::GoogleAi,
+            google_login_page(),
+        ),
+        (
+            "login-openai",
+            "auth.openai.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "chatgpt-na-coluna-do-claude",
+            "chatgpt.com",
+            ProviderId::Claude,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "modo-ia",
+            "www.google.com",
+            ProviderId::GoogleAi,
+            google_login_page(),
+        ),
+        (
+            "chatgpt",
+            "chatgpt.com",
+            ProviderId::ChatGpt,
+            chat_page(role, rich_answer("ChatGPT"), vec![]),
+        ),
+        (
+            "claude",
+            "claude.ai",
+            ProviderId::Claude,
+            chat_page(role, rich_answer("Claude"), vec![]),
+        ),
+    ]);
+    // O script le a pagina de login como uma resposta, e a conferencia do
+    // host contra a propria pagina deixa-a passar: nao prova nada.
+    let own = parse_answer_read(&raws[0], "accounts.google.com").expect("o login lido");
+    assert!(own.ok && own.text.contains("Fazer login"), "{own:?}");
+
+    // O caminho que embarca: o `PageReads` entrega a leitura (o URL da
+    // coluna nao mudou), e a decisao recusa-a pelo provedor da coluna.
+    let login_url = "https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.google.com%2Fsearch%3Fudm%3D50";
+    let view = FakeEvalView::at(login_url);
+    let epoch = NavEpoch::default();
+    let mut reads = PageReads::default();
+    let now = Instant::now();
+    let selector = ProviderId::GoogleAi.answer_read().expect("seletor");
+    let (tx, rx) = std::sync::mpsc::channel::<PageEvalEvent>();
+    reads
+        .read_with_arg(
+            &view,
+            answer_read_spec(),
+            &answer_read_config(selector),
+            &epoch,
+            now,
+            move |event| {
+                let _ = tx.send(event);
+            },
+            |_, _| {},
+        )
+        .expect("a leitura comeca");
+    view.answer(0, &raws[0]);
+    let arrived = rx.try_recv().expect("o callback entregou");
+    let PageEvalOutcome::Delivered { raw, .. } = reads.settle(arrived, || view.page_url(), now)
+    else {
+        panic!("o PageReads nao entregou a leitura");
+    };
+    assert_eq!(
+        column_answer_read(ProviderId::GoogleAi, view.page_url().as_deref(), &raw),
+        Err(AnswerReadError::NotProviderPage {
+            provider: "Google IA",
+            host: "accounts.google.com".into(),
+        }),
+        "a pagina de login passou por resposta do Modo IA"
+    );
+
+    for (raw, provider, page) in [
+        (
+            &raws[1],
+            ProviderId::GoogleAi,
+            "https://www.google.com/search?q=raft",
+        ),
+        (
+            &raws[1],
+            ProviderId::GoogleAi,
+            "https://www.google.com/search?udm=14&udm=50&q=raft",
+        ),
+        (
+            &raws[2],
+            ProviderId::ChatGpt,
+            "https://auth.openai.com/log-in",
+        ),
+        (&raws[3], ProviderId::Claude, "https://chatgpt.com/c/1"),
+        (
+            &raws[5],
+            ProviderId::ChatGpt,
+            "https://chatgpt.com.evil.io/c/1",
+        ),
+        (&raws[5], ProviderId::ChatGpt, "https://evilchatgpt.com/c/1"),
+        (&raws[5], ProviderId::ChatGpt, "about:blank"),
+        (&raws[5], ProviderId::ChatGpt, "nada"),
+    ] {
+        assert!(
+            matches!(
+                column_answer_read(provider, Some(page), raw),
+                Err(AnswerReadError::NotProviderPage { .. })
+            ),
+            "{page} passou pela coluna do {provider:?}"
+        );
+    }
+    assert!(matches!(
+        column_answer_read(ProviderId::ChatGpt, None, &raws[5]),
+        Err(AnswerReadError::NotProviderPage { .. })
+    ));
+    for host in login_hosts() {
+        for provider in ProviderId::default_slots() {
+            assert!(
+                provider_page_host(provider, Some(&format!("https://{host}/?udm=50"))).is_err(),
+                "o login {host} passou pela coluna do {provider:?}"
+            );
+        }
+    }
+
+    // A pagina do proprio provedor passa, e o host da resposta ainda tem de
+    // bater com ela.
+    for (raw, provider, page, host) in [
+        (
+            &raws[4],
+            ProviderId::GoogleAi,
+            "https://www.google.com/search?udm=50&q=raft",
+            "www.google.com",
+        ),
+        (
+            &raws[5],
+            ProviderId::ChatGpt,
+            "https://chatgpt.com/c/abc",
+            "chatgpt.com",
+        ),
+        (
+            &raws[6],
+            ProviderId::Claude,
+            "https://Claude.ai/chat/1",
+            "claude.ai",
+        ),
+    ] {
+        let read = column_answer_read(provider, Some(page), raw)
+            .unwrap_or_else(|error| panic!("{page}: {}", error.describe()));
+        assert_eq!(read.host, host);
+        assert!(read.ok);
+    }
+    assert!(matches!(
+        column_answer_read(
+            ProviderId::ChatGpt,
+            Some("https://chatgpt.com/c/1"),
+            &answer_json("claude.ai", "Olá", &[])
+        ),
+        Err(AnswerReadError::HostMismatch { .. })
+    ));
+    assert_eq!(
+        provider_page_host(ProviderId::ChatGpt, Some("https://ChatGPT.com/c/1?x=1")),
+        Ok("chatgpt.com".to_string())
+    );
+
+    // Fiacao (presenca): o braco da leitura decide por `column_answer_read`
+    // com o provedor da coluna, nunca pelo `parse_answer_read` sozinho.
+    let source = code_without_tests(include_str!("consensus.rs"));
+    let page_event = source
+        .split("fn consensus_page_event(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn finish_consensus_run(").next())
+        .expect("consensus_page_event");
+    assert!(page_event.contains("column_answer_read(column.provider, page_url.as_deref(), &raw)"));
+    assert!(!page_event.contains("parse_answer_read("));
+}
+
+/// Um run do turno `turn` da sessao `session` sobre as tres colunas, com o
+/// fim de cada uma.
+fn finished_run(
+    session: &ResearchSession,
+    turn: u32,
+    outcomes: [ColumnOutcome; 3],
+) -> ConsensusRun {
+    let mut run = ConsensusRun::begin(1, &session.id, turn, Instant::now(), three_columns());
+    for (column, outcome) in run.columns.iter_mut().zip(outcomes) {
+        column.outcome = Some(outcome);
+    }
+    run
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-3): um run grava SO
+/// na sessao dele. O dono perguntou Q1, pediu o Consenso, e antes de ele
+/// acabar perguntou Q2 as tres (`compare`: sessao nova, tambem com o turno
+/// 1); o run de Q1 que acaba depois nao toca na sessao de Q2 -- nem item,
+/// nem tentativa, nem leitura guardada --, e na sessao de Q1 grava-se
+/// inteiro. Um run cujo turno nao existe tambem nao grava. Sabotagem:
+/// `record_consensus_run` sem a conferencia da sessao (a resposta de Q1
+/// entra na sessao de Q2).
+#[test]
+fn consensus_run_never_writes_into_another_session() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut first = ResearchSession::new("Q1");
+    let turn = begin_question_turn(&mut first, TurnOrigin::Compare, None, "Q1", 0, &slots);
+    let run = finished_run(
+        &first,
+        turn,
+        [
+            ColumnOutcome::OtherQuestion,
+            ColumnOutcome::Read(answer_read_of("chatgpt.com", "Resposta de Q1", &[])),
+            ColumnOutcome::OtherQuestion,
+        ],
+    );
+    let mut second = ResearchSession::new("Q2");
+    let second_turn = begin_question_turn(&mut second, TurnOrigin::Compare, None, "Q2", 0, &slots);
+    assert_eq!(second_turn, turn, "as duas sessoes tem o turno 1");
+    let before = serde_json::to_value(&second).expect("json");
+    assert_eq!(
+        record_consensus_run(&mut second, &run),
+        None,
+        "o run de Q1 gravou na sessao de Q2"
+    );
+    assert_eq!(
+        serde_json::to_value(&second).expect("json"),
+        before,
+        "a sessao de Q2 mudou"
+    );
+
+    let recorded = record_consensus_run(&mut first, &run).expect("a sessao do run");
+    assert_eq!(recorded.item_ids.len(), 1);
+    assert_eq!(
+        recorded
+            .answers
+            .iter()
+            .map(|answer| (answer.provider.as_str(), answer.status))
+            .collect::<Vec<_>>(),
+        [
+            ("Google IA", AttemptStatus::OtherQuestion),
+            ("ChatGPT", AttemptStatus::Read),
+            ("Claude", AttemptStatus::OtherQuestion),
+        ]
+    );
+    let item = first
+        .items
+        .iter()
+        .find(|item| item.id == recorded.item_ids[0])
+        .expect("item");
+    assert_eq!(item.text, "Resposta de Q1");
+    assert_eq!(item.turn, Some(turn));
+    assert_eq!(first.turn(turn).expect("turno").attempts.len(), 3);
+    assert_eq!(first.consensus.len(), 1);
+
+    // Um turno que a sessao nao tem: nada.
+    let ghost = finished_run(
+        &first,
+        99,
+        [
+            ColumnOutcome::Read(answer_read_of("www.google.com", "x", &[])),
+            ColumnOutcome::OtherQuestion,
+            ColumnOutcome::OtherQuestion,
+        ],
+    );
+    let items = first.items.len();
+    assert_eq!(record_consensus_run(&mut first, &ghost), None);
+    assert_eq!(first.items.len(), items);
+    assert_eq!(first.consensus.len(), 1);
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-3): um turno novo
+/// acaba o run que ainda lia o anterior. O dono pediu o Consenso do turno 2
+/// (a pergunta X escrita na coluna do ChatGPT) e, antes de ele assentar,
+/// escreveu Y na mesma coluna (turno 3, sem a coluna navegar): o run do
+/// turno 2 sai com as leituras em voo canceladas, a coluna que ja assentou
+/// fica lida, as outras saem como «outra pergunta» SEM o texto da ultima
+/// leitura (pode ja ser de Y), e grava-se no turno 2 -- a resposta de Y
+/// nunca entra no turno de X. A mesma operacao repetida (o turno 2 outra
+/// vez) nao acaba o run; outra sessao acaba. Sabotagem: `supersede` a
+/// olhar so para a sessao (o run de X continua e le a resposta de Y).
+#[test]
+fn a_new_turn_supersedes_the_running_read() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut session = ResearchSession::new("Q");
+    begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots);
+    let ask = ask_turn_providers(1, [0, 2]);
+    let x = begin_question_turn(
+        &mut session,
+        TurnOrigin::AskOtherColumns,
+        Some(1),
+        "X",
+        0,
+        &ask,
+    );
+
+    let view = FakeEvalView::at("https://chatgpt.com/c/1");
+    let epoch = NavEpoch::default();
+    let selector = ProviderId::ChatGpt.answer_read().expect("seletor");
+    let mut state = ConsensusState::new();
+    let now = Instant::now();
+    let id = state.begin_run(&session.id, x, now, three_columns());
+    let token = state
+        .reads
+        .read_with_arg(
+            &view,
+            answer_read_spec(),
+            &answer_read_config(selector),
+            &epoch,
+            now,
+            |_| {},
+            |_, _| {},
+        )
+        .expect("a leitura comeca");
+    {
+        let run = state.run_mut(id).expect("run");
+        run.columns[0].outcome = Some(ColumnOutcome::Read(answer_read_of(
+            "www.google.com",
+            "Resposta de X",
+            &[],
+        )));
+        run.columns[1].pending = Some(token);
+        run.columns[1].last = Some(answer_read_of(
+            "chatgpt.com",
+            "Começo da resposta de Y",
+            &[],
+        ));
+    }
+    assert_eq!(state.reads.in_flight(), 1);
+
+    // A mesma operacao (o turno de X outra vez): o run continua.
+    assert!(state.supersede(&session.id, x).is_none());
+    assert!(state.run_mut(id).is_some());
+    assert_eq!(state.reads.in_flight(), 1);
+
+    // Y: outro turno na mesma sessao.
+    let y = begin_question_turn(
+        &mut session,
+        TurnOrigin::AskOtherColumns,
+        Some(1),
+        "Y",
+        0,
+        &ask,
+    );
+    assert_ne!(y, x);
+    let run = state
+        .supersede(&session.id, y)
+        .expect("o turno novo nao acabou o run do anterior");
+    assert!(state.run_mut(id).is_none());
+    assert_eq!(state.reads.in_flight(), 0, "a leitura em voo sobreviveu");
+    assert_eq!(run.turn, x);
+    assert!(run.finished());
+    assert_eq!(
+        run.columns
+            .iter()
+            .map(|column| column.outcome.clone())
+            .collect::<Vec<_>>(),
+        [
+            Some(ColumnOutcome::Read(answer_read_of(
+                "www.google.com",
+                "Resposta de X",
+                &[]
+            ))),
+            Some(ColumnOutcome::OtherQuestion),
+            Some(ColumnOutcome::OtherQuestion),
+        ]
+    );
+    let recorded = record_consensus_run(&mut session, &run).expect("grava no turno de X");
+    assert_eq!(recorded.item_ids.len(), 1);
+    assert_eq!(session.turn(x).expect("X").attempts.len(), 3);
+    assert!(
+        session.turn(y).expect("Y").attempts.is_empty(),
+        "o run de X gravou no turno de Y"
+    );
+    assert!(
+        !session
+            .items
+            .iter()
+            .any(|item| item.text.contains("resposta de Y")),
+        "a resposta de Y entrou num turno"
+    );
+
+    // Outra sessao (o `compare` abriu uma nova) tambem acaba o run.
+    state.begin_run(&session.id, y, now, three_columns());
+    assert!(state.supersede("outra-sessao", 1).is_some());
+    // Sem run, nada.
+    assert!(state.supersede(&session.id, y).is_none());
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-4): a chave de
+/// operacao de uma pergunta esta ancorada no turno mais recente. Na mesma
+/// coluna, sem ela navegar (a pergunta escrita na pagina nao sobe a
+/// geracao), X, Y e X outra vez sao TRES turnos -- o segundo X nunca volta
+/// ao turno do primeiro --, e o mesmo Enter repetido enquanto a pergunta
+/// ainda e a ultima e o mesmo turno. O ordinal devolvido e sempre o do
+/// turno mais recente, o que o Consenso le. A ancora fica na sessao: depois
+/// de a gravar e ler, vale igual. Os provedores de um turno do
+/// `ask_other_columns` levam a coluna de origem primeiro. Sabotagem:
+/// `anchored_operation_key` com a ancora fixa (o X de novo devolve o turno
+/// do primeiro X).
+#[test]
+fn consensus_turn_key_is_anchored_to_the_latest_turn() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let ask = ask_turn_providers(1, [0, 2]);
+    let ask_from_1 = |session: &mut ResearchSession, text: &str, epoch: u64| {
+        let turn = begin_question_turn(
+            session,
+            TurnOrigin::AskOtherColumns,
+            Some(1),
+            text,
+            epoch,
+            &ask,
+        );
+        assert_eq!(
+            session.current_turn().map(|turn| turn.ordinal),
+            Some(turn),
+            "o turno devolvido nao e o mais recente"
+        );
+        turn
+    };
+    let mut session = ResearchSession::new("Q");
+    assert_eq!(
+        begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots),
+        1
+    );
+    let x = ask_from_1(&mut session, "X", 0);
+    assert_eq!(
+        ask_from_1(&mut session, "X", 0),
+        x,
+        "o Enter repetido abriu outro turno"
+    );
+    let y = ask_from_1(&mut session, "Y", 0);
+    let x_again = ask_from_1(&mut session, "X", 0);
+    assert_eq!((x, y), (2, 3));
+    assert_eq!(x_again, 4, "o X de novo voltou ao turno {x}");
+    assert_eq!(ask_from_1(&mut session, "X", 0), x_again);
+    // A coluna navegou: a mesma pergunta e outra operacao.
+    let moved = ask_from_1(&mut session, "X", 1);
+    assert_eq!(moved, 5);
+    // Gravada e lida: a ancora vem da sessao.
+    let mut reloaded: ResearchSession =
+        serde_json::from_str(&serde_json::to_string(&session).expect("json")).expect("rele");
+    assert_eq!(ask_from_1(&mut reloaded, "X", 1), moved);
+    assert_eq!(ask_from_1(&mut reloaded, "Y", 1), 6);
+    // Uma chave gravada sem ancora (antes dela) e a sua propria base.
+    let mut old = ResearchSession::new("antiga");
+    let plain = neural_core::operation_key(TurnOrigin::AskOtherColumns, Some(1), "X", 0);
+    old.begin_turn(&plain, TurnOrigin::AskOtherColumns, "X", &["ChatGPT"]);
+    assert_eq!(anchored_operation_key(&old, &plain), plain);
+    assert_eq!(ask_from_1(&mut old, "X", 0), 1);
+    assert_eq!(ask_from_1(&mut old, "Y", 0), 2);
+
+    // A coluna de origem responde a mesma pergunta: entra primeiro.
+    assert_eq!(
+        ask,
+        [
+            ProviderId::ChatGpt,
+            ProviderId::GoogleAi,
+            ProviderId::Claude
+        ]
+    );
+    assert_eq!(
+        session.turn(x).expect("X").providers,
+        ["ChatGPT", "Google IA", "Claude"]
+    );
+    assert_eq!(ask_turn_providers(0, [1, 2]), slots);
+    assert_eq!(
+        ask_turn_providers(2, [2, 0, 1, 7]),
+        [
+            ProviderId::Claude,
+            ProviderId::GoogleAi,
+            ProviderId::ChatGpt
+        ]
+    );
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-4): o Consenso le SO
+/// as colunas que o turno mais recente perguntou. Depois de uma pergunta da
+/// palette so ao ChatGPT, as respostas velhas que ficaram na coluna do
+/// Modo IA e na do Claude nao sao lidas para esse turno (`consensus_hosts`)
+/// -- e, mesmo que um run as trouxesse, nao se gravam nele. Sabotagem:
+/// `consensus_hosts` sem o filtro pelo turno (as tres colunas sao lidas).
+#[test]
+fn consensus_reads_only_the_providers_of_the_latest_turn() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut session = ResearchSession::new("Q");
+    let compare = begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots);
+    let load = begin_question_turn(
+        &mut session,
+        TurnOrigin::LoadProvider,
+        Some(1),
+        "só ao ChatGPT",
+        0,
+        &[ProviderId::ChatGpt],
+    );
+    let generation = |column: WebViewHost| match column {
+        WebViewHost::Column(index) => 10 + index as u64,
+        _ => 0,
+    };
+    let latest = session.current_turn().expect("turno");
+    assert_eq!(latest.ordinal, load);
+    assert_eq!(
+        consensus_hosts(latest, COMPARATOR_COLUMNS, generation),
+        [(WebViewHost::Column(1), 11)],
+        "uma coluna que o turno nao perguntou foi lida"
+    );
+    let all = session.turn(compare).expect("compare");
+    assert_eq!(
+        consensus_hosts(all, COMPARATOR_COLUMNS, generation),
+        [
+            (WebViewHost::Column(0), 10),
+            (WebViewHost::Column(1), 11),
+            (WebViewHost::Column(2), 12)
+        ]
+    );
+    // So as colunas a vista.
+    assert_eq!(
+        consensus_hosts(all, 2, generation),
+        [(WebViewHost::Column(0), 10), (WebViewHost::Column(1), 11)]
+    );
+    assert!(consensus_hosts(all, 0, generation).is_empty());
+
+    // Um run que trouxesse as tres para o turno do ChatGPT so grava o ChatGPT.
+    let run = finished_run(
+        &session,
+        load,
+        [
+            ColumnOutcome::Read(answer_read_of("www.google.com", "velha do Modo IA", &[])),
+            ColumnOutcome::Read(answer_read_of("chatgpt.com", "nova do ChatGPT", &[])),
+            ColumnOutcome::Read(answer_read_of("claude.ai", "velha do Claude", &[])),
+        ],
+    );
+    let recorded = record_consensus_run(&mut session, &run).expect("grava");
+    assert_eq!(
+        recorded
+            .answers
+            .iter()
+            .map(|answer| answer.provider.as_str())
+            .collect::<Vec<_>>(),
+        ["ChatGPT"]
+    );
+    assert_eq!(recorded.item_ids.len(), 1);
+    let turn = session.turn(load).expect("turno");
+    assert_eq!(turn.attempts.len(), 1);
+    assert_eq!(turn.attempts[0].provider, "ChatGPT");
+    assert!(
+        !session.items.iter().any(|item| item.text.contains("velha")),
+        "uma resposta velha entrou no turno"
+    );
+}
+
+/// Gate (critico, dados do utilizador; consensus, RT-1): a pagina continua
+/// a empurrar a resposta (`research-answer`) depois de o Consenso a ler, e
+/// o braco `ResearchAnswer` do event loop (o provedor da coluna pelo
+/// `research_answer_provider`, com o nome da coluna -- «ChatGPT», o mesmo
+/// do turno -- e o `upsert_provider_answer`) nunca escreve por cima do item
+/// do turno: o texto, as ligacoes e o item da tentativa ficam. Sabotagem
+/// (no `neural-core`): `upsert_provider_answer` sem o `item.turn.is_none()`.
+#[test]
+fn research_answer_push_never_overwrites_a_turn_answer() {
+    use neural_core::TurnOrigin;
+    let slots = ProviderId::default_slots();
+    let mut session = ResearchSession::new("Q");
+    let turn = begin_question_turn(&mut session, TurnOrigin::Compare, None, "Q", 0, &slots);
+    let run = finished_run(
+        &session,
+        turn,
+        [
+            ColumnOutcome::Translated,
+            ColumnOutcome::Read(answer_read_of(
+                "chatgpt.com",
+                "Resposta lida \u{E000}0\u{E001}",
+                &["https://example.com/a"],
+            )),
+            ColumnOutcome::OtherQuestion,
+        ],
+    );
+    let recorded = record_consensus_run(&mut session, &run).expect("grava");
+    let read_id = recorded.item_ids[0].clone();
+
+    // O braco `ResearchAnswer`: o provedor pelo nome da coluna 1.
+    let translation = TranslationState::with_sink(Box::new(|_| {}));
+    let provider = research_answer_provider(&translation, Some("ChatGPT"), 1).expect("provedor");
+    assert_eq!(provider, ProviderId::ChatGpt.display_name());
+    let pushed =
+        session.upsert_provider_answer(provider.clone(), "texto empurrado pela pagina", None);
+    assert_ne!(pushed, read_id, "o empurrao foi ao item do turno");
+    session.upsert_provider_answer(provider, "texto empurrado outra vez", None);
+
+    let item = session
+        .items
+        .iter()
+        .find(|item| item.id == read_id)
+        .expect("item do turno");
+    assert_eq!(item.text, "Resposta lida \u{E000}0\u{E001}");
+    assert_eq!(item.links, ["https://example.com/a"]);
+    assert_eq!(item.turn, Some(turn));
+    let attempt = session
+        .turn(turn)
+        .expect("turno")
+        .attempts_of("ChatGPT")
+        .next()
+        .expect("tentativa")
+        .clone();
+    assert_eq!(attempt.item_id.as_deref(), Some(read_id.as_str()));
+    let pushed_item = session
+        .items
+        .iter()
+        .find(|item| item.id == pushed)
+        .expect("item empurrado");
+    assert_eq!(pushed_item.text, "texto empurrado outra vez");
+    assert_eq!(pushed_item.turn, None);
+}
