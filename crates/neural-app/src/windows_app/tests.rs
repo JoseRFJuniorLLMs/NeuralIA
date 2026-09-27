@@ -64,6 +64,30 @@ fn the_tissue_runs_right_through_where_the_brand_sits() {
 }
 
 #[test]
+fn every_webview_enables_native_touchpad_pinch_without_replacing_mouse_zoom() {
+    let hooks = normalize_newlines(include_str!("webview_hooks.rs"));
+    let scripts = normalize_newlines(include_str!("page_scripts.rs"));
+
+    assert!(
+        hooks.contains("enable_native_pinch_zoom(webview)"),
+        "uma WebView pode nascer sem o pinch nativo do WebView2"
+    );
+    assert!(hooks.contains("ICoreWebView2Settings5"));
+    assert!(hooks.contains("SetIsPinchZoomEnabled(true)"));
+
+    // Pinch e browser zoom sao controles diferentes no WebView2. Nao se liga
+    // o zoom nativo de Ctrl+roda aqui: o NeuralIA mantem o seu caminho atual.
+    assert!(
+        !hooks.contains("SetIsZoomControlEnabled(true)"),
+        "o pinch foi corrigido ligando tambem outro mecanismo de zoom"
+    );
+    assert!(
+        scripts.contains("e.ctrlKey"),
+        "o caminho existente de Ctrl+roda desapareceu ao corrigir o touchpad"
+    );
+}
+
+#[test]
 fn the_window_and_taskbar_icons_come_from_the_project_icon() {
     // O `resumed` pousa na janela o que `app_icons` devolve. Com o id do
     // recurso errado (ou sem o assets/logo.ico compilado no executavel) a
