@@ -1644,7 +1644,7 @@ name = "neural-core"
 version = "2.4.0"
 dependencies = [
  "flate2",
- "quick-xml",
+ "quick-xml 0.42.0",
  "rusqlite",
  "scraper",
  "serde",
