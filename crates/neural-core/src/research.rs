@@ -345,7 +345,7 @@ fn unique_id(parts: &[&str], hex_len: usize) -> String {
     digest.update(pid.to_le_bytes());
     digest.update(nonce.to_le_bytes());
 
-    let hex = format!("{:x}", digest.finalize());
+    let hex = digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     hex[..hex_len.min(hex.len())].to_string()
 }
 
