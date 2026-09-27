@@ -46,7 +46,8 @@ $allowlist = @(
     @{ Path = 'tabs.cleared'; Kind = 'Automatic'; Why = 'a geracao do Apagar historico' }
     @{ Path = 'WebView2/'; Kind = 'Automatic'; Why = 'o perfil do WebView2 (cookies, cache, inicios de sessao): o runtime escreve-o; o modo privado do perfil e do private-mode-core' }
     @{ Path = 'panel-width.json'; Kind = 'Automatic'; Why = 'a largura dos paineis, ao arrastar a pega (grant = privacy-guard-retrofit)' }
-    @{ Path = 'agent/'; Kind = 'Automatic'; Why = 'o trace e a auditoria legados do agente (int-agents-finish leva-os)' }
+    @{ Path = 'agent/'; Kind = 'Automatic'; Why = 'o trace e a auditoria legados do agente' }
+    @{ Path = 'agents/'; Kind = 'Automatic'; Why = 'o canal MCP local e as conversas do Agents Hub; o PrivacyGuard nao concede escrita em Private' }
     @{ Path = 'theme'; Kind = 'Setting'; Why = 'a escolha do tema' }
     @{ Path = 'gmail'; Kind = 'Setting'; Why = 'os avisos do Gmail' }
     @{ Path = 'pomodoro'; Kind = 'Setting'; Why = 'as duracoes do Pomodoro' }
