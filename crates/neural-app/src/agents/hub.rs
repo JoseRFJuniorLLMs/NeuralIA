@@ -1923,6 +1923,43 @@ pub(crate) mod tests {
     /// pergunta que já estava pendente. Os cartões continuam vivos em memória
     /// e o agente recebe cada desfecho, mas resposta, dismiss, cancel e timeout
     /// nunca podem recriar a conversa que o utilizador acabou de apagar.
+    /// Gate crítico: se persistir o badge de leitura falha, repetir o
+    /// mesmo mark_read tem de tentar novamente. A RAM dizer "ja lido" nao
+    /// pode mascarar um state.json que nunca chegou ao disco.
+    #[test]
+    fn a_failed_mark_read_save_is_retried_even_when_the_ram_mark_is_unchanged() {
+        let f = fixture("marks-retry");
+        let claude = f.hub.connect("claude").unwrap();
+        send(&f.hub, claude, "mensagem").unwrap();
+        assert_eq!(f.hub.unread("claude"), 1);
+
+        let state_file = f.dir.0.join("agents").join("state.json");
+        std::fs::create_dir(&state_file).unwrap();
+
+        f.hub.mark_read("claude");
+        assert_eq!(f.hub.unread("claude"), 0);
+        assert!(f.hub.snapshot().store_error.is_some());
+        assert!(state_file.is_dir());
+
+        std::fs::remove_dir(&state_file).unwrap();
+
+        // Nenhum mark mudou na RAM. Mesmo assim, a escrita anterior falhou,
+        // logo esta chamada precisa repetir o snapshot pendente.
+        f.hub.mark_read("claude");
+        assert!(
+            state_file.is_file(),
+            "mark_read nao repetiu o state.json que tinha falhado"
+        );
+
+        let reopened = reopen(&f);
+        reopened.load();
+        assert_eq!(
+            reopened.unread("claude"),
+            0,
+            "o restart ressuscitou o badge que a sessao dizia estar lido"
+        );
+    }
+
     #[test]
     fn clearing_history_with_a_pending_question_never_recreates_the_conversation() {
         let f = fixture("clear-pending");
