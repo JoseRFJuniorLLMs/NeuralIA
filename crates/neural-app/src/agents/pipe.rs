@@ -814,6 +814,11 @@ struct ClientConn {
     writer: Pipe,
 }
 
+trait RequestConnection {
+    fn send_request(&mut self, request: &Value) -> io::Result<()>;
+    fn receive_reply(&mut self) -> io::Result<Value>;
+}
+
 impl ClientConn {
     fn send(&mut self, request: &Value) -> io::Result<()> {
         let mut line = request.to_string().into_bytes();
@@ -835,6 +840,26 @@ impl ClientConn {
             )),
         }
     }
+}
+
+impl RequestConnection for ClientConn {
+    fn send_request(&mut self, request: &Value) -> io::Result<()> {
+        self.send(request)
+    }
+
+    fn receive_reply(&mut self) -> io::Result<Value> {
+        self.receive()
+    }
+}
+
+fn exchange_once(
+    conn: &mut impl RequestConnection,
+    request: &Value,
+) -> Result<Value, LinkError> {
+    conn.send_request(request)
+        .map_err(|error| LinkError::Broken(error.to_string()))?;
+    conn.receive_reply()
+        .map_err(|error| LinkError::Broken(error.to_string()))
 }
 
 fn read_small_file(path: &Path, len: usize) -> Option<String> {
@@ -895,17 +920,11 @@ impl HubLink for PipeLink {
         // Uma falha de escrita pode acontecer depois de alguns ou de todos os
         // bytes terem chegado ao hub. Repetir automaticamente um pedido com
         // efeito colateral (send_message/ask_user) criaria duplicados.
-        if let Err(error) = self.conn.as_mut().expect("connected").send(request) {
+        let result = exchange_once(self.conn.as_mut().expect("connected"), request);
+        if result.is_err() {
             self.conn = None;
-            return Err(LinkError::Broken(error.to_string()));
         }
-        match self.conn.as_mut().expect("connected").receive() {
-            Ok(reply) => Ok(reply),
-            Err(error) => {
-                self.conn = None;
-                Err(LinkError::Broken(error.to_string()))
-            }
-        }
+        result
     }
 
     fn ensure_connected(&mut self) -> Result<(), LinkError> {
@@ -1165,6 +1184,28 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         running.stop();
+    }
+
+    #[test]
+    fn a_failed_send_is_never_replayed() {
+        struct Failing {
+            sends: usize,
+        }
+        impl RequestConnection for Failing {
+            fn send_request(&mut self, _request: &Value) -> io::Result<()> {
+                self.sends += 1;
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "caiu"))
+            }
+            fn receive_reply(&mut self) -> io::Result<Value> {
+                panic!("receive must not run after a failed send")
+            }
+        }
+        let mut conn = Failing { sends: 0 };
+        assert!(matches!(
+            exchange_once(&mut conn, &json!({"t":"call"})),
+            Err(LinkError::Broken(_))
+        ));
+        assert_eq!(conn.sends, 1, "a side-effecting request was replayed");
     }
 
     #[test]
