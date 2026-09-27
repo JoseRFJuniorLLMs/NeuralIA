@@ -29075,6 +29075,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             path: None,
             host: None,
             bytes: None,
+            recovery_only: false,
             outcome: RecordOutcome::Cancelled,
             at,
         };
