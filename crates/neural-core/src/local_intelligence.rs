@@ -967,7 +967,10 @@ mod tests {
         let second = b"model-v2";
         let second_manifest = ModelPackManifest {
             version: "2".into(),
-            sha256: format!("{:x}", Sha256::digest(second)),
+            sha256: Sha256::digest(second)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             ..first_manifest.clone()
         };
         let model = manager.install(&second_manifest, second).unwrap();
@@ -1001,7 +1004,10 @@ mod tests {
             id: "semantic-small".into(),
             version: "1".into(),
             file: "model.bin".into(),
-            sha256: format!("{:x}", Sha256::digest(b"expected")),
+            sha256: Sha256::digest(b"expected")
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
             capabilities: vec!["embedding".into()],
             license: "test".into(),
         };
