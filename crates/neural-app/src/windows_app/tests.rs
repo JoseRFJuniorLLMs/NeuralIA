@@ -2779,8 +2779,9 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
 /// Presenca e ordem no texto do ficheiro (AGENTS.md §4.3: isto nao prova
 /// comportamento -- o do painel e do olho esta provado acima, sobre o
 /// `LivePanel` e a barra pintada). Prende o que so o `App` faz: a saida
-/// unica das superficies web fecha o Gemini Live (e os outros paineis)
-/// antes de esconder os hosts orfaos, e nenhuma funcao troca para uma
+/// unica das superficies web fecha o Gemini Live antes de esconder os hosts
+/// orfaos. O painel de servicos usa a sua politica de transicao: YouTube pode
+/// sobreviver minimizado; os outros servicos fecham. Nenhuma funcao troca para uma
 /// superficie que nao e o comparador sem passar por ela. Antes, um erro
 /// nativo (`show_native_error`) ia para a Home com a captura a correr num
 /// painel escondido, sem olho e sem Desligar.
@@ -2800,7 +2801,7 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
         .expect("destroy_web_surfaces esconde os hosts orfaos");
     for close in [
         "self.close_live_panel();",
-        "self.close_service_panel();",
+        "self.service_panel_for_transition();",
         "self.close_side_panel(PanelExit::SurfaceChange);",
     ] {
         assert!(
