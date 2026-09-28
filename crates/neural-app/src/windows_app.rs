@@ -225,6 +225,9 @@ pub(in crate::windows_app) enum UserEvent {
         result: Result<Vec<MemoryHit>, String>,
     },
     MemoryCleared(Result<(), String>),
+    /// Falha observável de uma operação de memória que não pode sumir
+    /// silenciosamente só porque a fila bounded encheu.
+    MemoryWriteFailed(String),
     ResearchAnswer {
         source_index: usize,
         text: String,
@@ -2848,11 +2851,13 @@ enum MemoryCommand {
 #[derive(Clone)]
 pub(crate) struct MemoryWorker {
     tx: SyncSender<MemoryCommand>,
+    sink: EventSink,
 }
 
 impl MemoryWorker {
     pub(crate) fn new(root: std::path::PathBuf, sink: EventSink) -> Self {
         let (tx, rx) = sync_channel::<MemoryCommand>(128);
+        let worker_sink = sink.clone();
         let _ = thread::Builder::new()
             .name("neural-memory".into())
             .spawn(move || {
@@ -2863,13 +2868,14 @@ impl MemoryWorker {
                         while let Ok(command) = rx.recv() {
                             match command {
                                 MemoryCommand::Query(query) => {
-                                    sink.send(UserEvent::MemoryQueryReady {
+                                    worker_sink.send(UserEvent::MemoryQueryReady {
                                         query,
                                         result: Err(error.to_string()),
                                     });
                                 }
                                 MemoryCommand::Clear => {
-                                    sink.send(UserEvent::MemoryCleared(Err(error.to_string())));
+                                    worker_sink
+                                        .send(UserEvent::MemoryCleared(Err(error.to_string())));
                                 }
                                 _ => {}
                             }
@@ -2912,29 +2918,39 @@ impl MemoryWorker {
                                 store.query(&MemoryQuery::new(query.clone()))
                             }
                             .map_err(|error| error.to_string());
-                            sink.send(UserEvent::MemoryQueryReady { query, result });
+                            worker_sink.send(UserEvent::MemoryQueryReady { query, result });
                         }
                         MemoryCommand::Clear => {
                             let result = store
                                 .forget(neural_core::ForgetScope::All)
                                 .map(|_| ())
                                 .map_err(|error| error.to_string());
-                            sink.send(UserEvent::MemoryCleared(result));
+                            worker_sink.send(UserEvent::MemoryCleared(result));
                         }
                         MemoryCommand::SaveSession(session) => {
                             if let Err(error) = store.save_session(&session) {
-                                eprintln!("research session save failed: {error}");
+                                let message =
+                                    format!("sessão de pesquisa não foi gravada: {error}");
+                                eprintln!("{message}");
+                                worker_sink.send(UserEvent::MemoryWriteFailed(message));
                             }
                         }
                         MemoryCommand::Rebuild => {
                             if let Err(error) = store.rebuild() {
-                                eprintln!("memory rebuild failed: {error}");
+                                let message = format!("memória não foi reconstruída: {error}");
+                                eprintln!("{message}");
+                                worker_sink.send(UserEvent::MemoryWriteFailed(message));
                             }
                         }
                     }
                 }
             });
-        Self { tx }
+        Self { tx, sink }
+    }
+
+    #[cfg(test)]
+    fn from_sender_for_test(tx: SyncSender<MemoryCommand>, sink: EventSink) -> Self {
+        Self { tx, sink }
     }
 
     pub(crate) fn capture(&self, document: MemoryDocument) {
@@ -2944,8 +2960,17 @@ impl MemoryWorker {
     }
 
     pub(crate) fn query(&self, query: String) {
-        if self.tx.try_send(MemoryCommand::Query(query)).is_err() {
-            eprintln!("memory queue saturated; query not scheduled");
+        if self
+            .tx
+            .try_send(MemoryCommand::Query(query.clone()))
+            .is_err()
+        {
+            let message = "fila da memória saturada; pesquisa não agendada".to_string();
+            eprintln!("{message}");
+            self.sink.send(UserEvent::MemoryQueryReady {
+                query,
+                result: Err(message),
+            });
         }
     }
 
@@ -2957,7 +2982,9 @@ impl MemoryWorker {
     pub(crate) fn clear(&self, current_research: &mut Option<ResearchSession>) {
         *current_research = None;
         if self.tx.try_send(MemoryCommand::Clear).is_err() {
-            eprintln!("memory queue saturated; clear not scheduled");
+            let message = "fila da memória saturada; limpeza não agendada".to_string();
+            eprintln!("{message}");
+            self.sink.send(UserEvent::MemoryCleared(Err(message)));
         }
     }
 
@@ -2967,13 +2994,75 @@ impl MemoryWorker {
             .try_send(MemoryCommand::SaveSession(session))
             .is_err()
         {
-            eprintln!("memory queue saturated; session save not scheduled");
+            let message = "fila da memória saturada; sessão de pesquisa não agendada".to_string();
+            eprintln!("{message}");
+            self.sink.send(UserEvent::MemoryWriteFailed(message));
         }
     }
 
     pub(crate) fn rebuild(&self) {
         if self.tx.try_send(MemoryCommand::Rebuild).is_err() {
-            eprintln!("memory queue saturated; rebuild not scheduled");
+            let message = "fila da memória saturada; reconstrução não agendada".to_string();
+            eprintln!("{message}");
+            self.sink.send(UserEvent::MemoryWriteFailed(message));
+        }
+    }
+}
+
+#[cfg(test)]
+mod memory_queue_saturation_tests {
+    use super::*;
+    use std::sync::mpsc::{channel, sync_channel};
+
+    fn saturated_worker() -> (MemoryWorker, std::sync::mpsc::Receiver<UserEvent>) {
+        let (commands, _held_receiver) = sync_channel::<MemoryCommand>(1);
+        assert!(commands.try_send(MemoryCommand::Rebuild).is_ok());
+        let (events, rx) = channel::<UserEvent>();
+        (
+            MemoryWorker::from_sender_for_test(commands, EventSink::channel(events)),
+            rx,
+        )
+    }
+
+    #[test]
+    fn saturated_memory_query_returns_an_error_event_without_blocking() {
+        let (worker, events) = saturated_worker();
+        worker.query("agulha".to_string());
+        match events.recv_timeout(Duration::from_millis(100)).unwrap() {
+            UserEvent::MemoryQueryReady { query, result } => {
+                assert_eq!(query, "agulha");
+                assert!(result.unwrap_err().contains("saturada"));
+            }
+            _ => panic!("evento inesperado"),
+        }
+    }
+
+    #[test]
+    fn saturated_memory_clear_drops_the_live_session_but_reports_the_failure() {
+        let (worker, events) = saturated_worker();
+        let mut session = Some(ResearchSession::new("apagar"));
+        worker.clear(&mut session);
+        assert!(session.is_none());
+        match events.recv_timeout(Duration::from_millis(100)).unwrap() {
+            UserEvent::MemoryCleared(Err(error)) => assert!(error.contains("saturada")),
+            _ => panic!("evento inesperado"),
+        }
+    }
+
+    #[test]
+    fn saturated_session_save_and_rebuild_are_observable() {
+        let (worker, events) = saturated_worker();
+        worker.save_session(ResearchSession::new("persistir"));
+        worker.rebuild();
+
+        for expected in ["sessão de pesquisa", "reconstrução"] {
+            match events.recv_timeout(Duration::from_millis(100)).unwrap() {
+                UserEvent::MemoryWriteFailed(error) => assert!(
+                    error.contains(expected),
+                    "esperava {expected:?}, recebi {error:?}"
+                ),
+                _ => panic!("evento inesperado"),
+            }
         }
     }
 }

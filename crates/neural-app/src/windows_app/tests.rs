@@ -15480,7 +15480,11 @@ fn clearing_memory_drops_the_live_research_session() {
     // receber fontes: o proximo save_session reescrevia no disco a
     // pergunta que o utilizador acabou de apagar.
     let (tx, rx) = sync_channel::<MemoryCommand>(4);
-    let worker = MemoryWorker { tx };
+    let (events, _events_rx) = std::sync::mpsc::channel();
+    let worker = MemoryWorker {
+        tx,
+        sink: EventSink::channel(events),
+    };
     let mut current_research = Some(ResearchSession::new("pergunta secreta"));
     worker.clear(&mut current_research);
     assert!(matches!(rx.try_recv(), Ok(MemoryCommand::Clear)));
