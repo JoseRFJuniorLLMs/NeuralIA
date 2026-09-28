@@ -1053,6 +1053,17 @@ jobs:
           '@
             },
             @{
+              Label = "agents-failed-append-must-mark-stale"
+              Test = "a_failed_persistent_append_is_repaired_by_the_next_write"
+              SourcePath = "crates/neural-app/src/agents/store.rs"
+              Old = @'
+                  if write_result.is_err() {
+          '@
+              New = @'
+                  if false {
+          '@
+            },
+            @{
               Label = "agents-clear-partial-failure-hides-survivors"
               Test = "a_partial_clear_failure_keeps_disk_survivors_visible_in_memory"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
