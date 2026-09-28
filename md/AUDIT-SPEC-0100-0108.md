@@ -7,7 +7,7 @@
 
 | SPEC | Caminho que embarca | Gate atual | Classificação | Lacuna que continua aberta |
 |---|---|---|---|---|
-| 0100 | `MemoryWorker` → `MemoryStore` em `neural-app` | core + `spec_product_wiring.rs` + testes de custo/forget/recall | **núcleo real + wiring** | comportamento assíncrono da fila e UX de erro/saturação ainda não têm E2E |
+| 0100 | `MemoryWorker` → `MemoryStore` em `neural-app` | core + wiring + gates de saturação sobre a fila bounded real, com eventos/UX observáveis | **caminho real + comportamento de saturação** | `capture` segue best-effort por desenho; falta apenas ampliar stress/performance além dos gates bounded atuais |
 | 0101 | `ResearchSession` usado diretamente por `windows_app.rs` | core + wiring de capture/compare/synthesize/export | **núcleo real + wiring** | falta E2E WebView → resposta capturada → sessão persistida → export |
 | 0102 | `hashed_embedding` no store; lifecycle de model packs não embarca | core + gate que proíbe afirmar que `ModelPackManager` está ligado ao app | **parcial e honesto** | install/uninstall, lazy load, fallback de backend e benchmark de produto |
 | 0103 | `semanticAnchors()` nos scripts JS de Reader/Split/Comparator | gate de produto mira os scripts que embarcam | **caminho real, cobertura estrutural** | falta E2E por fornecedor e medição de jank/performance |
