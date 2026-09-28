@@ -1053,6 +1053,17 @@ jobs:
           '@
             },
             @{
+              Label = "agents-clear-partial-failure-hides-survivors"
+              Test = "a_partial_clear_failure_keeps_disk_survivors_visible_in_memory"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                    if result.is_ok() {
+          '@
+              New = @'
+                    if true {
+          '@
+            },
+            @{
               Label = "agents-private-question-outcome-persists-after-mode-change"
               Test = "a_private_origin_question_stays_memory_only_after_returning_to_normal"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
