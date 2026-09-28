@@ -2110,8 +2110,14 @@ pub(crate) mod tests {
 
     #[test]
     fn marks_writer_never_lets_an_older_snapshot_overwrite_a_newer_one() {
-        let old = MarksSnapshot { generation: 1, marks: BTreeMap::new() };
-        let new = MarksSnapshot { generation: 2, marks: BTreeMap::new() };
+        let old = MarksSnapshot {
+            generation: 1,
+            marks: BTreeMap::new(),
+        };
+        let new = MarksSnapshot {
+            generation: 2,
+            marks: BTreeMap::new(),
+        };
         let mut writer = MarksWriter::default();
         let mut writes = Vec::new();
         assert!(
