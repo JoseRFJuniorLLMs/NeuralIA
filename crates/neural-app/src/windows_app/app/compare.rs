@@ -131,7 +131,7 @@ impl App {
 
     fn open_comparator(&mut self, query: &str) {
         self.close_side_panel(PanelExit::NewSearch);
-        self.close_service_panel();
+        self.service_panel_for_transition();
         self.close_live_panel();
         let reuse_comparator = self
             .comparator
