@@ -1208,6 +1208,25 @@ mod youtube_transition_tests {
     }
 
     #[test]
+    fn youtube_surface_transitions_use_the_preserving_path_not_direct_close() {
+        let chrome = include_str!("chrome.rs");
+        let compare = include_str!("compare.rs");
+        let pages = include_str!("pages.rs");
+
+        let destroy = chrome
+            .split("pub(in crate::windows_app) fn destroy_web_surfaces")
+            .nth(1)
+            .and_then(|tail| tail.split("pub(in crate::windows_app) fn").next())
+            .expect("destroy_web_surfaces body");
+        assert!(destroy.contains("self.service_panel_for_transition();"));
+        assert!(!destroy.contains("self.close_service_panel();"));
+
+        assert!(chrome.contains("self.service_panel_for_transition();"));
+        assert!(compare.contains("self.service_panel_for_transition();"));
+        assert!(pages.contains("self.service_panel_for_transition();"));
+    }
+
+    #[test]
     fn non_youtube_services_keep_the_old_close_policy() {
         for service in [
             Service::Meet,
