@@ -1770,8 +1770,13 @@ fn remote_destination_redacts_secrets_and_refuses_private_sources() {
         "Redefinir senha token=SEGREDO123"
     );
 
-    // Invisiveis saem em qualquer destino.
-    let hidden = source("h", "api\u{200B}_key=abc\nTexto \u{202E}visível.");
+    // Invisiveis saem em qualquer destino. O canario inclui caracteres
+    // fora de hexadecimal para nunca colidir por acaso com o nonce aleatorio
+    // do fence (um segredo curto como "abc" tornava este gate flaky).
+    let hidden = source(
+        "h",
+        "api\u{200B}_key=HIDDEN_SECRET_CANARY_123\nTexto \u{202E}visível.",
+    );
     let pack = build_context(
         question,
         std::slice::from_ref(&hidden),
@@ -1780,7 +1785,12 @@ fn remote_destination_redacts_secrets_and_refuses_private_sources() {
     )
     .unwrap();
     assert!(!pack.rendered().contains('\u{200B}') && !pack.rendered().contains('\u{202E}'));
-    assert!(!pack.rendered().contains("abc"), "{}", pack.rendered());
+    assert!(
+        !pack.rendered().contains("HIDDEN_SECRET_CANARY_123"),
+        "{}",
+        pack.rendered()
+    );
+    assert!(pack.rendered().contains("api_key: [REDACTED]"));
     let pack = build_context(question, &[hidden], &local, &HashingEmbedder).unwrap();
     assert!(!pack.rendered().contains('\u{202E}'));
 }
