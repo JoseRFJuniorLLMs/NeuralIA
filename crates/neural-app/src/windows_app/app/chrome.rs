@@ -331,7 +331,7 @@ impl App {
         // so se pinta no comparador) e sem o botao Desligar -- bastava um erro
         // nativo (`show_native_error`) ou um link para a Web completa.
         self.close_live_panel();
-        self.close_service_panel();
+        self.service_panel_for_transition();
         // O do Ctrl+H pela saida unica: o texto de uma nota a meio vai para
         // o disco antes de a pagina sair (gate
         // `every_way_out_of_the_side_panel_saves_the_note_being_typed_once`).
@@ -401,7 +401,7 @@ impl App {
         debug_log(format_args!("show_home (surface era {:?})", self.surface));
         self.caption_reveal.reset();
         self.close_side_panel(PanelExit::Home);
-        self.close_service_panel();
+        self.service_panel_for_transition();
         self.close_live_panel();
         self.next_generation();
         self.surface = Surface::Home;
