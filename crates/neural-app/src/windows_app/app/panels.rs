@@ -128,6 +128,17 @@ where
     }
 }
 
+pub(in crate::windows_app) fn service_transition_input(
+    service: Service,
+    state: ServicePanelState,
+) -> Option<ServiceInput> {
+    if service == Service::YouTube {
+        (!state.minimized()).then_some(ServiceInput::Minimize)
+    } else {
+        Some(ServiceInput::Close)
+    }
+}
+
 impl App {
     /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha
     /// -- ou, minimizado, volta (`ServicePanelState`).
@@ -207,14 +218,27 @@ impl App {
         }
     }
 
-    /// Fecha o painel de servicos so se ele estiver a vista.
+    /// Uma transicao interna (Ctrl+H, Home, nova pesquisa, EPUB) preserva o
+    /// YouTube como uma aba de fundo minimizada. Os outros servicos mantem o
+    /// comportamento anterior e fecham.
+    pub(in crate::windows_app) fn service_panel_for_transition(&mut self) {
+        let Some(panel) = self.service_panel.as_ref() else {
+            return;
+        };
+        if let Some(input) = service_transition_input(panel.service, panel.state) {
+            self.service_input(input);
+        }
+    }
+
+    /// Outro painel da direita precisa do espaco. YouTube minimiza; os demais
+    /// servicos fecham como antes.
     pub(in crate::windows_app) fn close_docked_service_panel(&mut self) {
         if self
             .service_panel
             .as_ref()
             .is_some_and(|panel| !panel.state.minimized())
         {
-            self.close_service_panel();
+            self.service_panel_for_transition();
         }
     }
 
@@ -1160,6 +1184,37 @@ impl App {
                     3,
                 );
             }
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod youtube_transition_tests {
+    use super::*;
+
+    #[test]
+    fn internal_transitions_minimize_youtube_instead_of_closing_it() {
+        assert_eq!(
+            service_transition_input(Service::YouTube, ServicePanelState::default()),
+            Some(ServiceInput::Minimize)
+        );
+    }
+
+    #[test]
+    fn an_already_minimized_youtube_needs_no_second_transition() {
+        let mut state = ServicePanelState::default();
+        assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
+        assert_eq!(service_transition_input(Service::YouTube, state), None);
+    }
+
+    #[test]
+    fn non_youtube_services_keep_the_old_close_policy() {
+        for service in [Service::Meet, Service::WhatsApp, Service::Gmail, Service::Breath] {
+            assert_eq!(
+                service_transition_input(service, ServicePanelState::default()),
+                Some(ServiceInput::Close)
+            );
         }
     }
 }
