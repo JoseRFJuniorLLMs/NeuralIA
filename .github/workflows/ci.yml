@@ -1053,6 +1053,71 @@ jobs:
           '@
             },
             @{
+              Label = "agents-failed-append-must-mark-stale"
+              Test = "a_failed_persistent_append_is_repaired_by_the_next_write"
+              SourcePath = "crates/neural-app/src/agents/store.rs"
+              Old = @'
+                  if write_result.is_err() {
+          '@
+              New = @'
+                  if false {
+          '@
+            },
+            @{
+              Label = "agents-marks-failure-must-not-advance-generation"
+              Test = "marks_writer_retries_a_generation_after_a_failed_write"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                  write(&snapshot.marks)?;
+                  self.persisted_generation = snapshot.generation;
+          '@
+              New = @'
+                  self.persisted_generation = snapshot.generation;
+                  write(&snapshot.marks)?;
+          '@
+            },
+            @{
+              Label = "agents-marks-old-snapshot-must-not-overwrite-new"
+              Test = "marks_writer_never_lets_an_older_snapshot_overwrite_a_newer_one"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                  if snapshot.generation < self.latest_generation_seen
+                      || snapshot.generation <= self.persisted_generation
+          '@
+              New = @'
+                  if false
+          '@
+            },
+            @{
+              Label = "agents-marks-newer-failure-blocks-older-snapshot"
+              Test = "marks_writer_never_accepts_an_older_snapshot_after_a_newer_write_failed"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                  if snapshot.generation < self.latest_generation_seen
+                      || snapshot.generation <= self.persisted_generation
+          '@
+              New = @'
+                  if snapshot.generation <= self.persisted_generation
+          '@
+            },
+            @{
+              Label = "agents-marks-recovery-must-clear-error"
+              Test = "a_failed_mark_read_save_is_retried_even_when_the_ram_mark_is_unchanged"
+              SourcePath = "crates/neural-app/src/agents/hub.rs"
+              Old = @'
+                          if state
+                              .store_error
+                              .as_deref()
+                              .is_some_and(|error| error.starts_with(MARKS_ERROR_PREFIX))
+                          {
+                              state.store_error = None;
+                          }
+          '@
+              New = @'
+                          let _ = &state.store_error;
+          '@
+            },
+            @{
               Label = "agents-clear-partial-failure-hides-survivors"
               Test = "a_partial_clear_failure_keeps_disk_survivors_visible_in_memory"
               SourcePath = "crates/neural-app/src/agents/hub.rs"
