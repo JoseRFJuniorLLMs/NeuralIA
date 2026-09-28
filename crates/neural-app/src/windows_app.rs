@@ -3016,7 +3016,7 @@ mod memory_queue_saturation_tests {
 
     fn saturated_worker() -> (MemoryWorker, std::sync::mpsc::Receiver<UserEvent>) {
         let (commands, _held_receiver) = sync_channel::<MemoryCommand>(1);
-        commands.try_send(MemoryCommand::Rebuild).unwrap();
+        assert!(commands.try_send(MemoryCommand::Rebuild).is_ok());
         let (events, rx) = channel::<UserEvent>();
         (
             MemoryWorker::from_sender_for_test(commands, EventSink::channel(events)),
