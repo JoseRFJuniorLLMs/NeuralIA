@@ -1188,7 +1188,6 @@ impl App {
     }
 }
 
-
 #[cfg(test)]
 mod youtube_transition_tests {
     use super::*;
@@ -1210,7 +1209,12 @@ mod youtube_transition_tests {
 
     #[test]
     fn non_youtube_services_keep_the_old_close_policy() {
-        for service in [Service::Meet, Service::WhatsApp, Service::Gmail, Service::Breath] {
+        for service in [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::Gmail,
+            Service::Breath,
+        ] {
             assert_eq!(
                 service_transition_input(service, ServicePanelState::default()),
                 Some(ServiceInput::Close)
