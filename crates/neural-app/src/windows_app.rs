@@ -2874,7 +2874,8 @@ impl MemoryWorker {
                                     });
                                 }
                                 MemoryCommand::Clear => {
-                                    worker_sink.send(UserEvent::MemoryCleared(Err(error.to_string())));
+                                    worker_sink
+                                        .send(UserEvent::MemoryCleared(Err(error.to_string())));
                                 }
                                 _ => {}
                             }
@@ -2928,7 +2929,8 @@ impl MemoryWorker {
                         }
                         MemoryCommand::SaveSession(session) => {
                             if let Err(error) = store.save_session(&session) {
-                                let message = format!("sessão de pesquisa não foi gravada: {error}");
+                                let message =
+                                    format!("sessão de pesquisa não foi gravada: {error}");
                                 eprintln!("{message}");
                                 worker_sink.send(UserEvent::MemoryWriteFailed(message));
                             }
