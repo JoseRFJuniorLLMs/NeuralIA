@@ -284,7 +284,7 @@ impl App {
             return;
         }
         self.close_side_panel(PanelExit::SurfaceChange);
-        self.close_service_panel();
+        self.service_panel_for_transition();
         self.next_generation();
         self.destroy_web_surfaces();
         self.show_omnibox(false);
