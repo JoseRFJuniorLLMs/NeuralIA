@@ -910,23 +910,88 @@ impl AgentHub {
     /// delas), mas o desfecho delas passa a ser so de memoria: responder,
     /// cancelar ou expirar depois do clear nao recria a conversa apagada.
     pub(crate) fn clear_conversations(&self) -> Result<(), String> {
+        self.clear_conversations_with(|store| store.clear())
+    }
+
+    fn clear_conversations_with(
+        &self,
+        clear: impl FnOnce(&ConversationStore) -> std::io::Result<()>,
+    ) -> Result<(), String> {
         let store = self.inner.store.clone();
         let mut result = Ok(());
         self.with_state(|state, events| {
-            result = store.clear().map_err(|error| error.to_string());
-            for entry in state.agents.values_mut() {
-                let last = entry.conversation.last_id();
-                entry.marks.next_id = entry.marks.next_id.max(last + 1);
-                entry.marks.read_up_to = entry.marks.next_id.saturating_sub(1);
-                entry.conversation = Conversation::default();
+            result = clear(&store).map_err(|error| error.to_string());
+
+            if result.is_ok() {
+                for entry in state.agents.values_mut() {
+                    let last = entry.conversation.last_id();
+                    entry.marks.next_id = entry.marks.next_id.max(last + 1);
+                    entry.marks.read_up_to = entry.marks.next_id.saturating_sub(1);
+                    entry.conversation = Conversation::default();
+                    entry.delivered_up_to = 0;
+                }
+                state.store_error = None;
+            } else {
+                // Um clear pode remover apenas parte dos ficheiros antes de
+                // falhar. A RAM passa a refletir o que realmente sobreviveu
+                // no disco, para a UI nao esconder dados que reapareceriam no
+                // proximo arranque.
+                let mut loaded = store.load();
+                for (agent, entry) in state.agents.iter_mut() {
+                    let old_next = entry
+                        .marks
+                        .next_id
+                        .max(entry.conversation.last_id().saturating_add(1))
+                        .max(1);
+                    let conversation = loaded.conversations.remove(agent).unwrap_or_default();
+                    let disk_mark = loaded.marks.remove(agent);
+                    let survived = !conversation.records.is_empty() || disk_mark.is_some();
+                    if survived {
+                        let mut mark = disk_mark.unwrap_or_default();
+                        mark.next_id = mark
+                            .next_id
+                            .max(conversation.last_id().saturating_add(1))
+                            .max(old_next);
+                        entry.conversation = conversation;
+                        entry.marks = mark;
+                        entry.delivered_up_to = entry.conversation.last_id();
+                    } else {
+                        entry.conversation = Conversation::default();
+                        entry.marks.next_id = old_next;
+                        entry.marks.read_up_to = old_next.saturating_sub(1);
+                        entry.delivered_up_to = 0;
+                    }
+                }
+
+                for (agent, conversation) in loaded.conversations {
+                    if state.agents.len() >= MAX_AGENTS {
+                        break;
+                    }
+                    let mark = loaded.marks.remove(&agent).unwrap_or_default();
+                    state
+                        .agents
+                        .entry(agent)
+                        .or_insert_with(|| AgentEntry::new(conversation, mark));
+                }
+                for (agent, mark) in loaded.marks {
+                    if state.agents.len() >= MAX_AGENTS {
+                        break;
+                    }
+                    state
+                        .agents
+                        .entry(agent)
+                        .or_insert_with(|| AgentEntry::new(Conversation::default(), mark));
+                }
+                state.store_error = result.clone().err();
             }
+
+            // O gesto de apagar ocorreu mesmo se o filesystem conseguiu apenas
+            // parte. Perguntas pendentes nao podem recriar historia depois da
+            // tentativa de clear.
             for question in state.questions.values_mut() {
                 if matches!(question.state, QuestionState::Pending) {
                     question.outcome_storage = QuestionOutcomeStorage::Discard;
                 }
-            }
-            if result.is_ok() {
-                state.store_error = None;
             }
             events.push(AgentEvent::Changed);
         });
@@ -1855,6 +1920,48 @@ pub(crate) mod tests {
     /// pergunta que já estava pendente. Os cartões continuam vivos em memória
     /// e o agente recebe cada desfecho, mas resposta, dismiss, cancel e timeout
     /// nunca podem recriar a conversa que o utilizador acabou de apagar.
+    /// Gate crítico: uma falha parcial ao apagar não pode deixar a UI
+    /// fingir que tudo sumiu. O hub recarrega o que realmente sobreviveu.
+    #[test]
+    fn a_partial_clear_failure_keeps_disk_survivors_visible_in_memory() {
+        let f = fixture("clear-partial-error");
+        let claude = f.hub.connect("claude").unwrap();
+        let codex = f.hub.connect("codex").unwrap();
+        send(&f.hub, claude, "claude antes").unwrap();
+        send(&f.hub, codex, "codex antes").unwrap();
+
+        let agents_dir = f.dir.0.join("agents");
+        let claude_file = agents_dir.join("claude.jsonl");
+        let codex_file = agents_dir.join("codex.jsonl");
+        assert!(claude_file.exists());
+        assert!(codex_file.exists());
+
+        let error = f
+            .hub
+            .clear_conversations_with(|_| {
+                std::fs::remove_file(&claude_file)?;
+                Err(std::io::Error::other(
+                    "falha simulada depois do primeiro ficheiro",
+                ))
+            })
+            .unwrap_err();
+        assert!(error.contains("falha simulada"), "{error}");
+
+        assert!(!claude_file.exists());
+        assert!(codex_file.exists());
+        assert!(f.hub.conversation("claude").is_empty());
+        assert_eq!(
+            f.hub.conversation("codex").len(),
+            1,
+            "a UI escondeu um ficheiro que o clear falhado deixou no disco"
+        );
+
+        let reopened = reopen(&f);
+        reopened.load();
+        assert!(reopened.conversation("claude").is_empty());
+        assert_eq!(reopened.conversation("codex").len(), 1);
+    }
+
     #[test]
     fn clearing_history_with_a_pending_question_never_recreates_the_conversation() {
         let f = fixture("clear-pending");
