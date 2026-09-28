@@ -2049,32 +2049,62 @@ pub(crate) mod tests {
 
     #[test]
     fn marks_writer_retries_a_generation_after_a_failed_write() {
-        let snapshot = MarksSnapshot { generation: 1, marks: BTreeMap::new() };
+        let snapshot = MarksSnapshot {
+            generation: 1,
+            marks: BTreeMap::new(),
+        };
         let mut writer = MarksWriter::default();
         writer
             .persist(&snapshot, |_| Err(std::io::Error::other("falha")))
             .unwrap_err();
         assert_eq!(writer.persisted_generation, 0);
         let mut writes = 0;
-        assert!(writer.persist(&snapshot, |_| { writes += 1; Ok(()) }).unwrap());
+        assert!(
+            writer
+                .persist(&snapshot, |_| {
+                    writes += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
         assert_eq!(writes, 1);
         assert_eq!(writer.persisted_generation, 1);
     }
 
     #[test]
     fn marks_writer_never_accepts_an_older_snapshot_after_a_newer_write_failed() {
-        let old = MarksSnapshot { generation: 1, marks: BTreeMap::new() };
-        let new = MarksSnapshot { generation: 2, marks: BTreeMap::new() };
+        let old = MarksSnapshot {
+            generation: 1,
+            marks: BTreeMap::new(),
+        };
+        let new = MarksSnapshot {
+            generation: 2,
+            marks: BTreeMap::new(),
+        };
         let mut writer = MarksWriter::default();
         writer
             .persist(&new, |_| Err(std::io::Error::other("disco indisponível")))
             .unwrap_err();
         assert_eq!(writer.latest_generation_seen, 2);
         let mut stale_writes = 0;
-        assert!(!writer.persist(&old, |_| { stale_writes += 1; Ok(()) }).unwrap());
+        assert!(
+            !writer
+                .persist(&old, |_| {
+                    stale_writes += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
         assert_eq!(stale_writes, 0);
         let mut retry_writes = 0;
-        assert!(writer.persist(&new, |_| { retry_writes += 1; Ok(()) }).unwrap());
+        assert!(
+            writer
+                .persist(&new, |_| {
+                    retry_writes += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
         assert_eq!(retry_writes, 1);
     }
 
@@ -2084,8 +2114,22 @@ pub(crate) mod tests {
         let new = MarksSnapshot { generation: 2, marks: BTreeMap::new() };
         let mut writer = MarksWriter::default();
         let mut writes = Vec::new();
-        assert!(writer.persist(&new, |_| { writes.push(2); Ok(()) }).unwrap());
-        assert!(!writer.persist(&old, |_| { writes.push(1); Ok(()) }).unwrap());
+        assert!(
+            writer
+                .persist(&new, |_| {
+                    writes.push(2);
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(
+            !writer
+                .persist(&old, |_| {
+                    writes.push(1);
+                    Ok(())
+                })
+                .unwrap()
+        );
         assert_eq!(writes, vec![2]);
     }
 
