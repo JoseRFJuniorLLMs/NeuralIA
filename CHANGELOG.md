@@ -4,6 +4,16 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Agents Hub — clear parcial não esconde histórico que sobreviveu no disco (PR #212; 91fe5f8, 833abff):** se a limpeza remove só parte dos ficheiros e falha, o hub recarrega o que realmente restou em disco, preserva IDs monotónicos e mantém a UI coerente com o próximo arranque; perguntas pendentes passam a descartar o desfecho para não recriar histórico depois da tentativa de apagar. Gate crítico determinístico e sabotagem permanente no CI.
+- **Agents Hub — append JSONL falhado é reparado na escrita seguinte (PR #213; c06dbac, b9a2d72):** qualquer falha de append persistente marca a conversa como `stale`; a próxima escrita permitida reescreve o JSONL a partir dos registos persistentes em memória, impedindo que um registo visível apenas em RAM desapareça depois do restart. Gate crítico e sabotagem permanente no CI.
+- **Agents Hub — `state.json` não perde marks por falha ou reorder de writes (PR #213; 420c185, b9a2d72):** snapshots de marks carregam geração monotónica, a escrita é serializada por `MarksWriter`, uma geração falhada pode ser repetida sem ser considerada persistida, snapshots antigos não sobrescrevem novos e um retry bem-sucedido limpa apenas o erro de persistência correspondente. Gates cobrem retry, ordem, falha nova bloqueando snapshot antigo e preservação de erros não relacionados.
+- **YouTube — reprodução sobrevive às transições internas (PR #211; ea6eb09, 591bff6):** Home, Ctrl+H/Notas, nova pesquisa e entrada no EPUB minimizam o painel do YouTube em vez de destruir a WebView; um YouTube já minimizado não recebe nova transição, enquanto Meet, WhatsApp, Gmail e Respiração continuam fechando como antes. O clique explícito no próprio serviço continua sendo o caminho de fechamento.
+
+### Testing
+- **Context budget — canário de redação sem colisão acidental (PR #205; cd24649):** o teste de segredos usa um valor que não pode coincidir por acaso com dados do fixture, tornando a prova de redação determinística sem alterar o comportamento do produto.
+
+
 ## [2.5.0] - 2026-09-27
 
 ### Added
