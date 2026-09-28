@@ -239,6 +239,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                 }
             }
+            UserEvent::MemoryWriteFailed(error) => {
+                self.show_splash(format!("Memória: {error}"), 4);
+            }
             UserEvent::AskEverywhere { source_index, text } => {
                 self.ask_other_columns(source_index, text)
             }
