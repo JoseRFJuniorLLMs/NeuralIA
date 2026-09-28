@@ -682,14 +682,21 @@ impl ConversationStore {
         if conversation.stale {
             return self.rewrite(agent, conversation);
         }
-        fs::create_dir_all(self.dir())?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.conversation_path(agent))?;
-        // Um so `write_all`: a linha entra inteira ou o arranque seguinte
-        // descarta-a.
-        file.write_all(line.as_bytes())
+        let write_result = (|| {
+            fs::create_dir_all(self.dir())?;
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.conversation_path(agent))?;
+            // Um so `write_all`: a linha entra inteira ou o arranque
+            // seguinte descarta-a; em erro, `stale` obriga a proxima
+            // escrita a reparar o ficheiro inteiro.
+            file.write_all(line.as_bytes())
+        })();
+        if write_result.is_err() {
+            conversation.stale = true;
+        }
+        write_result
     }
 
     /// Reescreve o ficheiro com os registos que podem estar no disco: os de
@@ -1091,6 +1098,61 @@ pub(crate) mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(top, vec!["agents".to_string()]);
+    }
+
+    /// Gate crítico: se um append persistente falha depois de o registo
+    /// entrar na RAM, a proxima escrita permitida tem de reparar o buraco no
+    /// JSONL. Um restart nunca pode transformar [1,2,3] em [1,3].
+    #[test]
+    fn a_failed_persistent_append_is_repaired_by_the_next_write() {
+        let dir = TempDir::new("append-repair");
+        let (_registry, store) = open_store(&dir.0);
+        let mut conversation = Conversation::default();
+
+        store
+            .append("claude", &mut conversation, message(1, "um"))
+            .unwrap();
+        let path = store.conversation_path("claude");
+        let backup = store.dir().join("claude.jsonl.keep");
+        fs::rename(&path, &backup).unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let error = store
+            .append("claude", &mut conversation, message(2, "dois"))
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert_eq!(
+            conversation
+                .records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&backup, &path).unwrap();
+
+        store
+            .append("claude", &mut conversation, message(3, "tres"))
+            .unwrap();
+
+        let loaded = store.load();
+        let ids: Vec<u64> = loaded.conversations["claude"]
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "o append seguinte nao reparou o registo perdido do disco"
+        );
+        assert_eq!(
+            conversation.bytes(),
+            fs::metadata(&path).unwrap().len(),
+            "bytes da RAM e do JSONL divergiram depois da reparacao"
+        );
     }
 
     #[test]
