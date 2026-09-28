@@ -270,6 +270,36 @@ struct Question {
     outcome_storage: QuestionOutcomeStorage,
 }
 
+#[derive(Debug, Clone)]
+struct MarksSnapshot {
+    generation: u64,
+    marks: BTreeMap<String, AgentMarks>,
+}
+
+#[derive(Debug, Default)]
+struct MarksWriter {
+    persisted_generation: u64,
+    latest_generation_seen: u64,
+}
+
+impl MarksWriter {
+    fn persist(
+        &mut self,
+        snapshot: &MarksSnapshot,
+        write: impl FnOnce(&BTreeMap<String, AgentMarks>) -> std::io::Result<()>,
+    ) -> std::io::Result<bool> {
+        if snapshot.generation < self.latest_generation_seen
+            || snapshot.generation <= self.persisted_generation
+        {
+            return Ok(false);
+        }
+        self.latest_generation_seen = self.latest_generation_seen.max(snapshot.generation);
+        write(&snapshot.marks)?;
+        self.persisted_generation = snapshot.generation;
+        Ok(true)
+    }
+}
+
 struct HubState {
     agents: BTreeMap<String, AgentEntry>,
     questions: BTreeMap<u64, Question>,
@@ -279,10 +309,12 @@ struct HubState {
     server: HubServerState,
     loaded: bool,
     store_error: Option<String>,
+    marks_generation: u64,
 }
 
 struct HubInner {
     state: Mutex<HubState>,
+    marks_writer: Mutex<MarksWriter>,
     /// Acorda quem espera por uma resposta.
     changed: Condvar,
     store: ConversationStore,
@@ -327,7 +359,9 @@ impl AgentHub {
                     server: HubServerState::Starting,
                     loaded: false,
                     store_error: None,
+                    marks_generation: 0,
                 }),
+                marks_writer: Mutex::new(MarksWriter::default()),
                 changed: Condvar::new(),
                 store,
                 notify,
@@ -788,7 +822,8 @@ impl AgentHub {
             // Quem escreve ja leu o que estava acima.
             entry.marks.read_up_to = record.id;
             append(state, &store, agent, record.clone());
-            Ok::<_, String>((record, all_marks(state)))
+            let marks = changed_marks_snapshot(state);
+            Ok::<_, String>((record, marks))
         })?;
         self.save_marks(&marks);
         Ok(record)
@@ -799,22 +834,44 @@ impl AgentHub {
         let marks = self.with_state(|state, _| {
             let entry = state.agents.get_mut(agent)?;
             let last = entry.conversation.last_id();
-            if entry.marks.read_up_to == last {
-                return None;
+            if entry.marks.read_up_to != last {
+                entry.marks.read_up_to = last;
+                state.marks_generation = state.marks_generation.saturating_add(1);
             }
-            entry.marks.read_up_to = last;
-            Some(all_marks(state))
+            Some(marks_snapshot(state))
         });
         if let Some(marks) = marks {
             self.save_marks(&marks);
         }
     }
 
-    fn save_marks(&self, marks: &BTreeMap<String, AgentMarks>) {
-        if let Err(error) = self.inner.store.save_marks(marks) {
-            let message = format!("Não foi possível gravar o estado dos agentes: {error}");
-            eprintln!("[agents] {message}");
-            self.lock().store_error = Some(message);
+    fn save_marks(&self, snapshot: &MarksSnapshot) {
+        const MARKS_ERROR_PREFIX: &str = "Não foi possível gravar o estado dos agentes:";
+        let result = {
+            let mut writer = self
+                .inner
+                .marks_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            writer.persist(snapshot, |marks| self.inner.store.save_marks(marks))
+        };
+        match result {
+            Err(error) => {
+                let message = format!("{MARKS_ERROR_PREFIX} {error}");
+                eprintln!("[agents] {message}");
+                self.lock().store_error = Some(message);
+            }
+            Ok(true) => {
+                let mut state = self.lock();
+                if state
+                    .store_error
+                    .as_deref()
+                    .is_some_and(|error| error.starts_with(MARKS_ERROR_PREFIX))
+                {
+                    state.store_error = None;
+                }
+            }
+            Ok(false) => {}
         }
     }
 
@@ -1015,6 +1072,18 @@ fn ensure_agent(state: &mut HubState, agent: &str) -> Result<(), String> {
         AgentEntry::new(Conversation::default(), AgentMarks::default()),
     );
     Ok(())
+}
+
+fn marks_snapshot(state: &HubState) -> MarksSnapshot {
+    MarksSnapshot {
+        generation: state.marks_generation,
+        marks: all_marks(state),
+    }
+}
+
+fn changed_marks_snapshot(state: &mut HubState) -> MarksSnapshot {
+    state.marks_generation = state.marks_generation.saturating_add(1);
+    marks_snapshot(state)
 }
 
 fn all_marks(state: &HubState) -> BTreeMap<String, AgentMarks> {
@@ -1960,6 +2029,87 @@ pub(crate) mod tests {
         reopened.load();
         assert!(reopened.conversation("claude").is_empty());
         assert_eq!(reopened.conversation("codex").len(), 1);
+    }
+
+    #[test]
+    fn successful_marks_retry_does_not_clear_an_unrelated_store_error() {
+        let f = fixture("marks-unrelated-error");
+        let claude = f.hub.connect("claude").unwrap();
+        send(&f.hub, claude, "mensagem").unwrap();
+        {
+            let mut state = f.hub.lock();
+            state.store_error = Some("falha de conversa independente".to_string());
+        }
+        f.hub.mark_read("claude");
+        assert_eq!(
+            f.hub.snapshot().store_error.as_deref(),
+            Some("falha de conversa independente")
+        );
+    }
+
+    #[test]
+    fn marks_writer_retries_a_generation_after_a_failed_write() {
+        let snapshot = MarksSnapshot { generation: 1, marks: BTreeMap::new() };
+        let mut writer = MarksWriter::default();
+        writer
+            .persist(&snapshot, |_| Err(std::io::Error::other("falha")))
+            .unwrap_err();
+        assert_eq!(writer.persisted_generation, 0);
+        let mut writes = 0;
+        assert!(writer.persist(&snapshot, |_| { writes += 1; Ok(()) }).unwrap());
+        assert_eq!(writes, 1);
+        assert_eq!(writer.persisted_generation, 1);
+    }
+
+    #[test]
+    fn marks_writer_never_accepts_an_older_snapshot_after_a_newer_write_failed() {
+        let old = MarksSnapshot { generation: 1, marks: BTreeMap::new() };
+        let new = MarksSnapshot { generation: 2, marks: BTreeMap::new() };
+        let mut writer = MarksWriter::default();
+        writer
+            .persist(&new, |_| Err(std::io::Error::other("disco indisponível")))
+            .unwrap_err();
+        assert_eq!(writer.latest_generation_seen, 2);
+        let mut stale_writes = 0;
+        assert!(!writer.persist(&old, |_| { stale_writes += 1; Ok(()) }).unwrap());
+        assert_eq!(stale_writes, 0);
+        let mut retry_writes = 0;
+        assert!(writer.persist(&new, |_| { retry_writes += 1; Ok(()) }).unwrap());
+        assert_eq!(retry_writes, 1);
+    }
+
+    #[test]
+    fn marks_writer_never_lets_an_older_snapshot_overwrite_a_newer_one() {
+        let old = MarksSnapshot { generation: 1, marks: BTreeMap::new() };
+        let new = MarksSnapshot { generation: 2, marks: BTreeMap::new() };
+        let mut writer = MarksWriter::default();
+        let mut writes = Vec::new();
+        assert!(writer.persist(&new, |_| { writes.push(2); Ok(()) }).unwrap());
+        assert!(!writer.persist(&old, |_| { writes.push(1); Ok(()) }).unwrap());
+        assert_eq!(writes, vec![2]);
+    }
+
+    #[test]
+    fn a_failed_mark_read_save_is_retried_even_when_the_ram_mark_is_unchanged() {
+        let f = fixture("marks-retry");
+        let claude = f.hub.connect("claude").unwrap();
+        send(&f.hub, claude, "mensagem").unwrap();
+        assert_eq!(f.hub.unread("claude"), 1);
+
+        let state_file = f.dir.0.join("agents").join("state.json");
+        std::fs::create_dir(&state_file).unwrap();
+        f.hub.mark_read("claude");
+        assert_eq!(f.hub.unread("claude"), 0);
+        assert!(f.hub.snapshot().store_error.is_some());
+        std::fs::remove_dir(&state_file).unwrap();
+
+        f.hub.mark_read("claude");
+        assert!(state_file.is_file());
+        assert!(f.hub.snapshot().store_error.is_none());
+
+        let reopened = reopen(&f);
+        reopened.load();
+        assert_eq!(reopened.unread("claude"), 0);
     }
 
     #[test]
