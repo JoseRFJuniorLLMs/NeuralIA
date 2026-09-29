@@ -864,9 +864,7 @@ mod tests {
         let markdown = session.export_markdown();
         assert!(markdown.contains("Google IA"));
         assert!(markdown.contains("resposta com citação"));
-        assert!(markdown.contains(
-            "Fontes citadas:\n- https://example.test/spec0101-source\n"
-        ));
+        assert!(markdown.contains("Fontes citadas:\n- https://example.test/spec0101-source\n"));
     }
 
     #[test]
