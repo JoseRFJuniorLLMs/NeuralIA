@@ -93,6 +93,32 @@ jobs:
             [IO.File]::WriteAllText($path, $text)
           }
           git diff --exit-code -- $path
+      - name: Sabotage deterministic fallback must turn the lifecycle gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = @'
+                          None => LocalModelOutcome::Fallback {
+                              warning: selection.warning,
+                          },
+          '@
+          $new = @'
+                          None => LocalModelOutcome::Active {
+                              id: "sabotage".into(),
+                              version: "0".into(),
+                          },
+          '@
+          if (($text.Split($old).Count - 1) -ne 1) { throw "fallback sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app shipped_executor_installs_without_auto_activation_and_requires_benchmark
+            if ($LASTEXITCODE -eq 0) { throw "fallback sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
 
   sabotage:
     runs-on: ubuntu-latest
