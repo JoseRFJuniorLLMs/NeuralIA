@@ -6341,6 +6341,86 @@ fn route_input_sends_each_command_where_it_belongs() {
     assert_eq!(route_input("https://example.com"), InputRoute::Intent);
 }
 
+#[test]
+fn uninstalling_a_model_pack_does_not_change_ordinary_product_routes() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "neuralia-model-route-{}-{stamp}",
+        std::process::id()
+    ));
+    let data = root.join("data");
+    let import = root.join("import");
+    std::fs::create_dir_all(&import).expect("import dir");
+    let model = b"model-bytes";
+    let manifest = neural_core::ModelPackManifest {
+        id: "semantic-small".into(),
+        version: "1.0.0".into(),
+        file: "semantic.bin".into(),
+        sha256: "357e5d6fafa34d27360fec24b4326d3534905e33c6acdee60198fb078b7b79e5".into(),
+        capabilities: vec!["embeddings".into(), "intent".into()],
+        license: "Apache-2.0".into(),
+    };
+    std::fs::write(import.join("semantic.bin"), model).expect("model");
+    let manifest_path = import.join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("manifest");
+
+    let mut packs = crate::local_models::LocalModelPacks::new(&data);
+    crate::local_models::execute_local_model_command(
+        &mut packs,
+        crate::local_models::LocalModelCommand::Install(manifest_path),
+    )
+    .expect("install");
+    packs
+        .record_benchmark_explicit(
+            "semantic-small",
+            &neural_core::LocalBenchmark {
+                backend: "fixture-backend".into(),
+                samples: 2,
+                embedding_dimension: 384,
+                embed_micros_total: 10,
+                classify_micros_total: 10,
+                resident_model_bytes: Some(0),
+                measured_at: 1,
+            },
+        )
+        .expect("benchmark");
+    crate::local_models::execute_local_model_command(
+        &mut packs,
+        crate::local_models::LocalModelCommand::Activate("semantic-small".into()),
+    )
+    .expect("activate");
+    crate::local_models::execute_local_model_command(
+        &mut packs,
+        crate::local_models::LocalModelCommand::Uninstall("semantic-small".into()),
+    )
+    .expect("uninstall");
+
+    assert!(matches!(
+        crate::local_models::execute_local_model_command(
+            &mut packs,
+            crate::local_models::LocalModelCommand::Status
+        )
+        .expect("status"),
+        crate::local_models::LocalModelOutcome::Fallback { .. }
+    ));
+    assert_eq!(
+        route_input("memory:rust ownership"),
+        InputRoute::MemoryQuery("rust ownership".into())
+    );
+    assert_eq!(route_input("research:compare"), InputRoute::ResearchCompare);
+    assert_eq!(route_input("history:"), InputRoute::History);
+    assert_eq!(route_input("https://example.com"), InputRoute::Intent);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// SPEC-0100 / SPEC-0006 no caminho que embarca: "Private/incognito
 /// navigation never enters semantic memory" é uma restrição inegociável do
 /// `md/README.md`. O gate que existia para isto contava ocorrências de
