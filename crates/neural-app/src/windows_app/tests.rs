@@ -6325,6 +6325,18 @@ fn route_input_sends_each_command_where_it_belongs() {
         InputRoute::ResearchSynthesize
     );
     assert_eq!(route_input("research:export"), InputRoute::ResearchExport);
+    assert_eq!(
+        route_input("model:status"),
+        InputRoute::LocalModel(Ok(crate::local_models::LocalModelCommand::Status))
+    );
+    assert_eq!(
+        route_input("modelo:desativar"),
+        InputRoute::LocalModel(Ok(crate::local_models::LocalModelCommand::Deactivate))
+    );
+    assert!(matches!(
+        route_input("model:activate:"),
+        InputRoute::LocalModel(Err(_))
+    ));
     assert_eq!(route_input("o que é ownership"), InputRoute::Intent);
     assert_eq!(route_input("https://example.com"), InputRoute::Intent);
 }
