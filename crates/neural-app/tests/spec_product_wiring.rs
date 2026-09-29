@@ -232,7 +232,6 @@ fn spec_0102_structural_absence_keeps_model_packs_lazy_and_without_browser_autho
     }
 }
 
-
 /// O orcamento de contexto (`neural_core::context_budget`, plano 2.5) e
 /// biblioteca do core: o consenso e o primeiro a chama-lo, mais tarde.
 /// Enquanto nenhum ficheiro de `src/` o toca, a SPEC-0102 §8.2 diz isso;
