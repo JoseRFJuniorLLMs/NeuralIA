@@ -3258,6 +3258,9 @@ pub(in crate::windows_app) struct App {
     /// Estado nativo lido pela subclasse do EDIT da palette.
     pub(in crate::windows_app) palette_host: Box<PaletteHost>,
     pub(in crate::windows_app) config: CoreConfig,
+    /// SPEC-0102: so a raiz e o slot lazy do manager. O prefixo sublinhado
+    /// deixa explícito que nenhum fluxo de inferência consome packs ainda.
+    _local_models: crate::local_models::LocalModelPacks,
     /// O portao da persistencia (`crate::privacy`): dono do registo das
     /// lojas (a unica cunhagem do produto, feita no `App::new`) e dos
     /// escritores automaticos -- o historico, a memoria semantica e as
@@ -3370,6 +3373,9 @@ pub(in crate::windows_app) struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let config = CoreConfig::default();
+        // Estado barato: nao cria ModelPackManager, nao le o disco e nao
+        // escolhe backend. O manager so nasce numa acao explicita/tarefa local.
+        let local_models = crate::local_models::LocalModelPacks::new(&config.data_dir);
         // A escolha de tema vale antes do primeiro desenho.
         ThemeChoice::load(&config.data_dir.join("theme")).apply();
         GMAIL_NOTIFICATIONS.store(
@@ -3479,6 +3485,7 @@ impl App {
             palette: None,
             palette_host,
             config,
+            _local_models: local_models,
             privacy,
             timers,
             current_research: None,

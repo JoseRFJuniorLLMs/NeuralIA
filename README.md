@@ -45,9 +45,10 @@ num processo de inferência permanente.
   mantêm proveniência. `research:compare`, `research:synthesize` e
   `research:export` comparam, sintetizam e exportam a sessão em Markdown.
 - **Inteligência local opcional:** embeddings/classificação/entidades/resumos
-  possuem fallback determinístico sem modelo. A infraestrutura de biblioteca de
-  model packs valida manifesto, checksum, instalação/remoção e benchmark, mas
-  ainda não está ligada ao produto nem carrega modelos automaticamente.
+  possuem fallback determinístico sem modelo. O lifecycle de model packs já tem
+  um adaptador lazy no produto para manifesto, checksum, instalação/remoção,
+  benchmark e ativação explícita; nenhum backend de inferência é criado no
+  startup nem carregado automaticamente.
 - **Timeline semântica:** perguntas, respostas, títulos, código, tabelas,
   citações, fontes e conclusões viram âncoras navegáveis.
 - **Agente Web limitado:** `agent:https://site | search=texto | click=botão |

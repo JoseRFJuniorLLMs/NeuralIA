@@ -114,6 +114,7 @@ const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
 const CORE_MEMORY: &str = include_str!("../../neural-core/src/memory.rs");
 const LOCAL_INTELLIGENCE: &str = include_str!("../../neural-core/src/local_intelligence.rs");
+const LOCAL_MODELS: &str = include_str!("../src/local_models.rs");
 const CONTEXT_BUDGET: &str = include_str!("../../neural-core/src/context_budget.rs");
 
 /// Todos os `.rs` debaixo de `dir`, recursivamente.
@@ -195,12 +196,29 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
 }
 
 #[test]
-fn spec_0102_partial_product_uses_local_semantics_without_booting_model_packs() {
+fn spec_0102_product_wires_model_pack_lifecycle_without_eager_manager_startup() {
     assert!(CORE_MEMORY.contains("hashed_embedding(&entity_text)"));
     assert!(LOCAL_INTELLIGENCE.contains("pub struct ModelPackManager"));
+
+    assert!(LOCAL_MODELS.contains("manager: Option<ModelPackManager>"));
+    assert!(LOCAL_MODELS.contains("get_or_insert_with(|| ModelPackManager::new"));
+    assert!(LOCAL_MODELS.contains("pub(crate) fn install_explicit("));
+    assert!(LOCAL_MODELS.contains("pub(crate) fn activate_explicit("));
+    assert!(LOCAL_MODELS.contains("pub(crate) fn uninstall_explicit("));
+    assert!(APP.contains("_local_models: crate::local_models::LocalModelPacks"));
+    assert!(APP.contains(
+        "let local_models = crate::local_models::LocalModelPacks::new(&config.data_dir);"
+    ));
+    assert!(APP.contains("_local_models: local_models"));
+
+    let constructor = between(
+        LOCAL_MODELS,
+        "pub(crate) fn new(data_dir: &Path) -> Self {",
+        "fn manager(&mut self)",
+    );
     assert!(
-        !APP.contains("ModelPackManager"),
-        "model-pack lifecycle is not a shipped product feature yet; update SPEC-0102 when wiring it"
+        !constructor.contains("ModelPackManager::new"),
+        "startup state must not instantiate the model-pack manager"
     );
 }
 

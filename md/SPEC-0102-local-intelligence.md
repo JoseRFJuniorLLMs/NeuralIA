@@ -1,6 +1,6 @@
 # SPEC-0102 — Optional Local Intelligence
 
-**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs validado no core, ainda não ligado ao produto  
+**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs ligado ao produto de forma lazy, backend de inferência ainda não integrado  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -121,7 +121,7 @@ model-independent local intelligence primitives. This path is exercised by the
 core tests and by the product-wiring gate in
 `crates/neural-app/tests/spec_product_wiring.rs`.
 
-### Decision: model packs are library-only for now
+### Decision: model-pack lifecycle is product-wired, inference remains absent
 
 `ModelPackManager` is **not a NeuralIA product feature** in the current
 baseline. It is a `neural-core` lifecycle utility that validates manifests,
@@ -135,19 +135,19 @@ state becomes stale, the model file is altered or benchmark metadata is
 unusable, resolution returns the deterministic fallback plus a diagnostic
 warning instead of making ordinary local intelligence unavailable.
 
-It still performs **no download, no inference-backend construction, no
-automatic activation and no browser-startup hook**.
+It still performs **no download, no inference-backend construction and no
+automatic activation**. The product adapter itself does not create the manager,
+read pack state or load model bytes during startup.
 
-This is intentional. Wiring model packs into the product would require touching
-the browser lifecycle and proving lazy load, zero Home residency, failure
-fallback and measured resource budgets. Until that work is explicitly scheduled,
-the existence of `ModelPackManager` must not be presented as “model packs
-supported by NeuralIA”.
+This is intentional. Lifecycle wiring is now a shipped product boundary, but an
+installed/active pack is still only metadata plus a verified model artifact.
+No inference backend is selected or loaded yet, so NeuralIA must continue using
+the deterministic fallback for actual local intelligence.
 
 Therefore this specification remains **Parcial**. The deterministic local
-intelligence is shipped; optional pack lifecycle is library infrastructure only.
-The acceptance criteria below that mention enabling/uninstalling a pack remain
-open product criteria, not claims about the current browser.
+intelligence and lazy lifecycle wiring are shipped; backend construction,
+measured resident-memory budgets, idle unload and real pack inference remain
+open product criteria.
 
 ## 8.2. Context budget (library-only)
 

@@ -53,9 +53,11 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
 }
 
 #[test]
-fn model_pack_docs_do_not_claim_product_wiring() {
-    assert!(LOCAL_AI_SPEC.contains("not a NeuralIA product feature"));
-    assert!(README.contains("ainda não está ligada ao produto"));
+fn model_pack_docs_match_lazy_lifecycle_without_claiming_inference_backend() {
+    assert!(LOCAL_AI_SPEC.contains("product-side lazy adapter"));
+    assert!(LOCAL_AI_SPEC.contains("no inference-backend construction"));
+    assert!(README.contains("adaptador lazy no produto"));
+    assert!(README.contains("nenhum backend de inferência"));
 }
 
 /// O orcamento de contexto (`neural_core::context_budget`) existe e tem gates
