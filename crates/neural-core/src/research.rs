@@ -559,6 +559,15 @@ impl ResearchSession {
                 "### {}\n\nProvedor: {}\n\nURL: {}\n\n{}\n\n",
                 item.title, provider, url, item.text
             ));
+            if !item.links.is_empty() {
+                output.push_str("Fontes citadas:\n");
+                for link in &item.links {
+                    output.push_str("- ");
+                    output.push_str(link);
+                    output.push('\n');
+                }
+                output.push('\n');
+            }
         }
 
         if !self.syntheses.is_empty() {
@@ -828,6 +837,34 @@ mod tests {
         assert!(markdown.contains("https://example.com"));
         assert!(markdown.contains("Gemini"));
         assert!(markdown.contains("## Sínteses"));
+    }
+
+    /// Gate crítico (dados do utilizador): as ligações que o leitor do
+    /// Consenso validou e guardou numa resposta de provedor têm de sobreviver
+    /// ao export Markdown. Sem isto, a sessão persistida conserva a
+    /// proveniência mas o ficheiro que o utilizador leva para fora perde-a.
+    #[test]
+    fn markdown_export_preserves_provider_answer_links() {
+        let mut session = ResearchSession::new("exportar resposta com fontes");
+        let turn = session.begin_turn(
+            "load:export:google",
+            TurnOrigin::LoadProvider,
+            "pergunta",
+            &["Google IA"],
+        );
+        session
+            .add_turn_answer(
+                turn,
+                "Google IA",
+                "resposta com citação",
+                vec!["https://example.test/spec0101-source".into()],
+            )
+            .expect("o turno perguntou ao Google IA");
+
+        let markdown = session.export_markdown();
+        assert!(markdown.contains("Google IA"));
+        assert!(markdown.contains("resposta com citação"));
+        assert!(markdown.contains("Fontes citadas:\n- https://example.test/spec0101-source\n"));
     }
 
     #[test]
