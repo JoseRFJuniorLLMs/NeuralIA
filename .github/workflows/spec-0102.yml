@@ -5,16 +5,30 @@ on:
     paths:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
+      - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/main.rs'
+      - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/app/navigation.rs'
+      - 'crates/neural-app/src/windows_app/tests.rs'
+      - 'crates/neural-app/tests/spec_product_wiring.rs'
+      - 'crates/neural-app/tests/docs_truth.rs'
+      - 'README.md'
       - 'md/SPEC-0102-local-intelligence.md'
-      - 'md/README.md'
       - '.github/workflows/spec-0102.yml'
   push:
     branches: [main]
     paths:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
+      - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/main.rs'
+      - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/app/navigation.rs'
+      - 'crates/neural-app/src/windows_app/tests.rs'
+      - 'crates/neural-app/tests/spec_product_wiring.rs'
+      - 'crates/neural-app/tests/docs_truth.rs'
+      - 'README.md'
       - 'md/SPEC-0102-local-intelligence.md'
-      - 'md/README.md'
       - '.github/workflows/spec-0102.yml'
 
 permissions:
@@ -34,6 +48,51 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Product lifecycle behavior uses the shipped route and executor
+        shell: pwsh
+        run: |
+          cargo test --locked -p neural-app startup_state_has_zero_model_residency_and_does_no_pack_io
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app shipped_executor_installs_without_auto_activation_and_requires_benchmark
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app shipped_executor_activates_then_uninstall_returns_to_fallback
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app route_input_sends_each_command_where_it_belongs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Sabotage eager manager startup must turn the startup gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = '            manager: None,'
+          $new = '            manager: Some(ModelPackManager::new(data_dir.join("model-packs"))),'
+          if (($text.Split($old).Count - 1) -ne 1) { throw "eager-manager sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app startup_state_has_zero_model_residency_and_does_no_pack_io
+            if ($LASTEXITCODE -eq 0) { throw "eager manager sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage model command routing must turn the shipped-route gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/windows_app/app/navigation.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = "        return InputRoute::LocalModel(command);"
+          $new = "        return InputRoute::Intent;"
+          if (($text.Split($old).Count - 1) -ne 1) { throw "model-route sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app route_input_sends_each_command_where_it_belongs
+            if ($LASTEXITCODE -eq 0) { throw "model route sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
 
   sabotage:
     runs-on: ubuntu-latest
@@ -48,6 +107,7 @@ jobs:
         run: |
           cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
           cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
           cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
           cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
 
@@ -109,6 +169,33 @@ jobs:
             exit 1
           fi
           echo "Sabotage proof: activation without benchmark was rejected."
+
+      - name: Sabotage resident-memory evidence requirement
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '''    if benchmark.resident_model_bytes.is_none() {
+                  return Err("benchmark sem medida de memória residente".to_string());
+              }
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("residency sabotage target not found exactly once")
+          p.write_text(s.replace(old, ""), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Residency-evidence sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: benchmark without resident-memory evidence was rejected."
 
       - name: Sabotage active-pack hash revalidation
         shell: bash
@@ -176,5 +263,6 @@ jobs:
         run: |
           cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
           cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
           cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
           cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
