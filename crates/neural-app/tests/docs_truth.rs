@@ -54,11 +54,13 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
 
 #[test]
 fn model_pack_docs_match_lazy_lifecycle_without_claiming_inference_backend() {
+    // Markdown line wrapping must not change what this documentation guard sees.
+    let readme = README.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(LOCAL_AI_SPEC.contains("product-side lazy adapter"));
     assert!(LOCAL_AI_SPEC.contains("no inference-backend construction"));
     assert!(LOCAL_AI_SPEC.contains("resident-model-byte evidence"));
-    assert!(README.contains("model:status"));
-    assert!(README.contains("Nenhum backend de inferência"));
+    assert!(readme.contains("model:status"));
+    assert!(readme.contains("Nenhum backend de inferência"));
 }
 
 /// O orcamento de contexto (`neural_core::context_budget`) existe e tem gates
