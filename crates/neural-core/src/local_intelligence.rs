@@ -329,6 +329,11 @@ pub struct LocalBenchmark {
     pub embedding_dimension: usize,
     pub embed_micros_total: u128,
     pub classify_micros_total: u128,
+    /// Resident model bytes measured by the backend-specific harness. None
+    /// means latency was measured but memory residency was not, which is not
+    /// enough evidence to activate a pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_model_bytes: Option<u64>,
     pub measured_at: u64,
 }
 
@@ -399,11 +404,26 @@ pub fn benchmark_local_intelligence(
         embedding_dimension: dimension,
         embed_micros_total,
         classify_micros_total,
+        resident_model_bytes: None,
         measured_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
     })
+}
+
+/// Benchmark variant used when a backend-specific harness also measured model
+/// residency. Activation requires this stronger evidence; the generic latency
+/// benchmark above deliberately remains insufficient.
+pub fn benchmark_local_intelligence_with_residency(
+    backend: &str,
+    ai: &dyn LocalIntelligence,
+    corpus: &[String],
+    resident_model_bytes: u64,
+) -> Result<LocalBenchmark, String> {
+    let mut benchmark = benchmark_local_intelligence(backend, ai, corpus)?;
+    benchmark.resident_model_bytes = Some(resident_model_bytes);
+    Ok(benchmark)
 }
 
 /// Library-only filesystem utility for optional model-pack artifacts.
@@ -802,6 +822,9 @@ fn validate_benchmark(benchmark: &LocalBenchmark) -> Result<(), String> {
     if benchmark.embedding_dimension == 0 {
         return Err("benchmark sem dimensão de embedding".to_string());
     }
+    if benchmark.resident_model_bytes.is_none() {
+        return Err("benchmark sem medida de memória residente".to_string());
+    }
     Ok(())
 }
 
@@ -929,6 +952,7 @@ mod tests {
         let result = benchmark_local_intelligence("hashing-local", &ai, &corpus).unwrap();
         assert_eq!(result.samples, 2);
         assert_eq!(result.embedding_dimension, EMBEDDING_DIM);
+        assert_eq!(result.resident_model_bytes, None);
     }
 
     #[test]
@@ -1068,10 +1092,11 @@ mod tests {
         let loaded = manager.load_manifest("semantic-small").unwrap();
         assert_eq!(manager.verify(&loaded).unwrap(), pack.join("model.bin"));
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "hashing-local",
             &HashingLocalIntelligence,
             &["teste".to_string()],
+            0,
         )
         .unwrap();
         assert!(
@@ -1130,6 +1155,29 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_without_residency_evidence_cannot_enable_a_pack() {
+        let root = temp_root("benchmark-needs-residency");
+        let manager = ModelPackManager::new(&root);
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manager.install(&manifest, bytes).unwrap();
+
+        let benchmark = benchmark_local_intelligence(
+            "semantic-small",
+            &HashingLocalIntelligence,
+            &["NeuralIA".to_string()],
+        )
+        .unwrap();
+        let error = manager
+            .record_benchmark("semantic-small", &benchmark)
+            .unwrap_err();
+        assert!(error.contains("memória residente"), "{error}");
+        assert!(manager.activate("semantic-small").is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn model_pack_activation_requires_verified_pack_and_recorded_benchmark() {
         let root = temp_root("activation-requires-benchmark");
         let manager = ModelPackManager::new(&root);
@@ -1145,10 +1193,11 @@ mod tests {
             "activation must fail before benchmark evidence exists"
         );
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "semantic-small",
             &HashingLocalIntelligence,
             &["NeuralIA".to_string()],
+            0,
         )
         .unwrap();
         manager
@@ -1177,10 +1226,11 @@ mod tests {
         let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
         let model = manager.install(&manifest, bytes).unwrap();
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "semantic-small",
             &HashingLocalIntelligence,
             &["NeuralIA".to_string()],
+            0,
         )
         .unwrap();
         manager
@@ -1216,10 +1266,11 @@ mod tests {
         let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
         manager.install(&manifest, bytes).unwrap();
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "semantic-small",
             &HashingLocalIntelligence,
             &["NeuralIA".to_string()],
+            0,
         )
         .unwrap();
         manager
