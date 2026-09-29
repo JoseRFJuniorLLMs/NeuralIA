@@ -214,7 +214,38 @@ try {
         if ($persisted) {
             throw "Sabotagem ficou verde: a resposta ainda apareceu em $($persisted.FullName)."
         }
-        Write-Host "Sabotagem provada: sem save_session do Consenso, a resposta da WebView nao apareceu em nenhuma sessao persistida."
+        # No JSON alone could mean that the reader never received an answer.
+        # Prove the live session contains the answer and provenance through the
+        # real explicit export before accepting the missing-write sabotage.
+        $liveAnswer = $false
+        $watch.Restart()
+        while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $exportAck = Send-Command "research-export Column"
+            if ([string]$exportAck.detail -notmatch 'research-export id=([A-Za-z0-9_-]+)') {
+                throw "ACK do export sabotado nao trouxe id: $($exportAck.detail)"
+            }
+            $markdownPath = Join-Path (Join-Path $dataDir "research-exports") "$($Matches[1]).md"
+            if (Test-Path -LiteralPath $markdownPath) {
+                $markdown = [IO.File]::ReadAllText($markdownPath, $utf8)
+                if ($markdown.Contains($answer) -and $markdown.Contains("Google IA") -and $markdown.Contains($source)) {
+                    $liveAnswer = $true
+                    break
+                }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+        if (-not $liveAnswer) { throw "Sabotagem inconclusiva: a resposta nao chegou a sessao viva." }
+        # A live export can precede the asynchronous memory-worker write.
+        # Keep the app alive while observing the same post-answer window used
+        # by the Private gate, so a pending write cannot become a false green.
+        $watch.Restart()
+        while ($watch.Elapsed.TotalSeconds -lt 4) {
+            if ($process.HasExited) { throw "NeuralIA saiu durante a prova de ausencia de persistencia." }
+            $persisted = Find-PersistedAnswer
+            if ($persisted) { throw "Sabotagem ficou verde: a resposta ainda apareceu em $($persisted.FullName)." }
+            Start-Sleep -Milliseconds 100
+        }
+        Write-Host "Sabotagem provada: resposta e proveniencia chegaram a sessao viva, mas sem save_session nao chegaram ao disco."
         return
     }
 
