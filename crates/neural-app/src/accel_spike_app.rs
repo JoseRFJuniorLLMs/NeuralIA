@@ -38,6 +38,7 @@ use crate::accel_spike::{
     act_line, colnav_done_line, colnav_start_line, hello_line, hooked_line, native_line, page_line,
     parse_spike_command, ping_detail, spike_verdict, tiny_pdf,
 };
+use crate::privacy::PrivacyMode;
 use crate::windows_app::*;
 
 /// O registo do condutor; `None` sem `NEURALIA_ACCEL_SPIKE_DIR`.
@@ -361,6 +362,7 @@ impl App {
             )),
             SpikeVerb::Open(url) => self.accel_spike_open(host, url.as_deref()),
             SpikeVerb::ResearchOpen(url) => self.accel_spike_research_open(host, &url),
+            SpikeVerb::ResearchPrivate => self.accel_spike_research_private(host),
             SpikeVerb::ResearchStart => self.accel_spike_research_start(host),
             SpikeVerb::ResearchExport => self.accel_spike_research_export(host),
             SpikeVerb::Focus => self.accel_spike_focus(host),
@@ -400,6 +402,17 @@ impl App {
             .load_url(url)
             .map_err(|error| format!("load_url da fixture de pesquisa: {error}"))?;
         Ok(format!("research fixture {origin}"))
+    }
+
+    /// Coloca o mesmo PrivacyGuard do produto em Private, mas apenas no
+    /// executavel CI compilado com `accel-spike`. Os grants ja emitidos veem
+    /// a mudanca pelo modo partilhado do StoreRegistry.
+    fn accel_spike_research_private(&mut self, host: SpikeHost) -> Result<String, String> {
+        if host != SpikeHost::Column {
+            return Err("research-private so vale na Column".to_string());
+        }
+        self.privacy.set_mode_for_accel_spike(PrivacyMode::Private);
+        Ok("research privacy=private".to_string())
     }
 
     /// Cria um turno pelo mesmo caminho que a UI usa e inicia o leitor real do
