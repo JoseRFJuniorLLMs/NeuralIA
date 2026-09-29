@@ -7967,74 +7967,47 @@ __on('neuralia-comp-expand', 'mouseleave');
     );
 }
 
-/// Ctrl+roda e a pinca do touchpad (que o Chromium entrega como
-/// ctrl+wheel) passam pelo mapa de teclas QUE EMBARCA e chegam ao nativo
-/// como os mesmos zoomin/zoomout do Ctrl+= e do Ctrl+-. Sem Ctrl a roda e
-/// da pagina; uma pagina que trata o gesto (preventDefault) fica com ele.
+/// O mapa que embarca deixa a roda e a pinça com o Chromium; os atalhos
+/// de teclado continuam passando pelo mesmo IPC autenticado.
 #[test]
-fn ctrl_wheel_and_touchpad_pinch_zoom_through_the_app_steps() {
+fn native_zoom_wheel_never_duplicates_page_ipc() {
     const CAP: &str = "0123456789abcdef0123456789abcdef";
     let drive = r#"
 document.readyState = 'interactive';
 __fire('DOMContentLoaded');
 __drain();
 __fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0 });
-__fire('wheel', { ctrlKey: false, deltaY: -100, deltaMode: 0 });
 __fire('wheel', { ctrlKey: true, deltaY: 100, deltaMode: 0 });
-__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, defaultPrevented: true });
-__fire('wheel', { ctrlKey: true, deltaY: -100, deltaMode: 0, isTrusted: false });
 for (let i = 0; i < 10; i++) __fire('wheel', { ctrlKey: true, deltaY: -4, deltaMode: 0 });
-__fire('wheel', { ctrlKey: true, deltaY: 3, deltaMode: 0 });
-__fire('wheel', { ctrlKey: true, deltaY: 1, deltaMode: 1 });
+__fire('wheel', { ctrlKey: false, deltaY: -100, deltaMode: 0 });
+__fire('wheel', { ctrlKey: true, deltaY: -100, isTrusted: false });
+__drain();
+__fire('keydown', { ctrlKey: true, key: '+' });
+__fire('keydown', { ctrlKey: true, key: '-' });
+__fire('keydown', { ctrlKey: true, key: '0' });
 __drain();
 "#;
-    let cases = [serde_json::json!({
-        "name": "keymap",
-        "href": "https://example.com/",
-        "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP),
-        "drive": drive,
-    })];
     let program = format!(
-        "const INPUT = {};
-{}",
-        serde_json::json!({ "cases": cases }),
+        "const INPUT = {};\n{}",
+        serde_json::json!({ "cases": [{
+        "name": "native zoom", "href": "https://example.com/",
+        "script": NEURALIA_KEYMAP_SCRIPT.replace("__NEURALIA_CAP__", CAP), "drive": drive,
+    }] }),
         INJECTED_SCRIPT_HARNESS
     );
     let results: Vec<serde_json::Value> =
         serde_json::from_str(&run_node_program(&program)).expect("harness json");
-    let errors = &results[0]["errors"];
-    assert_eq!(errors.as_array().map(Vec::len), Some(0), "erros: {errors}");
+    assert_eq!(results[0]["errors"].as_array().map(Vec::len), Some(0));
     let actions: Vec<IpcAction> = results[0]["posted"]
         .as_array()
         .expect("posted")
         .iter()
         .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
         .collect();
-    // Entalhe para cima, entalhe para baixo, dez pedacos de pinca que
-    // somam um degrau, e uma linha (deltaMode 1) para baixo.
     assert_eq!(
         actions,
-        vec![
-            IpcAction::ZoomIn,
-            IpcAction::ZoomOut,
-            IpcAction::ZoomIn,
-            IpcAction::ZoomOut,
-        ]
+        vec![IpcAction::ZoomIn, IpcAction::ZoomOut, IpcAction::ZoomReset]
     );
-    // O nativo trata-os como o Ctrl+= e o Ctrl+-: os degraus do app.
-    assert!(matches!(
-        App::column_ipc_event_impl(0, IpcAction::ZoomIn),
-        Some(UserEvent::ZoomIn)
-    ));
-    assert!(matches!(
-        App::column_ipc_event_impl(0, IpcAction::ZoomOut),
-        Some(UserEvent::ZoomOut)
-    ));
-    // Um mecanismo so: nenhuma WebView liga o zoom proprio do WebView2
-    // (Ctrl+roda e pinca do Chromium), que somaria ao nosso.
-    let source = all_sources();
-    let forbidden = ["with_hotkeys_zoom(", "true)"].concat();
-    assert!(!source.contains(&forbidden));
 }
 
 /// A roda nao atravessa a fronteira de um iframe, e reencaminhar o ctrl+roda
@@ -8493,6 +8466,7 @@ fn column_menu_item_goes_after_every_native_item() {
 /// WebView2.
 #[derive(Default)]
 struct RecordingRegistrar {
+    zooms: Vec<WebViewHost>,
     menus: Vec<(WebViewHost, Vec<usize>)>,
     accelerators: Vec<WebViewHost>,
     downloads: Vec<WebViewHost>,
@@ -8506,6 +8480,11 @@ struct RecordingRegistrar {
 }
 
 impl HookRegistrar for RecordingRegistrar {
+    fn zoom(&mut self, host: WebViewHost) -> Result<(), String> {
+        self.zooms.push(host);
+        Ok(())
+    }
+
     fn context_menu(&mut self, host: WebViewHost, items: &[usize]) -> Result<(), String> {
         if self.fail_menu {
             return Err("ICoreWebView2_11 indisponível: E_NOINTERFACE".to_string());
@@ -36659,4 +36638,38 @@ fn research_answer_push_never_overwrites_a_turn_answer() {
         .expect("item empurrado");
     assert_eq!(pushed_item.text, "texto empurrado outra vez");
     assert_eq!(pushed_item.turn, None);
+}
+
+#[test]
+fn native_zoom_is_installed_in_every_visible_webview() {
+    let mut hosts = WebViewHost::ALL.to_vec();
+    for index in 0..COMPARATOR_COLUMNS {
+        hosts.extend([
+            WebViewHost::Column(index),
+            WebViewHost::Split(index),
+            WebViewHost::PrivateSplit(index),
+        ]);
+    }
+    hosts.extend(
+        [
+            Service::Meet,
+            Service::WhatsApp,
+            Service::Gmail,
+            Service::Breath,
+        ]
+        .map(WebViewHost::Service),
+    );
+    for host in hosts {
+        let mut registrar = RecordingRegistrar::default();
+        assert!(install_hooks_with(host, &webview_hooks(host), &mut registrar).is_empty());
+        assert_eq!(
+            registrar.zooms,
+            if host == WebViewHost::GmailMonitor {
+                vec![]
+            } else {
+                vec![host]
+            },
+            "{host:?}"
+        );
+    }
 }

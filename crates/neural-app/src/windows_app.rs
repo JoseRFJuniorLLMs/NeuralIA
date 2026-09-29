@@ -3225,6 +3225,7 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) auto_scroll_answered: bool,
     pub(in crate::windows_app) auto_scroll_token: u64,
     pub(in crate::windows_app) zoom: f64,
+    pub(in crate::windows_app) native_zoom: Rc<NativeZoomState>,
     /// O visualizador de PDF nao aceita script do host: rola-se por tecla.
     pub(in crate::windows_app) reading_pdf: bool,
     pub(in crate::windows_app) splash: Option<HWND>,
@@ -3458,6 +3459,7 @@ impl App {
             auto_scroll_answered: false,
             auto_scroll_token: 0,
             zoom: 1.0,
+            native_zoom: Rc::new(NativeZoomState::default()),
             reading_pdf: false,
             splash: None,
             splash_board: SplashBoard::default(),

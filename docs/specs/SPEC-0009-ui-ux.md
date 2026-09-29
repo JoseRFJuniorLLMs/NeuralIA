@@ -31,16 +31,21 @@ only one channel is a bug, not a limitation.
 - Backspace / Alt+Left / Alt+Right walk the page history.
 - Ctrl+R and F5 reload; Ctrl + / - / 0 zoom on Chrome's ladder; Ctrl+F opens an
   in-page find bar; Ctrl+P prints; F12 opens DevTools; Ctrl+U shows the source.
-- Ctrl + mouse wheel keeps using NeuralIA's existing zoom ladder, so the
-  shared app zoom state and new pages stay in sync. A precision-touchpad
-  two-finger pinch uses WebView2 Page Scale instead: every built WebView passes
-  through the common post-build hook, which enables
-  `ICoreWebView2Settings5::SetIsPinchZoomEnabled(true)`. The native browser
-  zoom control stays disabled, so pinch does not duplicate Ctrl+wheel. The
-  pinch scales the page as a page — text, images, video and layout together —
-  including service panels such as YouTube. Older WebView2 runtimes degrade
-  gracefully to the existing keyboard/mouse zoom. CI compiles and gates the
-  wiring; physical touchpad hardware is not emulated by the runner.
+- Ctrl + mouse wheel uses WebView2's native zoom control, including child
+  frames. The common post-build hook enables both native mouse zoom and
+  precision-touchpad pinch in every visible WebView. Native mouse zoom in
+  content pages updates the shared app zoom through `ZoomFactorChanged`;
+  panels keep their native zoom local. Notifications from closed/replaced
+  controllers, old factors and programmatic changes are ignored. The gates
+  `native_zoom_is_installed_in_every_visible_webview`,
+  `native_zoom_enables_mouse_and_touchpad_independently`,
+  `native_zoom_shipped_com_adapter_enables_both_settings`,
+  `native_zoom_ignores_programmatic_invalid_and_superseded_changes` and
+  `native_zoom_wheel_never_duplicates_page_ipc` cover this dispatch and the
+  absence of duplicate page IPC. Pinch uses WebView2 Page Scale (local to the
+  page, separate from the shared mouse/keyboard factor); the runner does not
+  emulate physical touchpad hardware. Failure to enable either native control
+  is logged without preventing the other control from being attempted.
 - F11 toggles fullscreen for the current comparator column; F8 toggles auto-scroll;
   1/2/3 expand a column and 0 restores.
 - Backspace and the digits are ignored while typing in a field.
