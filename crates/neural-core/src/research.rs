@@ -559,15 +559,6 @@ impl ResearchSession {
                 "### {}\n\nProvedor: {}\n\nURL: {}\n\n{}\n\n",
                 item.title, provider, url, item.text
             ));
-            if !item.links.is_empty() {
-                output.push_str("Fontes citadas:\n");
-                for link in &item.links {
-                    output.push_str("- ");
-                    output.push_str(link);
-                    output.push('\n');
-                }
-                output.push('\n');
-            }
         }
 
         if !self.syntheses.is_empty() {
