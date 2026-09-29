@@ -317,6 +317,7 @@ mod tests {
             embedding_dimension: 384,
             embed_micros_total: 120,
             classify_micros_total: 80,
+            resident_model_bytes: Some(0),
             measured_at: 1,
         }
     }
