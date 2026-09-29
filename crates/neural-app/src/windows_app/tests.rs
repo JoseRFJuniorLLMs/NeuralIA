@@ -24392,8 +24392,9 @@ fn fn_items(code: &str) -> Vec<FnItem> {
 /// metodo seria o registo); so os dois construtores do guard o recebem,
 /// por valor. Dentro do guard o campo so se usa em `mode` e `store`: nada
 /// empresta nem devolve `self.registry`. O registo e os workers sao campos
-/// privados do guard, o construtor de teste -- a unica porta para
-/// `Private` -- so existe em `cfg(test)`, e o `App` ja nao tem o registo,
+/// privados do guard. O construtor de teste existe so em `cfg(test)`; a
+/// unica segunda porta e o setter `cfg(feature = "accel-spike")`, usado pelo
+/// E2E CI e ausente do executavel publicado. O `App` ja nao tem o registo,
 /// o historico, a memoria nem as abas.
 ///
 /// Sabotagem (revisao F5): `pub(crate) fn registry(&self) -> &'_
@@ -24461,7 +24462,8 @@ fn registry_is_minted_once_and_owned_by_the_guard() {
         "o guard empresta o registo"
     );
 
-    // 3. O construtor de teste e a unica cunhagem de teste, e so em cfg(test).
+    // 3. A cunhagem de teste so existe em cfg(test). O setter do modo usado
+    // pelo E2E so existe na feature accel-spike, que nao embarca no release.
     assert_eq!(privacy.matches("StoreRegistry::mint_for_test(").count(), 1);
     let before_for_test = privacy
         .split("pub(crate) fn for_test(")
@@ -24474,6 +24476,16 @@ fn registry_is_minted_once_and_owned_by_the_guard() {
     assert!(
         privacy.contains("registry.set_mode(mode.into());"),
         "for_test nao poe o modo pedido no registo"
+    );
+    let before_spike_setter = privacy
+        .split("pub(crate) fn set_mode_for_accel_spike(")
+        .next()
+        .expect("set_mode_for_accel_spike");
+    assert!(
+        before_spike_setter
+            .trim_end()
+            .ends_with("#[cfg(feature = \"accel-spike\")]"),
+        "setter de modo do harness escapou da feature accel-spike"
     );
     let product_new = privacy
         .split("pub(crate) fn new(")
@@ -24634,6 +24646,9 @@ fn registry_is_minted_once_and_owned_by_the_guard() {
             Some("new" | "for_test" | "with_registry") => true,
             Some("mode") => before == "self." && after.starts_with(".mode()"),
             Some("store") => before == "self." && after.starts_with(".grant(spec)"),
+            Some("set_mode_for_accel_spike") => {
+                before == "self." && after.starts_with(".set_mode(mode.into())")
+            }
             None => fields_span.contains(&at) && after.starts_with(":StoreRegistry,"),
             Some(_) => false,
         };
