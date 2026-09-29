@@ -1056,20 +1056,141 @@ fn register_webview_accelerators(
 
 // ===================== a metade depois do build =====================
 
-/// Ativa somente o Page Scale por pinça do WebView2. O zoom de Ctrl+roda e
-/// Ctrl +/- continua no mecanismo do NeuralIA, que guarda `self.zoom`.
-fn enable_native_pinch_zoom(webview: &WebView) -> Result<(), String> {
-    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+/// Os controles nativos funcionam também nos iframes e nos serviços sem
+/// scripts do NeuralIA. Cada setter é tentado mesmo se o outro falhar.
+trait NativeZoomControls {
+    fn wheel(&mut self, enabled: bool) -> Result<(), String>;
+    fn pinch(&mut self, enabled: bool) -> Result<(), String>;
+}
+
+fn enable_native_zoom_with(controls: &mut impl NativeZoomControls) -> Vec<String> {
+    let mut errors = Vec::new();
+    if let Err(error) = controls.wheel(true) {
+        errors.push(error);
+    }
+    if let Err(error) = controls.pinch(true) {
+        errors.push(error);
+    }
+    errors
+}
+
+struct ComZoomControls(webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings);
+
+impl NativeZoomControls for ComZoomControls {
+    fn wheel(&mut self, enabled: bool) -> Result<(), String> {
+        unsafe { self.0.SetIsZoomControlEnabled(enabled) }
+            .map_err(|error| format!("SetIsZoomControlEnabled: {error}"))
+    }
+
+    fn pinch(&mut self, enabled: bool) -> Result<(), String> {
+        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings5;
+        use windows_core::Interface;
+        let settings = self
+            .0
+            .cast::<ICoreWebView2Settings5>()
+            .map_err(|error| format!("ICoreWebView2Settings5: {error}"))?;
+        unsafe { settings.SetIsPinchZoomEnabled(enabled) }
+            .map_err(|error| format!("SetIsPinchZoomEnabled: {error}"))
+    }
+}
+
+/// Compartilhado pelos callbacks COM e pela app na thread da UI. Atualizar
+/// antes de chamar WebView::zoom evita realimentar mudanças programáticas.
+/// A geração descarta gestos anteriores a uma mudança programática;
+/// o fator vivo do controlador descarta notificações antigas do mesmo gesto.
+pub(in crate::windows_app) struct NativeZoomState {
+    factor: Cell<f64>,
+    generation: Cell<u64>,
+}
+
+impl Default for NativeZoomState {
+    fn default() -> Self {
+        Self {
+            factor: Cell::new(1.0),
+            generation: Cell::new(0),
+        }
+    }
+}
+
+impl NativeZoomState {
+    pub(in crate::windows_app) fn set_programmatic(&self, factor: f64) {
+        self.factor.set(factor);
+        self.generation.set(self.generation.get().wrapping_add(1));
+    }
+
+    fn observe(&self, factor: f64, controller: usize) -> Option<WebViewEvent> {
+        if !factor.is_finite() || factor <= 0.0 || (factor - self.factor.get()).abs() < 0.0001 {
+            return None;
+        }
+        Some(WebViewEvent::ZoomChanged {
+            controller,
+            factor,
+            generation: self.generation.get(),
+        })
+    }
+
+    fn current(&self, factor: f64, generation: u64, live_factor: Option<f64>) -> bool {
+        generation == self.generation.get()
+            && factor.is_finite()
+            && factor > 0.0
+            && live_factor == Some(factor)
+            && (factor - self.factor.get()).abs() >= 0.0001
+    }
+}
+
+fn register_native_zoom(
+    webview: &WebView,
+    host: WebViewHost,
+    state: Rc<NativeZoomState>,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<(), String> {
+    use webview2_com::ZoomFactorChangedEventHandler;
     use windows_core::Interface;
     use wry::WebViewExtWindows;
 
-    let settings = unsafe { webview.webview().Settings() }
-        .map_err(|error| format!("Settings indisponível: {error}"))?;
-    let settings = settings
-        .cast::<ICoreWebView2Settings5>()
-        .map_err(|error| format!("ICoreWebView2Settings5 indisponível: {error}"))?;
-    unsafe { settings.SetIsPinchZoomEnabled(true) }
-        .map_err(|error| format!("SetIsPinchZoomEnabled falhou: {error}"))
+    let settings =
+        unsafe { webview.webview().Settings() }.map_err(|error| format!("Settings: {error}"))?;
+    let mut errors = enable_native_zoom_with(&mut ComZoomControls(settings));
+    // Painéis mantêm o zoom nativo local; o estado compartilhado pertence
+    // às páginas de conteúdo percorridas por for_each_visible_webview.
+    if !matches!(
+        host,
+        WebViewHost::Column(_)
+            | WebViewHost::Split(_)
+            | WebViewHost::PrivateSplit(_)
+            | WebViewHost::External
+            | WebViewHost::Reader
+            | WebViewHost::Pdf
+            | WebViewHost::Epub
+    ) {
+        return if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        };
+    }
+    let controller = webview.controller();
+    let handler = ZoomFactorChangedEventHandler::create(Box::new(move |sender, _args| {
+        if let Some(sender) = sender {
+            let mut factor = 1.0;
+            unsafe {
+                sender.ZoomFactor(&mut factor)?;
+            }
+            if let Some(event) = state.observe(factor, sender.as_raw() as usize) {
+                let _ = proxy.send_event(UserEvent::WebView(event));
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0i64;
+    if let Err(error) = unsafe { controller.add_ZoomFactorChanged(&handler, &mut token) } {
+        errors.push(format!("ZoomFactorChanged: {error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 /// O painel do YouTube recebe apenas a timeline visual do NeuralIA. O script
@@ -1115,6 +1236,7 @@ fn install_service_visual_script(webview: &WebView, host: WebViewHost) -> Result
 /// construir. O produto passa o COM (`ComHookRegistrar`); o gate passa um
 /// registo que anota o que foi pedido para cada hospedeiro.
 pub(in crate::windows_app) trait HookRegistrar {
+    fn zoom(&mut self, host: WebViewHost) -> Result<(), String>;
     /// Os itens do registo (ids de `WEBVIEW_MENU_ITEMS`) no menu do botao
     /// direito deste hospedeiro.
     fn context_menu(&mut self, host: WebViewHost, items: &[usize]) -> Result<(), String>;
@@ -1142,6 +1264,11 @@ pub(in crate::windows_app) fn install_hooks_with(
     registrar: &mut impl HookRegistrar,
 ) -> Vec<String> {
     let mut missing = Vec::new();
+    if host != WebViewHost::GmailMonitor
+        && let Err(error) = registrar.zoom(host)
+    {
+        missing.push(format!("zoom: {} ({error})", host.describe()));
+    }
     if !hooks.menu.is_empty()
         && let Err(error) = registrar.context_menu(host, &hooks.menu)
     {
@@ -1192,6 +1319,7 @@ pub(in crate::windows_app) fn install_hooks_with(
 /// O registador do produto: o COM do WebView2 de uma WebView.
 struct ComHookRegistrar<'a> {
     webview: &'a WebView,
+    native_zoom: Rc<NativeZoomState>,
     auto_scroll: SharedFlag,
     downloads: &'a DownloadsShared,
     proxy: EventLoopProxy<UserEvent>,
@@ -1204,6 +1332,15 @@ struct ComHookRegistrar<'a> {
 }
 
 impl HookRegistrar for ComHookRegistrar<'_> {
+    fn zoom(&mut self, host: WebViewHost) -> Result<(), String> {
+        register_native_zoom(
+            self.webview,
+            host,
+            self.native_zoom.clone(),
+            self.proxy.clone(),
+        )
+    }
+
     fn context_menu(&mut self, host: WebViewHost, _items: &[usize]) -> Result<(), String> {
         let adblock = adblock_host(host).then(|| AdblockMenuSource {
             shared: Arc::clone(&self.adblock),
@@ -1368,6 +1505,11 @@ pub(in crate::windows_app) enum WebViewEvent {
     /// do artigo, o nosso visualizador): o endereco verdadeiro dessas duas
     /// paginas e `App::page_source`.
     PageLoaded { page: WebViewHost, url: String },
+    ZoomChanged {
+        controller: usize,
+        factor: f64,
+        generation: u64,
+    },
 }
 
 /// Um builder que ja passou pela metade do builder da tabela, com o
@@ -1442,12 +1584,6 @@ impl App {
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
     /// gancho e fica no log.
     fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {
-        if let Err(error) = enable_native_pinch_zoom(webview) {
-            debug_log(format_args!(
-                "pinch zoom: {} sem gesto nativo ({error})",
-                host.describe()
-            ));
-        }
         if let Err(error) = install_service_visual_script(webview, host) {
             debug_log(format_args!(
                 "service visual: {} sem timeline ({error})",
@@ -1456,6 +1592,7 @@ impl App {
         }
         let mut registrar = ComHookRegistrar {
             webview,
+            native_zoom: self.native_zoom.clone(),
             auto_scroll: self.auto_scroll.clone(),
             downloads: &self.downloads.shared,
             proxy: self.proxy.clone(),
@@ -1473,6 +1610,27 @@ impl App {
     pub(in crate::windows_app) fn webview_event(&mut self, event: WebViewEvent) {
         match event {
             WebViewEvent::PageLoaded { page, url } => self.page_loaded(page, url),
+            WebViewEvent::ZoomChanged {
+                controller,
+                factor,
+                generation,
+            } => {
+                use windows_core::Interface;
+                use wry::WebViewExtWindows;
+                let mut live_factor = None;
+                self.for_each_visible_webview(|webview| {
+                    let live = webview.controller();
+                    if live.as_raw() as usize == controller {
+                        let mut current = 1.0;
+                        if unsafe { live.ZoomFactor(&mut current) }.is_ok() {
+                            live_factor = Some(current);
+                        }
+                    }
+                });
+                if self.native_zoom.current(factor, generation, live_factor) {
+                    self.set_zoom(factor);
+                }
+            }
         }
     }
 
@@ -1520,5 +1678,231 @@ mod service_visual_tests {
         assert!(script.contains("function semanticAnchors()"));
         assert!(!script.contains("chrome.webview.postMessage"));
         assert!(!script.contains("__NEURALIA_CAP__"));
+    }
+}
+
+#[cfg(test)]
+mod native_zoom_tests {
+    use super::*;
+
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Settings, ICoreWebView2Settings_Impl, ICoreWebView2Settings2_Impl,
+        ICoreWebView2Settings3_Impl, ICoreWebView2Settings4_Impl, ICoreWebView2Settings5,
+        ICoreWebView2Settings5_Impl,
+    };
+    use windows_core::Interface;
+
+    #[windows_core::implement(ICoreWebView2Settings5)]
+    #[derive(Default)]
+    struct MockZoomSettings {
+        wheel: Cell<bool>,
+        pinch: Cell<bool>,
+    }
+
+    fn unused_zoom_setting() -> windows_core::Result<()> {
+        Err(windows_core::Error::from_hresult(windows_core::HRESULT(
+            0x80004001u32 as i32, // E_NOTIMPL
+        )))
+    }
+
+    // The mock implements the inherited COM surface, but every unrelated method
+    // fails. Only the four zoom methods below store/read observable state.
+    macro_rules! unused_zoom_bool_methods {
+    ($($get:ident, $set:ident);* $(;)?) => {
+        $(
+            fn $get(&self, _value: *mut windows_core::BOOL) -> windows_core::Result<()> {
+                unused_zoom_setting()
+            }
+            fn $set(&self, _value: windows_core::BOOL) -> windows_core::Result<()> {
+                unused_zoom_setting()
+            }
+        )*
+    };
+}
+
+    impl ICoreWebView2Settings_Impl for MockZoomSettings_Impl {
+        unused_zoom_bool_methods!(
+            IsScriptEnabled, SetIsScriptEnabled;
+            IsWebMessageEnabled, SetIsWebMessageEnabled;
+            AreDefaultScriptDialogsEnabled, SetAreDefaultScriptDialogsEnabled;
+            IsStatusBarEnabled, SetIsStatusBarEnabled;
+            AreDevToolsEnabled, SetAreDevToolsEnabled;
+            AreDefaultContextMenusEnabled, SetAreDefaultContextMenusEnabled;
+            AreHostObjectsAllowed, SetAreHostObjectsAllowed;
+            IsBuiltInErrorPageEnabled, SetIsBuiltInErrorPageEnabled;
+        );
+
+        fn IsZoomControlEnabled(
+            &self,
+            enabled: *mut windows_core::BOOL,
+        ) -> windows_core::Result<()> {
+            if enabled.is_null() {
+                return Err(windows_core::Error::from_hresult(windows_core::HRESULT(
+                    0x80004003u32 as i32, // E_POINTER
+                )));
+            }
+            // SAFETY: COM caller supplied a non-null BOOL output pointer.
+            unsafe { *enabled = self.wheel.get().into() };
+            Ok(())
+        }
+
+        fn SetIsZoomControlEnabled(&self, enabled: windows_core::BOOL) -> windows_core::Result<()> {
+            self.wheel.set(enabled.as_bool());
+            Ok(())
+        }
+    }
+
+    impl ICoreWebView2Settings2_Impl for MockZoomSettings_Impl {
+        fn UserAgent(&self, _value: *mut windows_core::PWSTR) -> windows_core::Result<()> {
+            unused_zoom_setting()
+        }
+
+        fn SetUserAgent(&self, _value: &windows_core::PCWSTR) -> windows_core::Result<()> {
+            unused_zoom_setting()
+        }
+    }
+
+    impl ICoreWebView2Settings3_Impl for MockZoomSettings_Impl {
+        unused_zoom_bool_methods!(
+            AreBrowserAcceleratorKeysEnabled,
+            SetAreBrowserAcceleratorKeysEnabled
+        );
+    }
+
+    impl ICoreWebView2Settings4_Impl for MockZoomSettings_Impl {
+        unused_zoom_bool_methods!(
+            IsPasswordAutosaveEnabled, SetIsPasswordAutosaveEnabled;
+            IsGeneralAutofillEnabled, SetIsGeneralAutofillEnabled;
+        );
+    }
+
+    impl ICoreWebView2Settings5_Impl for MockZoomSettings_Impl {
+        fn IsPinchZoomEnabled(&self, enabled: *mut windows_core::BOOL) -> windows_core::Result<()> {
+            if enabled.is_null() {
+                return Err(windows_core::Error::from_hresult(windows_core::HRESULT(
+                    0x80004003u32 as i32, // E_POINTER
+                )));
+            }
+            // SAFETY: COM caller supplied a non-null BOOL output pointer.
+            unsafe { *enabled = self.pinch.get().into() };
+            Ok(())
+        }
+
+        fn SetIsPinchZoomEnabled(&self, enabled: windows_core::BOOL) -> windows_core::Result<()> {
+            self.pinch.set(enabled.as_bool());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn native_zoom_shipped_com_adapter_enables_both_settings() {
+        let settings5: ICoreWebView2Settings5 = MockZoomSettings::default().into();
+        let settings: ICoreWebView2Settings =
+            settings5.cast().expect("base Settings COM interface");
+        let mut wheel = windows_core::BOOL::default();
+        let mut pinch = windows_core::BOOL::default();
+        unsafe {
+            settings.IsZoomControlEnabled(&mut wheel).unwrap();
+            settings5.IsPinchZoomEnabled(&mut pinch).unwrap();
+        }
+        assert!(!wheel.as_bool());
+        assert!(!pinch.as_bool());
+
+        // Exercise the production adapter, including its QueryInterface to Settings5.
+        let errors = enable_native_zoom_with(&mut ComZoomControls(settings5.cast().unwrap()));
+        assert!(errors.is_empty(), "COM adapter failed: {errors:?}");
+        unsafe {
+            settings.IsZoomControlEnabled(&mut wheel).unwrap();
+            settings5.IsPinchZoomEnabled(&mut pinch).unwrap();
+        }
+        assert!(
+            wheel.as_bool(),
+            "production COM adapter left mouse zoom disabled"
+        );
+        assert!(
+            pinch.as_bool(),
+            "production COM adapter left pinch zoom disabled"
+        );
+    }
+
+    #[derive(Default)]
+    struct Controls {
+        calls: Vec<(&'static str, bool)>,
+        fail_wheel: bool,
+        fail_pinch: bool,
+    }
+    impl NativeZoomControls for Controls {
+        fn wheel(&mut self, enabled: bool) -> Result<(), String> {
+            self.calls.push(("wheel", enabled));
+            if self.fail_wheel {
+                Err("wheel failed".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn pinch(&mut self, enabled: bool) -> Result<(), String> {
+            self.calls.push(("pinch", enabled));
+            if self.fail_pinch {
+                Err("pinch failed".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn native_zoom_enables_mouse_and_touchpad_independently() {
+        for (wheel, pinch) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut controls = Controls {
+                fail_wheel: wheel,
+                fail_pinch: pinch,
+                ..Default::default()
+            };
+            let errors = enable_native_zoom_with(&mut controls);
+            assert_eq!(controls.calls, vec![("wheel", true), ("pinch", true)]);
+            assert_eq!(errors.len(), usize::from(wheel) + usize::from(pinch));
+        }
+    }
+
+    #[test]
+    fn native_zoom_ignores_programmatic_invalid_and_superseded_changes() {
+        let state = NativeZoomState::default();
+        state.set_programmatic(1.25);
+        assert!(state.observe(1.25, 1).is_none());
+        for factor in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
+            assert!(state.observe(factor, 1).is_none());
+        }
+        let Some(WebViewEvent::ZoomChanged {
+            factor, generation, ..
+        }) = state.observe(1.5, 1)
+        else {
+            panic!("mouse zoom did not reach app");
+        };
+        assert!(state.current(factor, generation, Some(1.5)));
+        // Um controlador fechado não muda o tracker nem invalida o gesto vivo.
+        let Some(WebViewEvent::ZoomChanged {
+            factor: old,
+            generation: old_generation,
+            ..
+        }) = state.observe(1.75, 2)
+        else {
+            panic!("fixture");
+        };
+        assert!(!state.current(old, old_generation, None));
+        assert!(state.current(factor, generation, Some(1.5)));
+        // Duas notificações do mesmo gesto: só vale o fator atual do COM.
+        assert!(!state.current(factor, generation, Some(2.0)));
+        let Some(WebViewEvent::ZoomChanged {
+            factor: next,
+            generation: next_generation,
+            ..
+        }) = state.observe(2.0, 1)
+        else {
+            panic!("second mouse zoom did not reach app");
+        };
+        assert!(state.current(next, next_generation, Some(2.0)));
+        state.set_programmatic(1.0);
+        assert!(!state.current(next, next_generation, Some(2.0)));
+        assert!(state.observe(1.0, 1).is_none());
     }
 }

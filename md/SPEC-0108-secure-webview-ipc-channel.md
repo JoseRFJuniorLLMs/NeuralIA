@@ -109,8 +109,10 @@ Nenhum script usa `window.ipc` (global do wry, envenenável pela página antes
 de ser lido tarde) nem `location.href` para ações.
 
 Todos os handlers que chamam `act` continuam a exigir `event.isTrusted`. Nenhum
-reage a uma mensagem da página em vez de um gesto: o ctrl+roda por cima de um
-iframe não faz zoom (gate `a_page_message_never_zooms_the_app_and_frames_forward_nothing`).
+reage a uma mensagem da página em vez de um gesto. Roda e pinça não mandam IPC:
+o WebView2 trata o zoom nativo, também nos iframes (gates
+`native_zoom_wheel_never_duplicates_page_ipc` e
+`a_page_message_never_zooms_the_app_and_frames_forward_nothing`).
 
 ### 3.3 Lado nativo
 

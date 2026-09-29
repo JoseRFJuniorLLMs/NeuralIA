@@ -272,20 +272,11 @@ fn spec_0103_product_gate_targets_the_shipped_javascript_timeline() {
 }
 
 #[test]
-fn every_neuralia_webview_keeps_app_mouse_zoom_and_enables_native_pinch() {
-    assert!(APP.contains("enable_native_pinch_zoom(webview)"));
-    assert!(APP.contains("ICoreWebView2Settings5"));
-    assert!(APP.contains("SetIsPinchZoomEnabled(true)"));
+fn no_page_wheel_handler_duplicates_native_zoom() {
     assert!(
-        !APP.contains("SetIsZoomControlEnabled(true)"),
-        "native browser zoom would duplicate NeuralIA mouse zoom"
+        !APP.contains("function wheelZoomAction("),
+        "page wheel handler duplicates native zoom"
     );
-    assert!(
-        APP.contains("function wheelZoomAction("),
-        "Ctrl+wheel must keep updating NeuralIA shared zoom ladder"
-    );
-    assert!(APP.contains("install_service_visual_script(webview, host)"));
-    assert!(APP.contains("AddScriptToExecuteOnDocumentCreated"));
 }
 
 #[test]

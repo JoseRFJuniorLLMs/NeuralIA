@@ -791,6 +791,7 @@ impl App {
     pub(in crate::windows_app) fn set_zoom(&mut self, zoom: f64) {
         self.zoom = zoom.clamp(ZOOM_STEPS[0], ZOOM_STEPS[ZOOM_STEPS.len() - 1]);
         let zoom = self.zoom;
+        self.native_zoom.set_programmatic(zoom);
         self.for_each_visible_webview(|webview| {
             let _ = webview.zoom(zoom);
         });
@@ -1017,7 +1018,10 @@ impl App {
 
     /// O WebView unico (Reader ou Full Web), ou as colunas que estao a ser
     /// vistas: em ecra completo so a expandida, nas tres colunas todas elas.
-    fn for_each_visible_webview(&self, mut action: impl FnMut(&WebView)) {
+    pub(in crate::windows_app) fn for_each_visible_webview(
+        &self,
+        mut action: impl FnMut(&WebView),
+    ) {
         if let Some(webview) = &self.webview {
             action(webview);
         }
