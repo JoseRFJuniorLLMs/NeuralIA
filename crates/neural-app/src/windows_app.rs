@@ -3258,9 +3258,9 @@ pub(in crate::windows_app) struct App {
     /// Estado nativo lido pela subclasse do EDIT da palette.
     pub(in crate::windows_app) palette_host: Box<PaletteHost>,
     pub(in crate::windows_app) config: CoreConfig,
-    /// SPEC-0102: so a raiz e o slot lazy do manager. O prefixo sublinhado
-    /// deixa explícito que nenhum fluxo de inferência consome packs ainda.
-    _local_models: crate::local_models::LocalModelPacks,
+    /// SPEC-0102: raiz + slot lazy do manager. O produto so toca neste
+    /// estado depois de um comando model:/modelo: explicitamente submetido.
+    pub(in crate::windows_app) local_models: crate::local_models::LocalModelPacks,
     /// O portao da persistencia (`crate::privacy`): dono do registo das
     /// lojas (a unica cunhagem do produto, feita no `App::new`) e dos
     /// escritores automaticos -- o historico, a memoria semantica e as
@@ -3485,7 +3485,7 @@ impl App {
             palette: None,
             palette_host,
             config,
-            _local_models: local_models,
+            local_models,
             privacy,
             timers,
             current_research: None,
