@@ -147,8 +147,9 @@ capability. It cannot navigate, click, execute page script or grant tools.
 
 Activation remains deliberately stricter than installation. The installed
 artifact must verify and the benchmark record must contain backend identity,
-sample count, embedding dimension, measured latency **and resident-model-byte
-evidence**. Older benchmark JSON without residency evidence fails closed.
+sample count, embedding dimension, measured latency and
+**resident-model-byte evidence**. Older benchmark JSON without residency
+evidence fails closed.
 A backend-specific benchmark harness can record zero resident model bytes when
 zero is the measured value, but absence of the measurement is not treated as
 zero.
