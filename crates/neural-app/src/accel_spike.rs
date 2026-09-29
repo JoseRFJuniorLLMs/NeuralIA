@@ -246,6 +246,8 @@ pub(crate) enum SpikeVerb {
     /// Navega a primeira coluna para a fixture de pesquisa que conserva o
     /// host oficial do Google AI Mode. So CI, sempre com DNS preso ao loopback.
     ResearchOpen(String),
+    /// Coloca o PrivacyGuard em Private no executavel CI-only.
+    ResearchPrivate,
     /// Abre um turno real, so do Google AI Mode, e inicia o leitor real do Consenso.
     ResearchStart,
     /// Chama o exportador real da sessao viva.
@@ -441,15 +443,18 @@ pub(crate) fn parse_spike_command(line: &str) -> Result<SpikeCommand, String> {
             }
             _ => return Err(format!("research-open so vale na Column: {line:?}")),
         },
-        "arm" | "focus" | "ping" | "research-start" | "research-export" if argument.is_some() => {
+        "arm" | "focus" | "ping" | "research-private" | "research-start" | "research-export"
+            if argument.is_some() =>
+        {
             return Err(format!("argumentos a mais: {line:?}"));
         }
         "arm" => SpikeVerb::Arm,
         "focus" => SpikeVerb::Focus,
         "ping" => SpikeVerb::Ping,
+        "research-private" if host == SpikeHost::Column => SpikeVerb::ResearchPrivate,
         "research-start" if host == SpikeHost::Column => SpikeVerb::ResearchStart,
         "research-export" if host == SpikeHost::Column => SpikeVerb::ResearchExport,
-        "research-start" | "research-export" => {
+        "research-private" | "research-start" | "research-export" => {
             return Err(format!("comando de pesquisa so vale na Column: {line:?}"));
         }
         "begin" => SpikeVerb::Begin(trial(argument)?),
@@ -892,11 +897,15 @@ mod tests {
             ))
         );
         assert_eq!(
-            parse_spike_command("16 research-start Column").map(|command| command.verb),
+            parse_spike_command("16 research-private Column").map(|command| command.verb),
+            Ok(SpikeVerb::ResearchPrivate)
+        );
+        assert_eq!(
+            parse_spike_command("17 research-start Column").map(|command| command.verb),
             Ok(SpikeVerb::ResearchStart)
         );
         assert_eq!(
-            parse_spike_command("17 research-export Column").map(|command| command.verb),
+            parse_spike_command("18 research-export Column").map(|command| command.verb),
             Ok(SpikeVerb::ResearchExport)
         );
 
@@ -924,8 +933,10 @@ mod tests {
             "1 research-open Column https://www.google.com:5123/search?udm=50",
             "1 research-open Column http://evilgoogle.com:5123/search?udm=50",
             "1 research-open External http://www.google.com:5123/search?udm=50",
+            "1 research-private External",
             "1 research-start External",
             "1 research-export Service",
+            "1 research-private Column extra",
             "1 research-start Column extra",
             "1 research-export Column extra",
         ] {
