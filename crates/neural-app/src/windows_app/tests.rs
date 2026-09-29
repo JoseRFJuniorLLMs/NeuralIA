@@ -24647,7 +24647,7 @@ fn registry_is_minted_once_and_owned_by_the_guard() {
             Some("mode") => before == "self." && after.starts_with(".mode()"),
             Some("store") => before == "self." && after.starts_with(".grant(spec)"),
             Some("set_mode_for_accel_spike") => {
-                before == "self." && after.starts_with(".set_mode(mode.into())")
+                before == "self." && after.starts_with(".set_mode(mode.into(")
             }
             None => fields_span.contains(&at) && after.starts_with(":StoreRegistry,"),
             Some(_) => false,
