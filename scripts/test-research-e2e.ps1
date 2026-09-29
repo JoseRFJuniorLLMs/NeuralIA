@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
     [switch]$ExpectPersistenceFailure,
+    [switch]$PrivateMode,
     [int]$TimeoutSec = 45
 )
 
@@ -11,6 +12,9 @@ param(
 # ao loopback. Assim o leitor real ainda passa por ProviderId::from_url e
 # column_answer_read, em vez de uma excecao de teste no validador.
 $ErrorActionPreference = "Stop"
+if ($ExpectPersistenceFailure -and $PrivateMode) {
+    throw "-ExpectPersistenceFailure e -PrivateMode sao modos de prova separados."
+}
 $exe = (Resolve-Path -LiteralPath $ExePath).Path
 $utf8 = [Text.UTF8Encoding]::new($false)
 $answer = "NEURALIA_SPEC0101_ANSWER_7F9C"
@@ -133,6 +137,13 @@ try {
         throw "A primeira coluna nao abriu: $($ping.detail)"
     }
 
+    if ($PrivateMode) {
+        $privateAck = Send-Command "research-private Column"
+        if ([string]$privateAck.detail -notmatch 'privacy=private') {
+            throw "O harness nao confirmou o modo privado: $($privateAck.detail)"
+        }
+    }
+
     Send-Command "research-open Column $fixtureUrl" | Out-Null
     Wait-Record {
         param($r)
@@ -140,6 +151,55 @@ try {
     } "NavigationCompleted da fixture Google" 30000 | Out-Null
 
     Send-Command "research-start Column" | Out-Null
+
+    if ($PrivateMode) {
+        $exportsRoot = Join-Path $dataDir "research-exports"
+        $automaticExports = @(Get-ChildItem -LiteralPath $exportsRoot -Filter *.md -File -ErrorAction SilentlyContinue)
+        if ($automaticExports.Count -ne 0) {
+            throw "Modo privado criou export automatico antes do pedido explicito: $($automaticExports[0].FullName)"
+        }
+
+        # O export explicito e permitido em qualquer modo (SPEC-0006). Alem de
+        # validar essa regra, ele prova que a resposta chegou a sessao viva; so
+        # depois disso a ausencia de JSON persistido e uma prova real do Private.
+        $markdown = $null
+        $markdownPath = $null
+        $watch.Restart()
+        while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+            $exportAck = Send-Command "research-export Column"
+            if ([string]$exportAck.detail -notmatch 'research-export id=([A-Za-z0-9_-]+)') {
+                throw "ACK do export privado nao trouxe id: $($exportAck.detail)"
+            }
+            $sessionId = $Matches[1]
+            $markdownPath = Join-Path $exportsRoot "$sessionId.md"
+            if (Test-Path -LiteralPath $markdownPath) {
+                $candidate = [IO.File]::ReadAllText($markdownPath, $utf8)
+                if ($candidate.Contains($answer) -and $candidate.Contains("Google IA") -and $candidate.Contains($source)) {
+                    $markdown = $candidate
+                    break
+                }
+            }
+            if ($process.HasExited) { throw "NeuralIA saiu antes de completar a sessao privada." }
+            Start-Sleep -Milliseconds 300
+        }
+        if (-not $markdown) {
+            throw "A sessao privada nao recebeu resposta/provedor/proveniencia pelo caminho real."
+        }
+
+        # save_session envia ao worker de memoria de forma assincrona. Espera
+        # mais um pouco depois de a resposta estar comprovadamente na sessao
+        # viva para apanhar qualquer escrita indevida tardia.
+        $watch.Restart()
+        while ($watch.Elapsed.TotalSeconds -lt 4) {
+            $persisted = Find-PersistedAnswer
+            if ($persisted) {
+                throw "Modo privado persistiu automaticamente a sessao em $($persisted.FullName)."
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        Write-Host "SPEC-0101 Private E2E: resposta ficou viva em memoria, sem persistencia/export automaticos; export explicito preservou provedor e proveniencia."
+        return
+    }
 
     $persisted = $null
     $watch.Restart()
