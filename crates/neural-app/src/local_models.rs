@@ -35,7 +35,9 @@ pub(crate) enum LocalModelOutcome {
 impl LocalModelOutcome {
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::Fallback { warning: Some(warning) } => {
+            Self::Fallback {
+                warning: Some(warning),
+            } => {
                 format!("Modelo local: fallback determinístico ({warning}).")
             }
             Self::Fallback { warning: None } => {
@@ -47,9 +49,7 @@ impl LocalModelOutcome {
             }
             Self::Activated { id } => format!("Model pack {id} ativado."),
             Self::Deactivated { changed: true } => "Model pack desativado.".to_string(),
-            Self::Deactivated { changed: false } => {
-                "Nenhum model pack estava ativo.".to_string()
-            }
+            Self::Deactivated { changed: false } => "Nenhum model pack estava ativo.".to_string(),
             Self::Uninstalled { id, removed: true } => {
                 format!("Model pack {id} removido; fallback determinístico ativo.")
             }
@@ -104,7 +104,9 @@ impl LocalModelPacks {
         let manifest: ModelPackManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|error| error.to_string())?;
         if !plain_filename(&manifest.file) {
-            return Err("arquivo do model pack deve ser um nome simples ao lado do manifest".into());
+            return Err(
+                "arquivo do model pack deve ser um nome simples ao lado do manifest".into(),
+            );
         }
         let parent = manifest_path
             .parent()
@@ -147,9 +149,7 @@ fn plain_filename(value: &str) -> bool {
         && !value.contains('\\')
 }
 
-pub(crate) fn parse_local_model_command(
-    input: &str,
-) -> Option<Result<LocalModelCommand, String>> {
+pub(crate) fn parse_local_model_command(input: &str) -> Option<Result<LocalModelCommand, String>> {
     let trimmed = input.trim();
     let rest = trimmed
         .strip_prefix("model:")
@@ -359,11 +359,8 @@ mod tests {
         let manifest_path = fixture.write_import();
 
         assert_eq!(
-            execute_local_model_command(
-                &mut packs,
-                LocalModelCommand::Install(manifest_path)
-            )
-            .unwrap(),
+            execute_local_model_command(&mut packs, LocalModelCommand::Install(manifest_path))
+                .unwrap(),
             LocalModelOutcome::Installed {
                 id: "semantic-small".into()
             }
@@ -468,8 +465,8 @@ mod tests {
         fs::write(&outside, MODEL).unwrap();
 
         let mut packs = fixture.packs();
-        let error = execute_local_model_command(&mut packs, LocalModelCommand::Install(path))
-            .unwrap_err();
+        let error =
+            execute_local_model_command(&mut packs, LocalModelCommand::Install(path)).unwrap_err();
         assert!(error.contains("nome simples"), "{error}");
         assert!(!fixture.data.join("model-packs").exists());
     }
