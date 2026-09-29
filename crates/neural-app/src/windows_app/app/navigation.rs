@@ -78,6 +78,7 @@ pub(in crate::windows_app) enum InputRoute {
     Agent(String),
     MemoryQuery(String),
     MemoryRebuild,
+    LocalModel(Result<crate::local_models::LocalModelCommand, String>),
     History,
     /// `tema:claro`, `tema:escuro`, `tema:sistema` (None: palavra desconhecida).
     Theme(Option<ThemeChoice>),
@@ -120,6 +121,9 @@ pub(in crate::windows_app) fn route_input(input: &str) -> InputRoute {
     // nunca aconteceu: procurava-se a palavra "rebuild" na memória e
     // anunciava-se "Buscando na memória local…".
     let trimmed = input.trim();
+    if let Some(command) = crate::local_models::parse_local_model_command(trimmed) {
+        return InputRoute::LocalModel(command);
+    }
     for (command, route) in [
         ("history:", InputRoute::History),
         ("research:compare", InputRoute::ResearchCompare),
@@ -436,6 +440,16 @@ impl App {
                 };
                 self.show_splash(text.to_string(), 3);
             }
+            InputRoute::LocalModel(Ok(command)) => {
+                match crate::local_models::execute_local_model_command(
+                    &mut self.local_models,
+                    command,
+                ) {
+                    Ok(outcome) => self.show_splash(outcome.message(), 4),
+                    Err(error) => self.show_native_error(error),
+                }
+            }
+            InputRoute::LocalModel(Err(error)) => self.show_splash(error, 5),
             InputRoute::History => self.show_recent_history(),
             InputRoute::Theme(Some(choice)) => self.choose_theme(choice),
             InputRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
