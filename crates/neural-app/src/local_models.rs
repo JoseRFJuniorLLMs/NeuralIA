@@ -1,15 +1,64 @@
-//! Product-side lifecycle adapter for SPEC-0102 optional model packs.
+//! Product lifecycle boundary for SPEC-0102 optional model packs.
 //!
-//! The adapter itself is cheap startup state: it stores only the pack root.
-//! `ModelPackManager` is constructed on the first explicit lifecycle action
-//! or when a feature actually asks to resolve the active pack. No inference
-//! backend is constructed here.
+//! Startup stores only a path. The manager is created on the first explicit
+//! model command, and this module never creates an inference backend or grants
+//! browser/agent authority to a model.
 
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Component, Path, PathBuf},
+};
 
 use neural_core::{
     LocalBenchmark, ModelPackActivation, ModelPackManager, ModelPackManifest, ModelPackSelection,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalModelCommand {
+    Status,
+    Install(PathBuf),
+    Activate(String),
+    Deactivate,
+    Uninstall(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LocalModelOutcome {
+    Fallback { warning: Option<String> },
+    Active { id: String, version: String },
+    Installed { id: String },
+    Activated { id: String },
+    Deactivated { changed: bool },
+    Uninstalled { id: String, removed: bool },
+}
+
+impl LocalModelOutcome {
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Fallback { warning: Some(warning) } => {
+                format!("Modelo local: fallback determinístico ({warning}).")
+            }
+            Self::Fallback { warning: None } => {
+                "Modelo local: fallback determinístico; nenhum pack ativo.".to_string()
+            }
+            Self::Active { id, version } => format!("Modelo local ativo: {id} v{version}."),
+            Self::Installed { id } => {
+                format!("Model pack {id} instalado; não foi ativado automaticamente.")
+            }
+            Self::Activated { id } => format!("Model pack {id} ativado."),
+            Self::Deactivated { changed: true } => "Model pack desativado.".to_string(),
+            Self::Deactivated { changed: false } => {
+                "Nenhum model pack estava ativo.".to_string()
+            }
+            Self::Uninstalled { id, removed: true } => {
+                format!("Model pack {id} removido; fallback determinístico ativo.")
+            }
+            Self::Uninstalled { id, removed: false } => {
+                format!("Model pack {id} não estava instalado.")
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct LocalModelPacks {
@@ -30,20 +79,42 @@ impl LocalModelPacks {
             .get_or_insert_with(|| ModelPackManager::new(self.root.clone()))
     }
 
-    /// Resolve only when a product feature actually needs local intelligence.
-    /// Missing/corrupt/stale packs remain a deterministic fallback.
+    /// No backend/model bytes are stored by this product adapter. It is useful
+    /// to expose this invariant to the real startup E2E instead of pretending
+    /// that an Option<ModelPackManager> is a memory measurement.
+    pub(crate) const fn resident_model_bytes(&self) -> usize {
+        0
+    }
+
+    pub(crate) fn manager_initialized(&self) -> bool {
+        self.manager.is_some()
+    }
+
+    /// Missing/corrupt/stale packs degrade to the deterministic fallback.
     pub(crate) fn resolve_for_task(&mut self) -> ModelPackSelection {
         self.manager().selection()
     }
 
-    /// Installation is deliberately an explicit product action. This function
-    /// never downloads anything and never activates the installed pack.
-    pub(crate) fn install_explicit(
-        &mut self,
-        manifest: &ModelPackManifest,
-        model_bytes: &[u8],
-    ) -> Result<PathBuf, String> {
-        self.manager().install(manifest, model_bytes)
+    /// Import a local manifest chosen by the user. The model named in the
+    /// manifest must be a sibling plain filename; traversal is rejected before
+    /// any model path is read. Core validates manifest/hash/license again.
+    fn install_manifest(&mut self, manifest_path: &Path) -> Result<String, String> {
+        let manifest_bytes = fs::read(manifest_path)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        let manifest: ModelPackManifest =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| error.to_string())?;
+        if !plain_filename(&manifest.file) {
+            return Err("arquivo do model pack deve ser um nome simples ao lado do manifest".into());
+        }
+        let parent = manifest_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let model_path = parent.join(&manifest.file);
+        let model_bytes =
+            fs::read(&model_path).map_err(|error| format!("{}: {error}", model_path.display()))?;
+        self.manager().install(&manifest, &model_bytes)?;
+        Ok(manifest.id)
     }
 
     pub(crate) fn record_benchmark_explicit(
@@ -54,23 +125,122 @@ impl LocalModelPacks {
         self.manager().record_benchmark(id, benchmark)
     }
 
-    /// Core activation refuses missing/invalid benchmark data before writing
-    /// active state. The adapter preserves that contract unchanged.
-    pub(crate) fn activate_explicit(&mut self, id: &str) -> Result<ModelPackActivation, String> {
+    fn activate_explicit(&mut self, id: &str) -> Result<ModelPackActivation, String> {
         self.manager().activate(id)
     }
 
-    pub(crate) fn deactivate_explicit(&mut self) -> Result<bool, String> {
+    fn deactivate_explicit(&mut self) -> Result<bool, String> {
         self.manager().deactivate()
     }
 
-    pub(crate) fn uninstall_explicit(&mut self, id: &str) -> Result<bool, String> {
+    fn uninstall_explicit(&mut self, id: &str) -> Result<bool, String> {
         self.manager().uninstall(id)
     }
+}
 
-    #[cfg(test)]
-    fn manager_initialized(&self) -> bool {
-        self.manager.is_some()
+fn plain_filename(value: &str) -> bool {
+    let mut components = Path::new(value).components();
+    matches!(components.next(), Some(Component::Normal(_)))
+        && components.next().is_none()
+        && !value.contains(':')
+        && !value.contains('/')
+        && !value.contains('\\')
+}
+
+pub(crate) fn parse_local_model_command(
+    input: &str,
+) -> Option<Result<LocalModelCommand, String>> {
+    let trimmed = input.trim();
+    let rest = trimmed
+        .strip_prefix("model:")
+        .or_else(|| trimmed.strip_prefix("modelo:"))?;
+
+    if rest.eq_ignore_ascii_case("status") || rest.eq_ignore_ascii_case("resolve") {
+        return Some(Ok(LocalModelCommand::Status));
+    }
+    if rest.eq_ignore_ascii_case("deactivate") || rest.eq_ignore_ascii_case("desativar") {
+        return Some(Ok(LocalModelCommand::Deactivate));
+    }
+
+    for (prefix, build) in [
+        (
+            "install:",
+            LocalModelCommand::Install as fn(PathBuf) -> LocalModelCommand,
+        ),
+        ("instalar:", LocalModelCommand::Install),
+    ] {
+        if let Some(value) = rest.strip_prefix(prefix) {
+            let path = value.trim().trim_matches('"').trim();
+            return Some(
+                (!path.is_empty())
+                    .then(|| build(PathBuf::from(path)))
+                    .ok_or_else(|| "informe o caminho do manifest.json".to_string()),
+            );
+        }
+    }
+    for prefix in ["activate:", "ativar:"] {
+        if let Some(value) = rest.strip_prefix(prefix) {
+            let id = value.trim();
+            return Some(
+                (!id.is_empty())
+                    .then(|| LocalModelCommand::Activate(id.to_string()))
+                    .ok_or_else(|| "informe o id do model pack".to_string()),
+            );
+        }
+    }
+    for prefix in ["uninstall:", "remover:"] {
+        if let Some(value) = rest.strip_prefix(prefix) {
+            let id = value.trim();
+            return Some(
+                (!id.is_empty())
+                    .then(|| LocalModelCommand::Uninstall(id.to_string()))
+                    .ok_or_else(|| "informe o id do model pack".to_string()),
+            );
+        }
+    }
+
+    Some(Err(
+        "Use model:status, model:install:<manifest>, model:activate:<id>, model:deactivate ou model:uninstall:<id>."
+            .to_string(),
+    ))
+}
+
+/// This is the same executor called by the shipped omnibox route. Keeping the
+/// decision here lets behavior tests exercise the production path instead of
+/// grepping source text.
+pub(crate) fn execute_local_model_command(
+    packs: &mut LocalModelPacks,
+    command: LocalModelCommand,
+) -> Result<LocalModelOutcome, String> {
+    match command {
+        LocalModelCommand::Status => {
+            let selection = packs.resolve_for_task();
+            Ok(match selection.active {
+                Some(active) => LocalModelOutcome::Active {
+                    id: active.manifest.id,
+                    version: active.manifest.version,
+                },
+                None => LocalModelOutcome::Fallback {
+                    warning: selection.warning,
+                },
+            })
+        }
+        LocalModelCommand::Install(path) => {
+            let id = packs.install_manifest(&path)?;
+            Ok(LocalModelOutcome::Installed { id })
+        }
+        LocalModelCommand::Activate(id) => {
+            let activation = packs.activate_explicit(&id)?;
+            Ok(LocalModelOutcome::Activated { id: activation.id })
+        }
+        LocalModelCommand::Deactivate => {
+            let changed = packs.deactivate_explicit()?;
+            Ok(LocalModelOutcome::Deactivated { changed })
+        }
+        LocalModelCommand::Uninstall(id) => {
+            let removed = packs.uninstall_explicit(&id)?;
+            Ok(LocalModelOutcome::Uninstalled { id, removed })
+        }
     }
 }
 
@@ -78,7 +248,6 @@ impl LocalModelPacks {
 mod tests {
     use super::*;
     use std::{
-        fs,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -88,7 +257,8 @@ mod tests {
     const MODEL_SHA256: &str = "357e5d6fafa34d27360fec24b4326d3534905e33c6acdee60198fb078b7b79e5";
 
     struct Fixture {
-        root: PathBuf,
+        data: PathBuf,
+        import: PathBuf,
     }
 
     impl Fixture {
@@ -102,17 +272,30 @@ mod tests {
                 "neuralia-local-model-packs-{}-{stamp}-{nonce}",
                 std::process::id()
             ));
-            Self { root }
+            Self {
+                data: root.join("data"),
+                import: root.join("import"),
+            }
         }
 
         fn packs(&self) -> LocalModelPacks {
-            LocalModelPacks::new(&self.root)
+            LocalModelPacks::new(&self.data)
+        }
+
+        fn write_import(&self) -> PathBuf {
+            fs::create_dir_all(&self.import).unwrap();
+            fs::write(self.import.join("semantic.bin"), MODEL).unwrap();
+            let path = self.import.join("manifest.json");
+            fs::write(&path, serde_json::to_vec_pretty(&manifest()).unwrap()).unwrap();
+            path
         }
     }
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
+            if let Some(root) = self.data.parent() {
+                let _ = fs::remove_dir_all(root);
+            }
         }
     }
 
@@ -139,87 +322,154 @@ mod tests {
     }
 
     #[test]
-    fn startup_state_does_not_construct_manager_or_touch_pack_directory() {
+    fn startup_state_has_zero_model_residency_and_does_no_pack_io() {
         let fixture = Fixture::new();
         let packs = fixture.packs();
-
+        assert_eq!(packs.resident_model_bytes(), 0);
         assert!(!packs.manager_initialized());
-        assert!(!fixture.root.join("model-packs").exists());
+        assert!(!fixture.data.join("model-packs").exists());
     }
 
     #[test]
-    fn activation_requires_a_recorded_benchmark() {
-        let fixture = Fixture::new();
-        let mut packs = fixture.packs();
-        let manifest = manifest();
-
-        packs.install_explicit(&manifest, MODEL).unwrap();
-        let error = packs.activate_explicit(&manifest.id).unwrap_err();
-
-        assert!(error.contains("benchmark"), "{error}");
-        let selection = packs.resolve_for_task();
-        assert!(selection.active.is_none());
-    }
-
-    #[test]
-    fn explicit_lifecycle_activates_then_uninstall_returns_to_fallback() {
-        let fixture = Fixture::new();
-        let mut packs = fixture.packs();
-        let manifest = manifest();
-
-        packs.install_explicit(&manifest, MODEL).unwrap();
-        packs
-            .record_benchmark_explicit(&manifest.id, &benchmark())
-            .unwrap();
-        packs.activate_explicit(&manifest.id).unwrap();
-
-        let selected = packs.resolve_for_task();
+    fn command_parser_is_closed_and_requires_explicit_actions() {
         assert_eq!(
-            selected
-                .active
-                .as_ref()
-                .map(|pack| pack.manifest.id.as_str()),
-            Some("semantic-small")
+            parse_local_model_command("model:status"),
+            Some(Ok(LocalModelCommand::Status))
         );
-        assert!(selected.warning.is_none());
-
-        assert!(packs.uninstall_explicit(&manifest.id).unwrap());
-        let fallback = packs.resolve_for_task();
-        assert!(fallback.active.is_none());
-        assert!(fallback.warning.is_none());
+        assert_eq!(
+            parse_local_model_command("modelo:desativar"),
+            Some(Ok(LocalModelCommand::Deactivate))
+        );
+        assert_eq!(parse_local_model_command("pesquisa comum"), None);
+        assert!(matches!(
+            parse_local_model_command("model:install:"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_local_model_command("model:qualquer-coisa"),
+            Some(Err(_))
+        ));
     }
 
     #[test]
-    fn corrupted_active_pack_degrades_to_diagnostic_fallback() {
+    fn shipped_executor_installs_without_auto_activation_and_requires_benchmark() {
         let fixture = Fixture::new();
         let mut packs = fixture.packs();
-        let manifest = manifest();
+        let manifest_path = fixture.write_import();
 
-        let model_path = packs.install_explicit(&manifest, MODEL).unwrap();
+        assert_eq!(
+            execute_local_model_command(
+                &mut packs,
+                LocalModelCommand::Install(manifest_path)
+            )
+            .unwrap(),
+            LocalModelOutcome::Installed {
+                id: "semantic-small".into()
+            }
+        );
+        assert_eq!(
+            execute_local_model_command(&mut packs, LocalModelCommand::Status).unwrap(),
+            LocalModelOutcome::Fallback { warning: None }
+        );
+        let error = execute_local_model_command(
+            &mut packs,
+            LocalModelCommand::Activate("semantic-small".into()),
+        )
+        .unwrap_err();
+        assert!(error.contains("benchmark"), "{error}");
+    }
+
+    #[test]
+    fn shipped_executor_activates_then_uninstall_returns_to_fallback() {
+        let fixture = Fixture::new();
+        let mut packs = fixture.packs();
+        let manifest_path = fixture.write_import();
+        execute_local_model_command(&mut packs, LocalModelCommand::Install(manifest_path)).unwrap();
         packs
-            .record_benchmark_explicit(&manifest.id, &benchmark())
+            .record_benchmark_explicit("semantic-small", &benchmark())
             .unwrap();
-        packs.activate_explicit(&manifest.id).unwrap();
-        fs::write(model_path, b"tampered").unwrap();
 
-        let fallback = packs.resolve_for_task();
-        assert!(fallback.active.is_none());
-        assert!(
-            fallback
-                .warning
-                .as_deref()
-                .is_some_and(|warning| warning.contains("hash")),
-            "{:?}",
-            fallback.warning
+        assert_eq!(
+            execute_local_model_command(
+                &mut packs,
+                LocalModelCommand::Activate("semantic-small".into())
+            )
+            .unwrap(),
+            LocalModelOutcome::Activated {
+                id: "semantic-small".into()
+            }
+        );
+        assert!(matches!(
+            execute_local_model_command(&mut packs, LocalModelCommand::Status).unwrap(),
+            LocalModelOutcome::Active { .. }
+        ));
+
+        assert_eq!(
+            execute_local_model_command(
+                &mut packs,
+                LocalModelCommand::Uninstall("semantic-small".into())
+            )
+            .unwrap(),
+            LocalModelOutcome::Uninstalled {
+                id: "semantic-small".into(),
+                removed: true
+            }
+        );
+        assert_eq!(
+            execute_local_model_command(&mut packs, LocalModelCommand::Status).unwrap(),
+            LocalModelOutcome::Fallback { warning: None }
         );
     }
 
     #[test]
-    fn deactivation_is_explicit_and_idempotent() {
+    fn shipped_status_degrades_corruption_to_diagnostic_fallback() {
         let fixture = Fixture::new();
         let mut packs = fixture.packs();
+        let manifest_path = fixture.write_import();
+        execute_local_model_command(&mut packs, LocalModelCommand::Install(manifest_path)).unwrap();
+        packs
+            .record_benchmark_explicit("semantic-small", &benchmark())
+            .unwrap();
+        execute_local_model_command(
+            &mut packs,
+            LocalModelCommand::Activate("semantic-small".into()),
+        )
+        .unwrap();
 
-        assert!(!packs.deactivate_explicit().unwrap());
-        assert!(!packs.deactivate_explicit().unwrap());
+        fs::write(
+            fixture
+                .data
+                .join("model-packs")
+                .join("semantic-small")
+                .join("semantic.bin"),
+            b"tampered",
+        )
+        .unwrap();
+
+        let status = execute_local_model_command(&mut packs, LocalModelCommand::Status).unwrap();
+        assert!(matches!(
+            status,
+            LocalModelOutcome::Fallback {
+                warning: Some(ref warning)
+            } if warning.contains("hash")
+        ));
+    }
+
+    #[test]
+    fn install_rejects_manifest_file_traversal_before_reading_outside_bundle() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.import).unwrap();
+        let mut bad = manifest();
+        bad.file = "../outside.bin".into();
+        let path = fixture.import.join("manifest.json");
+        fs::write(&path, serde_json::to_vec_pretty(&bad).unwrap()).unwrap();
+        let outside = fixture.import.parent().unwrap().join("outside.bin");
+        fs::write(&outside, MODEL).unwrap();
+
+        let mut packs = fixture.packs();
+        let error = execute_local_model_command(&mut packs, LocalModelCommand::Install(path))
+            .unwrap_err();
+        assert!(error.contains("nome simples"), "{error}");
+        assert!(!fixture.data.join("model-packs").exists());
     }
 }
