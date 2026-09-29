@@ -6,6 +6,7 @@
 
 use std::{
     fs,
+    io::Read,
     path::{Component, Path, PathBuf},
 };
 
@@ -66,6 +67,8 @@ pub(crate) struct LocalModelPacks {
     manager: Option<ModelPackManager>,
 }
 
+const MAX_IMPORT_MANIFEST_BYTES: u64 = 64 * 1024;
+
 impl LocalModelPacks {
     pub(crate) fn new(data_dir: &Path) -> Self {
         Self {
@@ -99,8 +102,16 @@ impl LocalModelPacks {
     /// manifest must be a sibling plain filename; traversal is rejected before
     /// any model path is read. Core validates manifest/hash/license again.
     fn install_manifest(&mut self, manifest_path: &Path) -> Result<String, String> {
-        let manifest_bytes = fs::read(manifest_path)
+        let manifest_file = fs::File::open(manifest_path)
             .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        let mut manifest_bytes = Vec::new();
+        manifest_file
+            .take(MAX_IMPORT_MANIFEST_BYTES + 1)
+            .read_to_end(&mut manifest_bytes)
+            .map_err(|error| format!("{}: {error}", manifest_path.display()))?;
+        if manifest_bytes.len() as u64 > MAX_IMPORT_MANIFEST_BYTES {
+            return Err("manifest do model pack excede 64 KiB".into());
+        }
         let manifest: ModelPackManifest =
             serde_json::from_slice(&manifest_bytes).map_err(|error| error.to_string())?;
         if !plain_filename(&manifest.file) {
@@ -113,9 +124,7 @@ impl LocalModelPacks {
             .filter(|path| !path.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let model_path = parent.join(&manifest.file);
-        let model_bytes =
-            fs::read(&model_path).map_err(|error| format!("{}: {error}", model_path.display()))?;
-        self.manager().install(&manifest, &model_bytes)?;
+        self.manager().install_from_file(&manifest, &model_path)?;
         Ok(manifest.id)
     }
 
@@ -375,6 +384,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("benchmark"), "{error}");
+    }
+
+    #[test]
+    fn oversized_import_manifest_is_rejected_before_pack_io() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(&fixture.import).unwrap();
+        let path = fixture.import.join("manifest.json");
+        fs::write(&path, vec![b' '; MAX_IMPORT_MANIFEST_BYTES as usize + 1]).unwrap();
+        let mut packs = fixture.packs();
+        let error =
+            execute_local_model_command(&mut packs, LocalModelCommand::Install(path)).unwrap_err();
+        assert!(error.contains("64 KiB"), "{error}");
+        assert!(!packs.manager_initialized());
+        assert!(!fixture.data.join("model-packs").exists());
     }
 
     #[test]
