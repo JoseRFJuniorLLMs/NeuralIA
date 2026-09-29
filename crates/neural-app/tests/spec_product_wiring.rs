@@ -196,20 +196,12 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
 }
 
 #[test]
-fn spec_0102_product_wires_model_pack_lifecycle_without_eager_manager_startup() {
+fn spec_0102_structural_absence_keeps_model_packs_lazy_and_without_browser_authority() {
+    // Positive lifecycle behavior is exercised by local_models unit tests and
+    // by windows_app::tests::route_input_sends_each_command_where_it_belongs.
+    // This wiring gate is deliberately only a negative/absence gate (§4.3).
     assert!(CORE_MEMORY.contains("hashed_embedding(&entity_text)"));
     assert!(LOCAL_INTELLIGENCE.contains("pub struct ModelPackManager"));
-
-    assert!(LOCAL_MODELS.contains("manager: Option<ModelPackManager>"));
-    assert!(LOCAL_MODELS.contains("get_or_insert_with(|| ModelPackManager::new"));
-    assert!(LOCAL_MODELS.contains("pub(crate) fn install_explicit("));
-    assert!(LOCAL_MODELS.contains("pub(crate) fn activate_explicit("));
-    assert!(LOCAL_MODELS.contains("pub(crate) fn uninstall_explicit("));
-    assert!(APP.contains("_local_models: crate::local_models::LocalModelPacks"));
-    assert!(APP.contains(
-        "let local_models = crate::local_models::LocalModelPacks::new(&config.data_dir);"
-    ));
-    assert!(APP.contains("_local_models: local_models"));
 
     let constructor = between(
         LOCAL_MODELS,
@@ -218,9 +210,28 @@ fn spec_0102_product_wires_model_pack_lifecycle_without_eager_manager_startup() 
     );
     assert!(
         !constructor.contains("ModelPackManager::new"),
-        "startup state must not instantiate the model-pack manager"
+        "startup adapter must not instantiate the model-pack manager"
     );
+
+    for forbidden in [
+        "TcpStream",
+        "UdpSocket",
+        "reqwest",
+        "ureq",
+        "WebView",
+        "BrowserAgent",
+        "AgentPermissionPolicy",
+        "AgentSecurityAction",
+        "execute_script",
+        "navigate(",
+    ] {
+        assert!(
+            !LOCAL_MODELS.contains(forbidden),
+            "model-pack lifecycle gained network/browser/agent authority: {forbidden}"
+        );
+    }
 }
+
 
 /// O orcamento de contexto (`neural_core::context_budget`, plano 2.5) e
 /// biblioteca do core: o consenso e o primeiro a chama-lo, mais tarde.
