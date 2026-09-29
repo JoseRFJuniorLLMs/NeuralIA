@@ -45,10 +45,12 @@ num processo de inferência permanente.
   mantêm proveniência. `research:compare`, `research:synthesize` e
   `research:export` comparam, sintetizam e exportam a sessão em Markdown.
 - **Inteligência local opcional:** embeddings/classificação/entidades/resumos
-  possuem fallback determinístico sem modelo. O lifecycle de model packs já tem
-  um adaptador lazy no produto para manifesto, checksum, instalação/remoção,
-  benchmark e ativação explícita; nenhum backend de inferência é criado no
-  startup nem carregado automaticamente.
+  possuem fallback determinístico sem modelo. Model packs têm lifecycle lazy e
+  explícito pela omnibox (`model:status`, `model:install:<manifest>`,
+  `model:activate:<id>`, `model:deactivate`, `model:uninstall:<id>`):
+  instalação não ativa sozinha, ativação exige benchmark com latência e
+  residência medidas, e corrupção volta ao fallback com diagnóstico. Nenhum
+  backend de inferência é criado no startup ou recebe autoridade de navegador.
 - **Timeline semântica:** perguntas, respostas, títulos, código, tabelas,
   citações, fontes e conclusões viram âncoras navegáveis.
 - **Agente Web limitado:** `agent:https://site | search=texto | click=botão |
