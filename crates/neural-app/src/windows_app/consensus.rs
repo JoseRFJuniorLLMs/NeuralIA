@@ -1111,6 +1111,10 @@ pub(in crate::windows_app) struct ConsensusState {
     pub(in crate::windows_app) reads: PageReads,
     pub(in crate::windows_app) run: Option<ConsensusRun>,
     next_run: u64,
+    /// Se o run vivo deve produzir a caixa nativa de comparação ao terminar.
+    /// O produto usa `true`; o E2E accel-spike usa `false` para não bloquear
+    /// o event loop numa caixa modal antes de validar o export.
+    report: bool,
     worker: Option<LazyWorker<ConsensusJob>>,
 }
 
@@ -1126,6 +1130,7 @@ impl ConsensusState {
             reads: PageReads::default(),
             run: None,
             next_run: 0,
+            report: true,
             worker: None,
         }
     }
@@ -1136,8 +1141,9 @@ impl ConsensusState {
         self.worker.as_ref().map_or(0, LazyWorker::threads_spawned)
     }
 
-    /// Um run novo do turno `turn` da sessao `session` sobre `hosts`; o
-    /// anterior, se havia, cai com as suas leituras em voo.
+    /// Wrapper dos gates unitarios: o produto usa `begin_run_with_report`
+    /// para poder suprimir apenas a caixa modal do harness CI.
+    #[cfg(test)]
     pub(in crate::windows_app) fn begin_run(
         &mut self,
         session: &str,
@@ -1145,9 +1151,21 @@ impl ConsensusState {
         started: Instant,
         hosts: impl IntoIterator<Item = (WebViewHost, u64)>,
     ) -> u64 {
+        self.begin_run_with_report(session, turn, started, hosts, true)
+    }
+
+    fn begin_run_with_report(
+        &mut self,
+        session: &str,
+        turn: u32,
+        started: Instant,
+        hosts: impl IntoIterator<Item = (WebViewHost, u64)>,
+        report: bool,
+    ) -> u64 {
         self.reads.cancel_all();
         self.next_run = self.next_run.wrapping_add(1).max(1);
         let id = self.next_run;
+        self.report = report;
         self.run = Some(ConsensusRun::begin(id, session, turn, started, hosts));
         id
     }
@@ -1247,6 +1265,15 @@ impl App {
     /// (`consensus_hosts`). Sem sessao ou sem colunas a vista, diz porque.
     /// Devolve se um run comecou.
     pub(in crate::windows_app) fn read_consensus(&mut self) -> bool {
+        self.read_consensus_with_report(true)
+    }
+
+    #[cfg(feature = "accel-spike")]
+    pub(in crate::windows_app) fn read_consensus_without_report(&mut self) -> bool {
+        self.read_consensus_with_report(false)
+    }
+
+    fn read_consensus_with_report(&mut self, report: bool) -> bool {
         let Some(session) = self.current_research.as_ref() else {
             self.show_native_text(CONSENSUS_TITLE, CONSENSUS_NO_SESSION);
             return false;
@@ -1286,9 +1313,9 @@ impl App {
             self.show_native_text(CONSENSUS_TITLE, CONSENSUS_NO_COLUMNS);
             return false;
         }
-        let id = self
-            .consensus
-            .begin_run(&session_id, turn, Instant::now(), hosts);
+        let id =
+            self.consensus
+                .begin_run_with_report(&session_id, turn, Instant::now(), hosts, report);
         debug_log(format_args!("consensus: run {id} do turno {turn} começou"));
         self.show_splash(CONSENSUS_READING.to_string(), 2);
         self.consensus_poll(id);
@@ -1468,10 +1495,11 @@ impl App {
     /// Todas as colunas acabaram: grava o run (`record_consensus`) e manda
     /// a comparacao para a thread.
     fn finish_consensus_run(&mut self) {
+        let report = self.consensus.report;
         let Some(run) = self.consensus.run.take() else {
             return;
         };
-        self.record_consensus(&run, true);
+        self.record_consensus(&run, report);
     }
 
     /// Grava um run na sessao viva (`record_consensus_run`: as tentativas no

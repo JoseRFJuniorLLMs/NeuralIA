@@ -243,6 +243,13 @@ pub(crate) enum SpikeVerb {
     /// comandos (o `hello` sai no `resumed`, antes de o comparador do
     /// `NEURALIA_STARTUP_INPUT` se construir) e se o hospedeiro esta aberto.
     Ping,
+    /// Navega a primeira coluna para a fixture de pesquisa que conserva o
+    /// host oficial do Google AI Mode. So CI, sempre com DNS preso ao loopback.
+    ResearchOpen(String),
+    /// Abre um turno real, so do Google AI Mode, e inicia o leitor real do Consenso.
+    ResearchStart,
+    /// Chama o exportador real da sessao viva.
+    ResearchExport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,38 +259,73 @@ pub(crate) struct SpikeCommand {
     pub(crate) verb: SpikeVerb,
 }
 
-/// So a fixture do condutor: `http://127.0.0.1:<porta>/...`. O exe do
-/// spike nunca abre outro endereco por um comando.
+/// Uma origem de fixture que o condutor pode autorizar: HTTP, porta explicita,
+/// sem credenciais. O host e validado separadamente antes de a origem ser
+/// guardada; depois a navegacao fica presa exatamente a essa origem.
+fn command_fixture_origin(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if parsed.scheme() != "http"
+        || parsed.port().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+/// So a fixture normal do condutor: `http://127.0.0.1:<porta>/...`.
 pub(crate) fn is_loopback_fixture(url: &str) -> bool {
     let Ok(parsed) = Url::parse(url) else {
         return false;
     };
-    parsed.scheme() == "http"
-        && matches!(parsed.host(), Some(Host::Ipv4(ip)) if ip.is_loopback() && ip.octets() == [127, 0, 0, 1])
-        && parsed.port().is_some()
-        && parsed.username().is_empty()
-        && parsed.password().is_none()
+    command_fixture_origin(url).is_some()
+        && matches!(
+            parsed.host(),
+            Some(Host::Ipv4(ip)) if ip.is_loopback() && ip.octets() == [127, 0, 0, 1]
+        )
 }
 
-/// A origem (`http://127.0.0.1:<porta>`) de uma URL da fixture; `None` para
-/// qualquer outra URL.
-pub(crate) fn fixture_origin(url: &str) -> Option<String> {
-    if !is_loopback_fixture(url) {
-        return None;
+/// A fixture da SPEC-0101 conserva o host que o validador REAL do Consenso
+/// exige. O workflow prende este nome a 127.0.0.1 antes de abrir o exe.
+pub(crate) fn is_research_fixture(url: &str) -> bool {
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if command_fixture_origin(url).is_none() {
+        return false;
     }
-    Url::parse(url)
-        .ok()
-        .map(|parsed| parsed.origin().ascii_serialization())
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let udm = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "udm")
+        .map(|(_, value)| value.into_owned());
+    matches!(host.as_str(), "google.com" | "www.google.com") && udm.as_deref() == Some("50")
 }
 
-/// A excecao de navegacao da coluna, so no exe do spike: a coluna pode ir
-/// para `target` quando o condutor ja pediu a fixture nela (`open Column
-/// <url>`, que guarda a origem em `fixture`) e `target` e exatamente dessa
-/// origem -- http, 127.0.0.1 e a porta da fixture. Tudo o resto fica com o
-/// gate que embarca (`comparator_webview_builder`), que este codigo nao
-/// toca; sem o pedido do condutor nem a fixture passa.
+/// A origem (`http://127.0.0.1:<porta>`) de uma URL da fixture normal.
+pub(crate) fn fixture_origin(url: &str) -> Option<String> {
+    if is_loopback_fixture(url) {
+        command_fixture_origin(url)
+    } else {
+        None
+    }
+}
+
+/// A origem da fixture de pesquisa, so depois da validacao Google + udm=50.
+pub(crate) fn research_fixture_origin(url: &str) -> Option<String> {
+    if is_research_fixture(url) {
+        command_fixture_origin(url)
+    } else {
+        None
+    }
+}
+
+/// A excecao de navegacao da coluna, so no exe do spike: uma origem so passa
+/// depois de ter sido pedida explicitamente pelo condutor. O alvo continua
+/// preso a HTTP + porta + sem credenciais e a origem tem de ser identica.
 pub(crate) fn column_fixture_navigation(target: &str, fixture: Option<&str>) -> bool {
-    match (fixture, fixture_origin(target)) {
+    match (fixture, command_fixture_origin(target)) {
         (Some(allowed), Some(origin)) => origin == allowed,
         _ => false,
     }
@@ -312,6 +354,14 @@ impl ColumnFixture {
     /// e a fixture de 127.0.0.1 (nada passa).
     pub(crate) fn request(&mut self, url: &str) -> Option<&str> {
         self.origin = fixture_origin(url);
+        self.navigation = None;
+        self.origin.as_deref()
+    }
+
+    /// A mesma excecao, mas para a fixture SPEC-0101 com o host oficial do
+    /// Google. So nasce por `research-open`; o `open` normal nao a aceita.
+    pub(crate) fn request_research(&mut self, url: &str) -> Option<&str> {
+        self.origin = research_fixture_origin(url);
         self.navigation = None;
         self.origin.as_deref()
     }
@@ -382,12 +432,26 @@ pub(crate) fn parse_spike_command(line: &str) -> Result<SpikeCommand, String> {
             }
             None => SpikeVerb::Open(None),
         },
-        "arm" | "focus" | "ping" if argument.is_some() => {
+        "research-open" => match (host, argument) {
+            (SpikeHost::Column, Some(url)) if is_research_fixture(url) => {
+                SpikeVerb::ResearchOpen(url.to_string())
+            }
+            (SpikeHost::Column, Some(_)) => {
+                return Err(format!("fixture de pesquisa invalida: {line:?}"));
+            }
+            _ => return Err(format!("research-open so vale na Column: {line:?}")),
+        },
+        "arm" | "focus" | "ping" | "research-start" | "research-export" if argument.is_some() => {
             return Err(format!("argumentos a mais: {line:?}"));
         }
         "arm" => SpikeVerb::Arm,
         "focus" => SpikeVerb::Focus,
         "ping" => SpikeVerb::Ping,
+        "research-start" if host == SpikeHost::Column => SpikeVerb::ResearchStart,
+        "research-export" if host == SpikeHost::Column => SpikeVerb::ResearchExport,
+        "research-start" | "research-export" => {
+            return Err(format!("comando de pesquisa so vale na Column: {line:?}"));
+        }
         "begin" => SpikeVerb::Begin(trial(argument)?),
         "pull" => SpikeVerb::Pull(trial(argument)?),
         _ => return Err(format!("verbo desconhecido: {line:?}")),
@@ -818,6 +882,23 @@ mod tests {
             parse_spike_command("2 ping External").map(|command| command.verb),
             Ok(SpikeVerb::Ping)
         );
+        assert_eq!(
+            parse_spike_command(
+                "15 research-open Column http://www.google.com:5123/search?udm=50&q=e2e"
+            )
+            .map(|command| command.verb),
+            Ok(SpikeVerb::ResearchOpen(
+                "http://www.google.com:5123/search?udm=50&q=e2e".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_spike_command("16 research-start Column").map(|command| command.verb),
+            Ok(SpikeVerb::ResearchStart)
+        );
+        assert_eq!(
+            parse_spike_command("17 research-export Column").map(|command| command.verb),
+            Ok(SpikeVerb::ResearchExport)
+        );
 
         for refused in [
             "",
@@ -839,9 +920,53 @@ mod tests {
             "1 ping Column extra",
             "1 ping",
             "1 ping Tab",
+            "1 research-open Column http://www.google.com:5123/search?udm=14",
+            "1 research-open Column https://www.google.com:5123/search?udm=50",
+            "1 research-open Column http://evilgoogle.com:5123/search?udm=50",
+            "1 research-open External http://www.google.com:5123/search?udm=50",
+            "1 research-start External",
+            "1 research-export Service",
+            "1 research-start Column extra",
+            "1 research-export Column extra",
         ] {
             assert!(parse_spike_command(refused).is_err(), "{refused:?}");
         }
+    }
+
+    #[test]
+    fn research_fixture_keeps_real_google_validation_but_only_after_explicit_request() {
+        let url = "http://www.google.com:5123/search?udm=50&q=e2e";
+        assert!(is_research_fixture(url));
+        assert_eq!(
+            research_fixture_origin(url).as_deref(),
+            Some("http://www.google.com:5123")
+        );
+        for refused in [
+            "http://www.google.com:5123/search?udm=14",
+            "http://www.google.com:5123/search?udm=14&udm=50&q=e2e",
+            "https://www.google.com:5123/search?udm=50",
+            "http://google.evil.test:5123/search?udm=50",
+            "http://user@www.google.com:5123/search?udm=50",
+            "http://www.google.com/search?udm=50",
+            "http://127.0.0.1:5123/search?udm=50",
+        ] {
+            assert!(!is_research_fixture(refused), "{refused}");
+            assert_eq!(research_fixture_origin(refused), None, "{refused}");
+        }
+
+        let mut state = ColumnFixture::NONE;
+        assert!(
+            !state.starting(url, 1),
+            "sem pedido a origem nao pode passar"
+        );
+        assert_eq!(
+            state.request_research(url),
+            Some("http://www.google.com:5123")
+        );
+        assert!(state.starting(url, 2));
+        assert!(state.starting("http://www.google.com:5123/other?still=same-origin", 3));
+        assert!(!state.starting("http://google.com:5123/search?udm=50", 4));
+        assert!(!state.starting("http://www.google.com:6000/search?udm=50", 5));
     }
 
     #[test]
