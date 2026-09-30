@@ -126,8 +126,7 @@ core tests and by the product-wiring gate in
 The product now has a **product-side lazy adapter** for `ModelPackManager`.
 `App::new` asks the `PrivacyGuard` for the declared `MODEL_PACKS_STORE`
 (`Explicit`) grant, and the adapter keeps that capability plus an empty manager
-slot. Requesting the grant performs no pack I/O: there is **no inference-backend
-construction**, no model-byte allocation and no pack filesystem access during
+slot. Requesting the grant performs no pack I/O: there is **no inference-backend construction**, no model-byte allocation and no pack filesystem access during
 Home startup. `ModelPackManager` is created lazily from the grant-rooted path on
 the first explicit model action. A CI-only startup probe observes that same
 `App` state before the first model command.
