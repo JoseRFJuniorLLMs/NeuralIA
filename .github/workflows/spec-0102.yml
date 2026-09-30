@@ -175,6 +175,7 @@ jobs:
           cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
           cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
           cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+          cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
 
       - name: Sabotage bounded on-disk model metadata reads
         shell: bash
@@ -243,6 +244,32 @@ jobs:
             exit 1
           fi
           echo "Sabotage proof: oversized metadata writes were rejected."
+
+      - name: Sabotage staged model hash must reject publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = 'if !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {'
+          new = 'if false && !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {'
+          if s.count(old) != 1:
+              raise SystemExit("staged-hash sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Staged-hash sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: a mismatched staged model cannot be published."
 
       - name: Sabotage manifest-license validation
         shell: bash
@@ -427,3 +454,4 @@ jobs:
           cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
           cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
           cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+          cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
