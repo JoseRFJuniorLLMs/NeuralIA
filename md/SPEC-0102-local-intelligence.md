@@ -146,9 +146,12 @@ Lifecycle actions are reachable only from explicit omnibox commands:
 There is no automatic download or activation. Import rejects a manifest whose
 model filename can escape the selected bundle before reading that model path.
 Model files over 64 MiB are rejected before staging or verification; the copy
-and hash loops also enforce this ceiling if a file grows during import. Import
-still runs on the UI event loop without progress or cancellation; moving that
-work off the event loop remains open in #220.
+and hash loops also enforce this ceiling if a file grows during import. Copy
+and hash work runs on a dedicated worker, with completion returned to the
+native event loop. Commands are serialized while a worker runs. Import has no
+progress indicator or cancellation yet; that product work remains open in #220.
+Normal App shutdown waits for an in-flight model operation to finish so it
+cannot leave a partially published pack behind.
 The lifecycle adapter has no network, WebView, browser-agent or permission
 capability. It cannot navigate, click, execute page script or grant tools.
 

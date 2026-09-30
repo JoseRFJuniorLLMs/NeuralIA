@@ -441,12 +441,16 @@ impl App {
                 self.show_splash(text.to_string(), 3);
             }
             InputRoute::LocalModel(Ok(command)) => {
-                match crate::local_models::execute_local_model_command(
+                let proxy = self.proxy.clone();
+                match crate::local_models::dispatch_local_model_command(
                     &mut self.local_models,
                     command,
+                    move |result| {
+                        let _ = proxy.send_event(UserEvent::LocalModelFinished(result));
+                    },
                 ) {
-                    Ok(outcome) => self.show_splash(outcome.message(), 4),
-                    Err(error) => self.show_native_error(error),
+                    Ok(()) => self.show_splash("Model pack: operação em andamento…".to_string(), 3),
+                    Err(error) => self.show_splash(format!("Model pack: {error}"), 5),
                 }
             }
             InputRoute::LocalModel(Err(error)) => self.show_splash(error, 5),

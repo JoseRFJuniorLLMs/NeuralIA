@@ -100,6 +100,8 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
+    /// Resultado do worker de model packs; o event loop continua responsivo durante I/O.
+    LocalModelFinished(Result<crate::local_models::LocalModelOutcome, String>),
     /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
     /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
     Theme(ThemeEvent),

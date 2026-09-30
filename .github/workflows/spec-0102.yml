@@ -11,6 +11,7 @@ on:
       - 'crates/neural-app/src/main.rs'
       - 'crates/neural-app/src/windows_app.rs'
       - 'crates/neural-app/src/windows_app/app/navigation.rs'
+      - 'crates/neural-app/src/windows_app/app/event_loop.rs'
       - 'crates/neural-app/src/windows_app/tests.rs'
       - 'crates/neural-app/tests/spec_product_wiring.rs'
       - 'crates/neural-app/tests/docs_truth.rs'
@@ -28,6 +29,7 @@ on:
       - 'crates/neural-app/src/main.rs'
       - 'crates/neural-app/src/windows_app.rs'
       - 'crates/neural-app/src/windows_app/app/navigation.rs'
+      - 'crates/neural-app/src/windows_app/app/event_loop.rs'
       - 'crates/neural-app/src/windows_app/tests.rs'
       - 'crates/neural-app/tests/spec_product_wiring.rs'
       - 'crates/neural-app/tests/docs_truth.rs'
@@ -65,6 +67,90 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p neural-app route_input_sends_each_command_where_it_belongs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app model_work_runs_off_the_caller_thread
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app model_worker_panic_still_notifies_error
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app shipped_dispatch_serializes_commands_and_returns_worker_result
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app model_pack_drop_waits_for_inflight_worker
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Sabotage synchronous model work must turn the worker gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = '    thread::Builder::new()'
+          $new = "    let result = work();`n    thread::Builder::new()"
+          $spawnOld = '.spawn(move || notify(work()))'
+          $spawnNew = '.spawn(move || notify(result))'
+          if (($text.Split($old).Count - 1) -ne 1 -or ($text.Split($spawnOld).Count - 1) -ne 1) {
+            throw "model worker sabotage anchors"
+          }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new).Replace($spawnOld, $spawnNew))
+            cargo test --locked -p neural-app model_work_runs_off_the_caller_thread
+            if ($LASTEXITCODE -eq 0) { throw "synchronous model work stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage model worker shutdown must turn the close gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = '            let _ = worker.join();'
+          $new = '            drop(worker);'
+          if (($text.Split($old).Count - 1) -ne 1) { throw "model worker shutdown sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app model_pack_drop_waits_for_inflight_worker
+            if ($LASTEXITCODE -eq 0) { throw "detached model worker stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage shipped omnibox route must reject synchronous model I/O
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/windows_app/app/navigation.rs"
+          $original = [IO.File]::ReadAllText($path)
+          $text = $original.Replace("`r`n", "`n")
+          $old = @'
+                          let proxy = self.proxy.clone();
+                          match crate::local_models::dispatch_local_model_command(
+                              &mut self.local_models,
+                              command,
+                              move |result| {
+                                  let _ = proxy.send_event(UserEvent::LocalModelFinished(result));
+                              },
+                          ) {
+                              Ok(()) => self.show_splash("Model pack: operação em andamento…".to_string(), 3),
+          '@
+          $new = @'
+                          match crate::local_models::execute_local_model_command(
+                              &mut self.local_models,
+                              command,
+                          ) {
+                              Ok(outcome) => self.show_splash(outcome.message(), 4),
+          '@
+          $old = $old.Replace("`r`n", "`n")
+          $new = $new.Replace("`r`n", "`n")
+          if (($text.Split($old).Count - 1) -ne 1) { throw "shipped model route sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            $output = (& cargo check --locked -p neural-app 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -or $output -notmatch 'cannot find function `execute_local_model_command`') {
+              throw "synchronous shipped route did not fail at the private executor barrier: $output"
+            }
+          } finally {
+            [IO.File]::WriteAllText($path, $original)
+          }
+          git diff --exit-code -- $path
       - name: Sabotage eager manager startup must turn the startup gate red
         shell: pwsh
         run: |
