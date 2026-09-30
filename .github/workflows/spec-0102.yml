@@ -169,6 +169,80 @@ jobs:
           cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
           cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
           cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
+          cargo test --locked -p neural-core oversized_installed_manifest_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_benchmark_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_active_record_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
+          cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
+          cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+
+      - name: Sabotage bounded on-disk model metadata reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          changes = (
+              (
+                  'if file.metadata().map_err(|error| error.to_string())?.len() > limit {',
+                  'if false && file.metadata().map_err(|error| error.to_string())?.len() > limit {',
+              ),
+              (
+                  'if bytes.len() as u64 > limit {',
+                  'if false && bytes.len() as u64 > limit {',
+              ),
+          )
+          for old, new in changes:
+              if s.count(old) != 1:
+                  raise SystemExit("bounded metadata sabotage anchor not found exactly once")
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core oversized_installed_manifest_is_rejected_before_deserialization
+          manifest_rc=$?
+          cargo test --locked -p neural-core oversized_benchmark_is_rejected_before_deserialization
+          benchmark_rc=$?
+          cargo test --locked -p neural-core oversized_active_record_is_rejected_before_deserialization
+          active_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$manifest_rc" -eq 0 ] || [ "$benchmark_rc" -eq 0 ] || [ "$active_rc" -eq 0 ]; then
+            echo "Bounded metadata sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: oversized installed metadata was rejected."
+
+      - name: Sabotage bounded model metadata writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = 'if chunk.len() > self.limit - self.bytes.len() {'
+          new = 'if false && chunk.len() > self.limit - self.bytes.len() {'
+          if s.count(old) != 1:
+              raise SystemExit("bounded JSON writer sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
+          manifest_rc=$?
+          cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
+          benchmark_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$manifest_rc" -eq 0 ] || [ "$benchmark_rc" -eq 0 ]; then
+            echo "Bounded metadata write sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: oversized metadata writes were rejected."
 
       - name: Sabotage manifest-license validation
         shell: bash
@@ -294,11 +368,7 @@ jobs:
           from pathlib import Path
           p = Path("crates/neural-core/src/local_intelligence.rs")
           s = p.read_text(encoding="utf-8")
-          old = '''        if self
-                      .read_activation()?
-                      .as_ref()
-                      .is_some_and(|activation| activation.id == id)
-                  {
+          old = '''        if clear_active {
                       self.deactivate()?;
                   }
 
@@ -318,6 +388,32 @@ jobs:
           fi
           echo "Sabotage proof: uninstall without deactivation was rejected."
 
+      - name: Sabotage cleanup after corrupt active state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '            Err(_) => true,'
+          new = '            Err(error) => return Err(error),'
+          if s.count(old) != 1:
+              raise SystemExit("corrupt active cleanup sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Corrupt active cleanup sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: corrupt active state did not block uninstall."
+
       - name: Restored SPEC-0102 lifecycle tests are green
         run: |
           cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
@@ -325,3 +421,9 @@ jobs:
           cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
           cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
           cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
+          cargo test --locked -p neural-core oversized_installed_manifest_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_benchmark_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_active_record_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
+          cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
+          cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
