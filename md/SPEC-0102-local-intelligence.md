@@ -128,9 +128,11 @@ The product now has a **product-side lazy adapter** for `ModelPackManager`.
 (`Explicit`) grant, and the adapter keeps that capability plus an empty manager
 slot. Requesting the grant performs no pack I/O: there is **no inference-backend construction**, no model-byte allocation and no pack filesystem access during
 Home startup. `ModelPackManager` is created lazily from the grant-rooted path on
-the first explicit model action. The current gate proves the product adapter
-starts with zero resident model bytes and performs no pack I/O, but it does **not**
-construct the full `App`; whole-App startup residency therefore remains unproven.
+the first explicit model action. The CI startup E2E launches the full `App`
+with an isolated data directory before any model command and requires
+`resident_model_bytes=0`, `manager_initialized=false`, and no `model-packs/`
+directory. This proves the shipped App path has not initialized or loaded a
+model at startup; it is not a claim about unrelated process working-set memory.
 
 Lifecycle actions are reachable only from explicit omnibox commands:
 
