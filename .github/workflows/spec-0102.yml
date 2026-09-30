@@ -176,6 +176,72 @@ jobs:
           cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
           cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
           cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
+          cargo test --locked -p neural-core oversized_file_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core oversized_installed_pack_is_rejected_before_hashing
+          cargo test --locked -p neural-core oversized_bytes_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core growing_model_copy_stops_at_byte_limit
+          cargo test --locked -p neural-core growing_model_hash_stops_at_byte_limit
+
+      - name: Sabotage model-pack byte limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = 'if bytes > limit {'
+          new = 'if false && bytes > limit {'
+          if s.count(old) != 1:
+              raise SystemExit("model-pack size sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core oversized_file_pack_is_rejected_before_staging
+          import_rc=$?
+          cargo test --locked -p neural-core oversized_installed_pack_is_rejected_before_hashing
+          verify_rc=$?
+          cargo test --locked -p neural-core oversized_bytes_pack_is_rejected_before_staging
+          bytes_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$import_rc" -eq 0 ] || [ "$verify_rc" -eq 0 ] || [ "$bytes_rc" -eq 0 ]; then
+            echo "Model-pack size sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: all three oversized model-pack paths failed."
+
+      - name: Sabotage model-pack copy and hash growth guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          for old in (
+              '        check_model_pack_size(copied, limit)?;',
+              '        check_model_pack_size(hashed, limit)?;',
+          ):
+              if s.count(old) != 1:
+                  raise SystemExit("model-pack growth sabotage anchor not found exactly once")
+              s = s.replace(old, '        // disabled for sabotage', 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core growing_model_copy_stops_at_byte_limit
+          copy_rc=$?
+          cargo test --locked -p neural-core growing_model_hash_stops_at_byte_limit
+          hash_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$copy_rc" -eq 0 ] || [ "$hash_rc" -eq 0 ]; then
+            echo "Model-pack growth sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: copy and hash growth guards were required."
 
       - name: Sabotage bounded on-disk model metadata reads
         shell: bash
@@ -455,3 +521,8 @@ jobs:
           cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
           cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
           cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
+          cargo test --locked -p neural-core oversized_file_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core oversized_installed_pack_is_rejected_before_hashing
+          cargo test --locked -p neural-core oversized_bytes_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core growing_model_copy_stops_at_byte_limit
+          cargo test --locked -p neural-core growing_model_hash_stops_at_byte_limit

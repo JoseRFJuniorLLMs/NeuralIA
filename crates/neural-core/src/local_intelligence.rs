@@ -17,6 +17,7 @@ const MODEL_PACK_ACTIVE_FILE: &str = "active.json";
 const MODEL_PACK_BENCHMARK_FILE: &str = "benchmark.json";
 const MODEL_PACK_HASH_HEX_LEN: usize = 64;
 const MODEL_PACK_HASH_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_MODEL_PACK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MODEL_PACK_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_MODEL_PACK_BENCHMARK_BYTES: u64 = 16 * 1024;
 const MAX_MODEL_PACK_ACTIVE_BYTES: u64 = 4 * 1024;
@@ -79,17 +80,76 @@ fn serialize_bounded<T: Serialize>(value: &T, limit: u64, label: &str) -> Result
     }
 }
 
-fn hash_model_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    let mut hasher = Sha256::new();
+fn check_model_pack_size(bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes > limit {
+        if limit == MAX_MODEL_PACK_BYTES {
+            return Err("model pack excede o limite de 64 MiB".into());
+        }
+        return Err(format!("model pack excede o limite de {limit} bytes"));
+    }
+    Ok(())
+}
+
+fn copy_model_file_bounded(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut source_file =
+        fs::File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    check_model_pack_size(
+        source_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len(),
+        MAX_MODEL_PACK_BYTES,
+    )?;
+    let mut destination_file = fs::File::create(destination)
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    copy_model_reader_bounded(
+        &mut source_file,
+        &mut destination_file,
+        MAX_MODEL_PACK_BYTES,
+    )
+}
+
+fn copy_model_reader_bounded(
+    mut source: impl Read,
+    mut destination: impl Write,
+    limit: u64,
+) -> Result<(), String> {
     let mut chunk = [0_u8; MODEL_PACK_HASH_CHUNK_BYTES];
+    let mut copied = 0_u64;
     loop {
-        let count = file
-            .read(&mut chunk)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
+        let count = source.read(&mut chunk).map_err(|error| error.to_string())?;
         if count == 0 {
             break;
         }
+        copied += count as u64;
+        check_model_pack_size(copied, limit)?;
+        destination
+            .write_all(&chunk[..count])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn hash_model_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    check_model_pack_size(
+        file.metadata().map_err(|error| error.to_string())?.len(),
+        MAX_MODEL_PACK_BYTES,
+    )?;
+    hash_model_reader_bounded(&mut file, MAX_MODEL_PACK_BYTES)
+}
+
+fn hash_model_reader_bounded(mut reader: impl Read, limit: u64) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; MODEL_PACK_HASH_CHUNK_BYTES];
+    let mut hashed = 0_u64;
+    loop {
+        let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hashed += count as u64;
+        check_model_pack_size(hashed, limit)?;
         hasher.update(&chunk[..count]);
     }
     Ok(hasher
@@ -508,13 +568,11 @@ pub fn benchmark_local_intelligence_with_residency(
     Ok(benchmark)
 }
 
-/// Library-only filesystem utility for optional model-pack artifacts.
+/// Filesystem utility for optional model-pack artifacts.
 ///
-/// This type verifies, stages, lists and removes pack files. It deliberately
-/// does not download packs, select an inference backend, activate a global
-/// model or hook itself into browser startup. As of SPEC-0102's current
-/// partial state, `neural-app` does not instantiate it; product lifecycle
-/// wiring requires a separate measured integration.
+/// The product creates it lazily after an explicit model command. It verifies,
+/// stages, lists and removes pack files, but does not download packs, run an
+/// inference backend or acquire browser/agent authority.
 #[derive(Debug, Clone)]
 pub struct ModelPackManager {
     root: PathBuf,
@@ -587,6 +645,7 @@ impl ModelPackManager {
         manifest: &ModelPackManifest,
         model_bytes: &[u8],
     ) -> Result<PathBuf, String> {
+        check_model_pack_size(model_bytes.len() as u64, MAX_MODEL_PACK_BYTES)?;
         self.install_with_writer(manifest, |staged_model| {
             fs::write(staged_model, model_bytes).map_err(|error| error.to_string())
         })
@@ -606,10 +665,9 @@ impl ModelPackManager {
         if !metadata.is_file() {
             return Err("ficheiro de origem do model pack não é um arquivo".into());
         }
+        check_model_pack_size(metadata.len(), MAX_MODEL_PACK_BYTES)?;
         self.install_with_writer(manifest, |staged_model| {
-            fs::copy(model_path, staged_model)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
+            copy_model_file_bounded(model_path, staged_model)
         })
     }
 
@@ -1187,6 +1245,79 @@ mod tests {
         assert_eq!(fs::metadata(&installed).unwrap().len(), bytes.len() as u64);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_file_pack_is_rejected_before_staging() {
+        let root = temp_root("oversized-file-pack");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("large.bin");
+        fs::File::create(&source)
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_BYTES + 1)
+            .unwrap();
+        let manifest = valid_manifest("semantic-small", "1.0.0", b"model-v1");
+        let manager = ModelPackManager::new(root.join("packs"));
+        let error = manager.install_from_file(&manifest, &source).unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+        assert!(!root.join("packs").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_installed_pack_is_rejected_before_hashing() {
+        let root = temp_root("oversized-installed-pack");
+        let pack = root.join("semantic-small");
+        fs::create_dir_all(&pack).unwrap();
+        fs::File::create(pack.join("model.bin"))
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_BYTES + 1)
+            .unwrap();
+        let manifest = valid_manifest("semantic-small", "1.0.0", b"model-v1");
+        fs::write(
+            pack.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = ModelPackManager::new(&root).verify(&manifest).unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_bytes_pack_is_rejected_before_staging() {
+        let root = temp_root("oversized-bytes-pack");
+        let bytes = vec![0; MAX_MODEL_PACK_BYTES as usize + 1];
+        let manifest = valid_manifest("semantic-small", "1.0.0", b"model-v1");
+        let error = ModelPackManager::new(&root)
+            .install(&manifest, &bytes)
+            .unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn growing_model_copy_stops_at_byte_limit() {
+        let mut at_limit = Vec::new();
+        copy_model_reader_bounded(&b"12345678"[..], &mut at_limit, 8).unwrap();
+        assert_eq!(at_limit, b"12345678");
+
+        let mut destination = Vec::new();
+        let error = copy_model_reader_bounded(&b"123456789"[..], &mut destination, 8).unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn growing_model_hash_stops_at_byte_limit() {
+        assert_eq!(
+            hash_model_reader_bounded(&b"12345678"[..], 8)
+                .unwrap()
+                .len(),
+            64
+        );
+        let error = hash_model_reader_bounded(&b"123456789"[..], 8).unwrap_err();
+        assert!(error.contains("limite"), "{error}");
     }
 
     #[test]
