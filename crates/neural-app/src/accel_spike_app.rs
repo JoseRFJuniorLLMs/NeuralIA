@@ -34,8 +34,8 @@ use neural_core::{ReaderArticle, ReaderBlock};
 use crate::accel_spike::{
     ColumnFixture, KeyEventKind, PROBE_ARM_SCRIPT, PROBE_PULL_SCRIPT, SPIKE_COMMAND_FILE,
     SPIKE_DIR_ENV, SPIKE_LOG_FILE, SpikeCommand, SpikeHost, SpikeKey, SpikeVerb, ack_line,
-    act_line, colnav_done_line, colnav_start_line, hello_line, hooked_line, native_line, page_line,
-    parse_spike_command, ping_detail, spike_verdict, tiny_pdf,
+    act_line, colnav_done_line, colnav_start_line, hello_line, hooked_line, model_start_line,
+    native_line, page_line, parse_spike_command, ping_detail, spike_verdict, tiny_pdf,
 };
 use crate::windows_app::*;
 
@@ -295,6 +295,11 @@ impl App {
         SPIKE_ACTIVE.store(true, Ordering::Release);
         self.auto_scroll_answered = true;
         spike_log(&hello_line(std::process::id()));
+        spike_log(&model_start_line(
+            self.local_models.resident_model_bytes(),
+            self.local_models.manager_initialized(),
+            self.config.data_dir.join("model-packs").exists(),
+        ));
         spawn_command_reader(dir, self.proxy.clone());
     }
 
