@@ -8,6 +8,8 @@ use std::{
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::Arc,
+    thread,
 };
 
 use neural_core::{
@@ -66,9 +68,11 @@ impl LocalModelOutcome {
 pub(crate) struct LocalModelPacks {
     manager: Option<ModelPackManager>,
     root: PathBuf,
+    busy: bool,
+    worker: Option<thread::JoinHandle<()>>,
     /// Capacidade que prova que esta raiz e a loja Explicit declarada pelo produto.
     /// Mantemo-la viva em vez de degradar o boundary novamente a um PathBuf nu.
-    _grant: StoreGrant,
+    _grant: Arc<StoreGrant>,
 }
 
 const MAX_IMPORT_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -85,8 +89,31 @@ impl LocalModelPacks {
         Ok(Self {
             manager: None,
             root,
-            _grant: grant,
+            busy: false,
+            worker: None,
+            _grant: Arc::new(grant),
         })
+    }
+
+    fn begin_work(&mut self) -> Result<Self, String> {
+        if self.busy {
+            return Err("model pack: operação em andamento".into());
+        }
+        self.busy = true;
+        Ok(Self {
+            manager: self.manager.clone(),
+            root: self.root.clone(),
+            busy: false,
+            worker: None,
+            _grant: Arc::clone(&self._grant),
+        })
+    }
+
+    pub(crate) fn finish_work(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        self.busy = false;
     }
 
     fn manager(&mut self) -> &ModelPackManager {
@@ -161,6 +188,49 @@ impl LocalModelPacks {
     }
 }
 
+impl Drop for LocalModelPacks {
+    fn drop(&mut self) {
+        self.finish_work();
+    }
+}
+
+fn spawn_model_work<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+    notify: impl FnOnce(T) + Send + 'static,
+) -> Result<thread::JoinHandle<()>, String> {
+    thread::Builder::new()
+        .name("neuralia-model-pack".into())
+        .spawn(move || notify(work()))
+        .map_err(|error| error.to_string())
+}
+
+fn catch_model_panic<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err("model pack: falha interna na operação".into()))
+}
+
+/// The shipped omnibox uses this boundary so copy, hash and pack resolution
+/// never execute on the window's event-loop thread. Completion is delivered
+/// through the caller's native event sink.
+pub(crate) fn dispatch_local_model_command(
+    packs: &mut LocalModelPacks,
+    command: LocalModelCommand,
+    notify: impl FnOnce(Result<LocalModelOutcome, String>) + Send + 'static,
+) -> Result<(), String> {
+    let mut worker_packs = packs.begin_work()?;
+    match spawn_model_work(
+        move || catch_model_panic(|| execute_local_model_command_inner(&mut worker_packs, command)),
+        notify,
+    ) {
+        Ok(worker) => packs.worker = Some(worker),
+        Err(error) => {
+            packs.finish_work();
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 fn plain_filename(value: &str) -> bool {
     let mut components = Path::new(value).components();
     matches!(components.next(), Some(Component::Normal(_)))
@@ -226,10 +296,9 @@ pub(crate) fn parse_local_model_command(input: &str) -> Option<Result<LocalModel
     ))
 }
 
-/// This is the same executor called by the shipped omnibox route. Keeping the
-/// decision here lets behavior tests exercise the production path instead of
-/// grepping source text.
-pub(crate) fn execute_local_model_command(
+/// This executor runs inside the shipped omnibox route's worker. Keeping the
+/// decision here lets behavior tests exercise the production path.
+fn execute_local_model_command_inner(
     packs: &mut LocalModelPacks,
     command: LocalModelCommand,
 ) -> Result<LocalModelOutcome, String> {
@@ -266,11 +335,20 @@ pub(crate) fn execute_local_model_command(
 }
 
 #[cfg(test)]
+pub(crate) fn execute_local_model_command(
+    packs: &mut LocalModelPacks,
+    command: LocalModelCommand,
+) -> Result<LocalModelOutcome, String> {
+    execute_local_model_command_inner(packs, command)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{
         sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        sync::mpsc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     static NONCE: AtomicU64 = AtomicU64::new(1);
@@ -345,6 +423,96 @@ mod tests {
             resident_model_bytes: Some(0),
             measured_at: 1,
         }
+    }
+
+    #[test]
+    fn model_work_runs_off_the_caller_thread() {
+        let caller = thread::current().id();
+        let (sender, receiver) = mpsc::channel();
+        let handle = spawn_model_work(
+            || thread::current().id(),
+            move |worker| sender.send(worker).unwrap(),
+        )
+        .unwrap();
+        let worker = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+        assert_ne!(caller, worker);
+    }
+
+    #[test]
+    fn model_worker_panic_still_notifies_error() {
+        let (sender, receiver) = mpsc::channel();
+        let handle = spawn_model_work(
+            || catch_model_panic(|| -> Result<(), String> { panic!("fixture panic") }),
+            move |result| sender.send(result).unwrap(),
+        )
+        .unwrap();
+        let result = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+        assert!(result.unwrap_err().contains("falha interna"));
+    }
+
+    #[test]
+    fn model_pack_drop_waits_for_inflight_worker() {
+        let fixture = Fixture::new();
+        let mut packs = fixture.packs();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (dropping_tx, dropping_rx) = mpsc::sync_channel(0);
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        packs.busy = true;
+        packs.worker = Some(thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        }));
+        let dropper = thread::spawn(move || {
+            dropping_tx.send(()).unwrap();
+            drop(packs);
+            dropped_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        dropping_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(dropped_rx.recv_timeout(Duration::from_millis(500)).is_err());
+        release_tx.send(()).unwrap();
+        dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        dropper.join().unwrap();
+    }
+
+    #[test]
+    fn shipped_dispatch_serializes_commands_and_returns_worker_result() {
+        let fixture = Fixture::new();
+        let mut packs = fixture.packs();
+        let manifest_path = fixture.write_import();
+        let (sender, receiver) = mpsc::channel();
+        dispatch_local_model_command(
+            &mut packs,
+            LocalModelCommand::Install(manifest_path),
+            move |result| sender.send(result).unwrap(),
+        )
+        .unwrap();
+        let error = dispatch_local_model_command(&mut packs, LocalModelCommand::Status, |_| {})
+            .unwrap_err();
+        assert!(error.contains("operação em andamento"), "{error}");
+
+        let result = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, LocalModelOutcome::Installed { .. }));
+        packs.finish_work();
+        let (sender, receiver) = mpsc::channel();
+        dispatch_local_model_command(&mut packs, LocalModelCommand::Status, move |result| {
+            sender.send(result).unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            LocalModelOutcome::Fallback { warning: None }
+        );
+        packs.finish_work();
     }
 
     #[test]
