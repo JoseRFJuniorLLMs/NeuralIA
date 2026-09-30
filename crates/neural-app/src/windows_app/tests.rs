@@ -6371,7 +6371,11 @@ fn uninstalling_a_model_pack_does_not_change_ordinary_product_routes() {
     )
     .expect("manifest");
 
-    let mut packs = crate::local_models::LocalModelPacks::new(&data);
+    let registry = neural_core::json_store::StoreRegistry::mint_for_test(&data);
+    let grant = registry
+        .grant(crate::stores::MODEL_PACKS_STORE)
+        .expect("model-pack store grant");
+    let mut packs = crate::local_models::LocalModelPacks::new(grant).expect("model-pack adapter");
     crate::local_models::execute_local_model_command(
         &mut packs,
         crate::local_models::LocalModelCommand::Install(manifest_path),
@@ -25612,8 +25616,8 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
         (
             "neural-core/src/local_intelligence.rs",
-            11,
-            "model packs: nao ligados ao produto (spec_0102); o local-model-packs traz o grant",
+            12,
+            "model-packs (Explicit): a raiz vem do MODEL_PACKS_STORE grant; o adapter mantem a capacidade e o manager faz I/O apenas sob essa raiz",
         ),
         (
             "neural-core/src/memory.rs",
