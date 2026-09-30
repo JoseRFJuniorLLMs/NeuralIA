@@ -452,7 +452,7 @@ pub(crate) fn model_start_line(
     pack_dir_exists: bool,
 ) -> String {
     format!(
-        "{\"t\":\"modelstart\",\"resident_model_bytes\":{resident_model_bytes},\"manager_initialized\":{manager_initialized},\"pack_dir_exists\":{pack_dir_exists}}"
+        "{{\"t\":\"modelstart\",\"resident_model_bytes\":{resident_model_bytes},\"manager_initialized\":{manager_initialized},\"pack_dir_exists\":{pack_dir_exists}}}"
     )
 }
 
