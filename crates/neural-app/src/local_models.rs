@@ -12,6 +12,7 @@ use std::{
 
 use neural_core::{
     LocalBenchmark, ModelPackActivation, ModelPackManager, ModelPackManifest, ModelPackSelection,
+    json_store::StoreGrant,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,18 +64,29 @@ impl LocalModelOutcome {
 
 #[derive(Debug)]
 pub(crate) struct LocalModelPacks {
-    root: PathBuf,
     manager: Option<ModelPackManager>,
+    root: PathBuf,
+    /// Capacidade que prova que esta raiz e a loja Explicit declarada pelo produto.
+    /// Mantemo-la viva em vez de degradar o boundary novamente a um PathBuf nu.
+    _grant: StoreGrant,
 }
 
 const MAX_IMPORT_MANIFEST_BYTES: u64 = 64 * 1024;
 
 impl LocalModelPacks {
-    pub(crate) fn new(data_dir: &Path) -> Self {
-        Self {
-            root: data_dir.join("model-packs"),
-            manager: None,
+    pub(crate) fn new(grant: StoreGrant) -> Result<Self, String> {
+        let expected = crate::stores::MODEL_PACKS_STORE;
+        if (grant.name(), grant.kind(), grant.shape())
+            != (expected.name, expected.kind, expected.shape)
+        {
+            return Err("model-pack adapter exige o grant MODEL_PACKS_STORE".into());
         }
+        let root = grant.path().to_path_buf();
+        Ok(Self {
+            manager: None,
+            root,
+            _grant: grant,
+        })
     }
 
     fn manager(&mut self) -> &ModelPackManager {
@@ -288,7 +300,11 @@ mod tests {
         }
 
         fn packs(&self) -> LocalModelPacks {
-            LocalModelPacks::new(&self.data)
+            let registry = neural_core::json_store::StoreRegistry::mint_for_test(&self.data);
+            let grant = registry
+                .grant(crate::stores::MODEL_PACKS_STORE)
+                .expect("model-pack store grant");
+            LocalModelPacks::new(grant).expect("model-pack adapter")
         }
 
         fn write_import(&self) -> PathBuf {
@@ -329,6 +345,21 @@ mod tests {
             resident_model_bytes: Some(0),
             measured_at: 1,
         }
+    }
+
+    #[test]
+    fn product_adapter_rejects_a_grant_for_another_store() {
+        let fixture = Fixture::new();
+        let registry = neural_core::json_store::StoreRegistry::mint_for_test(&fixture.data);
+        let wrong = registry
+            .grant(neural_core::json_store::StoreSpec::new(
+                "other-model-packs",
+                neural_core::json_store::StoreKind::Explicit,
+                neural_core::json_store::StoreShape::Dir,
+            ))
+            .expect("wrong-store fixture grant");
+        let error = LocalModelPacks::new(wrong).expect_err("wrong grant must be refused");
+        assert!(error.contains("MODEL_PACKS_STORE"), "{error}");
     }
 
     #[test]
