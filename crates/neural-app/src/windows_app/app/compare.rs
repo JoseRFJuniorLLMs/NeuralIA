@@ -5,7 +5,32 @@ use crate::windows_app::*;
 
 use neural_core::{ProviderId, TurnOrigin};
 
+pub(in crate::windows_app) fn write_research_export(
+    data_dir: &std::path::Path,
+    session: &ResearchSession,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = data_dir.join("research-exports");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.md", session.id));
+    std::fs::write(&path, session.export_markdown())?;
+    Ok(path)
+}
+
 impl App {
+    #[cfg(feature = "accel-spike")]
+    pub(in crate::windows_app) fn export_current_research_to_disk(
+        &self,
+    ) -> Result<(String, std::path::PathBuf), String> {
+        let session = self
+            .current_research
+            .as_ref()
+            .ok_or_else(|| "sem sessão de pesquisa".to_string())?;
+        let id = session.id.clone();
+        let path = write_research_export(&self.config.data_dir, session)
+            .map_err(|error| format!("export de pesquisa: {error}"))?;
+        Ok((id, path))
+    }
+
     fn current_research_item_ids(&self) -> Vec<String> {
         self.current_research
             .as_ref()
@@ -62,14 +87,8 @@ impl App {
             );
             return;
         };
-        let dir = self.config.data_dir.join("research-exports");
-        if let Err(error) = std::fs::create_dir_all(&dir) {
-            self.show_splash(format!("Export: {error}"), 4);
-            return;
-        }
-        let path = dir.join(format!("{}.md", session.id));
-        match std::fs::write(&path, session.export_markdown()) {
-            Ok(()) => self.show_native_text(
+        match write_research_export(&self.config.data_dir, session) {
+            Ok(path) => self.show_native_text(
                 "NeuralIA — Pesquisa exportada",
                 &format!("Markdown salvo em:\r\n{}", path.display()),
             ),

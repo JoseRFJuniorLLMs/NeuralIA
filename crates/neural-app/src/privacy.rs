@@ -10,9 +10,9 @@
 //! `save_session`, `save_tabs`, `save_tabs_due`, `rebuild_memory`) e pede
 //! grants pelo guard (`store`). Enquanto o modo disser `Private`, as
 //! gravacoes `Automatic` nao fazem nada e as leituras (`recent_history`,
-//! `query_memory`, `restore_tabs`) nao escrevem; hoje o produto so conhece
-//! `Normal` -- `Private` chega com o private-mode-core e ate la so existe
-//! pelo construtor de teste.
+//! `query_memory`, `restore_tabs`) nao escrevem. O produto publicado so conhece
+//! `Normal`; `Private` e alcancavel hoje apenas por testes e pelo harness
+//! `accel-spike`, que nao entra no executavel publicado.
 //!
 //! Gates (`windows_app/tests.rs`): `registry_is_minted_once_and_owned_by_the_guard`,
 //! `history_memory_and_tabs_are_written_only_through_the_privacy_guard`,
@@ -32,7 +32,7 @@ use crate::windows_app::{
 };
 
 /// O modo do guard: o mesmo que o registo passa a cada grant (`StoreMode`).
-/// `Private` nao e alcancavel no produto ainda (private-mode-core).
+/// `Private` nao e alcancavel no produto publicado ainda (private-mode-core).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PrivacyMode {
     Normal,
@@ -136,6 +136,14 @@ impl PrivacyGuard {
     /// O modo de agora, o mesmo que cada grant ja passado ve.
     pub(crate) fn mode(&self) -> PrivacyMode {
         self.registry.mode().into()
+    }
+
+    /// So para o executavel CI `--features accel-spike`: muda o mesmo modo
+    /// partilhado que os grants ja entregues consultam. A feature e provada
+    /// ausente do binario publicado pelo gate do marker do accel-spike.
+    #[cfg(feature = "accel-spike")]
+    pub(crate) fn set_mode_for_accel_spike(&self, mode: PrivacyMode) {
+        self.registry.set_mode(mode.into());
     }
 
     /// Um grant para uma loja da tabela (`crate::stores`): a unica maneira de

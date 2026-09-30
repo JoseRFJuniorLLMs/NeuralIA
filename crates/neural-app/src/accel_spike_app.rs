@@ -29,7 +29,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU32;
 
-use neural_core::{ReaderArticle, ReaderBlock};
+use neural_core::search::ProviderId;
+use neural_core::{ReaderArticle, ReaderBlock, TurnOrigin};
 
 use crate::accel_spike::{
     ColumnFixture, KeyEventKind, PROBE_ARM_SCRIPT, PROBE_PULL_SCRIPT, SPIKE_COMMAND_FILE,
@@ -37,6 +38,7 @@ use crate::accel_spike::{
     act_line, colnav_done_line, colnav_start_line, hello_line, hooked_line, native_line, page_line,
     parse_spike_command, ping_detail, spike_verdict, tiny_pdf,
 };
+use crate::privacy::PrivacyMode;
 use crate::windows_app::*;
 
 /// O registo do condutor; `None` sem `NEURALIA_ACCEL_SPIKE_DIR`.
@@ -359,6 +361,10 @@ impl App {
                 &format!("{:?}", self.surface),
             )),
             SpikeVerb::Open(url) => self.accel_spike_open(host, url.as_deref()),
+            SpikeVerb::ResearchOpen(url) => self.accel_spike_research_open(host, &url),
+            SpikeVerb::ResearchPrivate => self.accel_spike_research_private(host),
+            SpikeVerb::ResearchStart => self.accel_spike_research_start(host),
+            SpikeVerb::ResearchExport => self.accel_spike_research_export(host),
             SpikeVerb::Focus => self.accel_spike_focus(host),
             SpikeVerb::Arm => self.accel_spike_eval(seq, 0, host, "arm", PROBE_ARM_SCRIPT),
             SpikeVerb::Begin(trial) => {
@@ -373,6 +379,69 @@ impl App {
             Ok(detail) => spike_log(&ack_line(seq, true, &detail)),
             Err(error) => spike_log(&ack_line(seq, false, &error)),
         }
+    }
+
+    /// Fixture da SPEC-0101: a coluna conserva o host oficial do Google para
+    /// que `column_answer_read` use a validacao real. O workflow prende o DNS
+    /// ao loopback; sem o comando explicito esta excecao nao existe.
+    fn accel_spike_research_open(&mut self, host: SpikeHost, url: &str) -> Result<String, String> {
+        if host != SpikeHost::Column {
+            return Err("research-open so vale na Column".to_string());
+        }
+        let column = self
+            .comparator
+            .as_ref()
+            .and_then(|comparator| comparator.views.first())
+            .ok_or_else(|| "sem primeira coluna do comparador".to_string())?;
+        let origin = column_fixture()
+            .request_research(url)
+            .map(str::to_string)
+            .ok_or_else(|| "fixture de pesquisa recusada".to_string())?;
+        column
+            .webview
+            .load_url(url)
+            .map_err(|error| format!("load_url da fixture de pesquisa: {error}"))?;
+        Ok(format!("research fixture {origin}"))
+    }
+
+    /// Coloca o mesmo PrivacyGuard do produto em Private, mas apenas no
+    /// executavel CI compilado com `accel-spike`. Os grants ja emitidos veem
+    /// a mudanca pelo modo partilhado do StoreRegistry.
+    fn accel_spike_research_private(&mut self, host: SpikeHost) -> Result<String, String> {
+        if host != SpikeHost::Column {
+            return Err("research-private so vale na Column".to_string());
+        }
+        self.privacy.set_mode_for_accel_spike(PrivacyMode::Private);
+        Ok("research privacy=private".to_string())
+    }
+
+    /// Cria um turno pelo mesmo caminho que a UI usa e inicia o leitor real do
+    /// Consenso. So a primeira coluna foi perguntada, portanto as outras duas
+    /// nao entram no run.
+    fn accel_spike_research_start(&mut self, host: SpikeHost) -> Result<String, String> {
+        if host != SpikeHost::Column {
+            return Err("research-start so vale na Column".to_string());
+        }
+        let turn = self.consensus_begin_turn(
+            TurnOrigin::LoadProvider,
+            Some(0),
+            "SPEC-0101 research E2E",
+            &[ProviderId::GoogleAi],
+        );
+        if !self.read_consensus_without_report() {
+            return Err("o Consenso nao iniciou".to_string());
+        }
+        Ok(format!("research turn={turn}"))
+    }
+
+    /// Usa o exportador real. O id devolvido permite ao condutor localizar o
+    /// Markdown sem adivinhar nomes.
+    fn accel_spike_research_export(&mut self, host: SpikeHost) -> Result<String, String> {
+        if host != SpikeHost::Column {
+            return Err("research-export so vale na Column".to_string());
+        }
+        let (id, path) = self.export_current_research_to_disk()?;
+        Ok(format!("research-export id={id} path={}", path.display()))
     }
 
     /// A WebView de cada hospedeiro, se ele estiver aberto agora.

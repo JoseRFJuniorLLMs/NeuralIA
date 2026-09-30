@@ -53,6 +53,90 @@ jobs:
       - name: The spike exe carries the marker the release gate looks for
         shell: pwsh
         run: ./scripts/test-accel-spike-marker.ps1 -ExePath target/release/NeuralIA.exe -Expect Present
+      - name: SPEC-0101 research WebView to persisted session to Markdown E2E
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          foreach ($name in 'www.google.com', 'google.com', 'chatgpt.com', 'chat.openai.com', 'claude.ai') {
+            [IO.File]::AppendAllText($hostsPath, [Environment]::NewLine + "127.0.0.1 $name", [Text.Encoding]::ASCII)
+          }
+          ipconfig /flushdns | Out-Null
+          ./scripts/test-research-e2e.ps1 -ExePath target/release/NeuralIA.exe
+      - name: SPEC-0101 private research stays ephemeral but explicit export still works
+        shell: pwsh
+        timeout-minutes: 5
+        run: ./scripts/test-research-e2e.ps1 -ExePath target/release/NeuralIA.exe -PrivateMode -TimeoutSec 20
+      - name: Sabotage Private mode must expose forbidden automatic persistence
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $path = (Resolve-Path -LiteralPath "crates/neural-app/src/accel_spike_app.rs").Path
+          $original = [IO.File]::ReadAllText($path, $utf8)
+          $old = 'self.privacy.set_mode_for_accel_spike(PrivacyMode::Private);'
+          $new = 'self.privacy.set_mode_for_accel_spike(PrivacyMode::Normal);'
+          $count = ([regex]::Matches($original, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Private research sabotage anchor expected once, found $count." }
+          $failedForRightReason = $false
+          try {
+            [IO.File]::WriteAllText($path, $original.Replace($old, $new), $utf8)
+            cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+            if ($LASTEXITCODE -ne 0) { throw "The sabotaged private research build failed." }
+            try {
+              ./scripts/test-research-e2e.ps1 -ExePath target/release/NeuralIA.exe -PrivateMode -TimeoutSec 12
+            }
+            catch {
+              if ($_.Exception.Message -match 'Modo privado persistiu automaticamente') {
+                $failedForRightReason = $true
+                Write-Host "Sabotagem provada: sem Private real, a sessao foi persistida e o E2E ficou vermelho."
+              }
+              else {
+                throw "Private research sabotage failed for the wrong reason: $($_.Exception.Message)"
+              }
+            }
+            if (-not $failedForRightReason) {
+              throw "Sabotagem ficou verde: trocar Private por Normal nao foi detectado."
+            }
+          }
+          finally {
+            [IO.File]::WriteAllText($path, $original, $utf8)
+          }
+          git diff --exit-code -- crates/neural-app/src/accel_spike_app.rs
+      - name: Sabotage missing session persistence must break the research E2E
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          # All automatic session writes share this boundary. Removing only
+          # the consensus write still allows later events to save that session.
+          $path = (Resolve-Path -LiteralPath "crates/neural-app/src/privacy.rs").Path
+          $original = [IO.File]::ReadAllText($path, $utf8)
+          $old = 'self.memory.save_session(session);'
+          $new = 'drop(session);'
+          $count = ([regex]::Matches($original, [regex]::Escape($old))).Count
+          if ($count -ne 1) { throw "Research sabotage anchor expected once, found $count." }
+          try {
+            [IO.File]::WriteAllText($path, $original.Replace($old, $new), $utf8)
+            cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+            if ($LASTEXITCODE -ne 0) { throw "The sabotaged research build failed." }
+            ./scripts/test-research-e2e.ps1 -ExePath target/release/NeuralIA.exe -ExpectPersistenceFailure -TimeoutSec 12
+          }
+          finally {
+            [IO.File]::WriteAllText($path, $original, $utf8)
+          }
+          git diff --exit-code -- crates/neural-app/src/privacy.rs
+      - name: Restored research persistence and Private E2E must return to green
+        shell: pwsh
+        timeout-minutes: 8
+        run: |
+          cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+          if ($LASTEXITCODE -ne 0) { throw "The restored research build failed." }
+          ./scripts/test-research-e2e.ps1 -ExePath target/release/NeuralIA.exe
+          ./scripts/test-research-e2e.ps1 -ExePath target/release/NeuralIA.exe -PrivateMode -TimeoutSec 20
       - name: Accelerator spike E2E on the release exe (per-host table)
         shell: pwsh
         run: ./scripts/test-accel-spike.ps1 -ExePath target/release/NeuralIA.exe -TablePath accel-spike-table.md
