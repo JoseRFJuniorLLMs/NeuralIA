@@ -33,7 +33,7 @@ use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_
 use crate::privacy::{PrivacyGuard, PrivacyMode};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::secrets::redact_debug_secrets;
-use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE};
+use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, MODEL_PACKS_STORE};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::json_store::StoreRegistry;
 use neural_core::{
@@ -3373,9 +3373,6 @@ pub(in crate::windows_app) struct App {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         let config = CoreConfig::default();
-        // Estado barato: nao cria ModelPackManager, nao le o disco e nao
-        // escolhe backend. O manager so nasce numa acao explicita/tarefa local.
-        let local_models = crate::local_models::LocalModelPacks::new(&config.data_dir);
         // A escolha de tema vale antes do primeiro desenho.
         ThemeChoice::load(&config.data_dir.join("theme")).apply();
         GMAIL_NOTIFICATIONS.store(
@@ -3395,6 +3392,14 @@ impl App {
             &config,
             EventSink::proxy(proxy.clone()),
         );
+        // Estado barato e grant-typed: pedir a capacidade nao cria pasta nem
+        // le packs. O manager continua nascendo so numa acao model: explicita.
+        let local_models = crate::local_models::LocalModelPacks::new(
+            privacy
+                .store(MODEL_PACKS_STORE)
+                .expect("MODEL_PACKS_STORE deve estar no registro de lojas"),
+        )
+        .expect("MODEL_PACKS_STORE deve ter nome/tipo/forma corretos");
         let notes = ZettelWorker::new(config.data_dir.join("zettel"), proxy.clone());
         let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
