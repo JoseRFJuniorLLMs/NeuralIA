@@ -59,7 +59,8 @@ fn model_pack_docs_match_lazy_lifecycle_without_claiming_inference_backend() {
     assert!(LOCAL_AI_SPEC.contains("product-side lazy adapter"));
     assert!(LOCAL_AI_SPEC.contains("no inference-backend construction"));
     assert!(LOCAL_AI_SPEC.contains("resident-model-byte evidence"));
-    assert!(LOCAL_AI_SPEC.contains("does **not** construct the full `App`"));
+    assert!(LOCAL_AI_SPEC.contains("CI startup E2E launches the full `App`"));
+    assert!(LOCAL_AI_SPEC.contains("manager_initialized=false"));
     assert!(readme.contains("model:status"));
     assert!(readme.contains("Nenhum backend de inferência"));
 }
