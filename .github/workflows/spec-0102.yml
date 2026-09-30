@@ -6,6 +6,9 @@ on:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
       - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/accel_spike.rs'
+      - 'crates/neural-app/src/accel_spike_app.rs'
+      - 'scripts/test-model-pack-startup.ps1'
       - 'crates/neural-app/src/stores.rs'
       - 'docs/specs/SPEC-0006-security-privacy.md'
       - 'crates/neural-app/src/main.rs'
@@ -23,6 +26,9 @@ on:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
       - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/accel_spike.rs'
+      - 'crates/neural-app/src/accel_spike_app.rs'
+      - 'scripts/test-model-pack-startup.ps1'
       - 'crates/neural-app/src/stores.rs'
       - 'docs/specs/SPEC-0006-security-privacy.md'
       - 'crates/neural-app/src/main.rs'
@@ -152,6 +158,45 @@ jobs:
             [IO.File]::WriteAllText($path, $text)
           }
           git diff --exit-code -- $path
+
+  startup-e2e:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
+      - run: cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+      - name: Full App starts without model residency or model-pack IO
+        shell: pwsh
+        run: ./scripts/test-model-pack-startup.ps1 -ExePath target/release/NeuralIA.exe
+      - name: Sabotage eager model manager must make the full-App startup probe red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $path = "crates/neural-app/src/local_models.rs"
+          $original = [IO.File]::ReadAllText($path, $utf8)
+          $old = '            manager: None,'
+          $new = '            manager: Some(ModelPackManager::new(root.clone())),'
+          if (($original.Split($old).Count - 1) -ne 1) { throw "eager-manager sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $original.Replace($old, $new), $utf8)
+            cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+            if ($LASTEXITCODE -ne 0) { throw "sabotaged build failed" }
+            & pwsh -NoProfile -File ./scripts/test-model-pack-startup.ps1 -ExePath target/release/NeuralIA.exe *> model-startup-sabotage.log
+            $rc = $LASTEXITCODE
+            Get-Content -LiteralPath model-startup-sabotage.log
+            if ($rc -eq 0) { throw "eager-manager sabotage unexpectedly stayed green" }
+          }
+          finally {
+            [IO.File]::WriteAllText($path, $original, $utf8)
+          }
+          git diff --exit-code -- $path
+          cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-model-pack-startup.ps1 -ExePath target/release/NeuralIA.exe
 
   sabotage:
     runs-on: ubuntu-latest
