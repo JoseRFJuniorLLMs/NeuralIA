@@ -124,10 +124,13 @@ core tests and by the product-wiring gate in
 ### Decision: explicit product lifecycle, inference remains absent
 
 The product now has a **product-side lazy adapter** for `ModelPackManager`.
-`App::new` stores only the `model-packs` path and an empty manager slot:
-there is **no inference-backend construction**, no model-byte allocation and no
-pack filesystem access during Home startup. A CI-only startup probe observes
-that same `App` state before the first model command.
+`App::new` asks the `PrivacyGuard` for the declared `MODEL_PACKS_STORE`
+(`Explicit`) grant, and the adapter keeps that capability plus an empty manager
+slot. Requesting the grant performs no pack I/O: there is **no inference-backend
+construction**, no model-byte allocation and no pack filesystem access during
+Home startup. `ModelPackManager` is created lazily from the grant-rooted path on
+the first explicit model action. A CI-only startup probe observes that same
+`App` state before the first model command.
 
 Lifecycle actions are reachable only from explicit omnibox commands:
 
