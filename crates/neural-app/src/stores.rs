@@ -11,7 +11,7 @@
 //! (`guard.store(spec)`): o cofre das chaves (`KEYS_STORE`,
 //! `LIVE_KEY_STORE`), o portao de saida da IA (`AI_SETTINGS_STORE`,
 //! `AI_USAGE_STORE`, em `egress.rs`), a Traducao (`TRANSLATE_STORE`), o
-//! bloqueio, os downloads e os favoritos abrem as suas por grant; o
+//! bloqueio, os downloads, os favoritos e os model packs abrem as suas por grant; o
 //! historico, a memoria e as abas (`HISTORY_STORE`, `MEMORY_STORE`,
 //! `TABS_STORE`) sao do proprio guard, que e o unico que as escreve. O que
 //! ainda escreve pelo caminho esta na tabela da fase 0 (SPEC-0006) e na
@@ -80,6 +80,10 @@ pub(crate) const DOWNLOADS_LOG_STORE: StoreSpec =
 /// nunca o apaga. Partilhado entre janelas pelo trinco
 /// `bookmarks.json.lock`; so a thread `neural-bookmarks` o escreve.
 pub(crate) const BOOKMARKS_STORE: StoreSpec = StoreSpec::new("bookmarks.json", Explicit, File);
+/// `<data_dir>/model-packs`: packs locais instalados/removidos apenas por
+/// comando explicito do utilizador. O adapter de produto conserva este grant
+/// e so cria `ModelPackManager` quando uma acao `model:` realmente o exige.
+pub(crate) const MODEL_PACKS_STORE: StoreSpec = StoreSpec::new("model-packs", Explicit, Dir);
 /// `<data_dir>/downloads-settings.json`: a pasta dos downloads e
 /// «Permitir baixar programas». A seccao Downloads (downloads-ui) grava o
 /// interruptor (`App::set_allow_programs`); a pasta ainda so se le.
@@ -137,6 +141,7 @@ pub(crate) const APP_STORES: &[StoreSpec] = &[
     AI_USAGE_STORE,
     TRANSLATE_STORE,
     BOOKMARKS_STORE,
+    MODEL_PACKS_STORE,
 ];
 
 #[cfg(test)]
