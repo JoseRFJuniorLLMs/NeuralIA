@@ -6371,7 +6371,11 @@ fn uninstalling_a_model_pack_does_not_change_ordinary_product_routes() {
     )
     .expect("manifest");
 
-    let mut packs = crate::local_models::LocalModelPacks::new(&data);
+    let registry = neural_core::json_store::StoreRegistry::mint_for_test(&data);
+    let grant = registry
+        .grant(crate::stores::MODEL_PACKS_STORE)
+        .expect("model-pack store grant");
+    let mut packs = crate::local_models::LocalModelPacks::new(grant).expect("model-pack adapter");
     crate::local_models::execute_local_model_command(
         &mut packs,
         crate::local_models::LocalModelCommand::Install(manifest_path),
@@ -24205,7 +24209,8 @@ fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE,
         AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
-        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
+        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, MODEL_PACKS_STORE, TABS_STORE,
+        TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, GuardedAutomatic, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24226,6 +24231,7 @@ fn existing_stores_have_a_declared_kind() {
         ("pomodoro", Setting, File),
         ("zettel", Explicit, Dir),
         ("library", Explicit, Dir),
+        ("model-packs", Explicit, Dir),
         ("research-exports", Explicit, Dir),
         ("gemini-live.key", Explicit, File),
         ("keys", Explicit, Dir),
@@ -24280,6 +24286,7 @@ fn existing_stores_have_a_declared_kind() {
     let specs = [
         ("HISTORY_STORE", HISTORY_STORE.name),
         ("MEMORY_STORE", MEMORY_STORE.name),
+        ("MODEL_PACKS_STORE", MODEL_PACKS_STORE.name),
         ("TABS_STORE", TABS_STORE.name),
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
@@ -25612,8 +25619,8 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
         (
             "neural-core/src/local_intelligence.rs",
-            11,
-            "model packs: nao ligados ao produto (spec_0102); o local-model-packs traz o grant",
+            12,
+            "model-packs (Explicit): a raiz vem do MODEL_PACKS_STORE grant; o adapter mantem a capacidade e o manager faz I/O apenas sob essa raiz",
         ),
         (
             "neural-core/src/memory.rs",

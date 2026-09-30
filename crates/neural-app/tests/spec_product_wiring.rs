@@ -205,12 +205,16 @@ fn spec_0102_structural_absence_keeps_model_packs_lazy_and_without_browser_autho
 
     let constructor = between(
         LOCAL_MODELS,
-        "pub(crate) fn new(data_dir: &Path) -> Self {",
+        "pub(crate) fn new(grant: StoreGrant) -> Result<Self, String> {",
         "fn manager(&mut self)",
     );
     assert!(
         !constructor.contains("ModelPackManager::new"),
         "startup adapter must not instantiate the model-pack manager"
+    );
+    assert!(
+        constructor.contains("MODEL_PACKS_STORE") && constructor.contains("grant.path()"),
+        "model-pack product adapter must be rooted by the declared store grant"
     );
 
     for forbidden in [

@@ -6,6 +6,8 @@ on:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
       - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/stores.rs'
+      - 'docs/specs/SPEC-0006-security-privacy.md'
       - 'crates/neural-app/src/main.rs'
       - 'crates/neural-app/src/windows_app.rs'
       - 'crates/neural-app/src/windows_app/app/navigation.rs'
@@ -21,6 +23,8 @@ on:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
       - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/stores.rs'
+      - 'docs/specs/SPEC-0006-security-privacy.md'
       - 'crates/neural-app/src/main.rs'
       - 'crates/neural-app/src/windows_app.rs'
       - 'crates/neural-app/src/windows_app/app/navigation.rs'
@@ -51,6 +55,8 @@ jobs:
       - name: Product lifecycle behavior uses the shipped route and executor
         shell: pwsh
         run: |
+          cargo test --locked -p neural-app product_adapter_rejects_a_grant_for_another_store
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p neural-app startup_state_has_zero_model_residency_and_does_no_pack_io
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p neural-app shipped_executor_installs_without_auto_activation_and_requires_benchmark
@@ -66,7 +72,7 @@ jobs:
           $path = "crates/neural-app/src/local_models.rs"
           $text = [IO.File]::ReadAllText($path)
           $old = '            manager: None,'
-          $new = '            manager: Some(ModelPackManager::new(data_dir.join("model-packs"))),'
+          $new = '            manager: Some(ModelPackManager::new(root.clone())),'
           if (($text.Split($old).Count - 1) -ne 1) { throw "eager-manager sabotage anchor" }
           try {
             [IO.File]::WriteAllText($path, $text.Replace($old, $new))
@@ -76,6 +82,33 @@ jobs:
             [IO.File]::WriteAllText($path, $text)
           }
           git diff --exit-code -- $path
+      - name: Sabotage model-pack store capability must turn the grant gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = @'
+                  if (grant.name(), grant.kind(), grant.shape())
+                      != (expected.name, expected.kind, expected.shape)
+                  {
+          '@
+          $new = @'
+                  if false
+                      && (grant.name(), grant.kind(), grant.shape())
+                          != (expected.name, expected.kind, expected.shape)
+                  {
+          '@
+          if (($text.Split($old).Count - 1) -ne 1) { throw "model-pack grant sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app product_adapter_rejects_a_grant_for_another_store
+            if ($LASTEXITCODE -eq 0) { throw "wrong-store grant sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+
       - name: Sabotage model command routing must turn the shipped-route gate red
         shell: pwsh
         run: |

@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -16,6 +16,27 @@ static MODEL_PACK_NONCE: AtomicU64 = AtomicU64::new(1);
 const MODEL_PACK_ACTIVE_FILE: &str = "active.json";
 const MODEL_PACK_BENCHMARK_FILE: &str = "benchmark.json";
 const MODEL_PACK_HASH_HEX_LEN: usize = 64;
+const MODEL_PACK_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+fn hash_model_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; MODEL_PACK_HASH_CHUNK_BYTES];
+    loop {
+        let count = file
+            .read(&mut chunk)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&chunk[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentClass {
@@ -469,11 +490,7 @@ impl ModelPackManager {
 
         let path = pack.join(&manifest.file);
         reject_symlink(&path, "ficheiro do model pack")?;
-        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let actual = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let actual = hash_model_file(&path)?;
         if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
             return Err(format!("hash do model pack {} não confere", manifest.id));
         }
@@ -509,14 +526,38 @@ impl ModelPackManager {
         manifest: &ModelPackManifest,
         model_bytes: &[u8],
     ) -> Result<PathBuf, String> {
-        validate_manifest(manifest)?;
-        let actual = Sha256::digest(model_bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
-            return Err(format!("hash do model pack {} não confere", manifest.id));
+        self.install_with_writer(manifest, |staged_model| {
+            fs::write(staged_model, model_bytes).map_err(|error| error.to_string())
+        })
+    }
+
+    /// Importa o arquivo escolhido sem manter o model pack inteiro na RAM.
+    /// O hash do arquivo em staging verifica também mudanças no arquivo de
+    /// origem durante a cópia.
+    pub fn install_from_file(
+        &self,
+        manifest: &ModelPackManifest,
+        model_path: &Path,
+    ) -> Result<PathBuf, String> {
+        reject_symlink(model_path, "ficheiro de origem do model pack")?;
+        let metadata = fs::metadata(model_path)
+            .map_err(|error| format!("{}: {error}", model_path.display()))?;
+        if !metadata.is_file() {
+            return Err("ficheiro de origem do model pack não é um arquivo".into());
         }
+        self.install_with_writer(manifest, |staged_model| {
+            fs::copy(model_path, staged_model)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn install_with_writer(
+        &self,
+        manifest: &ModelPackManifest,
+        write_model: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<PathBuf, String> {
+        validate_manifest(manifest)?;
 
         fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
         let pack = self.root.join(&manifest.id);
@@ -530,18 +571,14 @@ impl ModelPackManager {
         let staged_manifest = staging.join("manifest.json");
 
         let stage_result = (|| -> Result<(), String> {
-            fs::write(&staged_model, model_bytes).map_err(|error| error.to_string())?;
+            write_model(&staged_model)?;
             fs::write(
                 &staged_manifest,
                 serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
 
-            let staged_bytes = fs::read(&staged_model).map_err(|error| error.to_string())?;
-            let staged_hash = Sha256::digest(staged_bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            let staged_hash = hash_model_file(&staged_model)?;
             if !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {
                 return Err("model pack staging hash mismatch".into());
             }
@@ -1059,6 +1096,37 @@ mod tests {
 
         assert!(manager.install(&manifest, b"tampered").is_err());
         assert!(!root.join("semantic-small").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn file_install_hashes_the_staged_pack_before_publication() {
+        let root = temp_root("file-install");
+        let source = root.join("source.bin");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![0x5a; 2 * 1024 * 1024 + 7];
+        fs::write(&source, &bytes).unwrap();
+        let manifest = ModelPackManifest {
+            id: "semantic-small".into(),
+            version: "1".into(),
+            file: "model.bin".into(),
+            sha256: Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            capabilities: vec!["embedding".into()],
+            license: "test".into(),
+        };
+        let manager = ModelPackManager::new(root.join("packs"));
+        let installed = manager.install_from_file(&manifest, &source).unwrap();
+        assert_eq!(fs::metadata(&installed).unwrap().len(), bytes.len() as u64);
+        assert_eq!(manager.verify(&manifest).unwrap(), installed);
+
+        fs::write(&source, b"tampered").unwrap();
+        assert!(manager.install_from_file(&manifest, &source).is_err());
+        assert_eq!(manager.verify(&manifest).unwrap(), installed);
+        assert_eq!(fs::metadata(&installed).unwrap().len(), bytes.len() as u64);
 
         let _ = fs::remove_dir_all(root);
     }
