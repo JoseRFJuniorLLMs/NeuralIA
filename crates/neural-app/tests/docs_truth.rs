@@ -56,7 +56,10 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
 fn model_pack_docs_match_lazy_lifecycle_without_claiming_inference_backend() {
     // Markdown line wrapping must not change what this documentation guard sees.
     let readme = README.split_whitespace().collect::<Vec<_>>().join(" ");
-    let local_ai = LOCAL_AI_SPEC.split_whitespace().collect::<Vec<_>>().join(" ");
+    let local_ai = LOCAL_AI_SPEC
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(local_ai.contains("product-side lazy adapter"));
     assert!(local_ai.contains("no inference-backend construction"));
     assert!(local_ai.contains("resident-model-byte evidence"));
