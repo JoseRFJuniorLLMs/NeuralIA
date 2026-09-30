@@ -24209,7 +24209,8 @@ fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE,
         AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
-        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
+        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, MODEL_PACKS_STORE, TABS_STORE,
+        TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, GuardedAutomatic, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24230,6 +24231,7 @@ fn existing_stores_have_a_declared_kind() {
         ("pomodoro", Setting, File),
         ("zettel", Explicit, Dir),
         ("library", Explicit, Dir),
+        ("model-packs", Explicit, Dir),
         ("research-exports", Explicit, Dir),
         ("gemini-live.key", Explicit, File),
         ("keys", Explicit, Dir),
@@ -24284,6 +24286,7 @@ fn existing_stores_have_a_declared_kind() {
     let specs = [
         ("HISTORY_STORE", HISTORY_STORE.name),
         ("MEMORY_STORE", MEMORY_STORE.name),
+        ("MODEL_PACKS_STORE", MODEL_PACKS_STORE.name),
         ("TABS_STORE", TABS_STORE.name),
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
