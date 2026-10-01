@@ -1034,46 +1034,6 @@ impl DistractionReload {
     }
 }
 
-#[cfg(test)]
-mod global_distraction_command_tests {
-    use super::*;
-
-    #[test]
-    fn parser_accepts_home_and_palette_forms_without_stealing_normal_searches() {
-        assert_eq!(
-            parse_distraction_command("/distracoes"),
-            Some(DistractionCommand::Status)
-        );
-        assert_eq!(
-            parse_distraction_command("/distracoes off"),
-            Some(DistractionCommand::Off)
-        );
-        assert_eq!(
-            parse_distraction_command("distracoes:ligar"),
-            Some(DistractionCommand::On)
-        );
-        assert_eq!(parse_distraction_command("distracoes no brasil"), None);
-        assert_eq!(
-            parse_distraction_command("/distracoes talvez"),
-            Some(DistractionCommand::Help)
-        );
-    }
-
-    #[test]
-    fn global_distraction_command_changes_the_shared_policy() {
-        AdblockState::test_global_distraction_toggle_updates_shared_policy();
-    }
-
-    #[test]
-    fn global_reload_never_reloads_provider_columns() {
-        let all = DistractionReload::OpenExternalWeb;
-        assert!(!all.applies_to(WebViewHost::Column(0)));
-        assert!(all.applies_to(WebViewHost::Split(0)));
-        assert!(all.applies_to(WebViewHost::PrivateSplit(0)));
-        assert!(all.applies_to(WebViewHost::External));
-    }
-}
-
 impl App {
     pub(in crate::windows_app) fn distraction_command(&mut self, command: DistractionCommand) {
         match command {
@@ -1164,5 +1124,45 @@ impl App {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod global_distraction_command_tests {
+    use super::*;
+
+    #[test]
+    fn parser_accepts_home_and_palette_forms_without_stealing_normal_searches() {
+        assert_eq!(
+            parse_distraction_command("/distracoes"),
+            Some(DistractionCommand::Status)
+        );
+        assert_eq!(
+            parse_distraction_command("/distracoes off"),
+            Some(DistractionCommand::Off)
+        );
+        assert_eq!(
+            parse_distraction_command("distracoes:ligar"),
+            Some(DistractionCommand::On)
+        );
+        assert_eq!(parse_distraction_command("distracoes no brasil"), None);
+        assert_eq!(
+            parse_distraction_command("/distracoes talvez"),
+            Some(DistractionCommand::Help)
+        );
+    }
+
+    #[test]
+    fn global_distraction_command_changes_the_shared_policy() {
+        AdblockState::test_global_distraction_toggle_updates_shared_policy();
+    }
+
+    #[test]
+    fn global_reload_never_reloads_provider_columns() {
+        let all = DistractionReload::OpenExternalWeb;
+        assert!(!all.applies_to(WebViewHost::Column(0)));
+        assert!(all.applies_to(WebViewHost::Split(0)));
+        assert!(all.applies_to(WebViewHost::PrivateSplit(0)));
+        assert!(all.applies_to(WebViewHost::External));
     }
 }
