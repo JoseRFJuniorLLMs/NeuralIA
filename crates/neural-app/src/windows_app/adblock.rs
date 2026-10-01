@@ -652,10 +652,20 @@ impl AdblockState {
         assert!(state.set_distraction_default(false));
         assert!(!state.distraction_default_on());
         assert!(!state.distraction_policy().default_on);
-        assert!(!state.distraction.policy_for(WebViewHost::External).default_on);
+        assert!(
+            !state
+                .distraction
+                .policy_for(WebViewHost::External)
+                .default_on
+        );
         assert!(!state.set_distraction_default(false));
         assert!(state.set_distraction_default(true));
-        assert!(state.distraction.policy_for(WebViewHost::External).default_on);
+        assert!(
+            state
+                .distraction
+                .policy_for(WebViewHost::External)
+                .default_on
+        );
     }
 
     /// As regras da lista em memoria com os sites permitidos de agora.
