@@ -74,6 +74,21 @@ only one channel is a bug, not a limitation.
   action (SPEC-0005). Leaving a control clears only a hint that still belongs
   to that column: a late `none` does not erase the bar's or another column's
   hint (`a_late_none_from_a_column_does_not_erase_another_hint`).
+- Expanding a column (`⛶ <AI>`, keyboard `1`/`2`/`3`, or `F11`) enters borderless
+  fullscreen (`winit::window::Fullscreen::Borderless`), covering the entire display
+  and hiding the window title bar and caption controls (`bar_visible() = false`).
+  Returning to the 3-column split is triggered by `Esc`, key `0`, the in-page
+  `"✕ Sair da tela cheia"` button (`#neuralia-comp-expand`), or the native floating
+  exit button (`EXIT_BUTTON_HEIGHT`).
+- Each AI column pill provides navigation controls in strict sequence:
+  `+` (nova aba), `‹` (voltar), `›` (avançar), `↻` (recarregar apenas esta coluna),
+  and conditionally `文A` (tradução) and `☆` (favorito) when width permits.
+  Clicking `↻` reloads only the active page of that specific column.
+- The comparator title bar hosts a native Windows EDIT omnibox between the AI tabs
+  and the Pomodoro cluster, leaving row 2 dedicated to shortcuts (Gemini Live,
+  Meet, WhatsApp, YouTube, Gmail, Downloads, Privado). On narrower viewports
+  (< 900px or when available space < 80px), title address bar width is clamped to 0
+  to preserve room for tabs, and `Ctrl+L` opens the floating omnibox palette.
 - The right-hand panel (Ctrl+H history, services, Gemini Live) is resized by
   dragging its left edge: between 300 px and 60% of the window, stored per
   panel kind in `<data_dir>/panel-width.json` (atomic write) and the AI

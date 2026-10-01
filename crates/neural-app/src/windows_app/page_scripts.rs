@@ -1914,8 +1914,8 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   const style = document.createElement('style');
   style.id = 'neuralia-split-scroll-style';
   style.textContent = [
-    '*{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
-    '*::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}'
+    '.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
+    '.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}'
   ].join('');
   document.documentElement.appendChild(style);
 
@@ -1937,11 +1937,15 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
       const range = Math.max(0, el.scrollHeight - el.clientHeight);
       if (range <= bestRange + 24) continue;
       const css = getComputedStyle(el);
-      if (css.display === 'none' || css.visibility === 'hidden' || css.overflowY === 'hidden') continue;
+      if (css.display === 'none' || css.visibility === 'hidden'
+          || !['auto', 'scroll', 'overlay'].includes(css.overflowY)) continue;
       best = el;
       bestRange = range;
     }
-    currentRoot = best || docRoot;
+    const nextRoot = best || docRoot;
+    if (currentRoot && currentRoot !== nextRoot) currentRoot.classList.remove('neuralia-scroll-root');
+    currentRoot = nextRoot;
+    if (currentRoot) currentRoot.classList.add('neuralia-scroll-root');
     return currentRoot;
   }
 
@@ -2000,6 +2004,7 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
     for (const el of nodes) {
       if (raw.length >= 128) break;
       if (!el || el.closest('#neuralia-split-scroll-rail,#neuralia-comp-controls')) continue;
+      if (!state.docLike && state.root && !state.root.contains(el)) continue;
       const css = getComputedStyle(el);
       if (css.display === 'none' || css.visibility === 'hidden') continue;
       const label = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 96);
@@ -2024,16 +2029,11 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
     semantic = semanticAnchors();
     if (!semantic.length) return false;
     const state = metrics();
-    const pivot = state.top + Math.max(24, state.view * .24);
-    let current = 0;
-    for (let i = 0; i < semantic.length; i++) {
-      if (semantic[i].top <= pivot) current = i;
-      else break;
-    }
-    const target = Math.max(0, Math.min(semantic.length - 1, current + direction));
-    if (target === current && ((direction < 0 && current === 0)
-        || (direction > 0 && current === semantic.length - 1))) return false;
-    scrollToPosition(semantic[target].top);
+    const ordered = direction < 0 ? [...semantic].reverse() : semantic;
+    const target = ordered.find((item) => direction < 0
+      ? item.top < state.top - 24 : item.top > state.top + 24);
+    if (!target) return false;
+    scrollToPosition(target.top);
     return true;
   }
 
@@ -2052,6 +2052,7 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 
   function arrow(symbol, title, direction) {
     const button = document.createElement('button');
+    button.type = 'button';
     button.textContent = symbol;
     button.title = title;
     button.setAttribute('aria-label', title);
@@ -2596,6 +2597,7 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
       const expand = createElement('button');
       expand.id = 'neuralia-comp-expand';
+      expand.type = 'button';
       expand.textContent = '⛶ ' + colName;
       assign(expand.style, {
         position:'absolute', top:'10px', right:'10px',
@@ -2613,6 +2615,7 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
       const minimize = createElement('button');
       minimize.id = 'neuralia-comp-minimize';
+      minimize.type = 'button';
       minimize.textContent = '−';
       // A dica e a centrada do app (canal 'hint'), nao o title do browser:
       // com os dois, apareciam duas dicas diferentes ao mesmo tempo.
@@ -2663,6 +2666,7 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
       function arrow(symbol, title, direction) {
         const button = createElement('button');
+        button.type = 'button';
         button.textContent = symbol;
         button.title = title;
         assign(button.style, {

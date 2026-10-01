@@ -2,6 +2,7 @@
 //! expandir as colunas, o builder e o IPC de cada coluna, abrir em todas
 //! (split-windows-app-c).
 use crate::windows_app::*;
+use winit::window::Fullscreen;
 
 use neural_core::{ProviderId, TurnOrigin};
 
@@ -423,21 +424,29 @@ impl App {
             return;
         }
 
+        let mut is_now_expanded = false;
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
         {
-            comp.expanded = if comp.expanded == Some(idx) {
-                None
+            if comp.expanded == Some(idx) {
+                comp.expanded = None;
             } else {
-                Some(idx)
-            };
+                comp.expanded = Some(idx);
+                is_now_expanded = true;
+            }
+        }
+        if let Some(window) = &self.window {
+            if is_now_expanded {
+                window.set_fullscreen(Some(Fullscreen::Borderless(None)));
+            } else {
+                window.set_fullscreen(None);
+            }
         }
         self.bar_hover = None;
         self.forget_tab_gesture();
         self.needs_clear = true;
 
-        // Expandir ocupa apenas a área de conteúdo. A titlebar do NeuralIA e
-        // minimizar/maximizar/fechar permanecem acessíveis.
+        // Expandir ocupa a tela toda; restaurar devolve o chrome.
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
@@ -505,9 +514,15 @@ impl App {
     }
 
     pub(in crate::windows_app) fn restore_comparator(&mut self) {
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+        }
         if let Some(comp) = &mut self.comparator {
             comp.expanded = None;
         }
+        self.bar_hover = None;
+        self.forget_tab_gesture();
+        self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
@@ -590,8 +605,8 @@ impl App {
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, content_y).into(),
-                            size: LogicalSize::new(logical_w, content_h).into(),
+                            position: LogicalPosition::new(0.0, 0.0).into(),
+                            size: LogicalSize::new(logical_w, logical_h).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {

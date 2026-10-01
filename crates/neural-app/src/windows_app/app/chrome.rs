@@ -202,11 +202,12 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
+        let address_visible = self.surface == Surface::Comparator
+            && self.bar_visible()
+            && title_address_rect(size.width as f64, scale, self.pomodoro_bar_label()).width > 0.0;
 
-        // O EDIT precisa manter a mesma identidade Win32 durante as trocas de
-        // decorations/HWND. Fora da Home ele continua WS_VISIBLE, mas fica
-        // estacionado muito fora do cliente e com 1x1 px: não aparece na
-        // titlebar nem disputa espaço com as abas.
+        // O mesmo EDIT nativo permanece vivo na Home e na barra de titulo.
+        // Nas outras superficies fica estacionado e sem autoridade de teclado.
         let inner = if self.surface == Surface::Home {
             let layout =
                 HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
@@ -217,6 +218,15 @@ impl App {
                 y: layout.input.y + pad_y,
                 width: (layout.input.width - pad_x * 2.0).max(1.0),
                 height: (layout.input.height - pad_y * 2.0).max(1.0),
+            }
+        } else if address_visible {
+            let address = title_address_rect(size.width as f64, scale, self.pomodoro_bar_label());
+            let padding = 8.0 * scale;
+            UiRect {
+                x: address.x + padding,
+                y: address.y + 2.0 * scale,
+                width: (address.width - 2.0 * padding).max(1.0),
+                height: (address.height - 4.0 * scale).max(1.0),
             }
         } else {
             UiRect {
@@ -238,11 +248,12 @@ impl App {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             apply_omnibox_interactivity(edit, self.surface);
+            if self.surface == Surface::Comparator && !address_visible {
+                EnableWindow(edit, 0);
+            }
             ShowWindow(edit, SW_SHOW);
         }
-        if self.surface == Surface::Home {
-            self.apply_omnibox_font(inner.height);
-        }
+        self.apply_omnibox_font(inner.height);
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -701,14 +712,15 @@ impl App {
         }
     }
 
-    fn is_fullscreen_column(&self) -> bool {
-        false
+    pub(in crate::windows_app) fn is_fullscreen_column(&self) -> bool {
+        self.comparator
+            .as_ref()
+            .is_some_and(|comp| comp.expanded.is_some())
     }
 
-    /// O chrome permanece visível também quando uma IA ocupa toda a área de
-    /// conteúdo. "Expandir" não significa tomar o monitor inteiro.
+    /// O chrome permanece visível apenas quando nenhuma IA está em tela cheia.
     pub(in crate::windows_app) fn bar_visible(&self) -> bool {
-        self.comparator.is_some()
+        self.comparator.is_some() && !self.is_fullscreen_column()
     }
 
     pub(in crate::windows_app) fn bar_layout(&self) -> Option<BarLayout> {
@@ -1275,6 +1287,7 @@ impl App {
             | BarHit::AddTab(index)
             | BarHit::ColumnBack(index)
             | BarHit::ColumnForward(index)
+            | BarHit::ColumnReload(index)
             | BarHit::ColumnTranslate(index)
             | BarHit::ColumnBookmark(index)
             | BarHit::TabOverflow(index) => Some(index),
