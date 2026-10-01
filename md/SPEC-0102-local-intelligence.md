@@ -126,11 +126,16 @@ core tests and by the product-wiring gate in
 The product now has a **product-side lazy adapter** for `ModelPackManager`.
 `App::new` asks the `PrivacyGuard` for the declared `MODEL_PACKS_STORE`
 (`Explicit`) grant, and the adapter keeps that capability plus an empty manager
-slot. Requesting the grant performs no pack I/O: there is **no inference-backend construction**, no model-byte allocation and no pack filesystem access during
-Home startup. `ModelPackManager` is created lazily from the grant-rooted path on
-the first explicit model action. The current gate proves the product adapter
-starts with zero resident model bytes and performs no pack I/O, but it does **not**
-construct the full `App`; whole-App startup residency therefore remains unproven.
+slot. Requesting the grant stores a path with **no inference-backend construction**
+or pack opening in the adapter. `ModelPackManager` is created lazily from the
+grant-rooted path on the first explicit model action. The CI startup E2E launches
+the full `App` in a CI-only accelerator-feature build with an isolated data
+directory before any model command. It requires `resident_model_bytes=0`,
+`manager_initialized=false`, and no `model-packs/` directory. The first value
+is the adapter's counter, currently constant zero because no inference backend
+exists in the product. This probe demonstrates an empty adapter slot and no
+created pack directory after `App::new`; it does not measure process residency,
+prove absence of filesystem reads, or inspect the published feature-off binary.
 
 Lifecycle actions are reachable only from explicit omnibox commands:
 
