@@ -1,6 +1,6 @@
 # SPEC-0108 — Canal seguro página→nativo (IPC do WebView2)
 
-**Status:** Parcial — transporte IPC implementado e coberto por testes no PR #24; revisão adversarial independente e release 2.1 pendentes  
+**Status:** Implementada — transporte IPC embarcado desde a 2.1.0, revisão adversarial independente concluída antes da publicação e contrato continuamente preso pelos gates do parser/WebView  
 **Alvo:** NeuralIA 2.1  
 **Substitui:** o transporte por navegação `neuralia:` descrito em SPEC-0005 §"Native bridge boundary" (o modelo de confiança mantém-se; muda o transporte)  
 **Depende de:** SPEC-0005, SPEC-0006, SPEC-0015
@@ -192,10 +192,11 @@ A SPEC-0108 só passa a "Implementada" quando, no CI:
 6. Revisão adversarial; gate; release **2.1.0** (mudança de canal interno —
    *minor*, não *patch*).
 
-### Estado do PR #24
+### Estado verificado após a 2.1.0
 
-Os passos 1–5 estão implementados no PR #24. O passo 6 permanece pendente;
-por isso esta spec não usa o status **Implementada**.
+Os passos 1–5 entraram pelo PR #24. O `CHANGELOG.md` da 2.1.0 registra a revisão adversarial independente concluída antes da publicação, fechando o passo 6. Desde então, o contrato permanece preso no caminho que embarca: `protocol_accepts_exactly_the_published_actions` mantém parser e listas publicadas sincronizados; `spec_0108_remote_navigation_handlers_reject_neuralia_scheme` mantém o esquema interno fora das superfícies remotas; e os gates dos scripts preservam a captura das primitivas no `document-created` e a exclusão de child frames.
+
+A SPEC é, portanto, **Implementada**. Mudanças futuras no conjunto de ações ou nos builders continuam obrigadas a atualizar os mesmos gates e documentos no mesmo PR.
 
 ## 7. O que não muda
 
