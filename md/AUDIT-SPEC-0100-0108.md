@@ -1,6 +1,6 @@
 # Auditoria dos gates SPEC-0100 a SPEC-0108
 
-**Estado auditado:** NeuralIA `main` após os PRs #42–#45.  
+**Estado auditado:** NeuralIA `main` após os PRs #42–#45. Este arquivo é um snapshot histórico dessa auditoria; o estado corrente de cada requisito vive na própria SPEC e no `CHANGELOG.md`.  
 **Regra:** um teste que cita uma SPEC só conta como gate de produto quando consegue ficar vermelho ao quebrar o caminho que realmente embarca.
 
 ## Matriz
