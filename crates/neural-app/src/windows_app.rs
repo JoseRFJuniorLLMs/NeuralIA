@@ -3922,11 +3922,10 @@ fn find_agent_element<'a>(
 /// que isto decidir.
 ///
 /// A separação é o que torna a SPEC-0105 testável no código que embarca. O
-/// `AgentRuntime` do `neural-core` -- sobre o qual corre
-/// `spec_0105_agent_runtime_is_bounded_structured_and_human_gated` -- não é
-/// usado por esta aplicação: o agente do produto é este. Enquanto a decisão
-/// estivesse entalada entre `show_splash` e `evaluate_script`, nenhum teste
-/// conseguia ficar vermelho quando o produto regredisse.
+/// antigo loop paralelo `neural_core::AgentRuntime` foi removido no PR #80:
+/// o agente do produto é este caminho. Enquanto a decisão estivesse entalada
+/// entre `show_splash` e `evaluate_script`, nenhum teste conseguia ficar
+/// vermelho quando o produto regredisse.
 #[derive(Debug, Clone, PartialEq)]
 enum AgentStepDecision {
     /// Terminar, com a razão que vai para o trace e para o utilizador.
@@ -4139,9 +4138,9 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
             field: *field,
             value_summary: format!("{} chars", text.chars().count()),
         },
-        AgentAction::Select { target, value } => AgentSecurityAction::Click {
+        AgentAction::Select { target, value } => AgentSecurityAction::Select {
             origin,
-            label: format!("select {} = {}", target.name, value),
+            description: format!("select {} = {}", target.name, value),
         },
         AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
         _ => AgentSecurityAction::Read { origin },
