@@ -205,8 +205,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::UpdateStatus {
-                result: Err(err),
-                ..
+                result: Err(err), ..
             } => {
                 self.show_splash(format!("Atualização: {err}"), 5);
                 self.status = Some(format!("Erro ao verificar atualização: {err}"));
