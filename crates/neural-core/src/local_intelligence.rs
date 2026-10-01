@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::ErrorKind,
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -16,6 +16,148 @@ static MODEL_PACK_NONCE: AtomicU64 = AtomicU64::new(1);
 const MODEL_PACK_ACTIVE_FILE: &str = "active.json";
 const MODEL_PACK_BENCHMARK_FILE: &str = "benchmark.json";
 const MODEL_PACK_HASH_HEX_LEN: usize = 64;
+const MODEL_PACK_HASH_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_MODEL_PACK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_MODEL_PACK_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_MODEL_PACK_BENCHMARK_BYTES: u64 = 16 * 1024;
+const MAX_MODEL_PACK_ACTIVE_BYTES: u64 = 4 * 1024;
+
+fn read_bounded(path: &Path, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    let file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    read_bounded_file(file, path, limit, label)
+}
+
+fn read_bounded_file(
+    file: fs::File,
+    path: &Path,
+    limit: u64,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    if file.metadata().map_err(|error| error.to_string())?.len() > limit {
+        return Err(format!("{label} excede o limite de {limit} bytes"));
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if bytes.len() as u64 > limit {
+        return Err(format!("{label} excede o limite de {limit} bytes"));
+    }
+    Ok(bytes)
+}
+
+struct BoundedJson {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedJson {
+    fn write(&mut self, chunk: &[u8]) -> std::io::Result<usize> {
+        if chunk.len() > self.limit - self.bytes.len() {
+            self.exceeded = true;
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "JSON limit"));
+        }
+        self.bytes.extend_from_slice(chunk);
+        Ok(chunk.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_bounded<T: Serialize>(value: &T, limit: u64, label: &str) -> Result<Vec<u8>, String> {
+    let mut writer = BoundedJson {
+        bytes: Vec::new(),
+        limit: limit as usize,
+        exceeded: false,
+    };
+    match serde_json::to_writer_pretty(&mut writer, value) {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.exceeded => Err(format!("{label} excede o limite de {limit} bytes")),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn check_model_pack_size(bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes > limit {
+        if limit == MAX_MODEL_PACK_BYTES {
+            return Err("model pack excede o limite de 64 MiB".into());
+        }
+        return Err(format!("model pack excede o limite de {limit} bytes"));
+    }
+    Ok(())
+}
+
+fn copy_model_file_bounded(source: &Path, destination: &Path) -> Result<(), String> {
+    let mut source_file =
+        fs::File::open(source).map_err(|error| format!("{}: {error}", source.display()))?;
+    check_model_pack_size(
+        source_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len(),
+        MAX_MODEL_PACK_BYTES,
+    )?;
+    let mut destination_file = fs::File::create(destination)
+        .map_err(|error| format!("{}: {error}", destination.display()))?;
+    copy_model_reader_bounded(
+        &mut source_file,
+        &mut destination_file,
+        MAX_MODEL_PACK_BYTES,
+    )
+}
+
+fn copy_model_reader_bounded(
+    mut source: impl Read,
+    mut destination: impl Write,
+    limit: u64,
+) -> Result<(), String> {
+    let mut chunk = [0_u8; MODEL_PACK_HASH_CHUNK_BYTES];
+    let mut copied = 0_u64;
+    loop {
+        let count = source.read(&mut chunk).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        copied += count as u64;
+        check_model_pack_size(copied, limit)?;
+        destination
+            .write_all(&chunk[..count])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn hash_model_file(path: &Path) -> Result<String, String> {
+    let mut file = fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    check_model_pack_size(
+        file.metadata().map_err(|error| error.to_string())?.len(),
+        MAX_MODEL_PACK_BYTES,
+    )?;
+    hash_model_reader_bounded(&mut file, MAX_MODEL_PACK_BYTES)
+}
+
+fn hash_model_reader_bounded(mut reader: impl Read, limit: u64) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut chunk = [0_u8; MODEL_PACK_HASH_CHUNK_BYTES];
+    let mut hashed = 0_u64;
+    loop {
+        let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+        if count == 0 {
+            break;
+        }
+        hashed += count as u64;
+        check_model_pack_size(hashed, limit)?;
+        hasher.update(&chunk[..count]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IntentClass {
@@ -329,6 +471,11 @@ pub struct LocalBenchmark {
     pub embedding_dimension: usize,
     pub embed_micros_total: u128,
     pub classify_micros_total: u128,
+    /// Resident model bytes measured by the backend-specific harness. None
+    /// means latency was measured but memory residency was not, which is not
+    /// enough evidence to activate a pack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resident_model_bytes: Option<u64>,
     pub measured_at: u64,
 }
 
@@ -399,6 +546,7 @@ pub fn benchmark_local_intelligence(
         embedding_dimension: dimension,
         embed_micros_total,
         classify_micros_total,
+        resident_model_bytes: None,
         measured_at: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -406,13 +554,25 @@ pub fn benchmark_local_intelligence(
     })
 }
 
-/// Library-only filesystem utility for optional model-pack artifacts.
+/// Benchmark variant used when a backend-specific harness also measured model
+/// residency. Activation requires this stronger evidence; the generic latency
+/// benchmark above deliberately remains insufficient.
+pub fn benchmark_local_intelligence_with_residency(
+    backend: &str,
+    ai: &dyn LocalIntelligence,
+    corpus: &[String],
+    resident_model_bytes: u64,
+) -> Result<LocalBenchmark, String> {
+    let mut benchmark = benchmark_local_intelligence(backend, ai, corpus)?;
+    benchmark.resident_model_bytes = Some(resident_model_bytes);
+    Ok(benchmark)
+}
+
+/// Filesystem utility for optional model-pack artifacts.
 ///
-/// This type verifies, stages, lists and removes pack files. It deliberately
-/// does not download packs, select an inference backend, activate a global
-/// model or hook itself into browser startup. As of SPEC-0102's current
-/// partial state, `neural-app` does not instantiate it; product lifecycle
-/// wiring requires a separate measured integration.
+/// The product creates it lazily after an explicit model command. It verifies,
+/// stages, lists and removes pack files, but does not download packs, run an
+/// inference backend or acquire browser/agent authority.
 #[derive(Debug, Clone)]
 pub struct ModelPackManager {
     root: PathBuf,
@@ -426,7 +586,7 @@ impl ModelPackManager {
     pub fn load_manifest(&self, id: &str) -> Result<ModelPackManifest, String> {
         validate_pack_component(id)?;
         let path = self.root.join(id).join("manifest.json");
-        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let bytes = read_bounded(&path, MAX_MODEL_PACK_MANIFEST_BYTES, "manifest")?;
         let manifest: ModelPackManifest =
             serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         if manifest.id != id {
@@ -449,11 +609,7 @@ impl ModelPackManager {
 
         let path = pack.join(&manifest.file);
         reject_symlink(&path, "ficheiro do model pack")?;
-        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
-        let actual = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let actual = hash_model_file(&path)?;
         if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
             return Err(format!("hash do model pack {} não confere", manifest.id));
         }
@@ -489,14 +645,39 @@ impl ModelPackManager {
         manifest: &ModelPackManifest,
         model_bytes: &[u8],
     ) -> Result<PathBuf, String> {
-        validate_manifest(manifest)?;
-        let actual = Sha256::digest(model_bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        if !actual.eq_ignore_ascii_case(manifest.sha256.trim()) {
-            return Err(format!("hash do model pack {} não confere", manifest.id));
+        check_model_pack_size(model_bytes.len() as u64, MAX_MODEL_PACK_BYTES)?;
+        self.install_with_writer(manifest, |staged_model| {
+            fs::write(staged_model, model_bytes).map_err(|error| error.to_string())
+        })
+    }
+
+    /// Importa o arquivo escolhido sem manter o model pack inteiro na RAM.
+    /// O hash do arquivo em staging verifica também mudanças no arquivo de
+    /// origem durante a cópia.
+    pub fn install_from_file(
+        &self,
+        manifest: &ModelPackManifest,
+        model_path: &Path,
+    ) -> Result<PathBuf, String> {
+        reject_symlink(model_path, "ficheiro de origem do model pack")?;
+        let metadata = fs::metadata(model_path)
+            .map_err(|error| format!("{}: {error}", model_path.display()))?;
+        if !metadata.is_file() {
+            return Err("ficheiro de origem do model pack não é um arquivo".into());
         }
+        check_model_pack_size(metadata.len(), MAX_MODEL_PACK_BYTES)?;
+        self.install_with_writer(manifest, |staged_model| {
+            copy_model_file_bounded(model_path, staged_model)
+        })
+    }
+
+    fn install_with_writer(
+        &self,
+        manifest: &ModelPackManifest,
+        write_model: impl FnOnce(&Path) -> Result<(), String>,
+    ) -> Result<PathBuf, String> {
+        validate_manifest(manifest)?;
+        let manifest_json = serialize_bounded(manifest, MAX_MODEL_PACK_MANIFEST_BYTES, "manifest")?;
 
         fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
         let pack = self.root.join(&manifest.id);
@@ -510,18 +691,10 @@ impl ModelPackManager {
         let staged_manifest = staging.join("manifest.json");
 
         let stage_result = (|| -> Result<(), String> {
-            fs::write(&staged_model, model_bytes).map_err(|error| error.to_string())?;
-            fs::write(
-                &staged_manifest,
-                serde_json::to_vec_pretty(manifest).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
+            write_model(&staged_model)?;
+            fs::write(&staged_manifest, &manifest_json).map_err(|error| error.to_string())?;
 
-            let staged_bytes = fs::read(&staged_model).map_err(|error| error.to_string())?;
-            let staged_hash = Sha256::digest(staged_bytes)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            let staged_hash = hash_model_file(&staged_model)?;
             if !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {
                 return Err("model pack staging hash mismatch".into());
             }
@@ -563,11 +736,14 @@ impl ModelPackManager {
             return Ok(false);
         }
 
-        if self
-            .read_activation()?
-            .as_ref()
-            .is_some_and(|activation| activation.id == id)
-        {
+        // Invalid active state already falls back, and must not block explicit
+        // cleanup. If removing that state fails, keep the pack installed.
+        let clear_active = match self.read_activation() {
+            Ok(Some(activation)) => activation.id == id,
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if clear_active {
             self.deactivate()?;
         }
 
@@ -656,17 +832,18 @@ impl ModelPackManager {
         validate_pack_component(id)?;
         let path = self.root.join(id).join(MODEL_PACK_BENCHMARK_FILE);
         reject_symlink(&path, "benchmark do model pack")?;
-        let bytes = fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let bytes = read_bounded(&path, MAX_MODEL_PACK_BENCHMARK_BYTES, "benchmark")?;
         serde_json::from_slice(&bytes).map_err(|error| error.to_string())
     }
 
     fn read_activation(&self) -> Result<Option<ModelPackActivation>, String> {
         let path = self.root.join(MODEL_PACK_ACTIVE_FILE);
-        let bytes = match fs::read(&path) {
-            Ok(bytes) => bytes,
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
+        let bytes = read_bounded_file(file, &path, MAX_MODEL_PACK_ACTIVE_BYTES, "estado ativo")?;
         let activation: ModelPackActivation =
             serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         validate_pack_component(&activation.id)?;
@@ -676,6 +853,8 @@ impl ModelPackManager {
     }
 
     fn write_activation(&self, activation: &ModelPackActivation) -> Result<(), String> {
+        let activation_json =
+            serialize_bounded(activation, MAX_MODEL_PACK_ACTIVE_BYTES, "estado ativo")?;
         fs::create_dir_all(&self.root).map_err(|error| error.to_string())?;
         let nonce = MODEL_PACK_NONCE.fetch_add(1, Ordering::Relaxed);
         let temp = self
@@ -687,11 +866,7 @@ impl ModelPackManager {
             std::process::id()
         ));
 
-        fs::write(
-            &temp,
-            serde_json::to_vec_pretty(activation).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        fs::write(&temp, activation_json).map_err(|error| error.to_string())?;
 
         let had_existing = final_path.exists();
         if had_existing {
@@ -724,15 +899,13 @@ impl ModelPackManager {
         let manifest = self.load_manifest(id)?;
         self.verify(&manifest)?;
         validate_benchmark(benchmark)?;
+        let benchmark_json =
+            serialize_bounded(benchmark, MAX_MODEL_PACK_BENCHMARK_BYTES, "benchmark")?;
 
         let dir = self.root.join(id);
         let path = dir.join(MODEL_PACK_BENCHMARK_FILE);
         let temp = dir.join(".benchmark.json.tmp");
-        fs::write(
-            &temp,
-            serde_json::to_vec_pretty(benchmark).map_err(|error| error.to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        fs::write(&temp, benchmark_json).map_err(|error| error.to_string())?;
         fs::rename(temp, &path).map_err(|error| error.to_string())?;
         Ok(path)
     }
@@ -801,6 +974,9 @@ fn validate_benchmark(benchmark: &LocalBenchmark) -> Result<(), String> {
     }
     if benchmark.embedding_dimension == 0 {
         return Err("benchmark sem dimensão de embedding".to_string());
+    }
+    if benchmark.resident_model_bytes.is_none() {
+        return Err("benchmark sem medida de memória residente".to_string());
     }
     Ok(())
 }
@@ -929,6 +1105,7 @@ mod tests {
         let result = benchmark_local_intelligence("hashing-local", &ai, &corpus).unwrap();
         assert_eq!(result.samples, 2);
         assert_eq!(result.embedding_dimension, EMBEDDING_DIM);
+        assert_eq!(result.resident_model_bytes, None);
     }
 
     #[test]
@@ -1040,6 +1217,110 @@ mod tests {
     }
 
     #[test]
+    fn file_install_hashes_the_staged_pack_before_publication() {
+        let root = temp_root("file-install");
+        let source = root.join("source.bin");
+        fs::create_dir_all(&root).unwrap();
+        let bytes = vec![0x5a; 2 * 1024 * 1024 + 7];
+        fs::write(&source, &bytes).unwrap();
+        let manifest = ModelPackManifest {
+            id: "semantic-small".into(),
+            version: "1".into(),
+            file: "model.bin".into(),
+            sha256: Sha256::digest(&bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            capabilities: vec!["embedding".into()],
+            license: "test".into(),
+        };
+        let manager = ModelPackManager::new(root.join("packs"));
+        let installed = manager.install_from_file(&manifest, &source).unwrap();
+        assert_eq!(fs::metadata(&installed).unwrap().len(), bytes.len() as u64);
+        assert_eq!(manager.verify(&manifest).unwrap(), installed);
+
+        fs::write(&source, b"tampered").unwrap();
+        assert!(manager.install_from_file(&manifest, &source).is_err());
+        assert_eq!(manager.verify(&manifest).unwrap(), installed);
+        assert_eq!(fs::metadata(&installed).unwrap().len(), bytes.len() as u64);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_file_pack_is_rejected_before_staging() {
+        let root = temp_root("oversized-file-pack");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("large.bin");
+        fs::File::create(&source)
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_BYTES + 1)
+            .unwrap();
+        let manifest = valid_manifest("semantic-small", "1.0.0", b"model-v1");
+        let manager = ModelPackManager::new(root.join("packs"));
+        let error = manager.install_from_file(&manifest, &source).unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+        assert!(!root.join("packs").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_installed_pack_is_rejected_before_hashing() {
+        let root = temp_root("oversized-installed-pack");
+        let pack = root.join("semantic-small");
+        fs::create_dir_all(&pack).unwrap();
+        fs::File::create(pack.join("model.bin"))
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_BYTES + 1)
+            .unwrap();
+        let manifest = valid_manifest("semantic-small", "1.0.0", b"model-v1");
+        fs::write(
+            pack.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let error = ModelPackManager::new(&root).verify(&manifest).unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_bytes_pack_is_rejected_before_staging() {
+        let root = temp_root("oversized-bytes-pack");
+        let bytes = vec![0; MAX_MODEL_PACK_BYTES as usize + 1];
+        let manifest = valid_manifest("semantic-small", "1.0.0", b"model-v1");
+        let error = ModelPackManager::new(&root)
+            .install(&manifest, &bytes)
+            .unwrap_err();
+        assert!(error.contains("64 MiB"), "{error}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn growing_model_copy_stops_at_byte_limit() {
+        let mut at_limit = Vec::new();
+        copy_model_reader_bounded(&b"12345678"[..], &mut at_limit, 8).unwrap();
+        assert_eq!(at_limit, b"12345678");
+
+        let mut destination = Vec::new();
+        let error = copy_model_reader_bounded(&b"123456789"[..], &mut destination, 8).unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        assert!(destination.is_empty());
+    }
+
+    #[test]
+    fn growing_model_hash_stops_at_byte_limit() {
+        assert_eq!(
+            hash_model_reader_bounded(&b"12345678"[..], 8)
+                .unwrap()
+                .len(),
+            64
+        );
+        let error = hash_model_reader_bounded(&b"123456789"[..], 8).unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+    }
+
+    #[test]
     fn model_pack_hash_is_verified_before_use() {
         let root = temp_root("pack");
         let pack = root.join("semantic-small");
@@ -1068,10 +1349,11 @@ mod tests {
         let loaded = manager.load_manifest("semantic-small").unwrap();
         assert_eq!(manager.verify(&loaded).unwrap(), pack.join("model.bin"));
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "hashing-local",
             &HashingLocalIntelligence,
             &["teste".to_string()],
+            0,
         )
         .unwrap();
         assert!(
@@ -1130,6 +1412,29 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_without_residency_evidence_cannot_enable_a_pack() {
+        let root = temp_root("benchmark-needs-residency");
+        let manager = ModelPackManager::new(&root);
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manager.install(&manifest, bytes).unwrap();
+
+        let benchmark = benchmark_local_intelligence(
+            "semantic-small",
+            &HashingLocalIntelligence,
+            &["NeuralIA".to_string()],
+        )
+        .unwrap();
+        let error = manager
+            .record_benchmark("semantic-small", &benchmark)
+            .unwrap_err();
+        assert!(error.contains("memória residente"), "{error}");
+        assert!(manager.activate("semantic-small").is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn model_pack_activation_requires_verified_pack_and_recorded_benchmark() {
         let root = temp_root("activation-requires-benchmark");
         let manager = ModelPackManager::new(&root);
@@ -1145,10 +1450,11 @@ mod tests {
             "activation must fail before benchmark evidence exists"
         );
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "semantic-small",
             &HashingLocalIntelligence,
             &["NeuralIA".to_string()],
+            0,
         )
         .unwrap();
         manager
@@ -1177,10 +1483,11 @@ mod tests {
         let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
         let model = manager.install(&manifest, bytes).unwrap();
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "semantic-small",
             &HashingLocalIntelligence,
             &["NeuralIA".to_string()],
+            0,
         )
         .unwrap();
         manager
@@ -1216,10 +1523,11 @@ mod tests {
         let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
         manager.install(&manifest, bytes).unwrap();
 
-        let benchmark = benchmark_local_intelligence(
+        let benchmark = benchmark_local_intelligence_with_residency(
             "semantic-small",
             &HashingLocalIntelligence,
             &["NeuralIA".to_string()],
+            0,
         )
         .unwrap();
         manager
@@ -1235,6 +1543,107 @@ mod tests {
             ModelPackSelection::deterministic_fallback()
         );
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_installed_manifest_is_rejected_before_deserialization() {
+        let root = temp_root("oversized-manifest");
+        let pack = root.join("semantic-small");
+        fs::create_dir_all(&pack).unwrap();
+        fs::File::create(pack.join("manifest.json"))
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_MANIFEST_BYTES + 1)
+            .unwrap();
+        let error = ModelPackManager::new(&root)
+            .load_manifest("semantic-small")
+            .unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_benchmark_is_rejected_before_deserialization() {
+        let root = temp_root("oversized-benchmark");
+        let pack = root.join("semantic-small");
+        fs::create_dir_all(&pack).unwrap();
+        fs::File::create(pack.join(MODEL_PACK_BENCHMARK_FILE))
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_BENCHMARK_BYTES + 1)
+            .unwrap();
+        let manager = ModelPackManager::new(&root);
+        let error = manager.load_benchmark("semantic-small").unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_active_record_is_rejected_before_deserialization() {
+        let root = temp_root("oversized-active-record");
+        fs::create_dir_all(&root).unwrap();
+        fs::File::create(root.join(MODEL_PACK_ACTIVE_FILE))
+            .unwrap()
+            .set_len(MAX_MODEL_PACK_ACTIVE_BYTES + 1)
+            .unwrap();
+        let manager = ModelPackManager::new(&root);
+        let error = manager.read_activation().unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn oversized_manifest_is_refused_before_installation() {
+        let root = temp_root("oversized-manifest-write");
+        let bytes = b"model-v1";
+        let mut manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manifest.license = "x".repeat(MAX_MODEL_PACK_MANIFEST_BYTES as usize);
+        let manager = ModelPackManager::new(&root);
+        let error = manager.install(&manifest, bytes).unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn oversized_benchmark_is_refused_before_recording() {
+        let root = temp_root("oversized-benchmark-write");
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        let manager = ModelPackManager::new(&root);
+        manager.install(&manifest, bytes).unwrap();
+        let mut benchmark = benchmark_local_intelligence_with_residency(
+            "hashing-local",
+            &HashingLocalIntelligence,
+            &["NeuralIA".to_string()],
+            0,
+        )
+        .unwrap();
+        benchmark.backend = "x".repeat(MAX_MODEL_PACK_BENCHMARK_BYTES as usize);
+        let error = manager
+            .record_benchmark("semantic-small", &benchmark)
+            .unwrap_err();
+        assert!(error.contains("limite"), "{error}");
+        assert!(
+            !root
+                .join("semantic-small")
+                .join(MODEL_PACK_BENCHMARK_FILE)
+                .exists()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn corrupt_active_record_does_not_block_explicit_uninstall() {
+        let root = temp_root("corrupt-active-uninstall");
+        let manager = ModelPackManager::new(&root);
+        let bytes = b"model-v1";
+        let manifest = valid_manifest("semantic-small", "1.0.0", bytes);
+        manager.install(&manifest, bytes).unwrap();
+        fs::write(root.join(MODEL_PACK_ACTIVE_FILE), b"{broken").unwrap();
+        assert!(manager.selection().active.is_none());
+        assert!(manager.selection().warning.is_some());
+        assert!(manager.uninstall("semantic-small").unwrap());
+        assert!(!root.join("semantic-small").exists());
+        assert!(!root.join(MODEL_PACK_ACTIVE_FILE).exists());
         let _ = fs::remove_dir_all(root);
     }
 }
