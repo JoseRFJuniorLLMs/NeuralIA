@@ -4545,7 +4545,7 @@ mod spec_0105_shipping_agent {
     }
 
     #[test]
-    fn reversible_click_runs_under_the_session_grant() {
+    fn generic_click_requires_confirmation_even_with_reversible_session_grant() {
         let page = page(vec![element("button", "Ver detalhes")]);
         let mut policy = policy();
         let decision = decide(
@@ -4557,14 +4557,18 @@ mod spec_0105_shipping_agent {
         let AgentStepDecision::Act(act) = decision else {
             panic!("esperava Act, veio {decision:?}");
         };
-        assert_eq!(act.confirmation, None);
-        assert!(policy.audit()[0].allowed);
+        assert_eq!(
+            act.confirmation.as_deref(),
+            Some("sensitive remote-state change")
+        );
+        assert!(matches!(act.security, AgentSecurityAction::Click { .. }));
+        assert!(!policy.audit()[0].allowed);
     }
 
     #[test]
     fn cross_origin_element_needs_approval() {
-        // O mesmo clique reversível, com a página noutra origem que a
-        // sessão nunca aprovou.
+        // Um clique genérico continua sensível e exige confirmação; numa
+        // origem que a sessão nunca aprovou, o gate também não pode afrouxar.
         let mut other = page(vec![element("button", "Ver detalhes")]);
         other.url = "https://outra.example/loja".into();
         let mut policy = policy();
