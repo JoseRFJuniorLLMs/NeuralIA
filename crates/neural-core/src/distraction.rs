@@ -559,6 +559,19 @@ impl DistractionPolicy {
         self.sites.get(site).copied().unwrap_or(self.default_on)
     }
 
+    /// Muda o padrão global. Exceções que passam a repetir o novo padrão são
+    /// removidas: não faz sentido persistir uma entrada de site sem efeito.
+    ///
+    /// Retorna `true` somente quando o padrão mudou.
+    pub fn set_default(&mut self, on: bool) -> bool {
+        if self.default_on == on {
+            return false;
+        }
+        self.default_on = on;
+        self.sites.retain(|_, site_on| *site_on != on);
+        true
+    }
+
     /// A escolha «Ocultar distracoes neste site». Igual ao padrao, o site
     /// deixa de ter escolha propria (segue o padrao se ele mudar).
     pub fn set_site(&mut self, site: &str, on: bool) -> SiteChange {
