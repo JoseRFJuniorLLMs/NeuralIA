@@ -623,10 +623,39 @@ impl AdblockState {
         outcome
     }
 
+    /// Muda o padrão global da anti-distração. As escolhas por site que
+    /// ficam redundantes com o novo padrão são compactadas pelo core.
+    pub(in crate::windows_app) fn set_distraction_default(&mut self, on: bool) -> bool {
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        self.distraction
+            .publish(&self.settings.distraction, &self.distraction_private);
+        true
+    }
+
+    pub(in crate::windows_app) fn distraction_default_on(&self) -> bool {
+        self.settings.distraction.default_on
+    }
+
     /// A politica gravada da anti-distracao (a do ficheiro).
     #[cfg(test)]
     pub(in crate::windows_app) fn distraction_policy(&self) -> &DistractionPolicy {
         &self.settings.distraction
+    }
+
+    #[cfg(test)]
+    pub(in crate::windows_app) fn test_global_distraction_toggle_updates_shared_policy() {
+        let mut state = Self::load(None);
+        assert!(state.distraction_default_on());
+        assert!(state.set_distraction_default(false));
+        assert!(!state.distraction_default_on());
+        assert!(!state.distraction_policy().default_on);
+        assert!(!state.distraction.policy_for(WebViewHost::External).default_on);
+        assert!(!state.set_distraction_default(false));
+        assert!(state.set_distraction_default(true));
+        assert!(state.distraction.policy_for(WebViewHost::External).default_on);
     }
 
     /// As regras da lista em memoria com os sites permitidos de agora.

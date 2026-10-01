@@ -772,6 +772,26 @@ jobs:
           '@
             },
             @{
+              Label = "distraction-global-toggle-does-not-publish"
+              Test = "global_distraction_command_changes_the_shared_policy"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        self.distraction
+            .publish(&self.settings.distraction, &self.distraction_private);
+          '@
+              New = @'
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        // SABOTAGE: saved settings changed, but open WebViews keep stale policy.
+          '@
+            },
+            @{
               Label = "distraction-clicks-a-reject-that-accepts"
               Test = "distraction_never_clicks_accept"
               SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
@@ -1565,6 +1585,27 @@ jobs:
           }
           ipconfig /flushdns | Out-Null
           ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
+      # SPEC-0114 on the exact release candidate: the page reloads once, then
+      # reports whether the real document-created COM script hid a cookie banner.
+      - name: SPEC-0114 WebView2 distraction E2E on tested exe
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          $name = 'news.distraction.test'
+          $entry = "127.0.0.1 $name"
+          $current = [IO.File]::ReadAllText($hostsPath)
+          $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?$'
+          if ($current -notmatch $pinned) {
+            $separator = if ($current.Length -gt 0 -and -not $current.EndsWith("`n")) { "`r`n" } else { "" }
+            [IO.File]::AppendAllText($hostsPath, "$separator$entry`r`n", [Text.Encoding]::ASCII)
+          }
+          if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
+            throw "The hosts file does not map $name to 127.0.0.1."
+          }
+          ipconfig /flushdns | Out-Null
+          ./scripts/test-distraction-e2e.ps1 -ExePath ci-tested/NeuralIA.exe
       # E2E of the download manager (downloads-manager) on the exact bytes
       # that release.yml packages. It opens the exe (windows that can take the
       # focus), so it never runs in the local suite. The fixture
