@@ -3922,11 +3922,10 @@ fn find_agent_element<'a>(
 /// que isto decidir.
 ///
 /// A separação é o que torna a SPEC-0105 testável no código que embarca. O
-/// `AgentRuntime` do `neural-core` -- sobre o qual corre
-/// `spec_0105_agent_runtime_is_bounded_structured_and_human_gated` -- não é
-/// usado por esta aplicação: o agente do produto é este. Enquanto a decisão
-/// estivesse entalada entre `show_splash` e `evaluate_script`, nenhum teste
-/// conseguia ficar vermelho quando o produto regredisse.
+/// antigo loop paralelo `neural_core::AgentRuntime` foi removido no PR #80:
+/// o agente do produto é este caminho. Enquanto a decisão estivesse entalada
+/// entre `show_splash` e `evaluate_script`, nenhum teste conseguia ficar
+/// vermelho quando o produto regredisse.
 #[derive(Debug, Clone, PartialEq)]
 enum AgentStepDecision {
     /// Terminar, com a razão que vai para o trace e para o utilizador.
@@ -4139,12 +4138,170 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
             field: *field,
             value_summary: format!("{} chars", text.chars().count()),
         },
-        AgentAction::Select { target, value } => AgentSecurityAction::Click {
-            origin,
-            label: format!("select {} = {}", target.name, value),
-        },
+        AgentAction::Select { target, value } => {
+            let material = format!(
+                "{} {} {}",
+                target.role.to_lowercase(),
+                target.name.to_lowercase(),
+                value.to_lowercase()
+            );
+            if [
+                "buy",
+                "purchase",
+                "pay",
+                "comprar",
+                "pagar",
+                "checkout",
+                "transfer",
+                "transferir",
+                "subscribe",
+                "assinar plano",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Payment {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else if ["delete", "remove", "excluir", "apagar", "cancel account"]
+                .iter()
+                .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::DeleteRemote {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else if [
+                "submit",
+                "send",
+                "confirm",
+                "enviar",
+                "confirmar",
+                "post",
+                "publish",
+                "publicar",
+                "save changes",
+                "salvar alterações",
+                "salvar alteracoes",
+                "create account",
+                "criar conta",
+                "authorize",
+                "autorizar",
+                "accept terms",
+                "aceitar termos",
+                "sign agreement",
+                "assinar acordo",
+                "finalize",
+                "finalizar",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Submit {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else {
+                AgentSecurityAction::Select {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            }
+        }
         AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
         _ => AgentSecurityAction::Read { origin },
+    }
+}
+
+#[cfg(test)]
+mod agent_risk_tests {
+    use super::*;
+
+    fn test_element(role: &str, name: &str) -> AgentElement {
+        AgentElement {
+            id: "target".into(),
+            generation: 1,
+            role: role.into(),
+            name: name.into(),
+            text: name.into(),
+            origin: "https://hostile.example".into(),
+            frame: "top".into(),
+            visible: true,
+            interactable: true,
+        }
+    }
+
+    fn test_page(target: AgentElement) -> ObservedPage {
+        ObservedPage {
+            generation: 1,
+            url: "https://hostile.example/form".into(),
+            title: "fixture".into(),
+            text_excerpt: "fixture".into(),
+            elements: vec![target],
+        }
+    }
+
+    #[test]
+    fn generic_click_never_inherits_a_reversible_grant_from_page_metadata() {
+        let target = test_element("button", "Next");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(&AgentAction::Click { target }, &page);
+
+        assert_eq!(security.risk(), ActionRisk::Sensitive);
+
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert_eq!(decision.risk, ActionRisk::Sensitive);
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+    }
+
+    #[test]
+    fn structured_select_keeps_the_native_reversible_class() {
+        let target = test_element("combobox", "Sort");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(
+            &AgentAction::Select {
+                target,
+                value: "recent".into(),
+            },
+            &page,
+        );
+
+        assert_eq!(security.risk(), ActionRisk::Reversible);
+
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert!(decision.allowed);
+        assert!(!decision.requires_confirmation);
+    }
+
+    #[test]
+    fn structured_select_page_metadata_can_only_raise_risk() {
+        let target = test_element("combobox", "Checkout plan");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(
+            &AgentAction::Select {
+                target,
+                value: "purchase premium".into(),
+            },
+            &page,
+        );
+
+        assert_eq!(security.risk(), ActionRisk::Restricted);
+        assert!(matches!(security, AgentSecurityAction::Payment { .. }));
+
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
     }
 }
 
