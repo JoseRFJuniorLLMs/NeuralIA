@@ -4208,7 +4208,7 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
                     description: format!("select {} = {}", target.name, value),
                 }
             }
-        },
+        }
         AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
         _ => AgentSecurityAction::Read { origin },
     }
@@ -4250,8 +4250,7 @@ mod agent_risk_tests {
 
         assert_eq!(security.risk(), ActionRisk::Sensitive);
 
-        let mut policy =
-            AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
         policy.grant_reversible_session_actions(true);
         let decision = policy.evaluate(&security);
 
@@ -4274,8 +4273,7 @@ mod agent_risk_tests {
 
         assert_eq!(security.risk(), ActionRisk::Reversible);
 
-        let mut policy =
-            AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
         policy.grant_reversible_session_actions(true);
         let decision = policy.evaluate(&security);
 
@@ -4298,8 +4296,7 @@ mod agent_risk_tests {
         assert_eq!(security.risk(), ActionRisk::Restricted);
         assert!(matches!(security, AgentSecurityAction::Payment { .. }));
 
-        let mut policy =
-            AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
         policy.grant_reversible_session_actions(true);
         let decision = policy.evaluate(&security);
 
