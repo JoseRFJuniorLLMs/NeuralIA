@@ -73,12 +73,18 @@ May execute without confirmation when user initiated:
 
 ### Class B — reversible interaction
 
-May execute under a session grant:
+May execute under a session grant only when the reversible class comes from a
+**native structured action**, not from page-provided role/name/text:
 
-- select filters;
-- fill non-sensitive search fields;
-- navigate pagination;
+- select filters through the native `Select` action;
+- fill non-sensitive search fields through the native `Search` action;
+- navigate pagination when represented by a bounded native navigation action;
 - open/close temporary tabs.
+
+A generic DOM click is ambiguous remote authority and is therefore **not**
+Class B merely because the page labels it “Next”, “Continue” or similar.
+Remote metadata may cause a stricter classification, but it cannot lower the
+native risk floor.
 
 ### Class C — sensitive communication/state
 
@@ -103,6 +109,25 @@ Must always stop for human control:
 - destructive account operations.
 
 The agent may prepare a Class D action but MUST NOT complete it autonomously.
+
+## 4.1. Untrusted-metadata risk floor
+
+The shipped policy distinguishes **intent class** from **page description**.
+
+- generic `AgentSecurityAction::Click` is Class C by default;
+- `AgentSecurityAction::Select` is Class B because the application created a
+  structured select action before consulting the page policy metadata;
+- `TypeText(Search)` is Class B;
+- arbitrary `TypeText(Text|Email|Unknown)` is Class C;
+- password/payment-card/OTP typing remains Class D.
+
+The page's role, accessible name and text may be used to find an element or to
+raise risk (for example a payment-looking click), but they are never sufficient
+evidence to downgrade a generic action into the reversible session grant.
+
+The product gate `generic_click_never_inherits_a_reversible_grant_from_page_metadata`
+exercises the shipped mapping; CI sabotage deliberately restores the unsafe
+Class-B click and requires that gate to turn red.
 
 ## 5. Sensitive data firewall
 
@@ -206,7 +231,8 @@ decisions and revokes reversible-session and extra-origin grants. A later
 Agent execution is forbidden from release until:
 
 1. capability classes exist in native code;
-2. sensitive actions require the right approval level;
+2. sensitive actions require the right approval level, and page metadata cannot
+   downgrade a generic click/text action into the reversible session grant;
 3. cookies/passwords are never exposed as model context;
 4. public-to-private network pivot tests pass;
 5. adversarial prompt-injection fixtures cannot grant extra tools;

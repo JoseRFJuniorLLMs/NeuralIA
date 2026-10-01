@@ -49,13 +49,13 @@ fn assert_observation_cannot_grant_capabilities(observed: ObservedPage) {
         )
     });
 
-    let reversible = policy.evaluate(&AgentSecurityAction::Click {
+    let generic_click = policy.evaluate(&AgentSecurityAction::Click {
         origin: target.origin.clone(),
         label: format!("{} {}", target.name, target.text),
     });
-    assert_eq!(reversible.risk, ActionRisk::Reversible);
-    assert!(!reversible.allowed);
-    assert!(reversible.requires_confirmation);
+    assert_eq!(generic_click.risk, ActionRisk::Sensitive);
+    assert!(!generic_click.allowed);
+    assert!(generic_click.requires_confirmation);
 
     let sensitive = policy.evaluate(&AgentSecurityAction::Submit {
         origin: target.origin.clone(),

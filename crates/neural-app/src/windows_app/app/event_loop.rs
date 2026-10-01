@@ -104,6 +104,7 @@ impl ApplicationHandler<UserEvent> for App {
     /// Fechar a janela com o comparador aberto: as abas ficam gravadas. E
     /// cada download a verificar acaba antes de sair (com prazo).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.local_models.finish_work();
         let _ = self.save_tab_session();
         self.finish_downloads_before_exit();
     }
@@ -114,6 +115,13 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
+            UserEvent::LocalModelFinished(result) => {
+                self.local_models.finish_work();
+                match result {
+                    Ok(outcome) => self.show_splash(outcome.message(), 4),
+                    Err(error) => self.show_splash(format!("Model pack: {error}"), 5),
+                }
+            }
             // Com downloads a correr, pergunta antes (`leave_guard`).
             UserEvent::ExitRequested => self.request_close(event_loop),
             UserEvent::SaveTabSession(token) => self.save_due_tab_session(token),

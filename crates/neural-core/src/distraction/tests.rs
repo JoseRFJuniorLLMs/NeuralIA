@@ -23,10 +23,7 @@ fn global_default_toggle_changes_future_sites_and_drops_redundant_overrides() {
     let mut policy = DistractionPolicy::default();
     assert!(web("https://news.example/article", &policy).is_some());
 
-    assert_eq!(
-        policy.set_site("quiet.example", false),
-        SiteChange::Changed
-    );
+    assert_eq!(policy.set_site("quiet.example", false), SiteChange::Changed);
     assert!(!policy.site_on("quiet.example"));
 
     assert!(policy.set_default(false));

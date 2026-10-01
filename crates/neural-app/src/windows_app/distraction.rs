@@ -20,9 +20,7 @@ pub(in crate::windows_app) enum DistractionCommand {
 pub(in crate::windows_app) const DISTRACTION_COMMAND_HELP: &str =
     "/distracoes · /distracoes on · /distracoes off";
 
-pub(in crate::windows_app) fn parse_distraction_command(
-    input: &str,
-) -> Option<DistractionCommand> {
+pub(in crate::windows_app) fn parse_distraction_command(input: &str) -> Option<DistractionCommand> {
     let normalized = input.trim().to_ascii_lowercase();
     let rest = if normalized == "/distracoes" || normalized == "distracoes:" {
         ""

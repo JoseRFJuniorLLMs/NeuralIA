@@ -4545,7 +4545,7 @@ mod spec_0105_shipping_agent {
     }
 
     #[test]
-    fn reversible_click_runs_under_the_session_grant() {
+    fn generic_click_requires_confirmation_even_with_reversible_session_grant() {
         let page = page(vec![element("button", "Ver detalhes")]);
         let mut policy = policy();
         let decision = decide(
@@ -4557,14 +4557,18 @@ mod spec_0105_shipping_agent {
         let AgentStepDecision::Act(act) = decision else {
             panic!("esperava Act, veio {decision:?}");
         };
-        assert_eq!(act.confirmation, None);
-        assert!(policy.audit()[0].allowed);
+        assert_eq!(
+            act.confirmation.as_deref(),
+            Some("sensitive remote-state change")
+        );
+        assert!(matches!(act.security, AgentSecurityAction::Click { .. }));
+        assert!(!policy.audit()[0].allowed);
     }
 
     #[test]
     fn cross_origin_element_needs_approval() {
-        // O mesmo clique reversível, com a página noutra origem que a
-        // sessão nunca aprovou.
+        // Um clique genérico continua sensível e exige confirmação; numa
+        // origem que a sessão nunca aprovou, o gate também não pode afrouxar.
         let mut other = page(vec![element("button", "Ver detalhes")]);
         other.url = "https://outra.example/loja".into();
         let mut policy = policy();
@@ -6325,8 +6329,104 @@ fn route_input_sends_each_command_where_it_belongs() {
         InputRoute::ResearchSynthesize
     );
     assert_eq!(route_input("research:export"), InputRoute::ResearchExport);
+    assert_eq!(
+        route_input("model:status"),
+        InputRoute::LocalModel(Ok(crate::local_models::LocalModelCommand::Status))
+    );
+    assert_eq!(
+        route_input("modelo:desativar"),
+        InputRoute::LocalModel(Ok(crate::local_models::LocalModelCommand::Deactivate))
+    );
+    assert!(matches!(
+        route_input("model:activate:"),
+        InputRoute::LocalModel(Err(_))
+    ));
     assert_eq!(route_input("o que é ownership"), InputRoute::Intent);
     assert_eq!(route_input("https://example.com"), InputRoute::Intent);
+}
+
+#[test]
+fn uninstalling_a_model_pack_does_not_change_ordinary_product_routes() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "neuralia-model-route-{}-{stamp}",
+        std::process::id()
+    ));
+    let data = root.join("data");
+    let import = root.join("import");
+    std::fs::create_dir_all(&import).expect("import dir");
+    let model = b"model-bytes";
+    let manifest = neural_core::ModelPackManifest {
+        id: "semantic-small".into(),
+        version: "1.0.0".into(),
+        file: "semantic.bin".into(),
+        sha256: "357e5d6fafa34d27360fec24b4326d3534905e33c6acdee60198fb078b7b79e5".into(),
+        capabilities: vec!["embeddings".into(), "intent".into()],
+        license: "Apache-2.0".into(),
+    };
+    std::fs::write(import.join("semantic.bin"), model).expect("model");
+    let manifest_path = import.join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("manifest");
+
+    let registry = neural_core::json_store::StoreRegistry::mint_for_test(&data);
+    let grant = registry
+        .grant(crate::stores::MODEL_PACKS_STORE)
+        .expect("model-pack store grant");
+    let mut packs = crate::local_models::LocalModelPacks::new(grant).expect("model-pack adapter");
+    crate::local_models::execute_local_model_command(
+        &mut packs,
+        crate::local_models::LocalModelCommand::Install(manifest_path),
+    )
+    .expect("install");
+    packs
+        .record_benchmark_explicit(
+            "semantic-small",
+            &neural_core::LocalBenchmark {
+                backend: "fixture-backend".into(),
+                samples: 2,
+                embedding_dimension: 384,
+                embed_micros_total: 10,
+                classify_micros_total: 10,
+                resident_model_bytes: Some(0),
+                measured_at: 1,
+            },
+        )
+        .expect("benchmark");
+    crate::local_models::execute_local_model_command(
+        &mut packs,
+        crate::local_models::LocalModelCommand::Activate("semantic-small".into()),
+    )
+    .expect("activate");
+    crate::local_models::execute_local_model_command(
+        &mut packs,
+        crate::local_models::LocalModelCommand::Uninstall("semantic-small".into()),
+    )
+    .expect("uninstall");
+
+    assert!(matches!(
+        crate::local_models::execute_local_model_command(
+            &mut packs,
+            crate::local_models::LocalModelCommand::Status
+        )
+        .expect("status"),
+        crate::local_models::LocalModelOutcome::Fallback { .. }
+    ));
+    assert_eq!(
+        route_input("memory:rust ownership"),
+        InputRoute::MemoryQuery("rust ownership".into())
+    );
+    assert_eq!(route_input("research:compare"), InputRoute::ResearchCompare);
+    assert_eq!(route_input("history:"), InputRoute::History);
+    assert_eq!(route_input("https://example.com"), InputRoute::Intent);
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 /// SPEC-0100 / SPEC-0006 no caminho que embarca: "Private/incognito
@@ -24092,7 +24192,8 @@ fn existing_stores_have_a_declared_kind() {
     use crate::stores::{
         ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, AI_SETTINGS_STORE,
         AI_USAGE_STORE, APP_STORES, BOOKMARKS_STORE, DOWNLOADS_LOG_STORE, DOWNLOADS_SETTINGS_STORE,
-        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, TABS_STORE, TRANSLATE_STORE,
+        HISTORY_STORE, KEYS_STORE, LIVE_KEY_STORE, MEMORY_STORE, MODEL_PACKS_STORE, TABS_STORE,
+        TRANSLATE_STORE,
     };
     use neural_core::json_store::StoreKind::{Automatic, Explicit, GuardedAutomatic, Setting};
     use neural_core::json_store::StoreShape::{Dir, File};
@@ -24113,6 +24214,7 @@ fn existing_stores_have_a_declared_kind() {
         ("pomodoro", Setting, File),
         ("zettel", Explicit, Dir),
         ("library", Explicit, Dir),
+        ("model-packs", Explicit, Dir),
         ("research-exports", Explicit, Dir),
         ("gemini-live.key", Explicit, File),
         ("keys", Explicit, Dir),
@@ -24167,6 +24269,7 @@ fn existing_stores_have_a_declared_kind() {
     let specs = [
         ("HISTORY_STORE", HISTORY_STORE.name),
         ("MEMORY_STORE", MEMORY_STORE.name),
+        ("MODEL_PACKS_STORE", MODEL_PACKS_STORE.name),
         ("TABS_STORE", TABS_STORE.name),
         ("KEYS_STORE", KEYS_STORE.name),
         ("LIVE_KEY_STORE", LIVE_KEY_STORE.name),
@@ -25514,8 +25617,8 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
         (
             "neural-core/src/local_intelligence.rs",
-            11,
-            "model packs: nao ligados ao produto (spec_0102); o local-model-packs traz o grant",
+            12,
+            "model-packs (Explicit): a raiz vem do MODEL_PACKS_STORE grant; o adapter mantem a capacidade e o manager faz I/O apenas sob essa raiz",
         ),
         (
             "neural-core/src/memory.rs",

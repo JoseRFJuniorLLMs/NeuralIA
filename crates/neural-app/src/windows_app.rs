@@ -33,7 +33,7 @@ use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_
 use crate::privacy::{PrivacyGuard, PrivacyMode};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::secrets::redact_debug_secrets;
-use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE};
+use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, MODEL_PACKS_STORE};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::json_store::StoreRegistry;
 use neural_core::{
@@ -100,6 +100,8 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
+    /// Resultado do worker de model packs; o event loop continua responsivo durante I/O.
+    LocalModelFinished(Result<crate::local_models::LocalModelOutcome, String>),
     /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
     /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
     Theme(ThemeEvent),
@@ -3259,6 +3261,9 @@ pub(in crate::windows_app) struct App {
     /// Estado nativo lido pela subclasse do EDIT da palette.
     pub(in crate::windows_app) palette_host: Box<PaletteHost>,
     pub(in crate::windows_app) config: CoreConfig,
+    /// SPEC-0102: raiz + slot lazy do manager. O produto so toca neste
+    /// estado depois de um comando model:/modelo: explicitamente submetido.
+    pub(in crate::windows_app) local_models: crate::local_models::LocalModelPacks,
     /// O portao da persistencia (`crate::privacy`): dono do registo das
     /// lojas (a unica cunhagem do produto, feita no `App::new`) e dos
     /// escritores automaticos -- o historico, a memoria semantica e as
@@ -3390,6 +3395,14 @@ impl App {
             &config,
             EventSink::proxy(proxy.clone()),
         );
+        // Estado barato e grant-typed: pedir a capacidade nao cria pasta nem
+        // le packs. O manager continua nascendo so numa acao model: explicita.
+        let local_models = crate::local_models::LocalModelPacks::new(
+            privacy
+                .store(MODEL_PACKS_STORE)
+                .expect("MODEL_PACKS_STORE deve estar no registro de lojas"),
+        )
+        .expect("MODEL_PACKS_STORE deve ter nome/tipo/forma corretos");
         let notes = ZettelWorker::new(config.data_dir.join("zettel"), proxy.clone());
         let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
@@ -3481,6 +3494,7 @@ impl App {
             palette: None,
             palette_host,
             config,
+            local_models,
             privacy,
             timers,
             current_research: None,
@@ -3922,11 +3936,10 @@ fn find_agent_element<'a>(
 /// que isto decidir.
 ///
 /// A separação é o que torna a SPEC-0105 testável no código que embarca. O
-/// `AgentRuntime` do `neural-core` -- sobre o qual corre
-/// `spec_0105_agent_runtime_is_bounded_structured_and_human_gated` -- não é
-/// usado por esta aplicação: o agente do produto é este. Enquanto a decisão
-/// estivesse entalada entre `show_splash` e `evaluate_script`, nenhum teste
-/// conseguia ficar vermelho quando o produto regredisse.
+/// antigo loop paralelo `neural_core::AgentRuntime` foi removido no PR #80:
+/// o agente do produto é este caminho. Enquanto a decisão estivesse entalada
+/// entre `show_splash` e `evaluate_script`, nenhum teste conseguia ficar
+/// vermelho quando o produto regredisse.
 #[derive(Debug, Clone, PartialEq)]
 enum AgentStepDecision {
     /// Terminar, com a razão que vai para o trace e para o utilizador.
@@ -4139,12 +4152,170 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
             field: *field,
             value_summary: format!("{} chars", text.chars().count()),
         },
-        AgentAction::Select { target, value } => AgentSecurityAction::Click {
-            origin,
-            label: format!("select {} = {}", target.name, value),
-        },
+        AgentAction::Select { target, value } => {
+            let material = format!(
+                "{} {} {}",
+                target.role.to_lowercase(),
+                target.name.to_lowercase(),
+                value.to_lowercase()
+            );
+            if [
+                "buy",
+                "purchase",
+                "pay",
+                "comprar",
+                "pagar",
+                "checkout",
+                "transfer",
+                "transferir",
+                "subscribe",
+                "assinar plano",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Payment {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else if ["delete", "remove", "excluir", "apagar", "cancel account"]
+                .iter()
+                .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::DeleteRemote {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else if [
+                "submit",
+                "send",
+                "confirm",
+                "enviar",
+                "confirmar",
+                "post",
+                "publish",
+                "publicar",
+                "save changes",
+                "salvar alterações",
+                "salvar alteracoes",
+                "create account",
+                "criar conta",
+                "authorize",
+                "autorizar",
+                "accept terms",
+                "aceitar termos",
+                "sign agreement",
+                "assinar acordo",
+                "finalize",
+                "finalizar",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Submit {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else {
+                AgentSecurityAction::Select {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            }
+        }
         AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
         _ => AgentSecurityAction::Read { origin },
+    }
+}
+
+#[cfg(test)]
+mod agent_risk_tests {
+    use super::*;
+
+    fn test_element(role: &str, name: &str) -> AgentElement {
+        AgentElement {
+            id: "target".into(),
+            generation: 1,
+            role: role.into(),
+            name: name.into(),
+            text: name.into(),
+            origin: "https://hostile.example".into(),
+            frame: "top".into(),
+            visible: true,
+            interactable: true,
+        }
+    }
+
+    fn test_page(target: AgentElement) -> ObservedPage {
+        ObservedPage {
+            generation: 1,
+            url: "https://hostile.example/form".into(),
+            title: "fixture".into(),
+            text_excerpt: "fixture".into(),
+            elements: vec![target],
+        }
+    }
+
+    #[test]
+    fn generic_click_never_inherits_a_reversible_grant_from_page_metadata() {
+        let target = test_element("button", "Next");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(&AgentAction::Click { target }, &page);
+
+        assert_eq!(security.risk(), ActionRisk::Sensitive);
+
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert_eq!(decision.risk, ActionRisk::Sensitive);
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+    }
+
+    #[test]
+    fn structured_select_keeps_the_native_reversible_class() {
+        let target = test_element("combobox", "Sort");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(
+            &AgentAction::Select {
+                target,
+                value: "recent".into(),
+            },
+            &page,
+        );
+
+        assert_eq!(security.risk(), ActionRisk::Reversible);
+
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert!(decision.allowed);
+        assert!(!decision.requires_confirmation);
+    }
+
+    #[test]
+    fn structured_select_page_metadata_can_only_raise_risk() {
+        let target = test_element("combobox", "Checkout plan");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(
+            &AgentAction::Select {
+                target,
+                value: "purchase premium".into(),
+            },
+            &page,
+        );
+
+        assert_eq!(security.risk(), ActionRisk::Restricted);
+        assert!(matches!(security, AgentSecurityAction::Payment { .. }));
+
+        let mut policy = AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
     }
 }
 

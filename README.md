@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v2.5.1** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v2.6.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -45,9 +45,14 @@ num processo de inferência permanente.
   mantêm proveniência. `research:compare`, `research:synthesize` e
   `research:export` comparam, sintetizam e exportam a sessão em Markdown.
 - **Inteligência local opcional:** embeddings/classificação/entidades/resumos
-  possuem fallback determinístico sem modelo. A infraestrutura de biblioteca de
-  model packs valida manifesto, checksum, instalação/remoção e benchmark, mas
-  ainda não está ligada ao produto nem carrega modelos automaticamente.
+  possuem fallback determinístico sem modelo. Model packs têm lifecycle lazy e
+  explícito pela omnibox (`model:status`, `model:install:<manifest>`,
+  `model:deactivate`, `model:uninstall:<id>`). Instalação não ativa sozinha
+  e `model:activate:<id>` fica indisponível enquanto nenhum backend de
+  inferência medido estiver ligado ao produto. O core preserva a infraestrutura
+  de ativação, que exige benchmark com latência e residência medidas; corrupção
+  volta ao fallback com diagnóstico. Nenhum backend de inferência é criado no
+  startup ou recebe autoridade de navegador.
 - **Timeline semântica:** perguntas, respostas, títulos, código, tabelas,
   citações, fontes e conclusões viram âncoras navegáveis.
 - **Agente Web limitado:** `agent:https://site | search=texto | click=botão |

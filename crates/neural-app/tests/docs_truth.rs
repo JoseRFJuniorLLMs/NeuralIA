@@ -53,9 +53,24 @@ fn normative_architecture_describes_current_bounded_ipc_and_webview_model() {
 }
 
 #[test]
-fn model_pack_docs_do_not_claim_product_wiring() {
-    assert!(LOCAL_AI_SPEC.contains("not a NeuralIA product feature"));
-    assert!(README.contains("ainda não está ligada ao produto"));
+fn model_pack_docs_match_lazy_lifecycle_without_claiming_inference_backend() {
+    // Markdown line wrapping must not change what this documentation guard sees.
+    let readme = README.split_whitespace().collect::<Vec<_>>().join(" ");
+    let local_ai = LOCAL_AI_SPEC
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(local_ai.contains("product-side lazy adapter"));
+    assert!(local_ai.contains("no inference-backend construction"));
+    assert!(local_ai.contains("resident-model-byte evidence"));
+    assert!(local_ai.contains("CI startup E2E launches the full `App`"));
+    assert!(local_ai.contains("manager_initialized=false"));
+    assert!(local_ai.contains("product route refuses `model:activate:<id>`"));
+    assert!(readme.contains("model:status"));
+    assert!(!readme.contains("`model:activate:<id>`, `model:deactivate`"));
+    assert!(readme.contains("model:activate:<id>"));
+    assert!(readme.contains("fica indisponível"));
+    assert!(readme.contains("Nenhum backend de inferência"));
 }
 
 /// O orcamento de contexto (`neural_core::context_budget`) existe e tem gates

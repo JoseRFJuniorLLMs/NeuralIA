@@ -59,6 +59,12 @@ pub enum AgentSecurityAction {
         origin: String,
         label: String,
     },
+    /// Reversible selection whose intent comes from the native structured
+    /// command, not from a page-provided role/label.
+    Select {
+        origin: String,
+        description: String,
+    },
     TypeText {
         origin: String,
         field: FieldKind,
@@ -97,13 +103,18 @@ impl AgentSecurityAction {
             Self::Read { .. } | Self::Extract { .. } | Self::Navigate { .. } => {
                 ActionRisk::ReadOnly
             }
-            Self::Click { .. }
+            Self::Select { .. }
             | Self::TypeText {
-                field: FieldKind::Search | FieldKind::Text,
+                field: FieldKind::Search,
                 ..
             } => ActionRisk::Reversible,
-            Self::TypeText {
-                field: FieldKind::Email | FieldKind::Unknown,
+            // A generic click is ambiguous remote authority. The page owns its
+            // role/name/text, so those strings may raise the risk but can never
+            // lower it into the session-grant class. Likewise arbitrary text
+            // fields are not the SPEC-0104 "non-sensitive search field" class.
+            Self::Click { .. }
+            | Self::TypeText {
+                field: FieldKind::Text | FieldKind::Email | FieldKind::Unknown,
                 ..
             }
             | Self::Submit { .. }
@@ -132,6 +143,7 @@ impl AgentSecurityAction {
             Self::Read { origin }
             | Self::Extract { origin }
             | Self::Click { origin, .. }
+            | Self::Select { origin, .. }
             | Self::TypeText { origin, .. }
             | Self::Submit { origin, .. }
             | Self::Upload { origin, .. }
@@ -390,6 +402,7 @@ fn audit_action_name(action: &AgentSecurityAction) -> &'static str {
         AgentSecurityAction::Extract { .. } => "extract",
         AgentSecurityAction::Navigate { .. } => "navigate",
         AgentSecurityAction::Click { .. } => "click",
+        AgentSecurityAction::Select { .. } => "select",
         AgentSecurityAction::TypeText { .. } => "type",
         AgentSecurityAction::Submit { .. } => "submit",
         AgentSecurityAction::Upload { .. } => "upload",
@@ -739,9 +752,9 @@ mod tests {
         let mut policy = AgentPermissionPolicy::new(Some("https://a.example".into()));
         policy.grant_reversible_session_actions(true);
 
-        let decision = policy.evaluate(&AgentSecurityAction::Click {
+        let decision = policy.evaluate(&AgentSecurityAction::Select {
             origin: "https://b.example".into(),
-            label: "Continue".into(),
+            description: "filter = recent".into(),
         });
 
         assert_eq!(decision.risk, ActionRisk::Reversible);
@@ -749,12 +762,55 @@ mod tests {
         assert!(decision.requires_confirmation);
 
         policy.approve_origin("https://b.example");
-        let approved = policy.evaluate(&AgentSecurityAction::Click {
+        let approved = policy.evaluate(&AgentSecurityAction::Select {
             origin: "https://b.example".into(),
-            label: "Continue".into(),
+            description: "filter = recent".into(),
         });
         assert!(approved.allowed);
         assert!(!approved.requires_confirmation);
+    }
+
+    #[test]
+    fn page_labels_cannot_downgrade_generic_clicks_or_text_fields_to_class_b() {
+        let mut policy = AgentPermissionPolicy::new(Some("https://evil.example".into()));
+        policy.grant_reversible_session_actions(true);
+
+        for action in [
+            AgentSecurityAction::Click {
+                origin: "https://evil.example".into(),
+                label: "Next".into(),
+            },
+            AgentSecurityAction::Click {
+                origin: "https://evil.example".into(),
+                label: "harmless continue".into(),
+            },
+            AgentSecurityAction::TypeText {
+                origin: "https://evil.example".into(),
+                field: FieldKind::Text,
+                value_summary: "5 chars".into(),
+            },
+        ] {
+            let decision = policy.evaluate(&action);
+            assert_eq!(decision.risk, ActionRisk::Sensitive);
+            assert_eq!(decision.capability, CapabilityClass::CSensitive);
+            assert!(!decision.allowed);
+            assert!(decision.requires_confirmation);
+        }
+
+        let select = policy.evaluate(&AgentSecurityAction::Select {
+            origin: "https://evil.example".into(),
+            description: "filter = recent".into(),
+        });
+        assert_eq!(select.risk, ActionRisk::Reversible);
+        assert!(select.allowed);
+
+        let search = policy.evaluate(&AgentSecurityAction::TypeText {
+            origin: "https://evil.example".into(),
+            field: FieldKind::Search,
+            value_summary: "5 chars".into(),
+        });
+        assert_eq!(search.risk, ActionRisk::Reversible);
+        assert!(search.allowed);
     }
 
     #[test]
@@ -875,11 +931,18 @@ mod tests {
                 CapabilityClass::AReadOnly,
             ),
             (
+                AgentSecurityAction::Select {
+                    origin: "https://example.com".into(),
+                    description: "page = next".into(),
+                },
+                CapabilityClass::BReversible,
+            ),
+            (
                 AgentSecurityAction::Click {
                     origin: "https://example.com".into(),
                     label: "Next".into(),
                 },
-                CapabilityClass::BReversible,
+                CapabilityClass::CSensitive,
             ),
             (
                 AgentSecurityAction::Submit {
@@ -931,25 +994,25 @@ mod tests {
         policy.grant_reversible_session_actions(true);
         policy.approve_origin("https://b.example");
 
-        let before = policy.evaluate(&AgentSecurityAction::Click {
+        let before = policy.evaluate(&AgentSecurityAction::Select {
             origin: "https://b.example".into(),
-            label: "Continue".into(),
+            description: "filter = recent".into(),
         });
         assert!(before.allowed);
 
         policy.stop();
         policy.resume();
 
-        let same_origin = policy.evaluate(&AgentSecurityAction::Click {
+        let same_origin = policy.evaluate(&AgentSecurityAction::Select {
             origin: "https://a.example".into(),
-            label: "Continue".into(),
+            description: "filter = recent".into(),
         });
         assert!(!same_origin.allowed);
         assert!(same_origin.requires_confirmation);
 
-        let cross_origin = policy.evaluate(&AgentSecurityAction::Click {
+        let cross_origin = policy.evaluate(&AgentSecurityAction::Select {
             origin: "https://b.example".into(),
-            label: "Continue".into(),
+            description: "filter = recent".into(),
         });
         assert!(!cross_origin.allowed);
         assert!(cross_origin.requires_confirmation);

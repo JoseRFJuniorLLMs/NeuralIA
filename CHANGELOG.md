@@ -4,6 +4,24 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-10-01
+
+### Added
+- **Model packs locais — lifecycle de produto (PR #236):** instalação explícita, verificação limitada, status, desativação e remoção passam pelo produto de forma lazy e fora da UI thread. O arranque continua sem construir o manager, sem criar a pasta de packs e com **0 bytes de modelo residente**; pack ausente/corrompido ou estado stale cai para fallback determinístico e diagnóstico visível.
+- **Anti-distração global (PR #235):** a Home e a paleta aceitam `/distracoes`, `/distracoes on`, `/distracoes off` e `distracoes:<ação>`; o padrão é persistido na política existente e aplicado às superfícies web abertas sem recarregar as colunas Gemini/ChatGPT/Claude.
+- **Consenso — persistência/export ponta a ponta (PR #216):** o fluxo real WebView → resposta capturada → sessão persistida → Markdown é exercitado em E2E, preservando provedor e proveniência; a variante privada prova ausência de persistência automática.
+
+### Security
+- **Piso de risco do agente (PR #234):** clique genérico e campos de texto arbitrários deixam de herdar autoridade reversível a partir de metadata controlada pela página. `Select` estruturado e `TypeText(Search)` mantêm Class B; metadata remota pode elevar o risco para submit/delete/payment, nunca reduzi-lo.
+
+### Testing
+- **SPEC-0114:** E2E em EXE/WebView2 real prova `AddScriptToExecuteOnDocumentCreated` numa fixture loopback e inclui sabotagem determinística da ligação COM.
+- **SPEC-0102:** gates de lifecycle cobrem lazy startup, limites de import/hash, operações fora da UI thread, fallback e recusa de ativação sem benchmark real.
+- **Release gate:** o instalador continua sendo produzido somente a partir do EXE medido pelo CI do `main`, com checksum, SBOM e attestação.
+
+### Known limitations
+- **Inferência local ainda não é ativada:** 2.6.0 entrega o lifecycle seguro dos model packs, mas não inventa benchmark nem backend. A ativação permanece recusada até existir um backend real de inferência que produza medições de latência e memória.
+
 ## [2.5.1] - 2026-09-29
 
 ### Fixed

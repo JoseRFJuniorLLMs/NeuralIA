@@ -78,6 +78,12 @@ mod egress;
 #[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
 mod lazy_worker;
 
+// SPEC-0102: adaptador de lifecycle de model packs no produto. Guardamos so a
+// raiz no startup; o ModelPackManager nasce apenas quando uma acao explicita
+// ou uma tarefa local realmente precisa resolver o pack ativo.
+#[cfg_attr(not(all(test, target_os = "windows")), allow(dead_code))]
+mod local_models;
+
 // Centro de avisos (infra-notify-popups): a fila, a entrega pelo Foco e pela
 // privacidade e o unico aviso do canto, sem Win32 -- testado tambem no Linux.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
