@@ -100,6 +100,15 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
+    /// Resultado da verificação de atualizações no GitHub.
+    UpdateStatus(Result<neural_core::update::UpdateStatus, String>),
+    /// Progresso de download da atualização (versão, fração 0.0..1.0).
+    UpdateProgress {
+        version: String,
+        progress: f64,
+    },
+    /// Instalador executável baixado e pronto para aplicar a atualização.
+    UpdateReady(std::path::PathBuf),
     /// Resultado do worker de model packs; o event loop continua responsivo durante I/O.
     LocalModelFinished(Result<crate::local_models::LocalModelOutcome, String>),
     /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele

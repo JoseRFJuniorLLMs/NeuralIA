@@ -101,6 +101,8 @@ pub(in crate::windows_app) enum InputRoute {
     OpenEpub(Option<PathBuf>),
     /// `update:` (e `update:check`, `atualizar:`, `!update`, `/update`): verificação de versão.
     UpdateCheck,
+    /// `sobre:` (e `about:`, `/sobre`, `/about`, `historia:`): tela sobre o projeto e sua história.
+    About,
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
 }
@@ -140,6 +142,15 @@ pub(in crate::windows_app) fn route_input(input: &str) -> InputRoute {
         ("atualizar:", InputRoute::UpdateCheck),
         ("!update", InputRoute::UpdateCheck),
         ("/update", InputRoute::UpdateCheck),
+        ("sobre:", InputRoute::About),
+        ("!sobre", InputRoute::About),
+        ("/sobre", InputRoute::About),
+        ("about:", InputRoute::About),
+        ("!about", InputRoute::About),
+        ("/about", InputRoute::About),
+        ("historia:", InputRoute::About),
+        ("!historia", InputRoute::About),
+        ("/historia", InputRoute::About),
         ("livros:", InputRoute::Library),
         ("biblioteca:", InputRoute::Library),
         ("books:", InputRoute::Library),
@@ -235,6 +246,8 @@ pub(in crate::windows_app) enum PaletteRoute {
     Distraction(DistractionCommand),
     /// Verificação de atualizações in-app (`update:`, `/update`, `atualizar:`).
     UpdateCheck,
+    /// Tela sobre o projeto e sua história (`sobre:`, `about:`, `/sobre`, `/about`).
+    About,
 }
 
 pub(in crate::windows_app) fn route_palette(
@@ -254,6 +267,7 @@ pub(in crate::windows_app) fn route_palette(
         InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
         InputRoute::Distraction(command) => return PaletteRoute::Distraction(command),
         InputRoute::UpdateCheck => return PaletteRoute::UpdateCheck,
+        InputRoute::About => return PaletteRoute::About,
         _ => {}
     }
     match parse_intent(input) {
@@ -527,13 +541,8 @@ impl App {
             InputRoute::Library => self.open_library(),
             InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
             InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
-            InputRoute::UpdateCheck => {
-                let current_version = env!("CARGO_PKG_VERSION");
-                self.show_splash(
-                    format!("NeuralIA v{current_version} · Verificação de atualização: canal oficial GitHub Releases"),
-                    4,
-                );
-            }
+            InputRoute::About => self.show_about(),
+            InputRoute::UpdateCheck => self.check_and_apply_update(true),
             InputRoute::Intent => match parse_intent(&input) {
                 Ok(Intent::Home) => {
                     self.request_home();
@@ -597,13 +606,8 @@ impl App {
             PaletteRoute::Theme(Some(choice)) => self.choose_theme(choice),
             PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
             PaletteRoute::Distraction(command) => self.distraction_command(command),
-            PaletteRoute::UpdateCheck => {
-                let current_version = env!("CARGO_PKG_VERSION");
-                self.show_splash(
-                    format!("NeuralIA v{current_version} · Verificação de atualização: canal oficial GitHub Releases"),
-                    4,
-                );
-            }
+            PaletteRoute::About => self.show_about(),
+            PaletteRoute::UpdateCheck => self.check_and_apply_update(true),
             // allow_local: a URL foi digitada num controlo nativo, e entrada
             // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
             // abre privada: open_split_mode(private) nao grava memoria nem

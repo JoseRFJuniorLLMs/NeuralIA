@@ -2,6 +2,26 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.7.1] - 2026-10-01
+
+### Added
+- **Atualizador automático diário com barra de progresso visual na tela:** verificação automática diária no canal oficial de releases do GitHub (`JoseRFJuniorLLMs/NeuralIA`) na inicialização sem bloqueio de I/O; download seguro do instalador executável com barra de progresso gráfica renderizada em tempo real na tela (`[████████░░░░░░░░] X%`), execução imediata do instalador e reinicialização limpa para aplicar a nova versão.
+- **Tela e comandos "Sobre o NeuralIA" (`sobre:`, `about:`, `/sobre`, `/about`, `historia:`, `/historia`):** janela nativa e notificação splash apresentando a história do projeto — Jose R F Junior abriu o Gerenciador de Tarefas do Windows, viu o Google Chrome consumindo 6 GB de RAM e decidiu criar seu próprio navegador em Rust, 100% voltado para IA e ultraleve, trazendo nativamente todos os recursos que não existiam no Chrome (Comparador Multi-IA em 3 colunas paralelas com Gemini, ChatGPT e Claude, Leitor limpo e focado sem anúncios, leitor PDF e EPUB nativo, bloqueador de anúncios de alta performance, memória semântica local privada com busca vetorial e arquitetura zero-alloc).
+- **Barra de endereços na barra de título com borda distinta estilo Chrome:** adicionado o método `Theme::omnibox_border`, garantindo contorno nítido de 1.5 px em repouso com contraste perceptível contra a barra nos temas claro e escuro, e contorno de 2.0 px na cor de destaque ao focar/digitar, com invalidação visual reativa via `WM_SETFOCUS` e `WM_KILLFOCUS`.
+- **Alinhamento contíguo dos ícones na barra de título:** unificado o cálculo de posicionamento dos 7 atalhos de serviço (`Gemini Live`, `Meet`, `WhatsApp`, `YouTube`, `Gmail`, `Downloads` e `Privado`) em relação ao primeiro botão de ferramentas (`tools[0]`), com espaçamento uniforme de 4 px, eliminando a folga vazia entre o botão do modo Privado e o Pomodoro.
+
+### Fixed
+- **Named Pipe DACL em sessões não elevadas:** corrigido erro no transporte de agentes (`pipe.rs`) ao criar o named pipe, adicionando fallback gracioso para DACL protegida quando a chamada `SetNamedSecurityInfoW` com `WRITE_OWNER` for negada em sessões de usuário padrão sem privilégios administrativos.
+- **Otimizações profundas de memória e alocação (Auditoria de 10 iterações):**
+  - Eliminação de mais de 50 mil alocações de heap no parser de listas de domínios do adblock (`adblock.rs`) utilizando `LineKind::Single`.
+  - Uso de `BufWriter` na gravação atômica do histórico (`history.rs`), reduzindo syscalls de I/O em disco.
+  - Guarda estrita de fronteira UTF-8 na extração de texto do Edge TTS e fatiamento binário zero-alloc (`speech.rs`).
+  - Fast-path de alocação zero para palavras em minúsculas na detecção de português (`translate.rs`).
+  - Comparação estrita de pre-releases seguindo SemVer 2.0.0 no verificador de atualizações (`update.rs`).
+  - Reutilização de buffers pré-alocados em varreduras de cabeçalhos de arquivos ZIP (`safezip.rs`).
+  - Otimizações de travessia e empacotamento no instalador (`neural-setup`) e na timeline semântica.
+  - Mitigação de path traversal e travessia zero-alloc no subsistema Zettel (`zettel.rs`).
+
 ## [2.7.0] - 2026-10-01
 
 ### Added

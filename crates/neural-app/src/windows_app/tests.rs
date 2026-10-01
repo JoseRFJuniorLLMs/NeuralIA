@@ -6378,6 +6378,15 @@ fn route_input_sends_each_command_where_it_belongs() {
     assert_eq!(route_input("ATUALIZAR:"), InputRoute::UpdateCheck);
     assert_eq!(route_input("!update"), InputRoute::UpdateCheck);
     assert_eq!(route_input("/update"), InputRoute::UpdateCheck);
+    assert_eq!(route_input("sobre:"), InputRoute::About);
+    assert_eq!(route_input("!sobre"), InputRoute::About);
+    assert_eq!(route_input("/sobre"), InputRoute::About);
+    assert_eq!(route_input("about:"), InputRoute::About);
+    assert_eq!(route_input("!about"), InputRoute::About);
+    assert_eq!(route_input("/about"), InputRoute::About);
+    assert_eq!(route_input("historia:"), InputRoute::About);
+    assert_eq!(route_input("!historia"), InputRoute::About);
+    assert_eq!(route_input("/historia"), InputRoute::About);
     assert_eq!(route_input("o que é ownership"), InputRoute::Intent);
     assert_eq!(route_input("https://example.com"), InputRoute::Intent);
 }
@@ -6978,6 +6987,12 @@ fn palette_routes_private_input_away_from_the_normal_column() {
         }
     );
     assert_eq!(route_palette("home:", 0, true), PaletteRoute::Home);
+    assert_eq!(
+        route_palette("update:", 0, false),
+        PaletteRoute::UpdateCheck
+    );
+    assert_eq!(route_palette("sobre:", 0, false), PaletteRoute::About);
+    assert_eq!(route_palette("/sobre", 1, true), PaletteRoute::About);
     assert_eq!(route_palette("   ", 0, false), PaletteRoute::Invalid(None));
     assert_eq!(
         route_palette("texto", COMPARATOR_COLUMNS, false),
@@ -25814,6 +25829,11 @@ fn no_raw_data_dir_write_outside_a_grant() {
             "neural-core/src/zettel.rs",
             4,
             "zettel/ (Explicit): notas que o utilizador escreveu; grant = privacy-guard-retrofit",
+        ),
+        (
+            "neural-core/src/update.rs",
+            1,
+            "o instalador baixado no temp do sistema, fora da pasta de dados",
         ),
     ];
 

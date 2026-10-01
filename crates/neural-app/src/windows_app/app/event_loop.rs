@@ -15,6 +15,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.create_omnibox();
                 self.sync_caption_buttons();
                 self.request_redraw();
+                self.check_daily_update();
                 // Spike de aceleradores (so no build de CI com a feature):
                 // antes do SubmitText, para a pergunta da rolagem ja estar
                 // respondida quando o comparador abrir.
@@ -115,6 +116,100 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
+            UserEvent::UpdateStatus(Ok(status)) => {
+                match status {
+                    neural_core::update::UpdateStatus::UpToDate { current_version } => {
+                        self.show_splash(
+                        format!("NeuralIA v{current_version} está atualizado na versão mais recente."),
+                        4,
+                    );
+                        self.status = Some("NeuralIA está atualizado.".to_string());
+                        self.request_redraw();
+                    }
+                    neural_core::update::UpdateStatus::UpdateAvailable {
+                        current_version,
+                        latest,
+                    } => {
+                        let new_ver = latest.version.clone();
+                        self.show_splash(
+                        format!(
+                            "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização…"
+                        ),
+                        5,
+                    );
+                        self.status = Some(format!("Baixando atualização v{new_ver}…"));
+                        self.request_redraw();
+
+                        if let Some(download_url) = latest.installer_url {
+                            let proxy = self.proxy.clone();
+                            let temp_installer =
+                                std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
+                            let ver = new_ver.clone();
+                            std::thread::Builder::new()
+                                .name("neural-update-download".into())
+                                .spawn(move || {
+                                    let res = neural_core::update::download_installer(
+                                        &download_url,
+                                        &temp_installer,
+                                        |progress| {
+                                            let _ = proxy.send_event(UserEvent::UpdateProgress {
+                                                version: ver.clone(),
+                                                progress,
+                                            });
+                                        },
+                                    );
+                                    match res {
+                                        Ok(()) => {
+                                            let _ = proxy
+                                                .send_event(UserEvent::UpdateReady(temp_installer));
+                                        }
+                                        Err(err) => {
+                                            let _ = proxy.send_event(UserEvent::UpdateStatus(Err(
+                                                format!("Falha no download da atualização: {err}"),
+                                            )));
+                                        }
+                                    }
+                                })
+                                .ok();
+                        } else {
+                            self.show_splash(
+                                format!("Nova versão v{new_ver} disponível em {}", latest.html_url),
+                                6,
+                            );
+                        }
+                    }
+                }
+            }
+            UserEvent::UpdateStatus(Err(err)) => {
+                self.show_splash(format!("Atualização: {err}"), 5);
+                self.status = Some(format!("Erro ao verificar atualização: {err}"));
+                self.request_redraw();
+            }
+            UserEvent::UpdateProgress { version, progress } => {
+                let percent = (progress * 100.0).clamp(0.0, 100.0) as usize;
+                let total_blocks = 20;
+                let filled = (percent * total_blocks) / 100;
+                let empty = total_blocks.saturating_sub(filled);
+                let bar: String = "█".repeat(filled) + &"░".repeat(empty);
+                let msg = format!("Baixando NeuralIA v{version}: [{bar}] {percent}%");
+                self.show_splash(msg.clone(), 3);
+                self.status = Some(msg);
+                self.request_redraw();
+            }
+            UserEvent::UpdateReady(installer_path) => {
+                self.show_splash(
+                    "Atualização baixada com sucesso! Reiniciando para atualizar…".to_string(),
+                    5,
+                );
+                self.status = Some("Reiniciando para aplicar atualização…".to_string());
+                self.request_redraw();
+
+                if let Err(err) = std::process::Command::new(&installer_path).spawn() {
+                    self.show_splash(format!("Não foi possível iniciar o instalador: {err}"), 6);
+                } else {
+                    self.request_close(event_loop);
+                }
+            }
             UserEvent::LocalModelFinished(result) => {
                 self.local_models.finish_work();
                 match result {

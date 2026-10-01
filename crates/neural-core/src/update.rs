@@ -143,6 +143,76 @@ pub fn check_update_status(current_version: &str, latest: ReleaseInfo) -> Update
         }
     }
 }
+/// Consulta a última release pública no GitHub através da API REST oficial.
+pub fn fetch_latest_release(repo: &str) -> Result<ReleaseInfo> {
+    let url = github_latest_release_url(repo);
+    let agent = ureq::Agent::new_with_defaults();
+    let mut response = agent
+        .get(&url)
+        .header("accept", "application/vnd.github.v3+json")
+        .header("user-agent", "NeuralIA-App")
+        .call()
+        .map_err(|e| NeuralError::Config(format!("Falha na consulta ao GitHub: {e}")))?;
+
+    let mut body_str = String::new();
+    use std::io::Read;
+    response
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
+        .reader()
+        .read_to_string(&mut body_str)
+        .map_err(|e| NeuralError::Config(format!("Falha ao ler release: {e}")))?;
+    parse_github_release_json(&body_str)
+}
+
+/// Faz o download do instalador da release reportando o progresso (de 0.0 a 1.0).
+pub fn download_installer(
+    installer_url: &str,
+    target_path: &std::path::Path,
+    mut on_progress: impl FnMut(f64),
+) -> Result<()> {
+    let agent = ureq::Agent::new_with_defaults();
+    let mut response = agent
+        .get(installer_url)
+        .header("user-agent", "NeuralIA-App")
+        .call()
+        .map_err(|e| NeuralError::Config(format!("Falha ao conectar para download: {e}")))?;
+
+    let total_bytes = response.body().content_length().unwrap_or(0);
+    let mut file = std::fs::File::create(target_path)
+        .map_err(|e| NeuralError::Config(format!("Falha ao criar arquivo de destino: {e}")))?;
+
+    let mut reader = response
+        .body_mut()
+        .with_config()
+        .limit(150 * 1024 * 1024)
+        .reader();
+
+    let mut buffer = [0u8; 32 * 1024];
+    let mut downloaded: u64 = 0;
+    use std::io::{Read, Write};
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|e| NeuralError::Config(format!("Erro no stream de download: {e}")))?;
+        if read == 0 {
+            break;
+        }
+        file.write_all(&buffer[..read])
+            .map_err(|e| NeuralError::Config(format!("Erro ao gravar dados do instalador: {e}")))?;
+        downloaded += read as u64;
+        if total_bytes > 0 {
+            on_progress((downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0));
+        } else {
+            on_progress(0.5);
+        }
+    }
+    file.flush()
+        .map_err(|e| NeuralError::Config(format!("Erro ao finalizar instalador: {e}")))?;
+    on_progress(1.0);
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

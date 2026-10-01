@@ -474,6 +474,64 @@ impl App {
         }
     }
 
+    pub(in crate::windows_app) fn show_about(&mut self) {
+        const ABOUT_TITLE: &str = "Sobre o NeuralIA";
+        const ABOUT_TEXT: &str = "NeuralIA — O Navegador Voltado para IA\nVersão 2.7.1 (x64)\nCriador: Jose R F Junior\n\nA História do NeuralIA:\nJose R F Junior entrou no gerenciador de tarefas e viu o Chrome usando 6 GB de RAM e resolveu fazer seu próprio navegador, voltado para IA, com todos os recursos que não existiam no Chrome:\n\n• Comparador Multi-IA nativo em 3 colunas paralelas (Gemini, ChatGPT e Claude)\n• Modo de Leitura limpo, focado e sem distrações nem anúncios\n• Visualizador nativo de PDFs com TextLayer e leitor EPUB integrado\n• Bloqueador de anúncios de alta performance integrado\n• Memória semântica local com busca vetorial e privacidade total\n• Arquitetura ultraleve em Rust com zero alocação desnecessária.";
+
+        self.show_native_text(ABOUT_TITLE, ABOUT_TEXT);
+        self.show_splash(
+            "NeuralIA: Criado por Jose R F Junior (voltado para IA e ultraleve).".to_string(),
+            4,
+        );
+        self.status = Some("NeuralIA — Criado por Jose R F Junior (voltado para IA)".to_string());
+        self.request_redraw();
+    }
+
+    /// Verificação diária automática de atualização na inicialização.
+    pub(in crate::windows_app) fn check_daily_update(&mut self) {
+        static LAST_CHECK_DAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now_days = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 86400;
+        let prev = LAST_CHECK_DAY.swap(now_days, std::sync::atomic::Ordering::SeqCst);
+        if prev == now_days {
+            return; // Já verificado hoje
+        }
+        self.check_and_apply_update(false);
+    }
+
+    /// Executa a checagem e atualização automática com barra de progresso na tela.
+    pub(in crate::windows_app) fn check_and_apply_update(&mut self, manual: bool) {
+        if manual {
+            self.show_splash("Verificando atualizações no GitHub…".to_string(), 3);
+            self.status = Some("Verificando atualizações no canal oficial…".to_string());
+            self.request_redraw();
+        }
+        let proxy = self.proxy.clone();
+        let current_version = env!("CARGO_PKG_VERSION").to_string();
+        std::thread::Builder::new()
+            .name("neural-auto-update".into())
+            .spawn(move || {
+                match neural_core::update::fetch_latest_release(
+                    neural_core::update::DEFAULT_GITHUB_REPO,
+                ) {
+                    Ok(latest) => {
+                        let status =
+                            neural_core::update::check_update_status(&current_version, latest);
+                        let _ = proxy.send_event(UserEvent::UpdateStatus(Ok(status)));
+                    }
+                    Err(err) => {
+                        if manual {
+                            let _ = proxy.send_event(UserEvent::UpdateStatus(Err(err.to_string())));
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+
     pub(in crate::windows_app) fn show_memory_results(
         &self,
         query: &str,
