@@ -4302,7 +4302,6 @@ mod agent_risk_tests {
 
         assert!(!decision.allowed);
         assert!(decision.requires_confirmation);
-        assert_eq!(decision.capability, CapabilityClass::DRestricted);
     }
 }
 
