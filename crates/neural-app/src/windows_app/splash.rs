@@ -150,8 +150,7 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
 
                 let text = SPLASH_TEXT
                     .lock()
-                    .map(|value| value.clone())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 if let Some(question) = question {
                     let buttons = splash_buttons(&client, question.buttons.len());
