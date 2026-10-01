@@ -515,6 +515,16 @@ pub(crate) fn hello_line(pid: u32) -> String {
     out
 }
 
+pub(crate) fn model_start_line(
+    resident_model_bytes: usize,
+    manager_initialized: bool,
+    pack_dir_exists: bool,
+) -> String {
+    format!(
+        "{{\"t\":\"modelstart\",\"resident_model_bytes\":{resident_model_bytes},\"manager_initialized\":{manager_initialized},\"pack_dir_exists\":{pack_dir_exists}}}"
+    )
+}
+
 pub(crate) fn ack_line(seq: u64, ok: bool, detail: &str) -> String {
     format!(
         "{{\"t\":\"ack\",\"seq\":{seq},\"ok\":{ok},\"detail\":{}}}",
