@@ -538,7 +538,7 @@ impl ServicePanelState {
             strip: self.strip_area(width, logical_w, top, strip),
             reserved_width: self.reserved_width(width),
             window_fullscreen: self.fullscreen(),
-            exit_button: self.app_fullscreen(),
+            exit_button: self.fullscreen(),
             resize_handle: self.docked(),
         }
     }
@@ -594,7 +594,7 @@ pub struct ServiceFrame {
     pub reserved_width: f64,
     /// A janela inteira em tela cheia, com o painel por cima de tudo.
     pub window_fullscreen: bool,
-    /// O "Sair da tela cheia" nativo (so a tela cheia pedida pela faixa).
+    /// O "Sair da tela cheia" nativo (em qualquer modo de tela cheia do painel).
     pub exit_button: bool,
     /// A pega de arrastar a borda (so com o painel encostado).
     pub resize_handle: bool,
@@ -694,7 +694,11 @@ pub fn is_escape_down(virtual_key: u32, key_down: bool) -> bool {
 
 /// O script (nosso, constante, sem dados da pagina) que pede a pagina para
 /// sair da tela cheia do DOM.
-pub const EXIT_PAGE_FULLSCREEN_SCRIPT: &str = "(function(){try{if(document.fullscreenElement&&document.exitFullscreen){document.exitFullscreen().catch(function(){});}}catch(e){}})();";
+pub const EXIT_PAGE_FULLSCREEN_SCRIPT: &str = "(function(){\
+try{if(document.exitFullscreen){document.exitFullscreen().catch(function(){});}else if(document.webkitExitFullscreen){document.webkitExitFullscreen();}}catch(e){}\
+try{var p=document.getElementById('movie_player');if(p&&typeof p.cancelFullScreen==='function'){p.cancelFullScreen();}}catch(e){}\
+try{var esc=new KeyboardEvent('keydown',{key:'Escape',code:'Escape',keyCode:27,which:27,bubbles:true,cancelable:true});document.dispatchEvent(esc);if(document.body){document.body.dispatchEvent(esc);}}catch(e){}\
+})();";
 
 #[cfg(test)]
 mod tests {
@@ -1117,11 +1121,11 @@ mod tests {
         assert!(!minimized.window_fullscreen);
         state.step(ServiceInput::IconClick);
 
-        // A pagina em tela cheia: janela inteira, sem pega nem faixa, e sem
-        // o "Sair" nativo (a pagina tem o dela e o Esc).
+        // A pagina em tela cheia: janela inteira, sem pega nem faixa, com
+        // o "Sair" nativo para permitir restaurar e voltar ao normal.
         state.step(ServiceInput::PageFullscreen(true));
         let page = frame(&state);
-        assert!(page.window_fullscreen && !page.exit_button && !page.resize_handle);
+        assert!(page.window_fullscreen && page.exit_button && !page.resize_handle);
         assert_eq!(
             page.panel.map(|p| (p.x, p.y, p.width, p.height)),
             Some((0.0, 0.0, 1600.0, 900.0))

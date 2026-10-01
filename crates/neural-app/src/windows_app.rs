@@ -2175,6 +2175,17 @@ unsafe extern "system" fn exit_button_subclass(
         // clique atravessa-a e vai parar ao WebView por baixo, que era por isso
         // que este botao nao fazia nada.
         WM_NCHITTEST => HTCLIENT as LRESULT,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR => {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetCursor(
+                    windows_sys::Win32::UI::WindowsAndMessaging::LoadCursorW(
+                        std::ptr::null_mut(),
+                        windows_sys::Win32::UI::WindowsAndMessaging::IDC_HAND,
+                    ),
+                );
+            }
+            1
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut paint);

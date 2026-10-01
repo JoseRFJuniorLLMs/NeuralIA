@@ -271,6 +271,115 @@ impl ChatThread {
     }
 }
 
+/// Erros da camada de armazenamento e ciclo de vida de conversas.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ChatError {
+    #[error("conversa não encontrada: {0:?}")]
+    ThreadNotFound(ChatThreadId),
+    #[error("turno não encontrado: {0:?}")]
+    TurnNotFound(TurnId),
+    #[error("limite de conteúdo excedido: {0}")]
+    ContentLimitExceeded(String),
+}
+
+/// Resumo leve de uma conversa para listagens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatThreadSummary {
+    pub thread_id: ChatThreadId,
+    pub title: String,
+    pub turns_count: usize,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub privacy: ThreadPrivacy,
+}
+
+/// Contrato síncrono para armazenamento e recuperação de conversas (SPEC-0115 §8).
+pub trait ChatStore: Send {
+    fn create_thread(&mut self, thread: ChatThread) -> Result<ChatThreadId, ChatError>;
+    fn get_thread(&self, id: &ChatThreadId) -> Result<ChatThread, ChatError>;
+    fn list_threads(&self) -> Result<Vec<ChatThreadSummary>, ChatError>;
+    fn delete_thread(&mut self, id: &ChatThreadId) -> Result<(), ChatError>;
+    fn add_response_to_turn(
+        &mut self,
+        thread_id: &ChatThreadId,
+        turn_id: &TurnId,
+        message: ChatMessage,
+    ) -> Result<(), ChatError>;
+}
+
+/// Implementação em memória de referência para testes e modo volátil.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryChatStore {
+    threads: std::collections::HashMap<ChatThreadId, ChatThread>,
+}
+
+impl InMemoryChatStore {
+    pub fn new() -> Self {
+        Self {
+            threads: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl ChatStore for InMemoryChatStore {
+    fn create_thread(&mut self, thread: ChatThread) -> Result<ChatThreadId, ChatError> {
+        let id = thread.thread_id.clone();
+        self.threads.insert(id.clone(), thread);
+        Ok(id)
+    }
+
+    fn get_thread(&self, id: &ChatThreadId) -> Result<ChatThread, ChatError> {
+        self.threads
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ChatError::ThreadNotFound(id.clone()))
+    }
+
+    fn list_threads(&self) -> Result<Vec<ChatThreadSummary>, ChatError> {
+        let mut list: Vec<_> = self
+            .threads
+            .values()
+            .map(|t| ChatThreadSummary {
+                thread_id: t.thread_id.clone(),
+                title: t.title.clone(),
+                turns_count: t.turns.len(),
+                created_at_ms: t.created_at_ms,
+                updated_at_ms: t.updated_at_ms,
+                privacy: t.privacy,
+            })
+            .collect();
+        list.sort_by_key(|a| std::cmp::Reverse(a.updated_at_ms));
+        Ok(list)
+    }
+
+    fn delete_thread(&mut self, id: &ChatThreadId) -> Result<(), ChatError> {
+        self.threads
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| ChatError::ThreadNotFound(id.clone()))
+    }
+
+    fn add_response_to_turn(
+        &mut self,
+        thread_id: &ChatThreadId,
+        turn_id: &TurnId,
+        message: ChatMessage,
+    ) -> Result<(), ChatError> {
+        let thread = self
+            .threads
+            .get_mut(thread_id)
+            .ok_or_else(|| ChatError::ThreadNotFound(thread_id.clone()))?;
+        let turn = thread
+            .turns
+            .iter_mut()
+            .find(|t| &t.turn_id == turn_id)
+            .ok_or_else(|| ChatError::TurnNotFound(turn_id.clone()))?;
+        turn.add_response(message);
+        thread.updated_at_ms = turn.created_at_ms.max(thread.updated_at_ms);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,5 +439,48 @@ mod tests {
         let serialized = serde_json::to_string(&thread).expect("serialize");
         let deserialized: ChatThread = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(thread, deserialized);
+    }
+
+    #[test]
+    fn test_in_memory_chat_store() {
+        let mut store = InMemoryChatStore::new();
+        let thread_id = ChatThreadId::new("store_thread");
+        let mut thread = ChatThread::new(
+            thread_id.clone(),
+            "Título da Thread".to_string(),
+            ThreadPrivacy::Persistent,
+            vec![ProviderId::ChatGpt],
+            100,
+        );
+        let turn = thread.begin_turn(TurnId::new("turn_1"), MessageId::new("user_msg_1"), 120);
+        let turn_id = turn.turn_id.clone();
+
+        store.create_thread(thread).expect("create thread");
+        let list = store.list_threads().expect("list threads");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].title, "Título da Thread");
+
+        let msg = ChatMessage::assistant_reply(
+            MessageId::new("reply_1"),
+            thread_id.clone(),
+            turn_id.clone(),
+            1,
+            ProviderId::ChatGpt,
+            vec![ContentPart::Text("Olá!".to_string())],
+            150,
+        );
+        store
+            .add_response_to_turn(&thread_id, &turn_id, msg)
+            .expect("add response");
+
+        let retrieved = store.get_thread(&thread_id).expect("get thread");
+        assert_eq!(retrieved.turns[0].responses.len(), 1);
+        assert_eq!(retrieved.turns[0].responses[0].full_text(), "Olá!");
+
+        store.delete_thread(&thread_id).expect("delete thread");
+        assert!(matches!(
+            store.get_thread(&thread_id),
+            Err(ChatError::ThreadNotFound(_))
+        ));
     }
 }

@@ -118,6 +118,11 @@ pub(in crate::windows_app) static WHEEL_PANEL_LEFT: AtomicI32 = AtomicI32::new(0
 pub(in crate::windows_app) static WHEEL_PANEL_TOP: AtomicI32 = AtomicI32::new(0);
 pub(in crate::windows_app) static WHEEL_PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
 pub(in crate::windows_app) static WHEEL_PANEL_BOTTOM: AtomicI32 = AtomicI32::new(0);
+pub(in crate::windows_app) static EXIT_BUTTON_REVEAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static EXIT_BUTTON_HWND: AtomicUsize = AtomicUsize::new(0);
+pub(in crate::windows_app) static EXIT_REVEAL_INSIDE: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) static EXIT_REVEAL_SHOW_THRESHOLD: AtomicI32 = AtomicI32::new(60);
+pub(in crate::windows_app) static EXIT_REVEAL_HIDE_THRESHOLD: AtomicI32 = AtomicI32::new(120);
 
 pub(in crate::windows_app) fn wheel_panel_rect() -> Option<ScreenRect> {
     WHEEL_PANEL_ACTIVE
@@ -194,34 +199,62 @@ pub(in crate::windows_app) unsafe extern "system" fn wheel_hook(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, HC_ACTION, MSLLHOOKSTRUCT, PostMessageW, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+        CallNextHookEx, GetForegroundWindow, HC_ACTION, MSLLHOOKSTRUCT, PostMessageW, SW_HIDE,
+        SW_SHOWNOACTIVATE, ShowWindow, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
         WindowFromPoint,
     };
     let message = wparam as u32;
-    if code == HC_ACTION as i32
-        && (message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL)
-        && lparam != 0
-    {
-        let info = &*(lparam as *const MSLLHOOKSTRUCT);
-        let app = WHEEL_APP_HWND.load(Ordering::Acquire) as HWND;
-        let foreground = !app.is_null() && GetForegroundWindow() == app;
-        let host = WHEEL_PANEL_HOST.load(Ordering::Acquire) as HWND;
-        let panel = wheel_panel_rect();
-        // So se pergunta ao Windows quem esta debaixo do cursor quando o
-        // resto ja apontava para o painel: fora dele o gancho nao gasta nada.
-        let hit_is_panel = foreground
-            && panel.is_some_and(|rect| rect.contains(info.pt.x, info.pt.y))
-            && wheel_hit_in_panel(host, WindowFromPoint(info.pt));
-        if wheel_route((info.pt.x, info.pt.y), panel, foreground, hit_is_panel) == WheelRoute::Panel
-            && let Some(target) = panel_window_at(host, info.pt)
-        {
-            let delta = (info.mouseData >> 16) as u16 as i16;
-            let (w, l) = wheel_message_params(delta, wheel_key_state(), info.pt.x, info.pt.y);
-            // PostMessage e nao SendMessage: o gancho nunca espera pelo
-            // processo do WebView2.
-            if PostMessageW(target, message, w, l) != 0 {
-                return 1;
+    if code == HC_ACTION as i32 && lparam != 0 {
+        if message == WM_MOUSEMOVE && EXIT_BUTTON_REVEAL_ACTIVE.load(Ordering::Acquire) {
+            let button = EXIT_BUTTON_HWND.load(Ordering::Acquire) as HWND;
+            let app = WHEEL_APP_HWND.load(Ordering::Acquire) as HWND;
+            if !button.is_null() && !app.is_null() && GetForegroundWindow() == app {
+                let info = &*(lparam as *const MSLLHOOKSTRUCT);
+                let mut client_origin = POINT { x: 0, y: 0 };
+                if ClientToScreen(app, &mut client_origin) != 0 {
+                    let rel_y = info.pt.y - client_origin.y;
+                    let currently_inside = EXIT_REVEAL_INSIDE.load(Ordering::Acquire);
+                    let threshold = if currently_inside {
+                        EXIT_REVEAL_HIDE_THRESHOLD.load(Ordering::Acquire)
+                    } else {
+                        EXIT_REVEAL_SHOW_THRESHOLD.load(Ordering::Acquire)
+                    };
+                    let inside = rel_y >= 0 && rel_y <= threshold;
+                    if inside != currently_inside {
+                        EXIT_REVEAL_INSIDE.store(inside, Ordering::Release);
+                        if inside {
+                            ShowWindow(button, SW_SHOWNOACTIVATE);
+                            InvalidateRect(button, std::ptr::null(), 1);
+                        } else {
+                            ShowWindow(button, SW_HIDE);
+                        }
+                    }
+                }
+            }
+        } else if message == WM_MOUSEWHEEL || message == WM_MOUSEHWHEEL {
+            let info = &*(lparam as *const MSLLHOOKSTRUCT);
+            let app = WHEEL_APP_HWND.load(Ordering::Acquire) as HWND;
+            let foreground = !app.is_null() && GetForegroundWindow() == app;
+            let host = WHEEL_PANEL_HOST.load(Ordering::Acquire) as HWND;
+            let panel = wheel_panel_rect();
+            // So se pergunta ao Windows quem esta debaixo do cursor quando o
+            // resto ja apontava para o painel: fora dele o gancho nao gasta nada.
+            let hit_is_panel = foreground
+                && panel.is_some_and(|rect| rect.contains(info.pt.x, info.pt.y))
+                && wheel_hit_in_panel(host, WindowFromPoint(info.pt));
+            if wheel_route((info.pt.x, info.pt.y), panel, foreground, hit_is_panel)
+                == WheelRoute::Panel
+                && let Some(target) = panel_window_at(host, info.pt)
+            {
+                let delta = (info.mouseData >> 16) as u16 as i16;
+                let (w, l) = wheel_message_params(delta, wheel_key_state(), info.pt.x, info.pt.y);
+                // PostMessage e nao SendMessage: o gancho nunca espera pelo
+                // processo do WebView2.
+                if PostMessageW(target, message, w, l) != 0 {
+                    return 1;
+                }
             }
         }
     }

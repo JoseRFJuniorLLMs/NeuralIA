@@ -10,6 +10,9 @@ All notable changes to NeuralIA are documented here.
 - **Protocolo Edge TTS & Síntese de Leitura em Voz Alta (SPEC-0116):** adicionado o módulo `neural_core::speech` com suporte a vozes neurais brasileiras e internacionais (`pt-BR-FranciscaNeural`, `pt-BR-AntonioNeural`, etc.), construtor SSML com proteção contra injeção e escape XML, envelopes de protocolo WebSocket (`speech.config`, `ssml`) e parser de metadados `WordBoundary` para sincronização palavra por palavra no Leitor e no Visualizador de PDF.
 - **Organização e rastreamento de especificações:** renomeados e formalmente rastreados os rascunhos de especificações para evitar colisões numéricas (`md/SPEC-0115-chat-surface.md`, `md/SPEC-0116-neural-read-aloud.md`, `md/memoria-relatorio.md`), com matriz de auditoria atualizada em `md/AUDIT-SPEC-0100-0108.md`.
 
+### Fixed
+- **Restauração e saída de tela cheia no YouTube:** corrigido bug onde o YouTube em tela cheia (DOM / HTML5 fullscreen) ficava sem botão ou controle visível para restaurar a janela e voltar ao normal. Agora o botão nativo flutuante de restauração ("✕ Sair da tela cheia") é ativado automaticamente e é revelado de forma fluida somente quando o cursor do mouse se move em direção à barra de título (topo da tela), ocultando-se quando o usuário volta o mouse para a área do vídeo.
+
 ## [2.6.2] - 2026-10-01
 
 ### Added

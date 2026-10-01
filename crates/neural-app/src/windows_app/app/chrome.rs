@@ -970,6 +970,9 @@ impl App {
             || self.service_frame().is_some_and(|frame| frame.exit_button);
 
         if !wanted {
+            EXIT_BUTTON_REVEAL_ACTIVE.store(false, Ordering::Release);
+            EXIT_BUTTON_HWND.store(0, Ordering::Release);
+            EXIT_REVEAL_INSIDE.store(false, Ordering::Release);
             if let Some(button) = self.exit_button.take() {
                 unsafe {
                     DestroyWindow(button);
@@ -987,6 +990,16 @@ impl App {
         let scale = window.scale_factor().max(1.0);
         let width = (EXIT_BUTTON_WIDTH * scale).round() as i32;
         let height = (EXIT_BUTTON_HEIGHT * scale).round() as i32;
+
+        WHEEL_APP_HWND.store(owner as usize, Ordering::Release);
+        EXIT_REVEAL_SHOW_THRESHOLD.store(
+            ((COMPARATOR_CHROME_HEIGHT + 20.0) * scale).round() as i32,
+            Ordering::Release,
+        );
+        EXIT_REVEAL_HIDE_THRESHOLD.store(
+            ((COMPARATOR_CHROME_HEIGHT + EXIT_BUTTON_HEIGHT + 30.0) * scale).round() as i32,
+            Ordering::Release,
+        );
 
         if self.exit_button.is_none() {
             unsafe {
@@ -1027,10 +1040,13 @@ impl App {
                 if !region.is_null() {
                     SetWindowRgn(created, region, 1);
                 }
+                EXIT_BUTTON_HWND.store(created as usize, Ordering::Release);
                 self.exit_button = Some(created);
             }
         }
 
+        EXIT_BUTTON_REVEAL_ACTIVE.store(true, Ordering::Release);
+        install_wheel_hook();
         self.position_exit_button();
     }
 
@@ -1057,20 +1073,26 @@ impl App {
             let top = ((COMPARATOR_CHROME_HEIGHT + 10.0) * scale).round() as i32;
             SetWindowPos(
                 button,
-                std::ptr::null_mut(),
+                windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOP,
                 origin.x + (client.right - width) / 2,
                 origin.y + top,
                 width,
                 height,
                 SWP_NOACTIVATE,
             );
-            show_popup_without_activation(button);
+            if EXIT_REVEAL_INSIDE.load(Ordering::Acquire) {
+                show_popup_without_activation(button);
+                InvalidateRect(button, std::ptr::null(), 1);
+            } else {
+                ShowWindow(button, SW_HIDE);
+            }
         }
     }
 
     /// Esconde o botao sem o destruir. Serve a perda de foco: a janela volta
     /// e o `sync_exit_button` decide de novo, sem recriar nada entretanto.
     fn hide_exit_button(&self) {
+        EXIT_REVEAL_INSIDE.store(false, Ordering::Release);
         if let Some(button) = self.exit_button {
             unsafe {
                 ShowWindow(button, SW_HIDE);

@@ -1950,6 +1950,37 @@ fn the_window_buttons_stay_hidden_under_the_fullscreen_service_panel() {
     ));
 }
 
+#[test]
+fn youtube_dom_fullscreen_offers_native_restore_exit_button() {
+    let mut state = ServicePanelState::default();
+    let frame = state.frame(560.0, 1920.0, 1080.0, COMPARATOR_CHROME_HEIGHT, 34.0);
+    assert!(
+        !frame.exit_button,
+        "encostado nao tem botao flutuante de saida"
+    );
+
+    // YouTube clicado em tela cheia na propria pagina (HTML5 Fullscreen API)
+    state.step(ServiceInput::PageFullscreen(true));
+    let fullscreen_frame = state.frame(560.0, 1920.0, 1080.0, COMPARATOR_CHROME_HEIGHT, 34.0);
+    assert!(
+        fullscreen_frame.exit_button,
+        "em tela cheia da pagina o botao flutuante nativo de restaurar/sair tem de estar ativo"
+    );
+    assert!(fullscreen_frame.window_fullscreen);
+
+    // Clicar no botao flutuante pede a pagina para sair de tela cheia (ServiceEffect::ExitPageFullscreen)
+    assert_eq!(
+        state.step(ServiceInput::ToggleFullscreen),
+        crate::panel_chrome::ServiceEffect::ExitPageFullscreen
+    );
+    // Pagina confirma saida de tela cheia
+    assert_eq!(
+        state.step(ServiceInput::PageFullscreen(false)),
+        crate::panel_chrome::ServiceEffect::Relayout
+    );
+    assert!(state.docked());
+}
+
 /// Escondido, o controlo dos botoes nao sobe na ordem Z: sem isto cada
 /// Resized ou regresso do foco o punha por cima do painel que acabou de
 /// ser levantado. A vista, sobe (tem de ficar por cima das WebViews, que

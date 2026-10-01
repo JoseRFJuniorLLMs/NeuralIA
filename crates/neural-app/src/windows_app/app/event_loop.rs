@@ -594,6 +594,35 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_home_go_hover();
                 self.refresh_caption_reveal();
                 self.update_home_tool_hover();
+                if EXIT_BUTTON_REVEAL_ACTIVE.load(Ordering::Acquire)
+                    && let Some(button) = self.exit_button
+                {
+                    let currently_inside = EXIT_REVEAL_INSIDE.load(Ordering::Acquire);
+                    let threshold = if currently_inside {
+                        EXIT_REVEAL_HIDE_THRESHOLD.load(Ordering::Acquire)
+                    } else {
+                        EXIT_REVEAL_SHOW_THRESHOLD.load(Ordering::Acquire)
+                    };
+                    let inside = position.y >= 0.0 && position.y <= threshold as f64;
+                    if inside != currently_inside {
+                        EXIT_REVEAL_INSIDE.store(inside, Ordering::Release);
+                        unsafe {
+                            if inside {
+                                show_popup_without_activation(button);
+                                windows_sys::Win32::Graphics::Gdi::InvalidateRect(
+                                    button,
+                                    std::ptr::null(),
+                                    1,
+                                );
+                            } else {
+                                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                                    button,
+                                    windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                                );
+                            }
+                        }
+                    }
+                }
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor = (-1.0, -1.0);
@@ -603,6 +632,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_home_go_hover();
                 self.refresh_caption_reveal();
                 self.update_home_tool_hover();
+                if EXIT_BUTTON_REVEAL_ACTIVE.load(Ordering::Acquire)
+                    && EXIT_REVEAL_INSIDE.swap(false, Ordering::AcqRel)
+                    && let Some(button) = self.exit_button
+                {
+                    unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                            button,
+                            windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE,
+                        );
+                    }
+                }
             }
             // Um evento por arquivo; o lote inteiro segue no `about_to_wait`.
             WindowEvent::DroppedFile(path) => self.pending_drops.push(path),

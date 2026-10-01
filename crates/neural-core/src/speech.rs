@@ -193,6 +193,27 @@ pub fn parse_edge_text_frame(frame: &str) -> Result<EdgeTtsResponse> {
     }
 }
 
+/// Parseia um frame binário do Edge TTS contendo chunks de áudio MP3 (SPEC-0116 §4.2).
+/// O envelope oficial da Microsoft traz:
+/// - 2 bytes big-endian: tamanho do cabeçalho de metadados em texto (`H`).
+/// - `H` bytes do cabeçalho de texto (`Path:audio\r\n...`).
+/// - Bytes restantes: dados brutos de áudio (MP3).
+pub fn parse_edge_binary_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 2 {
+        return None;
+    }
+    let header_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    if bytes.len() < 2 + header_len {
+        return None;
+    }
+    let header_str = std::str::from_utf8(&bytes[2..2 + header_len]).unwrap_or("");
+    if header_str.contains("Path:audio") {
+        Some(bytes[2 + header_len..].to_vec())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +284,28 @@ mod tests {
             }
             other => panic!("esperava WordBoundary, veio {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_edge_binary_frame() {
+        let header = "X-RequestId: req-1\r\nPath:audio\r\nContent-Type:audio/mpeg\r\n\r\n";
+        let header_bytes = header.as_bytes();
+        let header_len = header_bytes.len() as u16;
+        let dummy_mp3 = [0xFF, 0xFB, 0x90, 0x64, 0x00, 0x00];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&header_len.to_be_bytes());
+        packet.extend_from_slice(header_bytes);
+        packet.extend_from_slice(&dummy_mp3);
+
+        let audio = parse_edge_binary_frame(&packet).expect("parse audio chunk");
+        assert_eq!(audio, dummy_mp3);
+
+        let invalid_header = "Path:other\r\n\r\n";
+        let mut invalid_packet = Vec::new();
+        invalid_packet.extend_from_slice(&(invalid_header.len() as u16).to_be_bytes());
+        invalid_packet.extend_from_slice(invalid_header.as_bytes());
+        invalid_packet.extend_from_slice(&dummy_mp3);
+        assert!(parse_edge_binary_frame(&invalid_packet).is_none());
     }
 }

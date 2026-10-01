@@ -48,10 +48,12 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0109](SPEC-0109-webrtc-media-permissions.md) | WebRTC media permissions with native consent | 2.1 |
 | [SPEC-0110](SPEC-0110-pdf-text-reader.md) | Bounded PDF text extraction into semantic memory | 2.5 |
 | [SPEC-0114](SPEC-0114-anti-distracao.md) | Anti-distraction: cookie banners, newsletter modals, large fixed bars (reject-only on known CMPs) | 2.4 |
+| [SPEC-0115](SPEC-0115-chat-surface.md) | NeuralIA Chat Surface (Multi-Provider Conversation Layer) | 2.7 |
+| [SPEC-0116](SPEC-0116-neural-read-aloud.md) | Neural Read Aloud: Edge TTS WebSocket protocol and audio pipeline | 2.7 |
 
 A matriz que responde explicitamente “este teste exercita o caminho que
 embarca?” está em
-[AUDIT-SPEC-0100-0108](AUDIT-SPEC-0100-0108.md), hoje ampliada até as SPECs existentes de 0114 (0111–0113 não existem no repositório).
+[AUDIT-SPEC-0100-0108](AUDIT-SPEC-0100-0108.md), hoje ampliada até as SPECs existentes de 0116 (0111–0113 não existem no repositório).
 
 ## Implementation status
 
@@ -90,6 +92,8 @@ embarca?” está em
   settings/`/distracoes` controls remain open.
 - **SPEC-0111–0113:** no specification files exist under these numbers; this is
   a numbering gap, not an implementation state.
+- **SPEC-0115:** NeuralIA Chat Surface (Multi-Provider Conversation Layer). Core domain model and structured turns ship in `neural_core::chat`.
+- **SPEC-0116:** Leitura em Voz Alta Neural (Edge TTS Protocol & SSML Builder). Core protocol and synthesis builder ship in `neural_core::speech`.
 
 `crates/neural-core/tests/spec_010x_acceptance.rs` now keeps SPEC numbers only
 where the tested core is the same core used by the product. Reference-only checks for the Rust semantic-timeline parser and roadmap
