@@ -567,7 +567,10 @@ mod tests {
         let error = parse_local_model_command("model:activate:semantic-small")
             .expect("model command")
             .expect_err("activation must stay unavailable without a measured backend");
-        assert!(error.contains("nenhum backend de inferência medido"), "{error}");
+        assert!(
+            error.contains("nenhum backend de inferência medido"),
+            "{error}"
+        );
         let pt = parse_local_model_command("modelo:ativar:semantic-small")
             .expect("model command")
             .expect_err("Portuguese activation route must also stay unavailable");
