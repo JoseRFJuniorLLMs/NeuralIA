@@ -1914,6 +1914,8 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   const style = document.createElement('style');
   style.id = 'neuralia-split-scroll-style';
   style.textContent = [
+    '*{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
+    '*::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}',
     '.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
     '.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}'
   ].join('');
