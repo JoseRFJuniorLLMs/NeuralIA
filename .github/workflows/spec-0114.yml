@@ -1,0 +1,68 @@
+name: SPEC-0114 WebView2 distraction E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  distraction-webview2:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e
+        with:
+          toolchain: 1.98.1
+      - name: Build shipped feature set
+        shell: pwsh
+        run: cargo build --locked -p neural-app --bin NeuralIA --release
+      - name: Pin fixture host to loopback
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          $name = 'news.distraction.test'
+          $entry = "127.0.0.1 $name"
+          $current = [IO.File]::ReadAllText($hostsPath)
+          if ($current -notmatch ('(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?$')) {
+            [IO.File]::AppendAllText($hostsPath, "`r`n$entry`r`n", [Text.Encoding]::ASCII)
+          }
+          ipconfig /flushdns | Out-Null
+      - name: Real COM injection hides the fixture banner
+        shell: pwsh
+        run: ./scripts/test-distraction-e2e.ps1 -ExePath target/release/NeuralIA.exe
+      - name: Sabotage disabled COM registration must turn the E2E red
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $path = 'crates/neural-app/src/windows_app/distraction.rs'
+          $original = [IO.File]::ReadAllText($path, $utf8)
+          $old = @'
+    unsafe { core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script.as_str()), &handler) }
+        .map_err(|error| format!("AddScriptToExecuteOnDocumentCreated: {error}"))
+'@
+          $new = @'
+    Err("SABOTAGE: distraction COM registration disabled".into())
+'@
+          if (($original.Split($old).Count - 1) -ne 1) { throw 'SPEC-0114 sabotage anchor' }
+          try {
+            [IO.File]::WriteAllText($path, $original.Replace($old, $new), $utf8)
+            cargo build --locked -p neural-app --bin NeuralIA --release
+            if ($LASTEXITCODE -ne 0) { throw 'sabotaged build failed' }
+            ./scripts/test-distraction-e2e.ps1 -ExePath target/release/NeuralIA.exe -ExpectVisible
+          } finally {
+            [IO.File]::WriteAllText($path, $original, $utf8)
+          }
+          git diff --exit-code -- $path
+      - name: Restored COM path returns to green
+        shell: pwsh
+        run: |
+          cargo build --locked -p neural-app --bin NeuralIA --release
+          if ($LASTEXITCODE -ne 0) { throw 'restored build failed' }
+          ./scripts/test-distraction-e2e.ps1 -ExePath target/release/NeuralIA.exe
