@@ -187,7 +187,7 @@ Enquanto não houver um segundo revisor, qualquer alteração aqui só entra com
 
 **Aberto, por decidir pelo dono:**
 
-- **Arquitetura do agente.** `AgentRuntime`, `AgentPlanner` e `validate_action_reference` (`neural-core`) **não são usados pelo produto**. Ou a app passa a usá-los, ou a SPEC-0105 descreve o ciclo real e a biblioteca é marcada como não usada — ou removida. Código de segurança que não corre dá conforto falso a quem audita.
+- **Resolvido no PR #80 — arquitetura do agente.** O loop paralelo `AgentRuntime`/`AgentPlanner`/`AgentToolExecutor` foi removido. `agent_protocol` conserva apenas os tipos/configuração compartilhados; o único ciclo de execução do produto é `handle_agent_observation → decide_agent_step → confirmação nativa → execute_agent_action`.
 - **Risk-floor da SPEC-0104 corrigido no caminho que embarca:** metadata da página não pode rebaixar um clique genérico para Class B. `Click` é Sensitive por padrão; apenas ações nativas estruturadas (`Select`, `TypeText(Search)`) usam o grant reversível. `role`/nome/texto podem elevar risco ou ajudar a localizar o alvo, nunca reduzir o piso nativo. O gate crítico inclui sabotagem e continua sujeito às regras de revisão da §7.
 - **Resolvido no PR #54:** falha do índice de candidatos deixou de cair silenciosamente para full scan quando já existe corpus. Índice ausente/corrompido/impossível de abrir agora torna a degradação visível e orienta `memory:rebuild`; perfil vazio sem documentos continua válido.
 
