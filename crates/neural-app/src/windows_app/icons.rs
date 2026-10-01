@@ -172,9 +172,8 @@ pub(in crate::windows_app) unsafe fn draw_icon(
         let mut pixels = scratch.borrow_mut();
         pixels.clear();
         let required = size as usize * size as usize * 4;
-        let capacity = pixels.capacity();
-        if capacity < required {
-            pixels.reserve(required - capacity);
+        if pixels.capacity() < required {
+            pixels.reserve(required);
         }
         for py in 0..size as u32 {
             for px in 0..size as u32 {
