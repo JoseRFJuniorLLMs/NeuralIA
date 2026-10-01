@@ -772,6 +772,26 @@ jobs:
           '@
             },
             @{
+              Label = "distraction-global-toggle-does-not-publish"
+              Test = "global_distraction_command_changes_the_shared_policy"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        self.distraction
+            .publish(&self.settings.distraction, &self.distraction_private);
+          '@
+              New = @'
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        // SABOTAGE: saved settings changed, but open WebViews keep stale policy.
+          '@
+            },
+            @{
               Label = "distraction-clicks-a-reject-that-accepts"
               Test = "distraction_never_clicks_accept"
               SourcePath = "crates/neural-app/src/windows_app/distraction.rs"
