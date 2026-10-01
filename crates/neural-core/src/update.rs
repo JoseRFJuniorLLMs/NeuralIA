@@ -190,6 +190,13 @@ pub fn is_newer_version(current: &str, candidate: &str) -> bool {
     compare_semver(current, candidate) == std::cmp::Ordering::Greater
 }
 
+/// Política de aplicação do updater.
+/// Uma checagem automática nunca autoriza execução; somente uma ação manual
+/// com asset e digest verificáveis pode iniciar o download executável.
+pub fn may_install_update(user_requested: bool, latest: &ReleaseInfo) -> bool {
+    user_requested && latest.installer_url.is_some() && latest.installer_sha256.is_some()
+}
+
 /// Estado do resultado da checagem de versão.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStatus {
@@ -502,6 +509,24 @@ mod tests {
         let info = parse_github_release_json(json).expect("parse");
         assert!(info.installer_url.is_none());
         assert!(info.installer_sha256.is_none());
+    }
+
+    #[test]
+    fn updater_install_policy_requires_user_action_and_verified_asset() {
+        let mut info = ReleaseInfo {
+            tag: "v2.8.0".to_string(),
+            version: "2.8.0".to_string(),
+            html_url: "https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/tag/v2.8.0".to_string(),
+            installer_url: Some("https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v2.8.0/NeuralIA-Setup-2.8.0-x64.exe".to_string()),
+            installer_sha256: Some("a".repeat(64)),
+            published_at: None,
+            body: String::new(),
+        };
+        assert!(!may_install_update(false, &info));
+        assert!(may_install_update(true, &info));
+
+        info.installer_sha256 = None;
+        assert!(!may_install_update(true, &info));
     }
 
     #[test]
