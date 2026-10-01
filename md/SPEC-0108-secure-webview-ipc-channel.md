@@ -1,6 +1,6 @@
 # SPEC-0108 — Canal seguro página→nativo (IPC do WebView2)
 
-**Status:** Parcial — transporte IPC implementado e coberto por testes no PR #24; revisão adversarial independente e release 2.1 pendentes  
+**Status:** Parcial — transporte IPC embarcado e testado no caminho de produto; revisão adversarial independente/release gate pendente  
 **Alvo:** NeuralIA 2.1  
 **Substitui:** o transporte por navegação `neuralia:` descrito em SPEC-0005 §"Native bridge boundary" (o modelo de confiança mantém-se; muda o transporte)  
 **Depende de:** SPEC-0005, SPEC-0006, SPEC-0015
