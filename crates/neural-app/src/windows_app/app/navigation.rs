@@ -1183,7 +1183,13 @@ mod update_route_tests {
 
     #[test]
     fn check_commands_never_mean_install() {
-        for command in ["update:", "update:check", "atualizar:", "!update", "/update"] {
+        for command in [
+            "update:",
+            "update:check",
+            "atualizar:",
+            "!update",
+            "/update",
+        ] {
             assert_eq!(route_input(command), InputRoute::UpdateCheck, "{command}");
             assert_eq!(
                 route_palette(command, 0, false),
