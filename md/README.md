@@ -65,8 +65,9 @@ embarca?” está em
 - **SPEC-0104:** security policy is used by the shipped agent path; independent
   adversarial review remains a release gate.
 - **SPEC-0105:** the shipped runtime is `handle_agent_observation → decide_agent_step`;
-  its gate is now tested on the product path. `neural-core::AgentRuntime` is a
-  reference harness, not the browser execution loop.
+  its gate is tested on the product path. The unused parallel
+  `neural-core::AgentRuntime` loop was removed by PR #80; only the shared
+  protocol/configuration types remain in `agent_protocol`.
 - **SPEC-0106:** execution roadmap, not a runtime feature or a standalone "green"
   object-construction test.
 - **SPEC-0107:** Phase 0 is complete and Phase 1 is partial: SQLite/FTS5,
@@ -79,9 +80,9 @@ embarca?” está em
   the owner's section-7 yes. The settings switch and `/distracoes` are not built.
 
 `crates/neural-core/tests/spec_010x_acceptance.rs` now keeps SPEC numbers only
-where the tested core is the same core used by the product. Reference-only
-checks for the Rust semantic-timeline parser, `AgentRuntime` harness and roadmap
-object coexistence no longer present themselves as product acceptance gates.
+where the tested core is the same core used by the product. Reference-only checks for the Rust semantic-timeline parser and roadmap
+object coexistence no longer present themselves as product acceptance gates;
+the unused `AgentRuntime` harness itself was removed by PR #80.
 Shipped wiring is pinned in `crates/neural-app/tests/spec_product_wiring.rs`,
 and SPEC-0107 Phase 1 has its own operational acceptance test.
 
