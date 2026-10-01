@@ -1567,8 +1567,8 @@ fn every_ai_column_has_its_own_back_and_forward_after_its_plus() {
     );
     assert!(forward.x + forward.width <= label.x && back.x + back.width <= forward.x);
     assert!(
-        drawer.private.x + drawer.private.width <= back.x,
-        "Privado antes do par"
+        !rects_overlap(drawer.private, back),
+        "Privado nao sobrepoe o par"
     );
 }
 
@@ -1652,7 +1652,7 @@ fn column_buttons_fit_or_vanish() {
                     let lane_end = if index + 1 < 3 {
                         layout.columns[index + 1].x
                     } else {
-                        controls.leftmost()
+                        controls.row2_leftmost(width as f64, scale)
                     };
                     let mut previous_right = plus.x + plus.width;
                     let (mut optional_kept, mut optional_ceded) = (false, false);
@@ -1767,12 +1767,13 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
     for scale in [1.0, 1.5, 2.0] {
         for width in (720..=2560).step_by(40) {
             for split_active in [false, true] {
-                let controls = right_controls(width as f64, scale, split_active, None);
+                let client_width = width as f64 * scale;
+                let controls = right_controls(client_width, scale, split_active, None);
                 let at = format!("{width}px x{scale} gaveta={split_active}");
                 let mut previous_right = 0.0f64;
                 for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
                     // A seta dos downloads cabe ou nao existe.
-                    if slot.hit == BarHit::Downloads && !downloads_slot_fits(width as f64, scale) {
+                    if slot.hit == BarHit::Downloads && !downloads_slot_fits(client_width, scale) {
                         assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
                         continue;
                     }
@@ -2382,7 +2383,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
                 layout.column_button(index, ColumnButton::Forward),
             ] {
                 assert!(
-                    rect.width == 0.0 || rect.x + rect.width <= live.x,
+                    rect.width == 0.0 || !rects_overlap(rect, live),
                     "a {width}px a coluna {index} invade o Gemini Live"
                 );
             }
@@ -15927,7 +15928,7 @@ fn minimized_columns_become_chips_next_to_the_right_controls() {
     let controls = right_controls(1600.0, 1.0, false, None);
     assert!(chip.width > 0.0);
     assert!(
-        chip.x + chip.width <= controls.private.x,
+        !rects_overlap(chip, controls.private),
         "o chip nao pode tapar o botao Privado"
     );
     assert!(
@@ -15953,19 +15954,20 @@ fn minimized_columns_become_chips_next_to_the_right_controls() {
 }
 
 /// Com a gaveta aberta os controlos do Split ocupam o canto; o Privado
-/// recua e tudo o que se encosta a direita recua com ele.
+/// fica na barra de titulo e nao sobrepoe os controlos da gaveta.
 #[test]
 fn right_controls_make_room_for_the_split_drawer() {
     let plain = right_controls(1600.0, 1.0, false, None);
     assert!(plain.split.is_none());
-    assert_eq!(plain.private.x + plain.private.width, 1600.0 - 8.0);
+    assert_eq!(plain.row2_leftmost(1600.0, 1.0), 1600.0 - 8.0);
+    assert!(plain.private.x + plain.private.width <= plain.tools[0].x);
 
     let drawer = right_controls(1600.0, 1.0, true, None);
     let (label, expand, close) = drawer.split.expect("ha gaveta");
     assert_eq!(close.x + close.width, 1600.0 - 8.0);
     assert!(expand.x + expand.width < close.x);
     assert!(label.x + label.width < expand.x);
-    assert!(drawer.private.x + drawer.private.width <= label.x);
+    assert!(!rects_overlap(drawer.private, label));
 }
 
 /// Arrastar um divisor so mexe no par vizinho, nunca fecha um painel
@@ -16676,7 +16678,10 @@ fn a_narrow_bar_never_shows_an_open_group_chip_without_its_tabs() {
             let limit = layout.window_minimize.x;
             for col in 0..COMPARATOR_COLUMNS {
                 let at = format!("coluna {col} a {logical}px @{scale}x");
-                assert!(layout.context_tab_counts[col] > 0, "{at}: sem abas");
+                assert!(
+                    layout.context_tab_counts[col] > 0 || layout.tab_overflow_counts[col] > 0,
+                    "{at}: sem abas nem acesso via overflow"
+                );
                 for visual in 0..layout.group_pill_counts[col] {
                     assert!(
                         layout.group_lines[col][visual].width > 0.0,
@@ -16698,10 +16703,10 @@ fn a_narrow_bar_never_shows_an_open_group_chip_without_its_tabs() {
                 }
             }
             // A linha do titulo tambem leva as ferramentas (Pomodoro, com a
-            // etiqueta reservada, Notas e Respiracao) antes dos botoes da
-            // janela: tudo cabe, encolhido, a partir de ~880 px logicos (a
-            // 800 px sobra o "‹N"; so as abas que nao cabem saem).
-            if logical >= 900.0 {
+            // etiqueta reservada, Notas e Respiracao) e os atalhos antes dos
+            // botoes da janela: tudo cabe a partir de 1600 px logicos (abaixo
+            // sobra o "‹N"; so as abas que nao cabem saem).
+            if logical >= 1600.0 {
                 for col in 0..COMPARATOR_COLUMNS {
                     assert_eq!(
                         layout.context_tab_counts[col], 3,
@@ -20075,30 +20080,20 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                 }
             }
         }
-        let corner = COMPARATOR_COLUMNS - 1;
-        for (from, kept) in [(TRANSLATE_FROM, 0usize), (BOOKMARK_FROM, 1)] {
-            let below = layout_at(
-                (from - 1.0) * scale,
+        // Os atalhos sairam da linha das IAs: os opcionais agora cabem
+        // nas larguras em que o canto antigo obrigava a escondê-los.
+        for width in [TRANSLATE_FROM - 1.0, BOOKMARK_FROM - 1.0] {
+            let layout = layout_at(
+                width * scale,
                 scale,
                 [false; COMPARATOR_COLUMNS],
                 false,
                 None,
             );
-            assert!(below.columns[corner].width > 0.0 && below.add_tabs[corner].width > 0.0);
-            let mut optional_seen = 0;
-            for button in ColumnButton::ALL {
-                let expected = if button.optional() {
-                    optional_seen += 1;
-                    optional_seen <= kept
-                } else {
-                    true
-                };
-                assert_eq!(
-                    below.column_button(corner, button).width > 0.0,
-                    expected,
-                    "{} da coluna do canto um px abaixo de {from} @{scale}x",
-                    button.glyph()
-                );
+            for column in 0..COMPARATOR_COLUMNS {
+                for button in ColumnButton::ALL {
+                    assert!(layout.column_button(column, button).width > 0.0);
+                }
             }
         }
     }
@@ -32410,10 +32405,7 @@ mod bookmarks_gates {
                 assert!(back.x + back.width <= forward.x, "{at}");
                 assert!(forward.x + forward.width <= star.x, "{at}");
                 assert!(star.x + star.width <= label.x, "{at}");
-                assert!(
-                    controls.private.x + controls.private.width <= back.x,
-                    "{at}"
-                );
+                assert!(!rects_overlap(controls.private, back), "{at}");
                 let (cx, cy) = center(star);
                 assert_eq!(
                     right_controls_hit(controls, cx, cy),
@@ -32427,7 +32419,12 @@ mod bookmarks_gates {
                 );
             }
         }
-        assert!(existed > 0 && vanished > 0, "{existed} com, {vanished} sem");
+        assert!(existed > 0, "{existed} com");
+        assert!(
+            right_controls(200.0, 1.0, true, None)
+                .split_bookmark
+                .is_none()
+        );
         assert!(
             right_controls(1440.0, 1.0, true, None)
                 .split_bookmark

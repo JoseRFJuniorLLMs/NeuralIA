@@ -514,7 +514,7 @@ impl BarLayout {
             columns.split_active,
             columns.pomodoro_label,
         );
-        let controls_left = controls.leftmost();
+        let controls_left = controls.row2_leftmost(client_width, scale);
         let (back, forward) = controls.split_nav.unwrap_or((empty, empty));
         let reserved = if hidden.is_empty() {
             0.0
@@ -1122,21 +1122,19 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
     }
 }
 
-/// Os controlos do canto direito da segunda linha.
+/// Os controlos do canto direito da segunda linha e da barra de titulo.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
-    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda dos downloads.
+    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda dos downloads (na barra de titulo).
     pub(in crate::windows_app) services: [UiRect; 4],
     /// A seta dos downloads (downloads-ui), logo a esquerda do Privado.
     pub(in crate::windows_app) downloads: UiRect,
-    /// Gemini Live, logo a esquerda dos servicos: o inicio do canto.
+    /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
     pub(in crate::windows_app) live: UiRect,
     /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
     /// antes dos botoes da janela -- o mesmo sitio da Home
-    /// (`home_tool_buttons`). Na segunda linha tiravam a largura toda a
-    /// ultima coluna: a 1280 px a terceira IA ficava sem pilula, sem ‹ › e,
-    /// com o Pomodoro a correr, sem "+". O do Pomodoro alarga com o tempo.
+    /// (`home_tool_buttons`).
     pub(in crate::windows_app) tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
@@ -1176,16 +1174,21 @@ pub(in crate::windows_app) fn split_label_width(room: f64, split_active: bool) -
 /// pausar um Pomodoro nao mexe em nenhuma aba.
 pub(in crate::windows_app) const POMODORO_LABEL_RESERVE: &str = "⏸ 00:00";
 
-/// Onde comecam as ferramentas na linha de cima, com a etiqueta do Pomodoro
-/// ja reservada: as abas acabam antes disto.
+/// Onde comecam as ferramentas e atalhos na barra de titulo, com a etiqueta
+/// do Pomodoro ja reservada: as abas e a omnibox acabam antes disto.
 pub(in crate::windows_app) fn title_tools_left(
     client_width: f64,
     scale: f64,
     pomodoro_label: Option<BarLabel>,
 ) -> f64 {
-    let reserved = home_tool_buttons(client_width, scale, BarLabel::new(POMODORO_LABEL_RESERVE));
-    let actual = home_tool_buttons(client_width, scale, pomodoro_label);
-    reserved[0].x.min(actual[0].x)
+    let reserved = right_controls(
+        client_width,
+        scale,
+        false,
+        BarLabel::new(POMODORO_LABEL_RESERVE),
+    );
+    let actual = right_controls(client_width, scale, false, pomodoro_label);
+    reserved.live.x.min(actual.live.x)
 }
 
 /// EDIT da barra de titulo; o espaco restante fica para as abas, sem sobreposicao.
@@ -1212,10 +1215,8 @@ pub(in crate::windows_app) fn title_address_rect(
 }
 
 /// A seta dos downloads (downloads-ui) cabe ou nao existe: so a partir
-/// desta largura logica da janela. Abaixo, os 34 px dela no canto tiravam a
-/// terceira IA a pilula, o "+" e os ‹ › (gate
-/// `the_tools_never_take_room_from_the_ai_columns`, a 1024 px); sem ela, o
-/// Ctrl+J continua a abrir a seccao Downloads.
+/// desta largura logica da janela. Abaixo, o Ctrl+J continua a abrir a
+/// seccao Downloads.
 pub(in crate::windows_app) const DOWNLOADS_SLOT_MIN_WIDTH: f64 = 1100.0;
 
 /// A seta dos downloads cabe no canto a esta largura (`client_width` em
@@ -1224,9 +1225,12 @@ pub(in crate::windows_app) fn downloads_slot_fits(client_width: f64, scale: f64)
     client_width / scale.max(1.0) >= DOWNLOADS_SLOT_MIN_WIDTH
 }
 
-/// Geometria dos controlos encostados a direita. A mesma conta estava escrita
-/// tres vezes -- no desenho, no hit-testing e agora nos chips -- e as copias
-/// ja tinham comecado a divergir; aqui ela e uma so.
+/// Geometria dos controlos encostados a direita. Na barra de titulo (Row 1)
+/// ficam os 7 atalhos (Gemini Live, Meet, WhatsApp, YouTube, Gmail, Downloads,
+/// Privado) encostados ao Pomodoro, e as 3 ferramentas (Pomodoro, Notas,
+/// Respiracao). Na segunda linha (Row 2) fica apenas a gaveta do Split View
+/// (quando aberta), libertando 100% da largura da linha 2 para as colunas das
+/// IAs quando o Split View esta fechado.
 pub(in crate::windows_app) fn right_controls(
     client_width: f64,
     scale: f64,
@@ -1237,27 +1241,65 @@ pub(in crate::windows_app) fn right_controls(
     let row_y = (TITLE_TAB_HEIGHT + 7.0) * scale;
     let row_h = 30.0 * scale;
     let gap = 5.0 * scale;
-    // Botoes redondos so com icone, como no Chrome.
-    let icon = row_h;
-    let icon_gap = 4.0 * scale;
 
-    // Tudo o que tem largura fixa, em pixeis logicos: a gaveta sem o rotulo
-    // (fechar, expandir, ‹ e › e as folgas), o Privado, os downloads, os
-    // quatro servicos e o Gemini Live. O resto e da estrela dos favoritos
-    // da fonte e do rotulo da gaveta, por esta ordem: a estrela cabe
-    // inteira ou nao existe (como os botoes das colunas), e o rotulo, que
-    // so informa, fica com o que sobrar.
+    // Ferramentas na barra de titulo (Row 1): Pomodoro, Notas, Respiracao.
+    let tools = home_tool_buttons(client_width, scale, pomodoro_label);
+
+    // Os 7 atalhos na barra de titulo (Row 1), posicionados imediatamente
+    // a esquerda do Pomodoro (`tools[0]`), com folga de 6 px:
+    // [Live] [Meet] [WhatsApp] [YouTube] [Gmail] [Downloads] [Privado] -> [Pomodoro]
+    let title_y = 3.0 * scale;
+    let title_size = (TITLE_TAB_HEIGHT - 6.0) * scale;
+    let icon_gap = 4.0 * scale;
+    let cluster_gap = 6.0 * scale;
+    let reserved_tools =
+        home_tool_buttons(client_width, scale, BarLabel::new(POMODORO_LABEL_RESERVE));
+    let cluster_right = reserved_tools[0].x - cluster_gap;
+
+    let downloads_fits = downloads_slot_fits(client_width, scale);
+    let private = UiRect {
+        x: cluster_right - title_size,
+        y: title_y,
+        width: title_size,
+        height: title_size,
+    };
+    let downloads = if downloads_fits {
+        UiRect {
+            x: private.x - (title_size + icon_gap),
+            ..private
+        }
+    } else {
+        UiRect {
+            width: 0.0,
+            ..private
+        }
+    };
+    let services_right = if downloads_fits {
+        downloads.x
+    } else {
+        private.x
+    };
+    let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
+        x: services_right - (4 - index) as f64 * (title_size + icon_gap),
+        y: title_y,
+        width: title_size,
+        height: title_size,
+    });
+    let live = UiRect {
+        x: services[0].x - (title_size + icon_gap),
+        y: title_y,
+        width: title_size,
+        height: title_size,
+    };
+
+    // Linha 2 (Row 2): apenas os controlos da gaveta do Split View, se aberta.
     let logical = |value: f64| value / scale;
     let split_fixed = if split_active {
         30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
     } else {
         0.0
     };
-    // A seta dos downloads so conta quando cabe (`downloads_slot_fits`).
-    let downloads_fits = downloads_slot_fits(client_width, scale);
-    let slots = RIGHT_CLUSTER.len() as f64 - if downloads_fits { 0.0 } else { 1.0 };
-    let icons = logical(icon) * slots + logical(icon_gap) * (slots - 1.0);
-    let mut room = logical(client_width) - 8.0 - split_fixed - icons - RIGHT_CONTROLS_MIN_LEFT;
+    let mut room = logical(client_width) - 8.0 - split_fixed - RIGHT_CONTROLS_MIN_LEFT;
     let split_star = split_active && room >= SPLIT_STAR_ROOM;
     if split_star {
         room -= SPLIT_STAR_ROOM;
@@ -1286,8 +1328,6 @@ pub(in crate::windows_app) fn right_controls(
         (label, expand, close)
     });
 
-    // A estrela dos favoritos encostada ao rotulo (quando cabe), e o ‹ › a
-    // esquerda dela -- ou do rotulo, sem ela.
     let size = row_h - 4.0 * scale;
     let split_bookmark = split.filter(|_| split_star).map(|(label, _, _)| UiRect {
         x: label.x - 6.0 * scale - size,
@@ -1311,48 +1351,6 @@ pub(in crate::windows_app) fn right_controls(
         };
         (back, forward)
     });
-    let right = match split_nav {
-        Some((back, _)) => back.x - 6.0 * scale,
-        None => client_width - margin,
-    };
-    // Privado a direita e, a esquerda dele, os downloads (quando cabem:
-    // senao sem largura, no sitio do Privado), videochamada, WhatsApp,
-    // YouTube, Gmail e o Gemini Live. As ferramentas ficam na linha de cima.
-    let private = UiRect {
-        x: right - icon,
-        y: row_y,
-        width: icon,
-        height: icon,
-    };
-    let downloads = if downloads_fits {
-        UiRect {
-            x: private.x - (icon + icon_gap),
-            ..private
-        }
-    } else {
-        UiRect {
-            width: 0.0,
-            ..private
-        }
-    };
-    let services_right = if downloads_fits {
-        downloads.x
-    } else {
-        private.x
-    };
-    let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
-        x: services_right - (4 - index) as f64 * (icon + icon_gap),
-        y: row_y,
-        width: icon,
-        height: icon,
-    });
-    let live = UiRect {
-        x: services[0].x - (icon + icon_gap),
-        y: row_y,
-        width: icon,
-        height: icon,
-    };
-    let tools = home_tool_buttons(client_width, scale, pomodoro_label);
 
     RightControls {
         private,
@@ -1366,28 +1364,15 @@ pub(in crate::windows_app) fn right_controls(
     }
 }
 
-/// Um icone do canto direito da segunda linha: o alvo que e e o icone
-/// (`ICON_SLOT_*`) que mostra.
+/// Um icone do canto direito: o alvo que e e o icone (`ICON_SLOT_*`) que mostra.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) struct ClusterSlot {
     pub(in crate::windows_app) hit: BarHit,
     pub(in crate::windows_app) icon: usize,
 }
 
-/// O canto direito da segunda linha, da esquerda para a direita: o Gemini
-/// Live, os quatro servicos, os downloads (downloads-ui) e o Privado. E o
-/// registo do grupo: a pintura e o hit-testing percorrem esta lista com
-/// `RightControls::cluster`, e `right_controls` da a cada lugar a sua
-/// posicao. Uma feature com um icone no canto (⚖ consenso, ⬇ downloads,
-/// escudo) e uma linha aqui, um
-/// `ICON_SLOT_*` em `icons.rs` e o seu lugar em `right_controls`. Os lugares
-/// de 3211b0c existem sempre; o gate
-/// `right_cluster_slots_never_overlap_and_hit_back` prova a ordem, que os
-/// lugares nao se sobrepoem e que cada um volta a si no hit-testing. Um
-/// item que queira a regra "cabe ou nao existe" acrescenta-a e prende-a num
-/// gate: a seta dos downloads so existe a partir de
-/// `DOWNLOADS_SLOT_MIN_WIDTH` (sem ela, largura 0: nao se pinta nem se
-/// clica).
+/// O grupo dos 7 atalhos da barra de titulo, da esquerda para a direita:
+/// o Gemini Live, os quatro servicos, os downloads (downloads-ui) e o Privado.
 pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 7] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
@@ -1420,8 +1405,19 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 7] = [
 ];
 
 impl RightControls {
-    /// Onde comecam os controlos da direita na segunda linha: as colunas
-    /// acabam aqui. As ferramentas, na linha de cima, nao contam.
+    /// Onde comecam os controlos da direita na segunda linha (Row 2):
+    /// com gaveta aberta, o ‹ da navegacao da gaveta; sem gaveta, a margem
+    /// direita da janela. As colunas da segunda linha acabam aqui.
+    pub(in crate::windows_app) fn row2_leftmost(&self, client_width: f64, scale: f64) -> f64 {
+        match self.split_nav {
+            Some((back, _)) => back.x - 6.0 * scale,
+            None => client_width - 8.0 * scale,
+        }
+    }
+
+    /// Onde comecam os controlos da direita na barra de titulo (Row 1):
+    /// o Gemini Live e o inicio do grupo de atalhos.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::windows_app) fn leftmost(&self) -> f64 {
         self.live.x
     }

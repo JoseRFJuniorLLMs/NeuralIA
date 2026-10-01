@@ -4,6 +4,13 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-10-01
+
+### Added
+- **Barra de título — migração dos 7 atalhos ao lado do Pomodoro:** os 7 atalhos de serviços (`Gemini Live`, `Meet / Vídeo`, `WhatsApp`, `YouTube`, `Gmail`, `Downloads` e `Privado`) foram movidos da linha 2 diretamente para a barra de título (Row 1), posicionados imediatamente à esquerda do Pomodoro (`tools[0]`) com folga de 6 px.
+- **Comparador — linha 2 100% livre para as colunas de IA:** sem os botões de atalho na linha 2, as colunas do Comparador agora aproveitam a largura completa da janela quando o Split View está fechado. Com a gaveta do Split aberta, apenas os controles da própria gaveta (`‹`, `›`, `☆`, `Fonte · IA`, `⛶`, `✕`) ocupam o canto direito da linha 2.
+- **Estabilidade de posicionamento:** os atalhos na barra de título são ancorados à reserva máxima do Pomodoro (`POMODORO_LABEL_RESERVE`), garantindo que o início, pausa ou contagem do temporizador não mova os ícones de atalho nem as abas de título.
+
 ## [2.6.1] - 2026-10-01
 
 ### Added
