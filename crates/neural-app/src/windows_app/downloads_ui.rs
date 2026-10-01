@@ -1931,7 +1931,7 @@ impl App {
                 SWP_NOACTIVATE,
             );
             show_popup_without_activation(card);
-            InvalidateRect(card, std::ptr::null(), 1);
+            InvalidateRect(card, std::ptr::null(), 0);
         }
     }
 }
