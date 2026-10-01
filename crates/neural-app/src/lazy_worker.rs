@@ -145,7 +145,7 @@ impl<Job: Send + 'static> LazyWorker<Job> {
             .wait_timeout_while(state, timeout, |state| {
                 state.slot.is_some() || state.running
             })
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.slot.is_none() && !state.running
     }
 }

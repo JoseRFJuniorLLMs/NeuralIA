@@ -166,7 +166,8 @@ enum LineKind<'a> {
     Skip,
     /// Uma regra que esta lista nao entende.
     Ignored,
-    Candidates(Vec<&'a str>),
+    Single(&'a str),
+    Multiple(Vec<&'a str>),
 }
 
 fn classify_line(line: &str) -> LineKind<'_> {
@@ -189,7 +190,7 @@ fn classify_line(line: &str) -> LineKind<'_> {
         if name.contains(['^', '$', '|', '/', '*']) {
             return LineKind::Ignored;
         }
-        return LineKind::Candidates(vec![name]);
+        return LineKind::Single(name);
     }
     let mut tokens = line
         .split_whitespace()
@@ -202,13 +203,13 @@ fn classify_line(line: &str) -> LineKind<'_> {
         return if names.is_empty() {
             LineKind::Ignored
         } else {
-            LineKind::Candidates(names)
+            LineKind::Multiple(names)
         };
     }
     if tokens.next().is_some() {
         return LineKind::Ignored;
     }
-    LineKind::Candidates(vec![first])
+    LineKind::Single(first)
 }
 
 /// Um dominio da lista: normalizado e com pelo menos dois rotulos.
@@ -219,25 +220,37 @@ fn list_domain(candidate: &str) -> Option<String> {
 /// Le uma lista de dominios: uma por linha, `0.0.0.0 x` ou `||x^`.
 pub fn parse_domain_list(text: &str) -> ParsedList {
     let mut parsed = ParsedList::default();
+    let process_candidate = |candidate: &str, target: &mut ParsedList| -> bool {
+        let Some(domain) = list_domain(candidate) else {
+            target.ignored += 1;
+            return true;
+        };
+        if !target.domains.has_room_for(&domain) {
+            target.truncated = true;
+            return false;
+        }
+        target.domains.insert(&domain);
+        true
+    };
+
     for line in text.lines() {
-        let candidates = match classify_line(line) {
+        match classify_line(line) {
             LineKind::Skip => continue,
             LineKind::Ignored => {
                 parsed.ignored += 1;
-                continue;
             }
-            LineKind::Candidates(candidates) => candidates,
-        };
-        for candidate in candidates {
-            let Some(domain) = list_domain(candidate) else {
-                parsed.ignored += 1;
-                continue;
-            };
-            if !parsed.domains.has_room_for(&domain) {
-                parsed.truncated = true;
-                return parsed;
+            LineKind::Single(candidate) => {
+                if !process_candidate(candidate, &mut parsed) {
+                    return parsed;
+                }
             }
-            parsed.domains.insert(&domain);
+            LineKind::Multiple(candidates) => {
+                for candidate in candidates {
+                    if !process_candidate(candidate, &mut parsed) {
+                        return parsed;
+                    }
+                }
+            }
         }
     }
     parsed

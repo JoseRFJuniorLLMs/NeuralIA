@@ -152,7 +152,12 @@ pub fn parse_edge_text_frame(frame: &str) -> Result<EdgeTtsResponse> {
     let Some(pos) = frame.find("Path:") else {
         return Ok(EdgeTtsResponse::Other("unknown".to_string()));
     };
-    let path_line = &frame[pos + 5..];
+    let after_path = pos + "Path:".len();
+    let path_line = if frame.is_char_boundary(after_path) {
+        &frame[after_path..]
+    } else {
+        ""
+    };
     let path = path_line.lines().next().unwrap_or("").trim();
     match path {
         "turn.start" => Ok(EdgeTtsResponse::TurnStart),
@@ -193,12 +198,8 @@ pub fn parse_edge_text_frame(frame: &str) -> Result<EdgeTtsResponse> {
     }
 }
 
-/// Parseia um frame binário do Edge TTS contendo chunks de áudio MP3 (SPEC-0116 §4.2).
-/// O envelope oficial da Microsoft traz:
-/// - 2 bytes big-endian: tamanho do cabeçalho de metadados em texto (`H`).
-/// - `H` bytes do cabeçalho de texto (`Path:audio\r\n...`).
-/// - Bytes restantes: dados brutos de áudio (MP3).
-pub fn parse_edge_binary_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+/// Versão zero-alloc que retorna uma fatia dos bytes brutos de áudio sem alocar `Vec<u8>`.
+pub fn parse_edge_binary_frame_slice(bytes: &[u8]) -> Option<&[u8]> {
     if bytes.len() < 2 {
         return None;
     }
@@ -208,10 +209,19 @@ pub fn parse_edge_binary_frame(bytes: &[u8]) -> Option<Vec<u8>> {
     }
     let header_str = std::str::from_utf8(&bytes[2..2 + header_len]).unwrap_or("");
     if header_str.contains("Path:audio") {
-        Some(bytes[2 + header_len..].to_vec())
+        Some(&bytes[2 + header_len..])
     } else {
         None
     }
+}
+
+/// Parseia um frame binário do Edge TTS contendo chunks de áudio MP3 (SPEC-0116 §4.2).
+/// O envelope oficial da Microsoft traz:
+/// - 2 bytes big-endian: tamanho do cabeçalho de metadados em texto (`H`).
+/// - `H` bytes do cabeçalho de texto (`Path:audio\r\n...`).
+/// - Bytes restantes: dados brutos de áudio (MP3).
+pub fn parse_edge_binary_frame(bytes: &[u8]) -> Option<Vec<u8>> {
+    parse_edge_binary_frame_slice(bytes).map(Vec::from)
 }
 
 #[cfg(test)]

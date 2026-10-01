@@ -1019,6 +1019,7 @@ pub fn list_central_directory(
     // difere. O total dos nomes e dos extras tem o teto da política.
     let mut local_bytes = 0u64;
     let mut head = Vec::new();
+    let mut rest = Vec::new();
     for (start, _, central_name) in &spans {
         head.resize(LOCAL_LEN + central_name.len(), 0);
         source.read_at(*start, &mut head)?;
@@ -1047,7 +1048,7 @@ pub fn list_central_directory(
         } else {
             (name_at, name_len + extra_len)
         };
-        let mut rest = vec![0u8; rest_len];
+        rest.resize(rest_len, 0);
         if rest_len > 0 {
             source.read_at(rest_at, &mut rest)?;
         }
@@ -1131,6 +1132,7 @@ fn check_local_headers(
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by_key(|&index| records[index].header_offset);
     let mut previous_end = 0u64;
+    let mut local_name = Vec::new();
     for index in order {
         let record = &mut records[index];
         let fail = |reason: &str| EpubError::Corrupt {
@@ -1157,7 +1159,7 @@ fn check_local_headers(
         if name_len != record.raw_name.len() {
             return Err(fail("nome do cabeçalho local difere do diretório central"));
         }
-        let mut local_name = vec![0u8; name_len];
+        local_name.resize(name_len, 0);
         source
             .read_at(record.header_offset + LOCAL_LEN as u64, &mut local_name)
             .map_err(|_| fail("cabeçalho local fora do arquivo"))?;

@@ -184,8 +184,14 @@ fn portuguese_share(texts: &[PageText]) -> (usize, usize) {
                 continue;
             }
             words += 1;
-            let lower = word.to_lowercase();
-            if PORTUGUESE_WORDS.contains(&lower.as_str())
+            let lower_buf: String;
+            let lower: &str = if word.chars().any(char::is_uppercase) {
+                lower_buf = word.to_lowercase();
+                &lower_buf
+            } else {
+                word
+            };
+            if PORTUGUESE_WORDS.contains(&lower)
                 || lower.ends_with("ção")
                 || lower.ends_with("ções")
             {

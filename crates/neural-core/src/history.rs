@@ -136,12 +136,14 @@ impl HistoryStore {
     fn replace_atomically(&self, entries: &[HistoryEntry]) -> Result<()> {
         let temp = self.temp_path();
         let write_result = (|| -> Result<()> {
-            let mut file = File::create(&temp)?;
+            let file = File::create(&temp)?;
+            let mut writer = std::io::BufWriter::new(file);
             for entry in entries {
-                serde_json::to_writer(&mut file, entry)?;
-                file.write_all(b"\n")?;
+                serde_json::to_writer(&mut writer, entry)?;
+                writer.write_all(b"\n")?;
             }
-            file.flush()?;
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
             file.sync_data()?;
             drop(file);
             fs::rename(&temp, &self.path)?;

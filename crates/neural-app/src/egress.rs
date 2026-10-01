@@ -1373,7 +1373,10 @@ mod tests {
             normal(Memory, gemini(), true, 0, 200),
             Decision::Refuse(RefuseReason::NeverLeavesThePc(Memory))
         );
-        assert!(normal(Memory, at(Locality::Lan, false), false, 0, 200) != Decision::Send);
+        assert_ne!(
+            normal(Memory, at(Locality::Lan, false), false, 0, 200),
+            Decision::Send
+        );
         assert_eq!(
             normal(Media, at(Locality::Loopback, false), false, 0, 200),
             Decision::Send
@@ -1612,8 +1615,8 @@ mod tests {
                                             }
                                             continue;
                                         }
-                                        let allowed = !(privacy == PrivateMode && leaves)
-                                            && !(data == Memory && locality == Locality::Remote);
+                                        let allowed = !(privacy == PrivateMode && leaves
+                                            || data == Memory && locality == Locality::Remote);
                                         match decision {
                                             Decision::Send => assert!(
                                                 allowed && (!leaves || consented) && !over,
@@ -2132,10 +2135,10 @@ mod tests {
     /// novo. E por par (cerebro, site).
     #[test]
     fn consent_ledger_is_session_only() {
-        let dir = temp_dir("session");
-        let registry = StoreRegistry::mint_for_test(&dir);
         const SITES: StoreSpec =
             StoreSpec::new("translate-test.json", StoreKind::Setting, StoreShape::File);
+        let dir = temp_dir("session");
+        let registry = StoreRegistry::mint_for_test(&dir);
         let session = |registry: &StoreRegistry| {
             let mut gate = EgressGate::for_app(|spec| registry.grant(spec).ok());
             gate.attach_site_grants(
@@ -2291,10 +2294,10 @@ mod tests {
     /// ja em todas as janelas abertas, nao so nas que nascem depois.
     #[test]
     fn site_grants_only_where_offered_and_never_from_private() {
-        let dir = temp_dir("sites");
-        let registry = StoreRegistry::mint_for_test(&dir);
         const SITES: StoreSpec =
             StoreSpec::new("translate-test.json", StoreKind::Setting, StoreShape::File);
+        let dir = temp_dir("sites");
+        let registry = StoreRegistry::mint_for_test(&dir);
         let free = at(Locality::Remote, false);
         let page = |privacy| {
             click(

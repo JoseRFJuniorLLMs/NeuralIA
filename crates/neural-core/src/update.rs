@@ -79,31 +79,38 @@ pub fn parse_github_release_json(json_str: &str) -> Result<ReleaseInfo> {
     })
 }
 
-/// Compara duas versões em formato semver básico (ex: "2.6.2" vs "2.6.3").
-/// Retorna `Ordering::Greater` se `candidate` for estritamente mais recente que `current`.
+/// Compara duas versões em formato semver (ex: "2.6.2" vs "2.6.3", ou "2.7.0" vs "2.7.0-rc1").
+/// Segue a especificação SemVer 2.0.0:
+/// - Uma versão com pré-release (ex: "2.7.0-beta.1") é inferior à versão final ("2.7.0").
+/// - Retorna `Ordering::Greater` se `candidate` for estritamente mais recente que `current`.
 pub fn compare_semver(current: &str, candidate: &str) -> std::cmp::Ordering {
-    let parse_parts = |s: &str| -> Vec<u64> {
+    fn parse_semver(s: &str) -> ([u64; 3], Option<&str>) {
         let clean = s.trim().trim_start_matches('v');
-        clean
-            .split(['.', '-'])
-            .filter_map(|part| part.parse::<u64>().ok())
-            .collect()
-    };
-
-    let cur_parts = parse_parts(current);
-    let cand_parts = parse_parts(candidate);
-
-    let max_len = cur_parts.len().max(cand_parts.len());
-    for i in 0..max_len {
-        let cur = cur_parts.get(i).copied().unwrap_or(0);
-        let cand = cand_parts.get(i).copied().unwrap_or(0);
-        match cand.cmp(&cur) {
-            std::cmp::Ordering::Equal => continue,
-            non_eq => return non_eq,
+        let (num_part, pre_part) = match clean.split_once('-') {
+            Some((num, pre)) => (num, Some(pre)),
+            None => (clean, None),
+        };
+        let mut nums = [0u64; 3];
+        for (i, part) in num_part.split('.').take(3).enumerate() {
+            if let Ok(val) = part.parse::<u64>() {
+                nums[i] = val;
+            }
         }
+        (nums, pre_part)
     }
 
-    std::cmp::Ordering::Equal
+    let (cur_nums, cur_pre) = parse_semver(current);
+    let (cand_nums, cand_pre) = parse_semver(candidate);
+
+    match cand_nums.cmp(&cur_nums) {
+        std::cmp::Ordering::Equal => match (cur_pre, cand_pre) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(cur_p), Some(cand_p)) => cand_p.cmp(cur_p),
+        },
+        non_eq => non_eq,
+    }
 }
 
 /// Verdadeiro se `candidate` for uma versão superior a `current`.
@@ -167,6 +174,23 @@ mod tests {
         assert_eq!(compare_semver("2.6.2", "2.6.1"), std::cmp::Ordering::Less);
         assert_eq!(compare_semver("3.0.0", "2.9.9"), std::cmp::Ordering::Less);
         assert_eq!(compare_semver("2.6", "2.6.1"), std::cmp::Ordering::Greater);
+        // Regra SemVer 2.0.0: pré-release é estritamente menor que versão final
+        assert_eq!(
+            compare_semver("2.7.0", "2.7.0-rc1"),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_semver("2.7.0-rc1", "2.7.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("2.7.0-beta.1", "2.7.0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("2.7.0-rc1", "2.7.0-rc2"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]

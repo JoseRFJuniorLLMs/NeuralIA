@@ -233,6 +233,8 @@ pub(in crate::windows_app) enum PaletteRoute {
     Theme(Option<ThemeChoice>),
     /// Anti-distração: comando local, nunca é enviado à página/provedor.
     Distraction(DistractionCommand),
+    /// Verificação de atualizações in-app (`update:`, `/update`, `atualizar:`).
+    UpdateCheck,
 }
 
 pub(in crate::windows_app) fn route_palette(
@@ -251,6 +253,7 @@ pub(in crate::windows_app) fn route_palette(
         InputRoute::Pomodoro(command) => return PaletteRoute::Pomodoro(command),
         InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
         InputRoute::Distraction(command) => return PaletteRoute::Distraction(command),
+        InputRoute::UpdateCheck => return PaletteRoute::UpdateCheck,
         _ => {}
     }
     match parse_intent(input) {
@@ -594,6 +597,13 @@ impl App {
             PaletteRoute::Theme(Some(choice)) => self.choose_theme(choice),
             PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
             PaletteRoute::Distraction(command) => self.distraction_command(command),
+            PaletteRoute::UpdateCheck => {
+                let current_version = env!("CARGO_PKG_VERSION");
+                self.show_splash(
+                    format!("NeuralIA v{current_version} · Verificação de atualização: canal oficial GitHub Releases"),
+                    4,
+                );
+            }
             // allow_local: a URL foi digitada num controlo nativo, e entrada
             // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
             // abre privada: open_split_mode(private) nao grava memoria nem
