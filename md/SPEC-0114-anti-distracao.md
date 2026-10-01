@@ -1,8 +1,8 @@
 # SPEC-0114 — Anti-distração (avisos de cookies, newsletter e barras fixas)
 
 **Status:** Implementada no `main` pela `release/2.4.0` (PR #169, após
-#168 e autorização do dono). Esta branch acrescenta o controle global local
-`/distracoes [on|off|status]`, persistido na política existente, e fecha o
+#168 e autorização do dono). A extensão do PR #235 acrescenta o controle global
+local `/distracoes [on|off|status]`, persistido na política existente, e fecha o
 gate da ligação COM com E2E no EXE/WebView2 real e sabotagem determinística.
 
 ## Objetivo
