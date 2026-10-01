@@ -4138,9 +4138,76 @@ fn app_agent_security_action(action: &AgentAction, page: &ObservedPage) -> Agent
             field: *field,
             value_summary: format!("{} chars", text.chars().count()),
         },
-        AgentAction::Select { target, value } => AgentSecurityAction::Select {
-            origin,
-            description: format!("select {} = {}", target.name, value),
+        AgentAction::Select { target, value } => {
+            let material = format!(
+                "{} {} {}",
+                target.role.to_lowercase(),
+                target.name.to_lowercase(),
+                value.to_lowercase()
+            );
+            if [
+                "buy",
+                "purchase",
+                "pay",
+                "comprar",
+                "pagar",
+                "checkout",
+                "transfer",
+                "transferir",
+                "subscribe",
+                "assinar plano",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Payment {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else if ["delete", "remove", "excluir", "apagar", "cancel account"]
+                .iter()
+                .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::DeleteRemote {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else if [
+                "submit",
+                "send",
+                "confirm",
+                "enviar",
+                "confirmar",
+                "post",
+                "publish",
+                "publicar",
+                "save changes",
+                "salvar alterações",
+                "salvar alteracoes",
+                "create account",
+                "criar conta",
+                "authorize",
+                "autorizar",
+                "accept terms",
+                "aceitar termos",
+                "sign agreement",
+                "assinar acordo",
+                "finalize",
+                "finalizar",
+            ]
+            .iter()
+            .any(|word| material.contains(word))
+            {
+                AgentSecurityAction::Submit {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            } else {
+                AgentSecurityAction::Select {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
+            }
         },
         AgentAction::Extract { .. } => AgentSecurityAction::Extract { origin },
         _ => AgentSecurityAction::Read { origin },
@@ -4214,6 +4281,31 @@ mod agent_risk_tests {
 
         assert!(decision.allowed);
         assert!(!decision.requires_confirmation);
+    }
+
+    #[test]
+    fn structured_select_page_metadata_can_only_raise_risk() {
+        let target = test_element("combobox", "Checkout plan");
+        let page = test_page(target.clone());
+        let security = app_agent_security_action(
+            &AgentAction::Select {
+                target,
+                value: "purchase premium".into(),
+            },
+            &page,
+        );
+
+        assert_eq!(security.risk(), ActionRisk::Restricted);
+        assert!(matches!(security, AgentSecurityAction::Payment { .. }));
+
+        let mut policy =
+            AgentPermissionPolicy::new(Some("https://hostile.example".into()));
+        policy.grant_reversible_session_actions(true);
+        let decision = policy.evaluate(&security);
+
+        assert!(!decision.allowed);
+        assert!(decision.requires_confirmation);
+        assert_eq!(decision.capability, CapabilityClass::DRestricted);
     }
 }
 
