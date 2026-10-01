@@ -1802,8 +1802,8 @@ mod native_zoom_tests {
         let mut wheel = windows_core::BOOL::default();
         let mut pinch = windows_core::BOOL::default();
         unsafe {
-            settings.IsZoomControlEnabled(&mut wheel).unwrap();
-            settings5.IsPinchZoomEnabled(&mut pinch).unwrap();
+            settings.IsZoomControlEnabled(&raw mut wheel).unwrap();
+            settings5.IsPinchZoomEnabled(&raw mut pinch).unwrap();
         }
         assert!(!wheel.as_bool());
         assert!(!pinch.as_bool());
@@ -1812,8 +1812,8 @@ mod native_zoom_tests {
         let errors = enable_native_zoom_with(&mut ComZoomControls(settings5.cast().unwrap()));
         assert!(errors.is_empty(), "COM adapter failed: {errors:?}");
         unsafe {
-            settings.IsZoomControlEnabled(&mut wheel).unwrap();
-            settings5.IsPinchZoomEnabled(&mut pinch).unwrap();
+            settings.IsZoomControlEnabled(&raw mut wheel).unwrap();
+            settings5.IsPinchZoomEnabled(&raw mut pinch).unwrap();
         }
         assert!(
             wheel.as_bool(),

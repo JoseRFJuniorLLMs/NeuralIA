@@ -201,7 +201,13 @@ pub fn is_local_network_target(url: &Url) -> bool {
         Some(Host::Ipv6(ip)) => is_forbidden_ip(IpAddr::V6(ip)),
         Some(Host::Domain(domain)) => {
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
-            domain == "localhost" || domain.ends_with(".localhost") || domain.ends_with(".local")
+            domain == "localhost"
+                || domain.ends_with(".localhost")
+                || domain == "local"
+                || domain.ends_with(".local")
+                || domain == "internal"
+                || domain.ends_with(".internal")
+                || domain.ends_with(".lan")
         }
         None => false,
     }
@@ -395,7 +401,10 @@ mod tests {
             "http://192.168.1.1/",
             "http://169.254.1.1/",
             "http://localhost/",
+            "http://local/",
             "http://printer.local/",
+            "http://router.lan/",
+            "http://gateway.internal/",
             "http://[::1]/",
             "http://[fe80::1]/",
             "http://[fc00::1]/",

@@ -1008,7 +1008,10 @@ mod tests {
         let end = t0 + secs(10) + Duration::from_millis(1_498_400);
         assert!(
             timers
-                .run_until(&mut pomodoro, end - Duration::from_nanos(1))
+                .run_until(
+                    &mut pomodoro,
+                    end.checked_sub(Duration::from_nanos(1)).unwrap(),
+                )
                 .is_empty()
         );
         let finished = timers.run_until(&mut pomodoro, end);
@@ -1300,7 +1303,9 @@ mod tests {
 
         pomodoro.command(PomodoroCommand::Start, t0);
         // Arredonda para cima: com 0,4 s a faltar ainda se ve 00:01.
-        let late = t0 + secs(25 * 60) - Duration::from_millis(400);
+        let late = (t0 + secs(25 * 60))
+            .checked_sub(Duration::from_millis(400))
+            .unwrap();
         assert_eq!(pomodoro.label(late).as_deref(), Some("00:01"));
         assert_eq!(pomodoro.label(t0 + secs(754)).as_deref(), Some("12:26"));
         assert_eq!(

@@ -92,13 +92,20 @@ impl Note {
         };
         push_field(&mut out, "id", &id);
         push_field(&mut out, "title", &yaml_scalar(&self.title, false));
-        let tags: Vec<String> = self.tags.iter().map(|tag| yaml_scalar(tag, true)).collect();
-        push_field(&mut out, "tags", &format!("[{}]", tags.join(", ")));
+        out.push_str("tags: [");
+        for (i, tag) in self.tags.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&yaml_scalar(tag, true));
+        }
+        out.push_str("]\n");
         if let Some(source) = &self.source {
             push_field(&mut out, "source", &yaml_scalar(source, false));
         }
-        push_field(&mut out, "created", &self.created_unix.to_string());
-        push_field(&mut out, "updated", &self.updated_unix.to_string());
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "created: {}", self.created_unix);
+        let _ = writeln!(out, "updated: {}", self.updated_unix);
         for line in clean_extra_lines(&self.extra_front_matter) {
             out.push_str(&line);
             out.push('\n');
@@ -132,13 +139,41 @@ pub fn links(note: &Note) -> Vec<String> {
         if in_fence {
             continue;
         }
-        for target in wiki_targets(line) {
+        for_each_wiki_target(line, |target| {
             if is_valid_note_id(target) && seen.insert(target) {
                 out.push(target.to_string());
             }
-        }
+            true
+        });
     }
     out
+}
+
+fn note_links_to(note: &Note, target_id: &str) -> bool {
+    let mut in_fence = false;
+    for line in note.body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut found = false;
+        for_each_wiki_target(line, |target| {
+            if target == target_id {
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 /// Notas que ligam para `id` (a própria nota não conta), na ordem de `list`.
@@ -149,7 +184,7 @@ pub fn backlinks(store: &ZettelStore, id: &str) -> ZettelResult<Vec<Note>> {
     Ok(store
         .list()?
         .into_iter()
-        .filter(|note| note.id != id && links(note).iter().any(|target| target == id))
+        .filter(|note| note.id != id && note_links_to(note, id))
         .collect())
 }
 
@@ -891,8 +926,7 @@ fn yaml_quoted(value: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Alvos de `[[...]]` numa linha, saltando código em linha (`` `[[x]]` `` é texto).
-fn wiki_targets(line: &str) -> Vec<&str> {
-    let mut targets = Vec::new();
+fn for_each_wiki_target<'a>(line: &'a str, mut visit: impl FnMut(&'a str) -> bool) -> bool {
     let mut rest = line;
     while let Some(link) = rest.find("[[") {
         if let Some(code) = rest.find('`').filter(|&code| code < link) {
@@ -913,10 +947,12 @@ fn wiki_targets(line: &str) -> Vec<&str> {
             rest = after;
             continue;
         }
-        targets.push(link_target(inner));
+        if !visit(link_target(inner)) {
+            return false;
+        }
         rest = &after[close + 2..];
     }
-    targets
+    true
 }
 
 /// `id|alias`, `id#secção`, `id^bloco` -> `id`. O `\|` é como o Obsidian

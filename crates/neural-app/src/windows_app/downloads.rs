@@ -742,7 +742,7 @@ impl DownloadFinalizer {
                                 #[cfg(test)]
                                 if let Some(hook) = worker_hook
                                     .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .clone()
                                 {
                                     hook(job.id);
@@ -801,7 +801,7 @@ impl DownloadFinalizer {
         *self
             .before_commit
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(hook));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(hook));
     }
 
     #[cfg(test)]
@@ -1400,7 +1400,7 @@ mod recovery_regression_tests {
             "pending"
         );
     }
-    /// Gate critico: recovery_only tem uma unica tentativa. Depois de um
+    /// Gate critico: `recovery_only` tem uma unica tentativa. Depois de um
     /// segundo crash ele nao aparece como historico e nao conserva o caminho
     /// escondido para sempre.
     #[test]

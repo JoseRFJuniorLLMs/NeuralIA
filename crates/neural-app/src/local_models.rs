@@ -607,7 +607,11 @@ mod tests {
         let fixture = Fixture::new();
         fs::create_dir_all(&fixture.import).unwrap();
         let path = fixture.import.join("manifest.json");
-        fs::write(&path, vec![b' '; MAX_IMPORT_MANIFEST_BYTES as usize + 1]).unwrap();
+        fs::write(
+            &path,
+            vec![b' '; usize::try_from(MAX_IMPORT_MANIFEST_BYTES).unwrap_or(usize::MAX) + 1],
+        )
+        .unwrap();
         let mut packs = fixture.packs();
         let error =
             execute_local_model_command(&mut packs, LocalModelCommand::Install(path)).unwrap_err();

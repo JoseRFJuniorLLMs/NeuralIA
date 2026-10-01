@@ -847,7 +847,7 @@ impl DistractionSlot {
     pub(in crate::windows_app) fn bound_id(&self) -> Option<String> {
         self.state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .bound
             .clone()
     }

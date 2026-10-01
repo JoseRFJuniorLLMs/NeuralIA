@@ -800,8 +800,15 @@ fn walk_central_directory(
         reader.read_exact(&mut raw_name).map_err(truncated)?;
         let mut extra = vec![0u8; extra_len];
         reader.read_exact(&mut extra).map_err(truncated)?;
-        let mut comment = vec![0u8; comment_len];
-        reader.read_exact(&mut comment).map_err(truncated)?;
+        if comment_len > 0 {
+            let mut remaining = comment_len;
+            let mut drain = [0u8; 256];
+            while remaining > 0 {
+                let chunk = remaining.min(drain.len());
+                reader.read_exact(&mut drain[..chunk]).map_err(truncated)?;
+                remaining -= chunk;
+            }
+        }
 
         if size == SATURATED_32
             || compressed_size == SATURATED_32
