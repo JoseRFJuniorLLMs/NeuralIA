@@ -1,0 +1,32 @@
+name: TEMP inspect legacy agent test
+on:
+  push:
+    branches: [fix/spec-0104-untrusted-risk-floor]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Print legacy test function
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('crates/neural-app/src/windows_app/tests.rs')
+          s=p.read_text(encoding='utf-8')
+          name='fn reversible_click_runs_under_the_session_grant'
+          start=s.index(name)
+          brace=s.index('{',start)
+          depth=0
+          end=None
+          for i in range(brace,len(s)):
+              if s[i]=='{': depth+=1
+              elif s[i]=='}':
+                  depth-=1
+                  if depth==0:
+                      end=i+1
+                      break
+          print(s[start:end])
