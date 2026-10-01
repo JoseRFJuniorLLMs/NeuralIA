@@ -131,9 +131,7 @@ impl DomainSet {
         if self.domains.contains(domain.as_str()) {
             return DomainInsert::Duplicate;
         }
-        if self.domains.len() >= MAX_DOMAINS
-            || self.bytes + domain.len() > MAX_DOMAIN_BYTES
-        {
+        if self.domains.len() >= MAX_DOMAINS || self.bytes + domain.len() > MAX_DOMAIN_BYTES {
             return DomainInsert::Full;
         }
         self.bytes += domain.len();
