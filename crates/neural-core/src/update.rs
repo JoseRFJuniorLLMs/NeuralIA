@@ -250,9 +250,7 @@ pub fn download_installer(
     use std::io::{Read, Write};
     use std::time::{Duration, Instant};
 
-    if expected_sha256.len() != 64
-        || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit())
-    {
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(NeuralError::Config(
             "Atualização recusada: SHA-256 ausente ou inválido".to_string(),
         ));
@@ -350,8 +348,9 @@ pub fn download_installer(
                 NeuralError::Config(format!("Falha ao substituir instalador anterior: {e}"))
             })?;
         }
-        std::fs::rename(&part_path, target_path)
-            .map_err(|e| NeuralError::Config(format!("Falha ao publicar instalador verificado: {e}")))?;
+        std::fs::rename(&part_path, target_path).map_err(|e| {
+            NeuralError::Config(format!("Falha ao publicar instalador verificado: {e}"))
+        })?;
         on_progress(1.0);
         Ok(())
     })();
@@ -466,7 +465,9 @@ mod tests {
         );
         assert_eq!(
             info.installer_url.as_deref(),
-            Some("https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v2.7.0/NeuralIA-Setup-2.7.0-x64.exe")
+            Some(
+                "https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v2.7.0/NeuralIA-Setup-2.7.0-x64.exe"
+            )
         );
         assert_eq!(
             info.installer_sha256.as_deref(),
