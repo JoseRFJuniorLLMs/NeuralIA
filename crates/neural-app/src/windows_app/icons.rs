@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+
 use super::*;
 
 /// Slot 0..2 = icones das IAs, slot 3 = glifo da casa (pintado com a cor do tema).
@@ -33,6 +35,12 @@ pub(in crate::windows_app) const ICON_CACHE_CAPACITY: usize = 24;
 pub(in crate::windows_app) type IconCacheEntry = ((usize, u32), Arc<RgbaImage>);
 pub(in crate::windows_app) static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> =
     Mutex::new(Vec::new());
+
+thread_local! {
+    /// Buffer BGRX reutilizado pela thread de UI. Cresce até o maior ícone
+    /// pintado e depois só é limpo/repreenchido, sem uma alocação por WM_PAINT.
+    static ICON_BRGX_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// LRU minimo sobre um vector: o fim e o mais recentemente usado, o inicio e o
 /// candidato a sair. Estao separadas do cache de icones de proposito — assim a
@@ -160,22 +168,29 @@ pub(in crate::windows_app) unsafe fn draw_icon(
     // O cache entrega o `Arc`; aqui so se le, por isso basta emprestar.
     let scaled = icon_scaled(slot, size as u32);
     let image: &RgbaImage = &scaled;
-    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
-    for py in 0..size as u32 {
-        for px in 0..size as u32 {
-            let pixel = image.get_pixel(px, py);
-            let alpha = pixel[3] as f32 / 255.0;
-            let source = tint.unwrap_or((pixel[0], pixel[1], pixel[2]));
-            let channel = |value: u8, bg: u8| {
-                (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
-            };
-            pixels.push(channel(source.2, background.2));
-            pixels.push(channel(source.1, background.1));
-            pixels.push(channel(source.0, background.0));
-            pixels.push(0);
+    ICON_BRGX_SCRATCH.with(|scratch| {
+        let mut pixels = scratch.borrow_mut();
+        pixels.clear();
+        let required = size as usize * size as usize * 4;
+        if pixels.capacity() < required {
+            pixels.reserve(required - pixels.capacity());
         }
-    }
-    blit_bgrx(hdc, &pixels, x, y, size, size);
+        for py in 0..size as u32 {
+            for px in 0..size as u32 {
+                let pixel = image.get_pixel(px, py);
+                let alpha = pixel[3] as f32 / 255.0;
+                let source = tint.unwrap_or((pixel[0], pixel[1], pixel[2]));
+                let channel = |value: u8, bg: u8| {
+                    (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
+                };
+                pixels.push(channel(source.2, background.2));
+                pixels.push(channel(source.1, background.1));
+                pixels.push(channel(source.0, background.0));
+                pixels.push(0);
+            }
+        }
+        blit_bgrx(hdc, &pixels, x, y, size, size);
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
