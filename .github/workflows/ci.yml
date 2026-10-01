@@ -198,67 +198,6 @@ jobs:
 
           $sabotages = @(
             @{
-              Label = "agent-generic-click-downgraded-to-reversible"
-              Test = "generic_click_never_inherits_a_reversible_grant_from_page_metadata"
-              SourcePath = "crates/neural-core/src/agent_security.rs"
-              Old = @'
-                      Self::Select { .. }
-                      | Self::TypeText {
-                          field: FieldKind::Search,
-                          ..
-                      } => ActionRisk::Reversible,
-                      // A generic click is ambiguous remote authority. The page owns its
-                      // role/name/text, so those strings may raise the risk but can never
-                      // lower it into the session-grant class. Likewise arbitrary text
-                      // fields are not the SPEC-0104 "non-sensitive search field" class.
-                      Self::Click { .. }
-                      | Self::TypeText {
-          '@
-              New = @'
-                      Self::Select { .. }
-                      | Self::Click { .. }
-                      | Self::TypeText {
-                          field: FieldKind::Search,
-                          ..
-                      } => ActionRisk::Reversible,
-                      // SABOTAGE: page-controlled generic clicks got the Class B grant.
-                      Self::TypeText {
-          '@
-            },
-            @{
-              Label = "agent-select-collapsed-into-generic-click"
-              Test = "structured_select_keeps_the_native_reversible_class"
-              SourcePath = "crates/neural-app/src/windows_app.rs"
-              Old = @'
-                          AgentSecurityAction::Select {
-                              origin,
-                              description: format!("select {} = {}", target.name, value),
-                          }
-          '@
-              New = @'
-                          AgentSecurityAction::Click {
-                              origin,
-                              label: format!("select {} = {}", target.name, value),
-                          }
-          '@
-            },
-            @{
-              Label = "agent-select-metadata-cannot-raise-risk"
-              Test = "structured_select_page_metadata_can_only_raise_risk"
-              SourcePath = "crates/neural-app/src/windows_app.rs"
-              Old = @'
-                      let material = format!(
-                          "{} {} {}",
-                          target.role.to_lowercase(),
-                          target.name.to_lowercase(),
-                          value.to_lowercase()
-                      );
-          '@
-              New = @'
-                      let material = String::new(); // SABOTAGE: ignore page hints that should only raise risk.
-          '@
-            },
-            @{
               Label = "half-open-hit-test"
               Test = "ui_rect_edges_are_half_open_so_adjacent_controls_never_share_a_click"
               Old = @'
@@ -830,6 +769,87 @@ jobs:
           '@
               New = @'
                   Inspection::NotInspected => None,
+          '@
+            },
+            @{
+              Label = "agent-generic-click-downgraded-to-reversible"
+              Test = "generic_click_never_inherits_a_reversible_grant_from_page_metadata"
+              SourcePath = "crates/neural-core/src/agent_security.rs"
+              Old = @'
+                      Self::Select { .. }
+                      | Self::TypeText {
+                          field: FieldKind::Search,
+                          ..
+                      } => ActionRisk::Reversible,
+                      // A generic click is ambiguous remote authority. The page owns its
+                      // role/name/text, so those strings may raise the risk but can never
+                      // lower it into the session-grant class. Likewise arbitrary text
+                      // fields are not the SPEC-0104 "non-sensitive search field" class.
+                      Self::Click { .. }
+                      | Self::TypeText {
+          '@
+              New = @'
+                      Self::Select { .. }
+                      | Self::Click { .. }
+                      | Self::TypeText {
+                          field: FieldKind::Search,
+                          ..
+                      } => ActionRisk::Reversible,
+                      // SABOTAGE: page-controlled generic clicks got the Class B grant.
+                      Self::TypeText {
+          '@
+            },
+            @{
+              Label = "agent-select-collapsed-into-generic-click"
+              Test = "structured_select_keeps_the_native_reversible_class"
+              SourcePath = "crates/neural-app/src/windows_app.rs"
+              Old = @'
+                          AgentSecurityAction::Select {
+                              origin,
+                              description: format!("select {} = {}", target.name, value),
+                          }
+          '@
+              New = @'
+                          AgentSecurityAction::Click {
+                              origin,
+                              label: format!("select {} = {}", target.name, value),
+                          }
+          '@
+            },
+            @{
+              Label = "agent-select-metadata-cannot-raise-risk"
+              Test = "structured_select_page_metadata_can_only_raise_risk"
+              SourcePath = "crates/neural-app/src/windows_app.rs"
+              Old = @'
+                      let material = format!(
+                          "{} {} {}",
+                          target.role.to_lowercase(),
+                          target.name.to_lowercase(),
+                          value.to_lowercase()
+                      );
+          '@
+              New = @'
+                      let material = String::new(); // SABOTAGE: ignore page hints that should only raise risk.
+          '@
+            },
+            @{
+              Label = "distraction-global-toggle-does-not-publish"
+              Test = "global_distraction_command_changes_the_shared_policy"
+              SourcePath = "crates/neural-app/src/windows_app/adblock.rs"
+              Old = @'
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        self.distraction
+            .publish(&self.settings.distraction, &self.distraction_private);
+          '@
+              New = @'
+        if !self.settings.distraction.set_default(on) {
+            return false;
+        }
+        self.save_settings();
+        // SABOTAGE: saved settings changed, but open WebViews keep stale policy.
           '@
             },
             @{
@@ -1626,6 +1646,27 @@ jobs:
           }
           ipconfig /flushdns | Out-Null
           ./scripts/test-adblock.ps1 -ExePath ci-tested/NeuralIA.exe
+      # SPEC-0114 on the exact release candidate: the page reloads once, then
+      # reports whether the real document-created COM script hid a cookie banner.
+      - name: SPEC-0114 WebView2 distraction E2E on tested exe
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          $name = 'news.distraction.test'
+          $entry = "127.0.0.1 $name"
+          $current = [IO.File]::ReadAllText($hostsPath)
+          $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?$'
+          if ($current -notmatch $pinned) {
+            $separator = if ($current.Length -gt 0 -and -not $current.EndsWith("`n")) { "`r`n" } else { "" }
+            [IO.File]::AppendAllText($hostsPath, "$separator$entry`r`n", [Text.Encoding]::ASCII)
+          }
+          if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
+            throw "The hosts file does not map $name to 127.0.0.1."
+          }
+          ipconfig /flushdns | Out-Null
+          ./scripts/test-distraction-e2e.ps1 -ExePath ci-tested/NeuralIA.exe
       # E2E of the download manager (downloads-manager) on the exact bytes
       # that release.yml packages. It opens the exe (windows that can take the
       # focus), so it never runs in the local suite. The fixture
