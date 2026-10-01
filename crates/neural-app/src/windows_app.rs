@@ -33,7 +33,7 @@ use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_
 use crate::privacy::{PrivacyGuard, PrivacyMode};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
 use crate::secrets::redact_debug_secrets;
-use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE};
+use crate::stores::{ADBLOCK_LIST_STORE, ADBLOCK_SETTINGS_STORE, AGENTS_STORE, MODEL_PACKS_STORE};
 use crate::tab_session::{self, Loaded, SessionColumn, SessionGroup, SessionTab, TabSession};
 use neural_core::json_store::StoreRegistry;
 use neural_core::{
@@ -100,6 +100,8 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
+    /// Resultado do worker de model packs; o event loop continua responsivo durante I/O.
+    LocalModelFinished(Result<crate::local_models::LocalModelOutcome, String>),
     /// O tema (`theme.rs`): a unica variante do modulo, com o enum dele
     /// dentro. E o padrao de cada feature: uma variante aqui, o resto la.
     Theme(ThemeEvent),
@@ -3259,6 +3261,9 @@ pub(in crate::windows_app) struct App {
     /// Estado nativo lido pela subclasse do EDIT da palette.
     pub(in crate::windows_app) palette_host: Box<PaletteHost>,
     pub(in crate::windows_app) config: CoreConfig,
+    /// SPEC-0102: raiz + slot lazy do manager. O produto so toca neste
+    /// estado depois de um comando model:/modelo: explicitamente submetido.
+    pub(in crate::windows_app) local_models: crate::local_models::LocalModelPacks,
     /// O portao da persistencia (`crate::privacy`): dono do registo das
     /// lojas (a unica cunhagem do produto, feita no `App::new`) e dos
     /// escritores automaticos -- o historico, a memoria semantica e as
@@ -3390,6 +3395,14 @@ impl App {
             &config,
             EventSink::proxy(proxy.clone()),
         );
+        // Estado barato e grant-typed: pedir a capacidade nao cria pasta nem
+        // le packs. O manager continua nascendo so numa acao model: explicita.
+        let local_models = crate::local_models::LocalModelPacks::new(
+            privacy
+                .store(MODEL_PACKS_STORE)
+                .expect("MODEL_PACKS_STORE deve estar no registro de lojas"),
+        )
+        .expect("MODEL_PACKS_STORE deve ter nome/tipo/forma corretos");
         let notes = ZettelWorker::new(config.data_dir.join("zettel"), proxy.clone());
         let timers = Timers::new(proxy.clone());
         let reader_client = ReaderClient::new(config.reader_timeout_secs, config.reader_max_bytes);
@@ -3481,6 +3494,7 @@ impl App {
             palette: None,
             palette_host,
             config,
+            local_models,
             privacy,
             timers,
             current_research: None,

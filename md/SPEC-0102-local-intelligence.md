@@ -1,6 +1,6 @@
 # SPEC-0102 — Optional Local Intelligence
 
-**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs validado no core, ainda não ligado ao produto  
+**Status:** Parcial — inteligência local determinística integrada; lifecycle de model packs ligado ao produto de forma lazy, backend de inferência ainda não integrado  
 **Target:** NeuralIA 1.9
 
 ## 1. Purpose
@@ -121,33 +121,76 @@ model-independent local intelligence primitives. This path is exercised by the
 core tests and by the product-wiring gate in
 `crates/neural-app/tests/spec_product_wiring.rs`.
 
-### Decision: model packs are library-only for now
+### Decision: explicit product lifecycle, inference remains absent
 
-`ModelPackManager` is **not a NeuralIA product feature** in the current
-baseline. It is a `neural-core` lifecycle utility that validates manifests,
-license metadata and hashes, stages/replaces pack files atomically, records
-benchmarks, supports explicit activation/deactivation and removes packs.
+The product now has a **product-side lazy adapter** for `ModelPackManager`.
+`App::new` asks the `PrivacyGuard` for the declared `MODEL_PACKS_STORE`
+(`Explicit`) grant, and the adapter keeps that capability plus an empty manager
+slot. Requesting the grant stores a path with **no inference-backend construction**
+or pack opening in the adapter. `ModelPackManager` is created lazily from the
+grant-rooted path on the first explicit model action. The CI startup E2E launches
+the full `App` in a CI-only accelerator-feature build with an isolated data
+directory before any model command. It requires `resident_model_bytes=0`,
+`manager_initialized=false`, and no `model-packs/` directory. The first value
+is the adapter's counter, currently constant zero because no inference backend
+exists in the product. This probe demonstrates an empty adapter slot and no
+created pack directory after `App::new`; it does not measure process residency,
+prove absence of filesystem reads, or inspect the published feature-off binary.
 
-Activation in the core is deliberately stricter than installation: a pack is
-only marked active after the installed artifact verifies and a non-empty
-benchmark record exists. The active-state record pins id/version/hash. If that
-state becomes stale, the model file is altered or benchmark metadata is
-unusable, resolution returns the deterministic fallback plus a diagnostic
-warning instead of making ordinary local intelligence unavailable.
+Lifecycle actions exposed by the product are reachable only from explicit omnibox
+commands:
 
-It still performs **no download, no inference-backend construction, no
-automatic activation and no browser-startup hook**.
+- `model:status` / `modelo:status` resolves the active pack and reports either
+  the verified pack or deterministic fallback plus a diagnostic;
+- `model:install:<manifest.json>` imports a user-selected local manifest and
+  its sibling model file, validates path/hash/license/capabilities, and does
+  **not** activate it;
+- the product route refuses `model:activate:<id>` while no measured inference
+  backend exists, rather than manufacturing benchmark evidence for a backend
+  that is not present;
+- `model:deactivate` removes active selection without deleting the pack;
+- `model:uninstall:<id>` removes the pack and clears active state first.
 
-This is intentional. Wiring model packs into the product would require touching
-the browser lifecycle and proving lazy load, zero Home residency, failure
-fallback and measured resource budgets. Until that work is explicitly scheduled,
-the existence of `ModelPackManager` must not be presented as “model packs
-supported by NeuralIA”.
+There is no automatic download or activation. Import rejects a manifest whose
+model filename can escape the selected bundle before reading that model path.
+Model files over 64 MiB are rejected before staging or verification; the copy
+and hash loops also enforce this ceiling if a file grows during import. Copy
+and hash work runs on a dedicated worker, with completion returned to the
+native event loop. Commands are serialized while a worker runs. Import has no
+progress indicator or cancellation yet; that product work remains open in #220.
+Normal App shutdown waits for an in-flight model operation to finish so it
+cannot leave a partially published pack behind.
+The lifecycle adapter has no network, WebView, browser-agent or permission
+capability. It cannot navigate, click, execute page script or grant tools.
 
-Therefore this specification remains **Parcial**. The deterministic local
-intelligence is shipped; optional pack lifecycle is library infrastructure only.
-The acceptance criteria below that mention enabling/uninstalling a pack remain
-open product criteria, not claims about the current browser.
+Activation remains deliberately stricter than installation in the core
+infrastructure. The installed artifact must verify and the benchmark record
+must contain backend identity, sample count, embedding dimension, measured
+latency and **resident-model-byte evidence**. Older benchmark JSON without
+residency evidence fails closed. The current product does not expose activation
+because it has no inference backend that can honestly produce those
+measurements. A future backend-specific benchmark harness may record zero
+resident model bytes when zero is the measured value, but absence of the
+measurement is never treated as zero.
+
+If active state is missing, stale, corrupted, hash-invalid or paired with
+invalid benchmark evidence, resolution returns the existing deterministic
+fallback plus an observable warning rather than disabling navigation, memory
+or ordinary search. Uninstalling/deactivating a pack immediately returns
+resolution to that fallback.
+
+What is **not** implemented yet is equally important: there is still no local
+inference backend consuming the pack, no product activation path, no automatic
+pack download, and no pack becoming the browser/agent authority. Actual
+local-intelligence tasks therefore
+continue to use the deterministic implementation. A future backend must supply
+its measured residency/latency evidence before it can become default and must
+retain the no-network/no-browser-authority boundary.
+
+Therefore this specification remains **Parcial**: deterministic local
+intelligence plus the explicit lazy lifecycle boundary are shipped; real pack
+inference, idle backend unload and backend-specific resource budgets remain
+future work.
 
 ## 8.2. Context budget (library-only)
 

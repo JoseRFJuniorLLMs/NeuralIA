@@ -72,8 +72,8 @@ pub use agent_security::{
 pub use local_intelligence::{
     ActiveModelPack, EMBEDDING_DIM, Embedder, HashingEmbedder, HashingLocalIntelligence,
     IntentClass, LocalBenchmark, LocalIntelligence, ModelPackActivation, ModelPackManager,
-    ModelPackManifest, ModelPackSelection, benchmark_local_intelligence, cosine_similarity,
-    hashed_embedding,
+    ModelPackManifest, ModelPackSelection, benchmark_local_intelligence,
+    benchmark_local_intelligence_with_residency, cosine_similarity, hashed_embedding,
 };
 pub use memory::{
     CaptureOutcome, ForgetReport, ForgetScope, MemoryDoctorReport, MemoryDocument, MemoryHit,

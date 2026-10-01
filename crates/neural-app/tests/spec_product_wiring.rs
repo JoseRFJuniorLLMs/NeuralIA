@@ -114,6 +114,7 @@ const APP: &str = ALL_SOURCES;
 const IPC: &str = include_str!("../src/ipc.rs");
 const CORE_MEMORY: &str = include_str!("../../neural-core/src/memory.rs");
 const LOCAL_INTELLIGENCE: &str = include_str!("../../neural-core/src/local_intelligence.rs");
+const LOCAL_MODELS: &str = include_str!("../src/local_models.rs");
 const CONTEXT_BUDGET: &str = include_str!("../../neural-core/src/context_budget.rs");
 
 /// Todos os `.rs` debaixo de `dir`, recursivamente.
@@ -195,13 +196,44 @@ fn spec_0101_product_research_session_wires_capture_compare_synthesis_and_export
 }
 
 #[test]
-fn spec_0102_partial_product_uses_local_semantics_without_booting_model_packs() {
+fn spec_0102_structural_absence_keeps_model_packs_lazy_and_without_browser_authority() {
+    // Positive lifecycle behavior is exercised by local_models unit tests and
+    // by windows_app::tests::route_input_sends_each_command_where_it_belongs.
+    // This wiring gate is deliberately only a negative/absence gate (§4.3).
     assert!(CORE_MEMORY.contains("hashed_embedding(&entity_text)"));
     assert!(LOCAL_INTELLIGENCE.contains("pub struct ModelPackManager"));
-    assert!(
-        !APP.contains("ModelPackManager"),
-        "model-pack lifecycle is not a shipped product feature yet; update SPEC-0102 when wiring it"
+
+    let constructor = between(
+        LOCAL_MODELS,
+        "pub(crate) fn new(grant: StoreGrant) -> Result<Self, String> {",
+        "fn manager(&mut self)",
     );
+    assert!(
+        !constructor.contains("ModelPackManager::new"),
+        "startup adapter must not instantiate the model-pack manager"
+    );
+    assert!(
+        constructor.contains("MODEL_PACKS_STORE") && constructor.contains("grant.path()"),
+        "model-pack product adapter must be rooted by the declared store grant"
+    );
+
+    for forbidden in [
+        "TcpStream",
+        "UdpSocket",
+        "reqwest",
+        "ureq",
+        "WebView",
+        "BrowserAgent",
+        "AgentPermissionPolicy",
+        "AgentSecurityAction",
+        "execute_script",
+        "navigate(",
+    ] {
+        assert!(
+            !LOCAL_MODELS.contains(forbidden),
+            "model-pack lifecycle gained network/browser/agent authority: {forbidden}"
+        );
+    }
 }
 
 /// O orcamento de contexto (`neural_core::context_budget`, plano 2.5) e

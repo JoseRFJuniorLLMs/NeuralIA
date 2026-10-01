@@ -5,16 +5,36 @@ on:
     paths:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
+      - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/stores.rs'
+      - 'docs/specs/SPEC-0006-security-privacy.md'
+      - 'crates/neural-app/src/main.rs'
+      - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/app/navigation.rs'
+      - 'crates/neural-app/src/windows_app/app/event_loop.rs'
+      - 'crates/neural-app/src/windows_app/tests.rs'
+      - 'crates/neural-app/tests/spec_product_wiring.rs'
+      - 'crates/neural-app/tests/docs_truth.rs'
+      - 'README.md'
       - 'md/SPEC-0102-local-intelligence.md'
-      - 'md/README.md'
       - '.github/workflows/spec-0102.yml'
   push:
     branches: [main]
     paths:
       - 'crates/neural-core/src/local_intelligence.rs'
       - 'crates/neural-core/src/lib.rs'
+      - 'crates/neural-app/src/local_models.rs'
+      - 'crates/neural-app/src/stores.rs'
+      - 'docs/specs/SPEC-0006-security-privacy.md'
+      - 'crates/neural-app/src/main.rs'
+      - 'crates/neural-app/src/windows_app.rs'
+      - 'crates/neural-app/src/windows_app/app/navigation.rs'
+      - 'crates/neural-app/src/windows_app/app/event_loop.rs'
+      - 'crates/neural-app/src/windows_app/tests.rs'
+      - 'crates/neural-app/tests/spec_product_wiring.rs'
+      - 'crates/neural-app/tests/docs_truth.rs'
+      - 'README.md'
       - 'md/SPEC-0102-local-intelligence.md'
-      - 'md/README.md'
       - '.github/workflows/spec-0102.yml'
 
 permissions:
@@ -34,6 +54,216 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Product lifecycle behavior uses the shipped route and executor
+        shell: pwsh
+        run: |
+          cargo test --locked -p neural-app product_adapter_rejects_a_grant_for_another_store
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app startup_state_has_zero_model_residency_and_does_no_pack_io
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app product_parser_blocks_activation_without_measured_backend
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app activation_infrastructure_requires_benchmark_even_though_product_route_blocks_it
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app internal_activation_fixture_uninstalls_to_fallback
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app route_input_sends_each_command_where_it_belongs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app model_work_runs_off_the_caller_thread
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app model_worker_panic_still_notifies_error
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app shipped_dispatch_serializes_commands_and_returns_worker_result
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app model_pack_drop_waits_for_inflight_worker
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Sabotage synchronous model work must turn the worker gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = '    thread::Builder::new()'
+          $new = "    let result = work();`n    thread::Builder::new()"
+          $spawnOld = '.spawn(move || notify(work()))'
+          $spawnNew = '.spawn(move || notify(result))'
+          if (($text.Split($old).Count - 1) -ne 1 -or ($text.Split($spawnOld).Count - 1) -ne 1) {
+            throw "model worker sabotage anchors"
+          }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new).Replace($spawnOld, $spawnNew))
+            cargo test --locked -p neural-app model_work_runs_off_the_caller_thread
+            if ($LASTEXITCODE -eq 0) { throw "synchronous model work stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage model worker shutdown must turn the close gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = '            let _ = worker.join();'
+          $new = '            drop(worker);'
+          if (($text.Split($old).Count - 1) -ne 1) { throw "model worker shutdown sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app model_pack_drop_waits_for_inflight_worker
+            if ($LASTEXITCODE -eq 0) { throw "detached model worker stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage shipped omnibox route must reject synchronous model I/O
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/windows_app/app/navigation.rs"
+          $original = [IO.File]::ReadAllText($path)
+          $text = $original.Replace("`r`n", "`n")
+          $old = @'
+                          let proxy = self.proxy.clone();
+                          match crate::local_models::dispatch_local_model_command(
+                              &mut self.local_models,
+                              command,
+                              move |result| {
+                                  let _ = proxy.send_event(UserEvent::LocalModelFinished(result));
+                              },
+                          ) {
+                              Ok(()) => self.show_splash("Model pack: operação em andamento…".to_string(), 3),
+          '@
+          $new = @'
+                          match crate::local_models::execute_local_model_command(
+                              &mut self.local_models,
+                              command,
+                          ) {
+                              Ok(outcome) => self.show_splash(outcome.message(), 4),
+          '@
+          $old = $old.Replace("`r`n", "`n")
+          $new = $new.Replace("`r`n", "`n")
+          if (($text.Split($old).Count - 1) -ne 1) { throw "shipped model route sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            $output = (& cargo check --locked -p neural-app 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -or $output -notmatch 'cannot find function `execute_local_model_command`') {
+              throw "synchronous shipped route did not fail at the private executor barrier: $output"
+            }
+          } finally {
+            [IO.File]::WriteAllText($path, $original)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage eager manager startup must turn the startup gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = '            manager: None,'
+          $new = '            manager: Some(ModelPackManager::new(root.clone())),'
+          if (($text.Split($old).Count - 1) -ne 1) { throw "eager-manager sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app startup_state_has_zero_model_residency_and_does_no_pack_io
+            if ($LASTEXITCODE -eq 0) { throw "eager manager sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage model-pack store capability must turn the grant gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = @'
+                  if (grant.name(), grant.kind(), grant.shape())
+                      != (expected.name, expected.kind, expected.shape)
+                  {
+          '@
+          $new = @'
+                  if false
+                      && (grant.name(), grant.kind(), grant.shape())
+                          != (expected.name, expected.kind, expected.shape)
+                  {
+          '@
+          if (($text.Split($old).Count - 1) -ne 1) { throw "model-pack grant sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app product_adapter_rejects_a_grant_for_another_store
+            if ($LASTEXITCODE -eq 0) { throw "wrong-store grant sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+
+      - name: Sabotage model command routing must turn the shipped-route gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/windows_app/app/navigation.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = "        return InputRoute::LocalModel(command);"
+          $new = "        return InputRoute::Intent;"
+          if (($text.Split($old).Count - 1) -ne 1) { throw "model-route sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app route_input_sends_each_command_where_it_belongs
+            if ($LASTEXITCODE -eq 0) { throw "model route sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage product activation boundary must turn the route gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = @'
+                      return Some(Err(
+                          "model:activate indisponível: nenhum backend de inferência medido está ligado ao produto"
+                              .to_string(),
+                      ));
+          '@
+          $new = @'
+                      return Some(Ok(LocalModelCommand::Activate(id.to_string())));
+          '@
+          if (($text.Split($old).Count - 1) -ne 1) { throw "product activation sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app product_parser_blocks_activation_without_measured_backend
+            if ($LASTEXITCODE -eq 0) { throw "product activation boundary sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
+      - name: Sabotage deterministic fallback must turn the lifecycle gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = @'
+                          None => LocalModelOutcome::Fallback {
+                              warning: selection.warning,
+                          },
+          '@
+          $new = @'
+                          None => LocalModelOutcome::Active {
+                              id: "sabotage".into(),
+                              version: "0".into(),
+                          },
+          '@
+          if (($text.Split($old).Count - 1) -ne 1) { throw "fallback sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app activation_infrastructure_requires_benchmark_even_though_product_route_blocks_it
+            if ($LASTEXITCODE -eq 0) { throw "fallback sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
 
   sabotage:
     runs-on: ubuntu-latest
@@ -48,8 +278,176 @@ jobs:
         run: |
           cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
           cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
           cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
           cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
+          cargo test --locked -p neural-core oversized_installed_manifest_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_benchmark_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_active_record_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
+          cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
+          cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+          cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
+          cargo test --locked -p neural-core oversized_file_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core oversized_installed_pack_is_rejected_before_hashing
+          cargo test --locked -p neural-core oversized_bytes_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core growing_model_copy_stops_at_byte_limit
+          cargo test --locked -p neural-core growing_model_hash_stops_at_byte_limit
+
+      - name: Sabotage model-pack byte limit
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = 'if bytes > limit {'
+          new = 'if false && bytes > limit {'
+          if s.count(old) != 1:
+              raise SystemExit("model-pack size sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core oversized_file_pack_is_rejected_before_staging
+          import_rc=$?
+          cargo test --locked -p neural-core oversized_installed_pack_is_rejected_before_hashing
+          verify_rc=$?
+          cargo test --locked -p neural-core oversized_bytes_pack_is_rejected_before_staging
+          bytes_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$import_rc" -eq 0 ] || [ "$verify_rc" -eq 0 ] || [ "$bytes_rc" -eq 0 ]; then
+            echo "Model-pack size sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: all three oversized model-pack paths failed."
+
+      - name: Sabotage model-pack copy and hash growth guards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          for old in (
+              '        check_model_pack_size(copied, limit)?;',
+              '        check_model_pack_size(hashed, limit)?;',
+          ):
+              if s.count(old) != 1:
+                  raise SystemExit("model-pack growth sabotage anchor not found exactly once")
+              s = s.replace(old, '        // disabled for sabotage', 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core growing_model_copy_stops_at_byte_limit
+          copy_rc=$?
+          cargo test --locked -p neural-core growing_model_hash_stops_at_byte_limit
+          hash_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$copy_rc" -eq 0 ] || [ "$hash_rc" -eq 0 ]; then
+            echo "Model-pack growth sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: copy and hash growth guards were required."
+
+      - name: Sabotage bounded on-disk model metadata reads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          changes = (
+              (
+                  'if file.metadata().map_err(|error| error.to_string())?.len() > limit {',
+                  'if false && file.metadata().map_err(|error| error.to_string())?.len() > limit {',
+              ),
+              (
+                  'if bytes.len() as u64 > limit {',
+                  'if false && bytes.len() as u64 > limit {',
+              ),
+          )
+          for old, new in changes:
+              if s.count(old) != 1:
+                  raise SystemExit("bounded metadata sabotage anchor not found exactly once")
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core oversized_installed_manifest_is_rejected_before_deserialization
+          manifest_rc=$?
+          cargo test --locked -p neural-core oversized_benchmark_is_rejected_before_deserialization
+          benchmark_rc=$?
+          cargo test --locked -p neural-core oversized_active_record_is_rejected_before_deserialization
+          active_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$manifest_rc" -eq 0 ] || [ "$benchmark_rc" -eq 0 ] || [ "$active_rc" -eq 0 ]; then
+            echo "Bounded metadata sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: oversized installed metadata was rejected."
+
+      - name: Sabotage bounded model metadata writes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = 'if chunk.len() > self.limit - self.bytes.len() {'
+          new = 'if false && chunk.len() > self.limit - self.bytes.len() {'
+          if s.count(old) != 1:
+              raise SystemExit("bounded JSON writer sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
+          manifest_rc=$?
+          cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
+          benchmark_rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$manifest_rc" -eq 0 ] || [ "$benchmark_rc" -eq 0 ]; then
+            echo "Bounded metadata write sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: oversized metadata writes were rejected."
+
+      - name: Sabotage staged model hash must reject publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = 'if !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {'
+          new = 'if false && !staged_hash.eq_ignore_ascii_case(manifest.sha256.trim()) {'
+          if s.count(old) != 1:
+              raise SystemExit("staged-hash sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Staged-hash sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: a mismatched staged model cannot be published."
 
       - name: Sabotage manifest-license validation
         shell: bash
@@ -110,6 +508,33 @@ jobs:
           fi
           echo "Sabotage proof: activation without benchmark was rejected."
 
+      - name: Sabotage resident-memory evidence requirement
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '''    if benchmark.resident_model_bytes.is_none() {
+                  return Err("benchmark sem medida de memória residente".to_string());
+              }
+          '''
+          if s.count(old) != 1:
+              raise SystemExit("residency sabotage target not found exactly once")
+          p.write_text(s.replace(old, ""), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Residency-evidence sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: benchmark without resident-memory evidence was rejected."
+
       - name: Sabotage active-pack hash revalidation
         shell: bash
         run: |
@@ -148,11 +573,7 @@ jobs:
           from pathlib import Path
           p = Path("crates/neural-core/src/local_intelligence.rs")
           s = p.read_text(encoding="utf-8")
-          old = '''        if self
-                      .read_activation()?
-                      .as_ref()
-                      .is_some_and(|activation| activation.id == id)
-                  {
+          old = '''        if clear_active {
                       self.deactivate()?;
                   }
 
@@ -172,9 +593,48 @@ jobs:
           fi
           echo "Sabotage proof: uninstall without deactivation was rejected."
 
+      - name: Sabotage cleanup after corrupt active state
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/neural-core/src/local_intelligence.rs")
+          s = p.read_text(encoding="utf-8")
+          old = '            Err(_) => true,'
+          new = '            Err(error) => return Err(error),'
+          if s.count(old) != 1:
+              raise SystemExit("corrupt active cleanup sabotage anchor not found exactly once")
+          p.write_text(s.replace(old, new, 1), encoding="utf-8")
+          PY
+          set +e
+          cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+          rc=$?
+          set -e
+          git checkout -- crates/neural-core/src/local_intelligence.rs
+          git diff --exit-code -- crates/neural-core/src/local_intelligence.rs
+          if [ "$rc" -eq 0 ]; then
+            echo "Corrupt active cleanup sabotage unexpectedly stayed green" >&2
+            exit 1
+          fi
+          echo "Sabotage proof: corrupt active state did not block uninstall."
+
       - name: Restored SPEC-0102 lifecycle tests are green
         run: |
           cargo test --locked -p neural-core model_pack_manifest_requires_license_capability_version_and_full_sha256
           cargo test --locked -p neural-core model_pack_activation_requires_verified_pack_and_recorded_benchmark
+          cargo test --locked -p neural-core benchmark_without_residency_evidence_cannot_enable_a_pack
           cargo test --locked -p neural-core corrupt_active_pack_degrades_to_deterministic_fallback_with_warning
           cargo test --locked -p neural-core uninstalling_active_pack_deactivates_before_removing_files
+          cargo test --locked -p neural-core oversized_installed_manifest_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_benchmark_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_active_record_is_rejected_before_deserialization
+          cargo test --locked -p neural-core oversized_manifest_is_refused_before_installation
+          cargo test --locked -p neural-core oversized_benchmark_is_refused_before_recording
+          cargo test --locked -p neural-core corrupt_active_record_does_not_block_explicit_uninstall
+          cargo test --locked -p neural-core file_install_hashes_the_staged_pack_before_publication
+          cargo test --locked -p neural-core oversized_file_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core oversized_installed_pack_is_rejected_before_hashing
+          cargo test --locked -p neural-core oversized_bytes_pack_is_rejected_before_staging
+          cargo test --locked -p neural-core growing_model_copy_stops_at_byte_limit
+          cargo test --locked -p neural-core growing_model_hash_stops_at_byte_limit

@@ -140,6 +140,35 @@ jobs:
       - name: Accelerator spike E2E on the release exe (per-host table)
         shell: pwsh
         run: ./scripts/test-accel-spike.ps1 -ExePath target/release/NeuralIA.exe -TablePath accel-spike-table.md
+      - name: Full App startup keeps model adapter empty and pack directory absent
+        shell: pwsh
+        run: ./scripts/test-model-pack-startup.ps1 -ExePath target/release/NeuralIA.exe
+      - name: Sabotage eager model manager must turn full-App startup red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $utf8 = [Text.UTF8Encoding]::new($false)
+          $path = "crates/neural-app/src/local_models.rs"
+          $original = [IO.File]::ReadAllText($path, $utf8)
+          $old = '            manager: None,'
+          $new = '            manager: Some(ModelPackManager::new(root.clone())),'
+          if (($original.Split($old).Count - 1) -ne 1) { throw "eager-manager sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $original.Replace($old, $new), $utf8)
+            cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+            if ($LASTEXITCODE -ne 0) { throw "sabotaged build failed" }
+            $output = (& pwsh -NoProfile -File ./scripts/test-model-pack-startup.ps1 -ExePath target/release/NeuralIA.exe 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0 -or $output -notmatch 'startup eagerly initialized ModelPackManager') {
+              throw "eager-manager sabotage did not reach the expected gate: $output"
+            }
+          } finally {
+            [IO.File]::WriteAllText($path, $original, $utf8)
+          }
+          git diff --exit-code -- $path
+          cargo build --locked -p neural-app --bin NeuralIA --release --features accel-spike
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./scripts/test-model-pack-startup.ps1 -ExePath target/release/NeuralIA.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       # Proves the probe (AGENTS.md 4.2): with Handled=false the same E2E must
       # report that the page saw the key -- its own rule: this step fails if
       # no leak is seen. Runs even when the E2E step failed, so a harness
