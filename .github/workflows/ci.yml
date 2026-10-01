@@ -198,6 +198,50 @@ jobs:
 
           $sabotages = @(
             @{
+              Label = "agent-generic-click-downgraded-to-reversible"
+              Test = "generic_click_never_inherits_a_reversible_grant_from_page_metadata"
+              SourcePath = "crates/neural-core/src/agent_security.rs"
+              Old = @'
+            Self::Select { .. }
+            | Self::TypeText {
+                field: FieldKind::Search,
+                ..
+            } => ActionRisk::Reversible,
+            // A generic click is ambiguous remote authority. The page owns its
+            // role/name/text, so those strings may raise the risk but can never
+            // lower it into the session-grant class. Likewise arbitrary text
+            // fields are not the SPEC-0104 "non-sensitive search field" class.
+            Self::Click { .. }
+            | Self::TypeText {
+          '@
+              New = @'
+            Self::Select { .. }
+            | Self::Click { .. }
+            | Self::TypeText {
+                field: FieldKind::Search,
+                ..
+            } => ActionRisk::Reversible,
+            // SABOTAGE: page-controlled generic clicks got the Class B grant.
+            Self::TypeText {
+          '@
+            },
+            @{
+              Label = "agent-select-collapsed-into-generic-click"
+              Test = "structured_select_keeps_the_native_reversible_class"
+              Old = @'
+        AgentAction::Select { target, value } => AgentSecurityAction::Select {
+            origin,
+            description: format!("select {} = {}", target.name, value),
+        },
+          '@
+              New = @'
+        AgentAction::Select { target, value } => AgentSecurityAction::Click {
+            origin,
+            label: format!("select {} = {}", target.name, value),
+        },
+          '@
+            },
+            @{
               Label = "half-open-hit-test"
               Test = "ui_rect_edges_are_half_open_so_adjacent_controls_never_share_a_click"
               Old = @'
