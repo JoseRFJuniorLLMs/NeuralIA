@@ -3922,19 +3922,25 @@ fn splash_question_keeps_the_yes_no_geometry_and_answers_by_button() {
             right: width,
             bottom: height,
         };
-        let buttons = splash_buttons(&client, AUTO_SCROLL_QUESTION.buttons.len());
-        let new: Vec<(i32, i32, i32, i32)> = buttons
-            .iter()
+        let count = AUTO_SCROLL_QUESTION.buttons.len();
+        let new: Vec<(i32, i32, i32, i32)> = (0..count)
+            .map(|index| splash_button_rect(&client, count, index).expect("botao"))
             .map(|rect| (rect.left, rect.top, rect.right, rect.bottom))
             .collect();
         assert_eq!(new, old(&client), "{width}x{height}");
         let [yes, no] = old(&client)[..] else {
             unreachable!()
         };
-        assert_eq!(splash_button_at(&buttons, (yes.0 + yes.2) / 2), Some(0));
-        assert_eq!(splash_button_at(&buttons, (no.0 + no.2) / 2), Some(1));
-        assert_eq!(splash_button_at(&buttons, yes.2), None, "o vao");
-        assert_eq!(splash_button_at(&buttons, 5), None, "o texto");
+        assert_eq!(
+            splash_button_at(&client, count, (yes.0 + yes.2) / 2),
+            Some(0)
+        );
+        assert_eq!(
+            splash_button_at(&client, count, (no.0 + no.2) / 2),
+            Some(1)
+        );
+        assert_eq!(splash_button_at(&client, count, yes.2), None, "o vao");
+        assert_eq!(splash_button_at(&client, count, 5), None, "o texto");
     }
 
     let client = RECT {
@@ -3943,14 +3949,16 @@ fn splash_question_keeps_the_yes_no_geometry_and_answers_by_button() {
         right: 600,
         bottom: 50,
     };
-    let three = splash_buttons(&client, 3);
+    let three: Vec<RECT> = (0..3)
+        .map(|index| splash_button_rect(&client, 3, index).expect("botao"))
+        .collect();
     assert_eq!(three.len(), 3);
     assert!(three[2].right <= client.right);
     for pair in three.windows(2) {
         assert!(pair[0].right < pair[1].left, "botoes a tocar-se");
     }
     assert!(three[0].left > 0, "sobra lugar para a pergunta");
-    assert!(splash_buttons(&client, 0).is_empty());
+    assert!(splash_button_rect(&client, 0, 0).is_none());
 }
 
 #[test]
