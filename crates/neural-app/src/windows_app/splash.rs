@@ -57,35 +57,39 @@ fn splash_question() -> Option<SplashQuestion> {
     SPLASH_QUESTION.lock().ok().and_then(|question| *question)
 }
 
-/// Os `count` botoes, encostados a direita: cada um com um quinto da
-/// largura, separados por um quadragesimo. Uma so funcao para o desenho e
-/// o clique concordarem sempre; com dois sao o Sim e o Nao de sempre.
-pub(in crate::windows_app) fn splash_buttons(client: &RECT, count: usize) -> Vec<RECT> {
+/// Retangulo do botao `index`, da esquerda para a direita. A geometria e
+/// calculada na stack: WM_PAINT e hit-test nao alocam um Vec a cada evento.
+pub(in crate::windows_app) fn splash_button_rect(
+    client: &RECT,
+    count: usize,
+    index: usize,
+) -> Option<RECT> {
+    if index >= count {
+        return None;
+    }
     let width = client.right - client.left;
     let button = width / 5;
     let margin = width / 40;
-    let mut right = client.right - margin;
-    let mut rects: Vec<RECT> = (0..count)
-        .map(|_| {
-            let rect = RECT {
-                left: right - button,
-                top: client.top + margin,
-                right,
-                bottom: client.bottom - margin,
-            };
-            right = rect.left - margin;
-            rect
-        })
-        .collect();
-    rects.reverse();
-    rects
+    let from_right = count - 1 - index;
+    let right = client.right - margin - from_right as i32 * (button + margin);
+    Some(RECT {
+        left: right - button,
+        top: client.top + margin,
+        right,
+        bottom: client.bottom - margin,
+    })
 }
 
 /// O botao da pergunta na coluna `x` (so a coluna conta, como sempre).
-pub(in crate::windows_app) fn splash_button_at(buttons: &[RECT], x: i32) -> Option<usize> {
-    buttons
-        .iter()
-        .position(|button| x >= button.left && x < button.right)
+pub(in crate::windows_app) fn splash_button_at(
+    client: &RECT,
+    count: usize,
+    x: i32,
+) -> Option<usize> {
+    (0..count).find(|index| {
+        splash_button_rect(client, count, *index)
+            .is_some_and(|button| x >= button.left && x < button.right)
+    })
 }
 
 /// Aviso flutuante no fundo do ecra. Tem de ser nativo e nao injetado na
@@ -117,8 +121,7 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
         let mut client = RECT::default();
         if GetClientRect(hwnd, &mut client) != 0 {
             let x = (lparam & 0xFFFF) as i16 as i32;
-            let buttons = splash_buttons(&client, question.buttons.len());
-            if let Some(index) = splash_button_at(&buttons, x) {
+            if let Some(index) = splash_button_at(&client, question.buttons.len(), x) {
                 let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
                 let _ = proxy.send_event(UserEvent::SplashAnswer {
                     asker: question.asker,
@@ -153,8 +156,8 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
 
                 if let Some(question) = question {
-                    let buttons = splash_buttons(&client, question.buttons.len());
-                    let first = buttons.first().map_or(client.right, |button| button.left);
+                    let first = splash_button_rect(&client, question.buttons.len(), 0)
+                        .map_or(client.right, |button| button.left);
                     let mut asked = RECT {
                         left: client.left + (18.0 * scale) as i32,
                         top: client.top,
@@ -168,7 +171,11 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );
 
-                    for (rect, button) in buttons.iter().zip(question.buttons) {
+                    for (index, button) in question.buttons.iter().enumerate() {
+                        let Some(rect) = splash_button_rect(&client, question.buttons.len(), index)
+                        else {
+                            continue;
+                        };
                         let pill = UiRect {
                             x: rect.left as f64,
                             y: rect.top as f64,
