@@ -1,6 +1,6 @@
 # SPEC-0109 — WebRTC com consentimento nativo
 
-**Status:** Implementada nesta branch após gate verde.
+**Status:** Implementada no `main` — consentimento nativo integrado pelo PR #128; gates de política permanecem ativos.
 
 ## Objetivo
 

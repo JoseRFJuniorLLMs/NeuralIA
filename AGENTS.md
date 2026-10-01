@@ -187,7 +187,7 @@ Enquanto não houver um segundo revisor, qualquer alteração aqui só entra com
 
 **Aberto, por decidir pelo dono:**
 
-- **Arquitetura do agente.** `AgentRuntime`, `AgentPlanner` e `validate_action_reference` (`neural-core`) **não são usados pelo produto**. Ou a app passa a usá-los, ou a SPEC-0105 descreve o ciclo real e a biblioteca é marcada como não usada — ou removida. Código de segurança que não corre dá conforto falso a quem audita.
+- **Resolvido no PR #80 — arquitetura do agente.** O loop paralelo `AgentRuntime`/`AgentPlanner`/`AgentToolExecutor` foi removido. `agent_protocol` conserva apenas os tipos/configuração compartilhados; o único ciclo de execução do produto é `handle_agent_observation → decide_agent_step → confirmação nativa → execute_agent_action`.
 - **A classificação de risco confia na página.** `agent_field_kind` e `app_agent_security_action` decidem Restricted/Sensitive/Reversible a partir do `role`, `type`, `autocomplete` e texto do elemento — tudo servido por quem controla a página. A SPEC-0104 §1 diz que a página é dado não confiável; aqui ela é a autoridade sobre o seu próprio nível de risco. O que limita o estrago é o agente só tocar em elementos que o plano do utilizador nomeou.
 - **Resolvido no PR #54:** falha do índice de candidatos deixou de cair silenciosamente para full scan quando já existe corpus. Índice ausente/corrompido/impossível de abrir agora torna a degradação visível e orienta `memory:rebuild`; perfil vazio sem documentos continua válido.
 
