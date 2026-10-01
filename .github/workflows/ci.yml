@@ -1592,11 +1592,20 @@ jobs:
         timeout-minutes: 5
         run: |
           $ErrorActionPreference = "Stop"
-          $hostsPath = 'C:\Windows\System32\drivers\etc\hosts'
+          $hostsPath = 'C:\\Windows\\System32\\drivers\\etc\\hosts'
           $name = 'news.distraction.test'
           $entry = "127.0.0.1 $name"
           $current = [IO.File]::ReadAllText($hostsPath)
-          $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?      # E2E of the download manager (downloads-manager) on the exact bytes
+          $pinned = '(?m)^[ \t]*127\.0\.0\.1[ \t]+' + [regex]::Escape($name) + '[ \t]*\r?$'
+          if ($current -notmatch $pinned) {
+            [IO.File]::AppendAllText($hostsPath, "`r`n$entry`r`n", [Text.Encoding]::ASCII)
+          }
+          if ([IO.File]::ReadAllText($hostsPath) -notmatch $pinned) {
+            throw "The hosts file does not map $name to 127.0.0.1."
+          }
+          ipconfig /flushdns | Out-Null
+          ./scripts/test-distraction-e2e.ps1 -ExePath ci-tested/NeuralIA.exe
+      # E2E of the download manager (downloads-manager) on the exact bytes
       # that release.yml packages. It opens the exe (windows that can take the
       # focus), so it never runs in the local suite. The fixture
       # (scripts/downloads-fixture.mjs) listens on 127.0.0.1 only: no request
