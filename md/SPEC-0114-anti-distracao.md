@@ -1,9 +1,9 @@
 # SPEC-0114 — Anti-distração (avisos de cookies, newsletter e barras fixas)
 
-**Status:** Proposta. Código e gates na `release/2.4.0` (PR #168; plano
-2.4, item anti-distracao, cortável), verdes no CI do PR; o script injetado
-novo espera o sim do dono no §7 do `AGENTS.md` antes de entrar na `main`, e
-a ligação pelo COM ainda não tem teste que corra o exe (abaixo).
+**Status:** Implementada no `main` pela `release/2.4.0` (PR #169, após
+#168 e autorização do dono). Esta branch acrescenta o controle global local
+`/distracoes [on|off|status]`, persistido na política existente; a ligação
+pelo COM ainda não tem E2E que corra o exe (abaixo).
 
 ## Objetivo
 
@@ -96,6 +96,11 @@ e **nunca aceitar**.
   `cmp_banners_never_name_a_persistent_host` (neural-core);
 - `per_site_toggle_off_injects_nothing` (neural-core e o caminho do app);
 - `a_toggle_in_private_is_never_written`;
+- `global_distraction_command_changes_the_shared_policy`;
+- `global_reload_never_reloads_provider_columns`;
+- `distraction_command_stays_local_in_home_and_palette`;
+- sabotagem `distraction-global-toggle-does-not-publish`, que remove a
+  publicação da política e precisa deixar o gate do produto vermelho;
 - `distraction_script_posts_nothing_and_survives_a_poisoned_page`.
 
 Amostrados: `scroll_is_restored_only_when_we_hid_the_cause`,
@@ -109,9 +114,24 @@ Os gates correm o texto que embarca num DOM falso (`node:vm`), não num
 WebView2: a ligação pelo COM (`AddScriptToExecuteOnDocumentCreated`, o
 recarregar depois de uma escolha) não tem teste que corra o exe.
 
+## Estado do controle global
+
+A Home e a paleta reconhecem localmente:
+
+- `/distracoes` ou `/distracoes status`;
+- `/distracoes on` (também `ligar`/`ativar`);
+- `/distracoes off` (também `desligar`/`desativar`);
+- `distracoes:<ação>` como forma equivalente.
+
+A mudança grava `default_on`, publica a política compartilhada e re-registra
+o script. Para fazê-la valer já nas páginas abertas, recarrega somente Split,
+Split privado e Web completa; as colunas das IAs nunca são recarregadas por
+esse toggle. Escolhas privadas por site continuam somente em memória e podem
+sobrepor o padrão salvo durante a sessão.
+
 ## Fora desta fase
 
-- A secção de definições «Ocultar distrações (cookies, newsletter, barras
-  fixas)» (o `default_on` já é lido e gravado, mas não há controlo que o
-  mude) e o comando `/distracoes` da paleta e da Home.
+- A secção visual de Definições «Ocultar distrações (cookies, newsletter,
+  barras fixas)». O comando já cobre o controle global sem criar uma segunda
+  política.
 - Um teste E2E no exe (CI) que confirme a ligação pelo COM numa página real.
