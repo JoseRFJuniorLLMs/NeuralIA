@@ -20976,14 +20976,29 @@ fn a_minimized_service_marks_the_button_that_opened_it() {
                 Some(BarHit::Tool(Tool::Breath))
             );
             for service in [Service::Meet, Service::WhatsApp, Service::YouTube] {
-                let icon = service_icon_rect(bare, service).expect("icone do servico");
-                let (x, y) = center_of(icon);
+                let icon_bare = service_icon_rect(bare, service).expect("icone do servico");
+                let (bx, by) = center_of(icon_bare);
                 assert_eq!(
-                    right_controls_hit(running, x, y),
+                    right_controls_hit(bare, bx, by),
                     Some(BarHit::Service(service)),
-                    "{service:?} @{scale}x split={split}"
+                    "{service:?} bare @{scale}x split={split}"
+                );
+                let icon_running =
+                    service_icon_rect(running, service).expect("icone do servico running");
+                let (rx, ry) = center_of(icon_running);
+                assert_eq!(
+                    right_controls_hit(running, rx, ry),
+                    Some(BarHit::Service(service)),
+                    "{service:?} running @{scale}x split={split}"
                 );
             }
+            // Em repouso (bare), os icones estao juntos sem o espaco vazio artificial.
+            let pomodoro = bare.tools[0];
+            let private = bare.private;
+            assert!(
+                (pomodoro.x - (private.x + private.width) - 4.0 * scale).abs() < 1e-4,
+                "Privado e Pomodoro devem estar juntos com folga uniforme de 4px"
+            );
         }
     }
 }
@@ -36948,6 +36963,40 @@ fn native_zoom_is_installed_in_every_visible_webview() {
                 vec![host]
             },
             "{host:?}"
+        );
+    }
+}
+
+#[test]
+fn address_bar_has_distinct_visible_border_and_contiguous_service_icons() {
+    let dark = Theme::dark((0, 120, 212));
+    let (dark_border, dark_width) = dark.omnibox_border(false);
+    assert!(dark_width >= 1.5, "borda deve ter pelo menos 1.5px");
+    assert!(
+        contrast(dark_border, dark.surface) > 2.0,
+        "borda da omnibox deve destacar da superficie no tema escuro"
+    );
+    let (focus_border, focus_width) = dark.omnibox_border(true);
+    assert_eq!(focus_width, 2.0);
+    assert!(contrast(focus_border, dark.surface) > 3.0);
+
+    let light = Theme::light((0, 120, 212));
+    let (light_border, light_width) = light.omnibox_border(false);
+    assert!(light_width >= 1.5);
+    assert!(
+        contrast(light_border, light.surface) > 1.4,
+        "borda da omnibox deve destacar da superficie no tema claro"
+    );
+
+    // Verifica que na barra os icones do Privado e Pomodoro estao perfeitamente contiguos
+    for scale in [1.0, 1.25, 2.0] {
+        let controls = right_controls(1600.0, scale, false, None);
+        let private = controls.private;
+        let pomodoro = controls.tools[0];
+        let gap = pomodoro.x - (private.x + private.width);
+        assert!(
+            (gap - 4.0 * scale).abs() < 1e-4,
+            "distancia entre Privado e Pomodoro deve ser exatamente a folga padrao (4px), mas foi {gap}"
         );
     }
 }

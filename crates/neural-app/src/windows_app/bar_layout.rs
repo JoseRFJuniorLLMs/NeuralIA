@@ -298,6 +298,8 @@ pub(in crate::windows_app) struct BarState {
     /// Os downloads a correr (downloads-ui): a seta do canto pinta-se na cor
     /// de destaque e a dica diz quantos e quanto falta.
     pub(in crate::windows_app) downloads: DownloadsBadge,
+    /// Se a omnibox / barra de endereço está focada no momento.
+    pub(in crate::windows_app) omnibox_focused: bool,
 }
 
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
@@ -1246,15 +1248,13 @@ pub(in crate::windows_app) fn right_controls(
     let tools = home_tool_buttons(client_width, scale, pomodoro_label);
 
     // Os 7 atalhos na barra de titulo (Row 1), posicionados imediatamente
-    // a esquerda do Pomodoro (`tools[0]`), com folga de 6 px:
+    // a esquerda do Pomodoro (`tools[0]`), com folga uniforme de 4 px (icon_gap),
+    // mantendo todos os icones juntos sem espaco vazio entre Privado e Pomodoro:
     // [Live] [Meet] [WhatsApp] [YouTube] [Gmail] [Downloads] [Privado] -> [Pomodoro]
     let title_y = 3.0 * scale;
     let title_size = (TITLE_TAB_HEIGHT - 6.0) * scale;
     let icon_gap = 4.0 * scale;
-    let cluster_gap = 6.0 * scale;
-    let reserved_tools =
-        home_tool_buttons(client_width, scale, BarLabel::new(POMODORO_LABEL_RESERVE));
-    let cluster_right = reserved_tools[0].x - cluster_gap;
+    let cluster_right = tools[0].x - icon_gap;
 
     let downloads_fits = downloads_slot_fits(client_width, scale);
     let private = UiRect {

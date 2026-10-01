@@ -6449,13 +6449,15 @@ fn draw_home(
         let body_font = create_font((-17.0 * scale) as i32, FW_NORMAL as i32);
         let small_font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
         let old_font = SelectObject(target, body_font as _);
-
+        let focus = GetFocus();
+        let omnibox_focused = !focus.is_null() && (focus == hwnd || GetParent(focus) == hwnd);
+        let (border_color, border_width) = theme.omnibox_border(omnibox_focused);
         fill_pill(
             target,
             layout.input,
             layout.input.height / 2.0,
             theme.surface,
-            Some((theme.surface_line, scale)),
+            Some((border_color, border_width * scale)),
             theme.page_bg,
         );
         if go_hover {
@@ -6731,12 +6733,13 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
 
     let address = title_address_rect(width as f64, scale, columns.pomodoro_label);
     if address.width > 0.0 {
+        let (border_color, border_width) = theme.omnibox_border(state.omnibox_focused);
         fill_pill(
             target,
             address,
             address.height / 2.0,
             theme.surface,
-            Some((theme.bar_line, scale)),
+            Some((border_color, border_width * scale)),
             theme.bar_bg,
         );
     }

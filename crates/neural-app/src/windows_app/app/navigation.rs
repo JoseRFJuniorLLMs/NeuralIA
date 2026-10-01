@@ -321,6 +321,13 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
         return 0;
     }
 
+    if message == WM_SETFOCUS || message == WM_KILLFOCUS {
+        let parent = GetParent(hwnd);
+        if !parent.is_null() {
+            InvalidateRect(parent, std::ptr::null(), 0);
+        }
+    }
+
     if message == WM_KEYDOWN {
         let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
         let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;

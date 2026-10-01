@@ -308,6 +308,26 @@ impl Theme {
     pub(in crate::windows_app) fn brand(&self, index: usize) -> Rgb {
         BRAND_COLORS[index.min(COMPARATOR_COLUMNS - 1)]
     }
+
+    /// Borda da barra de endereço / omnibox para destaque nítido,
+    /// com espessura e contraste definidos inspirados no padrão do Chrome.
+    pub(in crate::windows_app) fn omnibox_border(&self, focused: bool) -> (Rgb, f64) {
+        let base_accent = readable(self.accent, self.surface, 3.5);
+        if focused {
+            (base_accent, 2.0)
+        } else if self.dark {
+            // No modo escuro, uma borda elegante e bem definida (1.5px) com contraste
+            // perceptível contra o fundo da barra e a superfície interna.
+            let visible_border = mix(self.surface_line, self.fg_muted, 0.42);
+            let border_color = mix(visible_border, base_accent, 0.35);
+            (border_color, 1.5)
+        } else {
+            // No modo claro, traço definido com 1.5px
+            let visible_border = mix(self.surface_line, self.fg_muted, 0.40);
+            let border_color = mix(visible_border, base_accent, 0.30);
+            (border_color, 1.5)
+        }
+    }
 }
 
 // ===================== o tema como modulo de feature (o padrao) =====================

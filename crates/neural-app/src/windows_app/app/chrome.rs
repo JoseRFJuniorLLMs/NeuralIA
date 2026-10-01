@@ -1383,6 +1383,9 @@ impl App {
             bookmarked: self.bookmarks.column_stars(),
             split_bookmarked: self.bookmarks.split_star(),
             downloads: downloads_badge(&self.downloads.manager),
+            omnibox_focused: self
+                .omnibox
+                .is_some_and(|edit| unsafe { GetFocus() == edit }),
         }
     }
 }

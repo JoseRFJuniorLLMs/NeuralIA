@@ -6,6 +6,7 @@ pub(in crate::windows_app) const EM_SETCUEBANNER: u32 = 0x1501;
 pub(in crate::windows_app) const EM_SETMARGINS: u32 = 0x00D3;
 pub(in crate::windows_app) const WM_CTLCOLOREDIT: u32 = 0x0133;
 pub(in crate::windows_app) const WM_ERASEBKGND: u32 = 0x0014;
+pub(in crate::windows_app) const WM_SETFOCUS: u32 = 0x0007;
 pub(in crate::windows_app) const WM_KILLFOCUS: u32 = 0x0008;
 pub(in crate::windows_app) const WM_CHAR: u32 = 0x0102;
 
