@@ -137,14 +137,17 @@ exists in the product. This probe demonstrates an empty adapter slot and no
 created pack directory after `App::new`; it does not measure process residency,
 prove absence of filesystem reads, or inspect the published feature-off binary.
 
-Lifecycle actions are reachable only from explicit omnibox commands:
+Lifecycle actions exposed by the product are reachable only from explicit omnibox
+commands:
 
 - `model:status` / `modelo:status` resolves the active pack and reports either
   the verified pack or deterministic fallback plus a diagnostic;
 - `model:install:<manifest.json>` imports a user-selected local manifest and
   its sibling model file, validates path/hash/license/capabilities, and does
   **not** activate it;
-- `model:activate:<id>` requests activation;
+- the product route refuses `model:activate:<id>` while no measured inference
+  backend exists, rather than manufacturing benchmark evidence for a backend
+  that is not present;
 - `model:deactivate` removes active selection without deleting the pack;
 - `model:uninstall:<id>` removes the pack and clears active state first.
 
@@ -160,14 +163,15 @@ cannot leave a partially published pack behind.
 The lifecycle adapter has no network, WebView, browser-agent or permission
 capability. It cannot navigate, click, execute page script or grant tools.
 
-Activation remains deliberately stricter than installation. The installed
-artifact must verify and the benchmark record must contain backend identity,
-sample count, embedding dimension, measured latency and
-**resident-model-byte evidence**. Older benchmark JSON without residency
-evidence fails closed.
-A backend-specific benchmark harness can record zero resident model bytes when
-zero is the measured value, but absence of the measurement is not treated as
-zero.
+Activation remains deliberately stricter than installation in the core
+infrastructure. The installed artifact must verify and the benchmark record
+must contain backend identity, sample count, embedding dimension, measured
+latency and **resident-model-byte evidence**. Older benchmark JSON without
+residency evidence fails closed. The current product does not expose activation
+because it has no inference backend that can honestly produce those
+measurements. A future backend-specific benchmark harness may record zero
+resident model bytes when zero is the measured value, but absence of the
+measurement is never treated as zero.
 
 If active state is missing, stale, corrupted, hash-invalid or paired with
 invalid benchmark evidence, resolution returns the existing deterministic
@@ -176,8 +180,9 @@ or ordinary search. Uninstalling/deactivating a pack immediately returns
 resolution to that fallback.
 
 What is **not** implemented yet is equally important: there is still no local
-inference backend consuming the pack, no automatic pack download, and no pack
-becoming the browser/agent authority. Actual local-intelligence tasks therefore
+inference backend consuming the pack, no product activation path, no automatic
+pack download, and no pack becoming the browser/agent authority. Actual
+local-intelligence tasks therefore
 continue to use the deterministic implementation. A future backend must supply
 its measured residency/latency evidence before it can become default and must
 retain the no-network/no-browser-authority boundary.
