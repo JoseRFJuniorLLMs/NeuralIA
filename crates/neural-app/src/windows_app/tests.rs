@@ -16088,7 +16088,7 @@ fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
 }
 
 #[test]
-fn expanded_column_keeps_window_chrome_and_content_offset() {
+fn expanded_column_takes_fullscreen_and_hides_chrome() {
     let source = shipped_source();
     let expand = source
         .split("fn expand_comparator")
@@ -16096,8 +16096,8 @@ fn expanded_column_keeps_window_chrome_and_content_offset() {
         .and_then(|part| part.split("fn minimize_comparator").next())
         .expect("expand_comparator body");
     assert!(
-        !expand.contains("set_fullscreen(Some"),
-        "expandir uma IA nao pode esconder os controles da janela"
+        expand.contains("set_fullscreen(Some(Fullscreen::Borderless(None)))"),
+        "expandir uma IA ocupa o monitor inteiro em fullscreen"
     );
 
     let layout = source
@@ -16105,8 +16105,8 @@ fn expanded_column_keeps_window_chrome_and_content_offset() {
         .nth(1)
         .and_then(|part| part.split("fn column_ipc_event_impl").next())
         .expect("layout body");
-    assert!(layout.contains("LogicalPosition::new(0.0, content_y)"));
-    assert!(layout.contains("LogicalSize::new(logical_w, content_h)"));
+    assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
+    assert!(layout.contains("LogicalSize::new(logical_w, logical_h)"));
 
     let bar = BarLayout::new(1600.0, 1.0, true, 3);
     assert!(bar.window_minimize.width > 0.0);
@@ -16115,9 +16115,9 @@ fn expanded_column_keeps_window_chrome_and_content_offset() {
 }
 
 #[test]
-fn comparator_uses_palette_instead_of_the_home_omnibox() {
+fn comparator_accepts_title_address_submit() {
     assert!(surface_accepts_omnibox_submit(Surface::Home));
-    assert!(!surface_accepts_omnibox_submit(Surface::Comparator));
+    assert!(surface_accepts_omnibox_submit(Surface::Comparator));
     assert!(matches!(
         App::column_ipc_event_impl(0, IpcAction::Omnibox),
         Some(UserEvent::OpenPalette(0))
@@ -16138,7 +16138,7 @@ fn comparator_uses_palette_instead_of_the_home_omnibox() {
 }
 
 #[test]
-fn comparator_disables_the_offscreen_home_omnibox() {
+fn comparator_enables_the_address_omnibox() {
     unsafe {
         let parent = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -16173,10 +16173,10 @@ fn comparator_disables_the_offscreen_home_omnibox() {
         assert!(!edit.is_null());
 
         apply_omnibox_interactivity(edit, Surface::Comparator);
-        assert_eq!(
+        assert_ne!(
             windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(edit),
             0,
-            "omnibox invisivel nao pode receber foco"
+            "omnibox no comparador aceita foco e digitacao"
         );
 
         apply_omnibox_interactivity(edit, Surface::Home);
@@ -16191,7 +16191,7 @@ fn comparator_disables_the_offscreen_home_omnibox() {
 }
 
 #[test]
-fn comparator_titlebar_does_not_reserve_an_omnibox_slot() {
+fn comparator_titlebar_reserves_address_without_overlapping_tabs() {
     let layout = BarLayout::with_contexts(
         1600.0,
         1.0,
@@ -16201,10 +16201,139 @@ fn comparator_titlebar_does_not_reserve_an_omnibox_slot() {
     );
     assert_eq!(layout.context_tab_counts[0], 1);
     assert!(
-        layout.context_tabs[0][0].x <= 100.0,
-        "a primeira aba foi empurrada por controle extra: {:?}",
+        layout.context_tabs[0][0].x + layout.context_tabs[0][0].width
+            <= title_address_rect(1600.0, 1.0, None).x,
+        "a primeira aba sobrepoe o endereco: {:?}",
         layout.context_tabs[0][0]
     );
+}
+
+#[test]
+fn title_address_preserves_native_private_context_and_validation() {
+    let minimized = [false, true, false];
+    assert_eq!(
+        title_address_context(Some((1, true)), Some(2), &minimized),
+        Some((1, true))
+    );
+    assert_eq!(
+        title_address_context(None, Some(2), &minimized),
+        Some((2, false))
+    );
+    assert_eq!(
+        title_address_context(None, None, &minimized),
+        Some((0, false))
+    );
+    assert_eq!(
+        title_address_context(Some((3, true)), None, &minimized),
+        None
+    );
+    assert_eq!(title_address_context(None, None, &[true; 3]), None);
+    assert!(matches!(
+        route_palette("https://example.com", 1, true),
+        PaletteRoute::OpenSplit { private: true, .. }
+    ));
+    assert!(matches!(
+        route_palette("texto pesquisavel", 1, true),
+        PaletteRoute::OpenPrivateProvider { .. }
+    ));
+    for input in [
+        "file:///C:/secret.txt",
+        "javascript:alert(1)",
+        "http://127.0.0.1/",
+    ] {
+        if input.starts_with("http:") {
+            assert!(matches!(
+                route_palette(input, 1, false),
+                PaletteRoute::OpenSplit { .. }
+            ));
+            assert!(matches!(
+                split_open_plan(
+                    Surface::Comparator,
+                    Some("ChatGPT"),
+                    1,
+                    input.to_string(),
+                    false,
+                    false,
+                    || "test-cap".to_string()
+                ),
+                SplitOpenPlan::Refuse { .. }
+            ));
+        } else {
+            assert!(
+                matches!(route_palette(input, 1, false), PaletteRoute::Invalid(_)),
+                "{input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn title_shortcuts_address_and_tabs_never_overlap() {
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        for width in [700.0, 1024.0, 1120.0, 1600.0, 2560.0] {
+            for label in [None, BarLabel::new("24:59"), BarLabel::new("⏸ 24:59")] {
+                let width = width * scale;
+                let controls = right_controls(width, scale, false, label);
+                let address = title_address_rect(width, scale, label);
+                let layout = BarLayout::with_contexts(
+                    width,
+                    scale,
+                    true,
+                    BarColumns {
+                        pomodoro_label: label,
+                        ..BarColumns::even(3)
+                    },
+                    [3; 3],
+                );
+                assert!(address.width == 0.0 || address.width >= 80.0 * scale);
+                if address.width > 0.0 {
+                    assert!(address.x + address.width <= controls.tools[0].x);
+                }
+                for index in 0..3 {
+                    for rect in &layout.context_tabs[index][..layout.context_tab_counts[index]] {
+                        if address.width > 0.0 {
+                            assert!(rect.x + rect.width <= address.x);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn each_reload_arrow_routes_only_its_own_ai_column() {
+    assert_eq!(
+        ColumnButton::ALL,
+        [
+            ColumnButton::Back,
+            ColumnButton::Forward,
+            ColumnButton::Reload,
+            ColumnButton::Translate,
+            ColumnButton::Bookmark
+        ]
+    );
+    assert_eq!(ColumnButton::Reload.glyph(), "↻");
+    let layout = BarLayout::new(1600.0, 1.0, true, 3);
+    for index in 0..COMPARATOR_COLUMNS {
+        let forward = layout.column_button(index, ColumnButton::Forward);
+        let reload = layout.column_button(index, ColumnButton::Reload);
+        let translate = layout.column_button(index, ColumnButton::Translate);
+        assert!(reload.width > 0.0 && reload.x >= forward.x + forward.width);
+        assert!(reload.x + reload.width <= translate.x);
+        let hit = layout
+            .hit(
+                reload.x + reload.width / 2.0,
+                reload.y + reload.height / 2.0,
+            )
+            .unwrap();
+        assert_eq!(hit, BarHit::ColumnReload(index));
+        assert!(
+            matches!(column_reload_event(hit), Some(UserEvent::ReloadTarget(PageTarget::Column(target))) if target == index)
+        );
+    }
+    assert!(column_reload_event(BarHit::ColumnReload(COMPARATOR_COLUMNS)).is_none());
+    assert!(column_reload_event(BarHit::ColumnForward(0)).is_none());
 }
 
 #[test]
@@ -19784,18 +19913,18 @@ fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
 #[test]
 fn the_tools_never_take_room_from_the_ai_columns() {
     // A largura (logica) a partir da qual as tres colunas a vista tem o
-    // 文A: a 1289 px a do canto ainda nao tem lugar para ele.
-    const TRANSLATE_FROM: f64 = 1290.0;
-    // E a da estrela, que precisa do lugar do 文A e do seu: a 1373 px a do
+    // 文A: a 1349 px a do canto ainda nao tem lugar para ele.
+    const TRANSLATE_FROM: f64 = 1350.0;
+    // E a da estrela, que precisa do lugar do 文A e do seu: a 1427 px a do
     // canto so tem o 文A.
-    const BOOKMARK_FROM: f64 = 1374.0;
+    const BOOKMARK_FROM: f64 = 1428.0;
     // Nas colunas que nao encostam ao canto os opcionais cabem de 1280 px
     // (a pilula legivel) para cima.
     const OTHERS_FROM: f64 = 1280.0;
     let optional_from = |button: ColumnButton| match button {
         ColumnButton::Translate => TRANSLATE_FROM,
         ColumnButton::Bookmark => BOOKMARK_FROM,
-        ColumnButton::Back | ColumnButton::Forward => 0.0,
+        ColumnButton::Back | ColumnButton::Forward | ColumnButton::Reload => 0.0,
     };
     let (running, paused) = shipped_pomodoro_labels();
     let topologies = [

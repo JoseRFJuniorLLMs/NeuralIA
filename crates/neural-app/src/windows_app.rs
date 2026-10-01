@@ -477,6 +477,7 @@ pub(in crate::windows_app) enum BarHit {
     /// ‹ e › de cada IA, logo depois do "+" da coluna.
     ColumnBack(usize),
     ColumnForward(usize),
+    ColumnReload(usize),
     /// O 文A de cada IA: «Traduzir página» (ou devolver o original).
     ColumnTranslate(usize),
     /// A estrela ☆/★ dos favoritos de cada IA, depois do › e do 文A.
@@ -1038,6 +1039,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
         BarHit::ColumnBack(_) => format!("Voltar no {provider}"),
         BarHit::ColumnForward(_) => format!("Avançar no {provider}"),
+        BarHit::ColumnReload(_) => format!("Recarregar o {provider}"),
         BarHit::ColumnTranslate(_) => format!(
             "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
         ),
@@ -6716,6 +6718,18 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     FillRect(target, &bottom_line, separator);
     DeleteObject(separator as _);
 
+    let address = title_address_rect(width as f64, scale, columns.pomodoro_label);
+    if address.width > 0.0 {
+        fill_pill(
+            target,
+            address,
+            address.height / 2.0,
+            theme.surface,
+            Some((theme.bar_line, scale)),
+            theme.bar_bg,
+        );
+    }
+
     SetBkMode(target, TRANSPARENT as i32);
     let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
     let tab_font = create_font((-10.0 * scale) as i32, FW_NORMAL as i32);
@@ -7003,9 +7017,10 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             // A estrela enche-se quando a pagina da coluna e um favorito.
             let glyph = match button {
                 ColumnButton::Bookmark => bookmark_star_glyph(*starred),
-                ColumnButton::Back | ColumnButton::Forward | ColumnButton::Translate => {
-                    button.glyph()
-                }
+                ColumnButton::Back
+                | ColumnButton::Forward
+                | ColumnButton::Reload
+                | ColumnButton::Translate => button.glyph(),
             };
             pairs.push((
                 layout.column_button(index, button),
@@ -7897,7 +7912,7 @@ unsafe fn draw_go_gradient(
 
 /// Rotulos do botao injetado no comparador. Em tela cheia a barra nativa some,
 /// por isso este botao tem de anunciar a saida.
-const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='none';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
+const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\\u{2715} Sair da tela cheia';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
 const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
 
 const AGENT_OBSERVER_SCRIPT: &str = concat!(

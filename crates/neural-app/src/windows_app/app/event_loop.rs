@@ -294,7 +294,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if surface_accepts_omnibox_submit(self.surface) {
                     let input = input.trim().to_string();
                     if !input.is_empty() {
-                        self.handle_input(input);
+                        if self.surface == Surface::Comparator {
+                            self.submit_title_address(input);
+                        } else {
+                            self.handle_input(input);
+                        }
                     }
                 }
             }

@@ -201,6 +201,8 @@ impl BarColumns {
 pub(in crate::windows_app) enum ColumnButton {
     Back,
     Forward,
+    /// ↻: «Recarregar» a página da coluna.
+    Reload,
     /// 文A: «Traduzir página» (`translation.rs`); outro clique devolve o
     /// original.
     Translate,
@@ -212,18 +214,32 @@ pub(in crate::windows_app) enum ColumnButton {
 /// Quantos botoes tem cada coluna: o tamanho das filas de `BarLayout`.
 pub(in crate::windows_app) const COLUMN_BUTTONS: usize = ColumnButton::ALL.len();
 
+pub(in crate::windows_app) fn column_reload_event(hit: BarHit) -> Option<UserEvent> {
+    match hit {
+        BarHit::ColumnReload(index) if index < COMPARATOR_COLUMNS => {
+            Some(UserEvent::ReloadTarget(PageTarget::Column(index)))
+        }
+        _ => None,
+    }
+}
+
 /// A pilula mais estreita (em pixeis logicos) com que um botao opcional da
 /// coluna ainda entra.
 pub(in crate::windows_app) const COLUMN_PILL_MIN: f64 = 60.0;
 
 impl ColumnButton {
-    pub(in crate::windows_app) const ALL: [Self; 4] =
-        [Self::Back, Self::Forward, Self::Translate, Self::Bookmark];
+    pub(in crate::windows_app) const ALL: [Self; 5] = [
+        Self::Back,
+        Self::Forward,
+        Self::Reload,
+        Self::Translate,
+        Self::Bookmark,
+    ];
     /// Largura logica de cada botao (a mesma do "+") e a folga entre eles.
     /// A folga passou de 4 para 2 com o 文A (translation) e fica em 2 com a
     /// estrela: com os quatro, os dois opcionais entram mais cedo, e a
     /// 1024 px a pilula da IA da direita ainda existe (fica estreita).
-    pub(in crate::windows_app) const WIDTH: f64 = 26.0;
+    pub(in crate::windows_app) const WIDTH: f64 = 24.0;
     pub(in crate::windows_app) const GAP: f64 = 2.0;
 
     /// Cede antes da pilula: o 文A (o «Traduzir página» do botao direito
@@ -238,6 +254,7 @@ impl ColumnButton {
         match self {
             Self::Back => "‹",
             Self::Forward => "›",
+            Self::Reload => "↻",
             Self::Translate => "文A",
             Self::Bookmark => "☆",
         }
@@ -248,6 +265,7 @@ impl ColumnButton {
         match self {
             Self::Back => BarHit::ColumnBack(column),
             Self::Forward => BarHit::ColumnForward(column),
+            Self::Reload => BarHit::ColumnReload(column),
             Self::Translate => BarHit::ColumnTranslate(column),
             Self::Bookmark => BarHit::ColumnBookmark(column),
         }
@@ -612,11 +630,17 @@ impl BarLayout {
         // Linha superior: todas as fontes/abas, antes das ferramentas e dos
         // controles da janela. A etiqueta do Pomodoro ja vai reservada: as
         // abas nao mexem quando ele arranca.
+        let address = title_address_rect(client_width, scale, columns.pomodoro_label);
         let tabs_left = 90.0 * scale;
-        let tabs_right = (title_tools_left(client_width, scale, columns.pomodoro_label)
-            - 8.0 * scale)
-            .min(window_minimize.x - 8.0 * scale)
-            .max(tabs_left);
+        let tabs_right = if address.width > 0.0 {
+            (address.x - 8.0 * scale)
+                .min(window_minimize.x - 8.0 * scale)
+                .max(tabs_left)
+        } else {
+            (title_tools_left(client_width, scale, columns.pomodoro_label) - 8.0 * scale)
+                .min(window_minimize.x - 8.0 * scale)
+                .max(tabs_left)
+        };
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
         let mut overflow = [empty; COMPARATOR_COLUMNS];
@@ -1081,7 +1105,7 @@ pub(in crate::windows_app) fn cut_victims(row: &TabRow, kept: &[bool]) -> Vec<us
 }
 
 pub(in crate::windows_app) fn surface_accepts_omnibox_submit(surface: Surface) -> bool {
-    matches!(surface, Surface::Home)
+    matches!(surface, Surface::Home | Surface::Comparator)
 }
 
 /// Mantem o HWND da omnibox vivo entre trocas de decoracao, mas remove a sua
@@ -1162,6 +1186,29 @@ pub(in crate::windows_app) fn title_tools_left(
     let reserved = home_tool_buttons(client_width, scale, BarLabel::new(POMODORO_LABEL_RESERVE));
     let actual = home_tool_buttons(client_width, scale, pomodoro_label);
     reserved[0].x.min(actual[0].x)
+}
+
+/// EDIT da barra de titulo; o espaco restante fica para as abas, sem sobreposicao.
+pub(in crate::windows_app) fn title_address_rect(
+    client_width: f64,
+    scale: f64,
+    pomodoro_label: Option<BarLabel>,
+) -> UiRect {
+    let scale = scale.max(1.0);
+    let right = title_tools_left(client_width, scale, pomodoro_label) - 8.0 * scale;
+    // Reserva espaco para as abas para que nenhuma fonte fique sem acesso.
+    let available = (right - (90.0 + 500.0) * scale).clamp(0.0, 240.0 * scale);
+    let width = if available >= 80.0 * scale {
+        available
+    } else {
+        0.0
+    };
+    UiRect {
+        x: right - width,
+        y: 3.0 * scale,
+        width,
+        height: (TITLE_TAB_HEIGHT - 6.0) * scale,
+    }
 }
 
 /// A seta dos downloads (downloads-ui) cabe ou nao existe: so a partir

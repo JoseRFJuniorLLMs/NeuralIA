@@ -830,6 +830,10 @@ impl App {
             self.service_input(ServiceInput::Escape);
             return;
         }
+        if self.is_fullscreen_column() {
+            self.restore_comparator();
+            return;
+        }
         if self.tab_gesture(TabGestureInput::Escape) == TabGestureEffect::Ignored {
             self.go_back();
         }
@@ -897,6 +901,11 @@ impl App {
             Some(BarHit::Forward) => self.navigate_history(HistoryStep::Forward),
             Some(BarHit::ColumnBack(index)) => self.navigate_column(index, HistoryStep::Back),
             Some(BarHit::ColumnForward(index)) => self.navigate_column(index, HistoryStep::Forward),
+            Some(hit @ BarHit::ColumnReload(_)) => {
+                if let Some(event) = column_reload_event(hit) {
+                    let _ = self.proxy.send_event(event);
+                }
+            }
             Some(BarHit::ColumnTranslate(index)) => {
                 self.translation_event(TranslateEvent::Requested(WebViewHost::Column(index)))
             }

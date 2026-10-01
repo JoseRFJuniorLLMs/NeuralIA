@@ -260,6 +260,21 @@ pub(in crate::windows_app) fn route_palette(
     }
 }
 
+/// Contexto escolhido apenas pelo estado nativo, sem metadados de pagina.
+pub(in crate::windows_app) fn title_address_context(
+    split: Option<(usize, bool)>,
+    expanded: Option<usize>,
+    minimized: &[bool],
+) -> Option<(usize, bool)> {
+    if let Some((source, private)) = split {
+        return (source < minimized.len()).then_some((source, private));
+    }
+    expanded
+        .filter(|index| *index < minimized.len())
+        .or_else(|| minimized.iter().position(|value| !*value))
+        .map(|source| (source, false))
+}
+
 /// Um `WM_KEYDOWN` da omnibox como a tecla do mapa de teclas: a tecla
 /// virtual, os modificadores lidos agora e a repeticao (o bit 30 do
 /// `lParam`: a tecla ja estava em baixo).
@@ -405,15 +420,30 @@ impl App {
     /// a pagina onde esta.
     pub(in crate::windows_app) fn focus_omnibox(&mut self) {
         if self.surface == Surface::Comparator {
-            let index = self
-                .comparator
-                .as_ref()
-                .and_then(|comp| {
-                    comp.expanded
-                        .or_else(|| (0..comp.views.len()).find(|index| !comp.minimized[*index]))
-                })
-                .unwrap_or(0);
-            self.open_ai_palette(index);
+            if let Some(window) = &self.window
+                && title_address_rect(
+                    window.inner_size().width as f64,
+                    window.scale_factor(),
+                    self.pomodoro_bar_label(),
+                )
+                .width
+                    == 0.0
+            {
+                let index = self
+                    .comparator
+                    .as_ref()
+                    .and_then(|comp| comp.expanded)
+                    .unwrap_or(0);
+                self.open_ai_palette(index);
+                return;
+            }
+            self.position_omnibox();
+            if let Some(edit) = self.omnibox {
+                unsafe {
+                    SetFocus(edit);
+                    SendMessageW(edit, EM_SETSEL, 0, -1);
+                }
+            }
             return;
         }
 
@@ -498,6 +528,24 @@ impl App {
         if !input.is_empty() {
             self.handle_input(input);
         }
+    }
+
+    /// Endereco digitado no controlo nativo: usa as mesmas rotas da palette,
+    /// incluindo o painel privado, nunca uma load_url sem validacao.
+    pub(in crate::windows_app) fn submit_title_address(&mut self, input: String) {
+        let Some(comp) = self.comparator.as_ref() else {
+            return;
+        };
+        let Some((source, private)) = title_address_context(
+            comp.split
+                .as_ref()
+                .map(|split| (split.source_index, split.private)),
+            comp.expanded,
+            &comp.minimized[..comp.views.len().min(COMPARATOR_COLUMNS)],
+        ) else {
+            return;
+        };
+        self.submit_palette(source, input, private);
     }
 
     /// Entrada da palette nativa. `source_index` e `private` vem do estado
