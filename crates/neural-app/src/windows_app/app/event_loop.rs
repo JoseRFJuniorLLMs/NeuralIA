@@ -134,104 +134,102 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::UpdateStatus {
                 result: Ok(status),
                 apply,
-            } => {
-                match status {
-                    neural_core::update::UpdateStatus::UpToDate { current_version } => {
-                        self.show_splash(
-                            format!(
-                                "NeuralIA v{current_version} está atualizado na versão mais recente."
-                            ),
-                            4,
-                        );
-                        self.status = Some("NeuralIA está atualizado.".to_string());
-                        self.request_redraw();
-                    }
-                    neural_core::update::UpdateStatus::UpdateAvailable {
-                        current_version,
-                        latest,
-                    } => {
-                        let new_ver = latest.version.clone();
-                        match update_disposition(apply, latest.installer.is_some()) {
-                            UpdateDisposition::NotifyOnly => {
-                                self.show_splash(
-                                    format!(
-                                        "NeuralIA v{new_ver} disponível (atual: v{current_version}). Use Atualizar para instalar."
-                                    ),
-                                    6,
-                                );
-                                self.status = Some(format!(
-                                    "Nova versão v{new_ver} disponível; instalação requer ação explícita."
-                                ));
-                                self.request_redraw();
-                            }
-                            UpdateDisposition::NoVerifiedInstaller => {
-                                self.show_splash(
-                                    format!(
-                                        "NeuralIA v{new_ver} disponível, mas a release não contém um instalador verificável."
-                                    ),
-                                    6,
-                                );
-                                self.status = Some(format!(
-                                    "Atualização v{new_ver} recusada: sem asset oficial com SHA-256."
-                                ));
-                                self.request_redraw();
-                            }
-                            UpdateDisposition::DownloadVerified => {
-                                let installer = latest
-                                    .installer
-                                    .expect("disposição exige instalador verificado");
-                                self.show_splash(
-                                    format!(
-                                        "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando e verificando…"
-                                    ),
-                                    5,
-                                );
-                                self.status =
-                                    Some(format!("Baixando atualização v{new_ver}…"));
-                                self.request_redraw();
+            } => match status {
+                neural_core::update::UpdateStatus::UpToDate { current_version } => {
+                    self.show_splash(
+                        format!(
+                            "NeuralIA v{current_version} está atualizado na versão mais recente."
+                        ),
+                        4,
+                    );
+                    self.status = Some("NeuralIA está atualizado.".to_string());
+                    self.request_redraw();
+                }
+                neural_core::update::UpdateStatus::UpdateAvailable {
+                    current_version,
+                    latest,
+                } => {
+                    let new_ver = latest.version.clone();
+                    match update_disposition(apply, latest.installer.is_some()) {
+                        UpdateDisposition::NotifyOnly => {
+                            self.show_splash(
+                                format!(
+                                    "NeuralIA v{new_ver} disponível (atual: v{current_version}). Use Atualizar para instalar."
+                                ),
+                                6,
+                            );
+                            self.status = Some(format!(
+                                "Nova versão v{new_ver} disponível; instalação requer ação explícita."
+                            ));
+                            self.request_redraw();
+                        }
+                        UpdateDisposition::NoVerifiedInstaller => {
+                            self.show_splash(
+                                format!(
+                                    "NeuralIA v{new_ver} disponível, mas a release não contém um instalador verificável."
+                                ),
+                                6,
+                            );
+                            self.status = Some(format!(
+                                "Atualização v{new_ver} recusada: sem asset oficial com SHA-256."
+                            ));
+                            self.request_redraw();
+                        }
+                        UpdateDisposition::DownloadVerified => {
+                            let installer = latest
+                                .installer
+                                .expect("disposição exige instalador verificado");
+                            self.show_splash(
+                                format!(
+                                    "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando e verificando…"
+                                ),
+                                5,
+                            );
+                        self.status = Some(format!("Baixando atualização v{new_ver}…"));
+                            self.request_redraw();
 
-                                let proxy = self.proxy.clone();
-                                let temp_installer = std::env::temp_dir()
-                                    .join(format!("neuralia-setup-v{new_ver}.exe"));
-                                let ver = new_ver.clone();
-                                std::thread::Builder::new()
-                                    .name("neural-update-download".into())
-                                    .spawn(move || {
-                                        let res = neural_core::update::download_installer(
-                                            &installer.url,
-                                            &installer.sha256,
-                                            &temp_installer,
-                                            |progress| {
-                                                let _ = proxy.send_event(
-                                                    UserEvent::UpdateProgress {
-                                                        version: ver.clone(),
-                                                        progress,
-                                                    },
-                                                );
-                                            },
-                                        );
-                                        match res {
-                                            Ok(()) => {
-                                                let _ = proxy.send_event(UserEvent::UpdateReady(
-                                                    temp_installer,
-                                                ));
-                                            }
-                                            Err(err) => {
-                                                let _ = proxy.send_event(
-                                                    UserEvent::UpdateStatus {
-                                                        result: Err(format!(
-                                                            "Falha no download/verificação da atualização: {err}"
-                                                        )),
-                                                        apply: true,
-                                                    },
-                                                );
-                                            }
+                        let proxy = self.proxy.clone();
+                        let temp_installer =
+                            std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
+                        let ver = new_ver.clone();
+                        std::thread::Builder::new()
+                                .name("neural-update-download".into())
+                                .spawn(move || {
+                                    let res = neural_core::update::download_installer(
+                                        &installer.url,
+                                        &installer.sha256,
+                                        &temp_installer,
+                                        |progress| {
+                                            let _ = proxy.send_event(
+                                                UserEvent::UpdateProgress {
+                                                    version: ver.clone(),
+                                                    progress,
+                                                },
+                                            );
+                                        },
+                                    );
+                                    match res {
+                                        Ok(()) => {
+                                            let _ = proxy.send_event(UserEvent::UpdateReady(
+                                                temp_installer,
+                                            ));
                                         }
-                                    })
-                                    .ok();
-                            }
+                                        Err(err) => {
+                                            let _ = proxy.send_event(
+                                                UserEvent::UpdateStatus {
+                                                    result: Err(format!(
+                                                        "Falha no download/verificação da atualização: {err}"
+                                                    )),
+                                                    apply: true,
+                                                },
+                                            );
+                                        }
+                                    }
+                                })
+                                .ok();
                         }
                     }
+                }
                 }
             }
             UserEvent::UpdateStatus {
@@ -860,7 +858,6 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 }
-
 
 #[cfg(test)]
 mod update_policy_tests {
