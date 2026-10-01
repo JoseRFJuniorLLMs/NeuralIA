@@ -256,27 +256,6 @@ pub(in crate::windows_app) fn route_palette(
     }
 }
 
-#[cfg(test)]
-mod distraction_route_tests {
-    use super::*;
-
-    #[test]
-    fn distraction_command_stays_local_in_home_and_palette() {
-        assert_eq!(
-            route_input("/distracoes off"),
-            InputRoute::Distraction(DistractionCommand::Off)
-        );
-        assert_eq!(
-            route_palette("/distracoes on", 0, false),
-            PaletteRoute::Distraction(DistractionCommand::On)
-        );
-        assert_eq!(
-            route_palette("/distracoes status", 1, true),
-            PaletteRoute::Distraction(DistractionCommand::Status)
-        );
-    }
-}
-
 /// Um `WM_KEYDOWN` da omnibox como a tecla do mapa de teclas: a tecla
 /// virtual, os modificadores lidos agora e a repeticao (o bit 30 do
 /// `lParam`: a tecla ja estava em baixo).
@@ -1082,5 +1061,26 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod distraction_route_tests {
+    use super::*;
+
+    #[test]
+    fn distraction_command_stays_local_in_home_and_palette() {
+        assert_eq!(
+            route_input("/distracoes off"),
+            InputRoute::Distraction(DistractionCommand::Off)
+        );
+        assert_eq!(
+            route_palette("/distracoes on", 0, false),
+            PaletteRoute::Distraction(DistractionCommand::On)
+        );
+        assert_eq!(
+            route_palette("/distracoes status", 1, true),
+            PaletteRoute::Distraction(DistractionCommand::Status)
+        );
     }
 }
