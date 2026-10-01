@@ -116,7 +116,10 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
-            UserEvent::UpdateStatus(Ok(status)) => {
+            UserEvent::UpdateStatus {
+                result: Ok(status),
+                install,
+            } => {
                 match status {
                     neural_core::update::UpdateStatus::UpToDate { current_version } => {
                         self.show_splash(
@@ -131,12 +134,24 @@ impl ApplicationHandler<UserEvent> for App {
                         latest,
                     } => {
                         let new_ver = latest.version.clone();
+                        if !install {
+                            self.show_splash(
+                                format!(
+                                    "Nova versão v{new_ver} disponível (atual: v{current_version}). Use “Verificar atualizações” para instalar."
+                                ),
+                                6,
+                            );
+                            self.status = Some(format!("NeuralIA v{new_ver} disponível."));
+                            self.request_redraw();
+                            return;
+                        }
+
                         self.show_splash(
-                        format!(
-                            "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização…"
-                        ),
-                        5,
-                    );
+                            format!(
+                                "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização verificada…"
+                            ),
+                            5,
+                        );
                         self.status = Some(format!("Baixando atualização v{new_ver}…"));
                         self.request_redraw();
 
@@ -167,9 +182,12 @@ impl ApplicationHandler<UserEvent> for App {
                                                 .send_event(UserEvent::UpdateReady(temp_installer));
                                         }
                                         Err(err) => {
-                                            let _ = proxy.send_event(UserEvent::UpdateStatus(Err(
-                                                format!("Falha no download da atualização: {err}"),
-                                            )));
+                                            let _ = proxy.send_event(UserEvent::UpdateStatus {
+                                                result: Err(format!(
+                                                    "Falha no download da atualização: {err}"
+                                                )),
+                                                install: true,
+                                            });
                                         }
                                     }
                                 })
@@ -186,7 +204,10 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::UpdateStatus(Err(err)) => {
+            UserEvent::UpdateStatus {
+                result: Err(err),
+                ..
+            } => {
                 self.show_splash(format!("Atualização: {err}"), 5);
                 self.status = Some(format!("Erro ao verificar atualização: {err}"));
                 self.request_redraw();
