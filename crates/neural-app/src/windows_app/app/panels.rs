@@ -565,7 +565,7 @@ impl App {
                 (area.height * scale).round().max(1.0) as i32,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
-            InvalidateRect(handle, std::ptr::null(), 1);
+            InvalidateRect(handle, std::ptr::null(), 0);
         }
     }
 
