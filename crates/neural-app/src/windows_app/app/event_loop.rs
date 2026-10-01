@@ -146,7 +146,7 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
 
-                        if !neural_core::update::may_install_update(true, &latest) {
+                        if !neural_core::update::may_install_update(install, &latest) {
                             self.show_splash(
                                 format!(
                                     "Nova versão v{new_ver} disponível, mas a instalação foi recusada por falta de asset ou SHA-256 verificável. {}",
