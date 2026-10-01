@@ -61,9 +61,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p neural-app startup_state_has_zero_model_residency_and_does_no_pack_io
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p neural-app shipped_executor_installs_without_auto_activation_and_requires_benchmark
+          cargo test --locked -p neural-app product_parser_blocks_activation_without_measured_backend
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked -p neural-app shipped_executor_activates_then_uninstall_returns_to_fallback
+          cargo test --locked -p neural-app activation_infrastructure_requires_benchmark_even_though_product_route_blocks_it
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p neural-app internal_activation_fixture_uninstalls_to_fallback
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked -p neural-app route_input_sends_each_command_where_it_belongs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -212,6 +214,30 @@ jobs:
             [IO.File]::WriteAllText($path, $text)
           }
           git diff --exit-code -- $path
+      - name: Sabotage product activation boundary must turn the route gate red
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $path = "crates/neural-app/src/local_models.rs"
+          $text = [IO.File]::ReadAllText($path)
+          $old = @'
+                      return Some(Err(
+                          "model:activate indisponível: nenhum backend de inferência medido está ligado ao produto"
+                              .to_string(),
+                      ));
+          '@
+          $new = @'
+                      return Some(Ok(LocalModelCommand::Activate(id.to_string())));
+          '@
+          if (($text.Split($old).Count - 1) -ne 1) { throw "product activation sabotage anchor" }
+          try {
+            [IO.File]::WriteAllText($path, $text.Replace($old, $new))
+            cargo test --locked -p neural-app product_parser_blocks_activation_without_measured_backend
+            if ($LASTEXITCODE -eq 0) { throw "product activation boundary sabotage stayed green" }
+          } finally {
+            [IO.File]::WriteAllText($path, $text)
+          }
+          git diff --exit-code -- $path
       - name: Sabotage deterministic fallback must turn the lifecycle gate red
         shell: pwsh
         run: |
@@ -232,7 +258,7 @@ jobs:
           if (($text.Split($old).Count - 1) -ne 1) { throw "fallback sabotage anchor" }
           try {
             [IO.File]::WriteAllText($path, $text.Replace($old, $new))
-            cargo test --locked -p neural-app shipped_executor_installs_without_auto_activation_and_requires_benchmark
+            cargo test --locked -p neural-app activation_infrastructure_requires_benchmark_even_though_product_route_blocks_it
             if ($LASTEXITCODE -eq 0) { throw "fallback sabotage stayed green" }
           } finally {
             [IO.File]::WriteAllText($path, $text)
