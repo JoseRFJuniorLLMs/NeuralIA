@@ -343,7 +343,12 @@ pub fn download_installer(
         file.sync_all()
             .map_err(|e| NeuralError::Config(format!("Erro ao sincronizar instalador: {e}")))?;
 
-        let actual = format!("{:x}", hasher.finalize());
+        let digest = hasher.finalize();
+        let mut actual = String::with_capacity(digest.len() * 2);
+        for byte in digest.iter() {
+            std::fmt::Write::write_fmt(&mut actual, format_args!("{byte:02x}"))
+                .map_err(|_| NeuralError::Config("Falha ao formatar SHA-256".to_string()))?;
+        }
         if !actual.eq_ignore_ascii_case(expected_sha256) {
             return Err(NeuralError::Config(format!(
                 "Atualização recusada: SHA-256 divergente (esperado {expected_sha256}, obtido {actual})"
