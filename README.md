@@ -47,10 +47,12 @@ num processo de inferência permanente.
 - **Inteligência local opcional:** embeddings/classificação/entidades/resumos
   possuem fallback determinístico sem modelo. Model packs têm lifecycle lazy e
   explícito pela omnibox (`model:status`, `model:install:<manifest>`,
-  `model:activate:<id>`, `model:deactivate`, `model:uninstall:<id>`):
-  instalação não ativa sozinha, ativação exige benchmark com latência e
-  residência medidas, e corrupção volta ao fallback com diagnóstico. Nenhum
-  backend de inferência é criado no startup ou recebe autoridade de navegador.
+  `model:deactivate`, `model:uninstall:<id>`). Instalação não ativa sozinha
+  e `model:activate:<id>` fica indisponível enquanto nenhum backend de
+  inferência medido estiver ligado ao produto. O core preserva a infraestrutura
+  de ativação, que exige benchmark com latência e residência medidas; corrupção
+  volta ao fallback com diagnóstico. Nenhum backend de inferência é criado no
+  startup ou recebe autoridade de navegador.
 - **Timeline semântica:** perguntas, respostas, títulos, código, tabelas,
   citações, fontes e conclusões viram âncoras navegáveis.
 - **Agente Web limitado:** `agent:https://site | search=texto | click=botão |
