@@ -185,14 +185,14 @@ impl ApplicationHandler<UserEvent> for App {
                                 ),
                                 5,
                             );
-                        self.status = Some(format!("Baixando atualização v{new_ver}…"));
+                            self.status = Some(format!("Baixando atualização v{new_ver}…"));
                             self.request_redraw();
 
-                        let proxy = self.proxy.clone();
-                        let temp_installer =
-                            std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
-                        let ver = new_ver.clone();
-                        std::thread::Builder::new()
+                            let proxy = self.proxy.clone();
+                            let temp_installer =
+                                std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
+                            let ver = new_ver.clone();
+                            std::thread::Builder::new()
                                 .name("neural-update-download".into())
                                 .spawn(move || {
                                     let res = neural_core::update::download_installer(
@@ -200,12 +200,10 @@ impl ApplicationHandler<UserEvent> for App {
                                         &installer.sha256,
                                         &temp_installer,
                                         |progress| {
-                                            let _ = proxy.send_event(
-                                                UserEvent::UpdateProgress {
-                                                    version: ver.clone(),
-                                                    progress,
-                                                },
-                                            );
+                                            let _ = proxy.send_event(UserEvent::UpdateProgress {
+                                                version: ver.clone(),
+                                                progress,
+                                            });
                                         },
                                     );
                                     match res {
@@ -215,14 +213,12 @@ impl ApplicationHandler<UserEvent> for App {
                                             ));
                                         }
                                         Err(err) => {
-                                            let _ = proxy.send_event(
-                                                UserEvent::UpdateStatus {
-                                                    result: Err(format!(
-                                                        "Falha no download/verificação da atualização: {err}"
-                                                    )),
-                                                    apply: true,
-                                                },
-                                            );
+                                            let _ = proxy.send_event(UserEvent::UpdateStatus {
+                                                result: Err(format!(
+                                                    "Falha no download/verificação da atualização: {err}"
+                                                )),
+                                                apply: true,
+                                            });
                                         }
                                     }
                                 })
@@ -230,8 +226,7 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                }
-            }
+            },
             UserEvent::UpdateStatus {
                 result: Err(err), ..
             } => {
