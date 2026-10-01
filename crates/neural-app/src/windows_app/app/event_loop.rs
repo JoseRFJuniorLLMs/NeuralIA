@@ -763,7 +763,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 windows_sys::Win32::Graphics::Gdi::InvalidateRect(
                                     button,
                                     std::ptr::null(),
-                                    1,
+                                    0,
                                 );
                             } else {
                                 windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
