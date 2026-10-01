@@ -32377,14 +32377,12 @@ mod bookmarks_gates {
             assert_eq!(layout.hit(cx, cy), Some(BarHit::ColumnBookmark(index)));
         }
         let mut existed = 0usize;
-        let mut vanished = 0usize;
         for scale in [1.0, 1.5, 2.0] {
             for width in (720..=2560).step_by(40) {
                 let controls = right_controls(width as f64, scale, true, None);
                 let (back, forward) = controls.split_nav.expect("‹ ›");
                 // Cabe inteira ou nao existe -- e sem ela nada a encontra.
                 let Some(star) = controls.split_bookmark else {
-                    vanished += 1;
                     let (label, _, _) = controls.split.expect("gaveta");
                     assert!(forward.x + forward.width <= label.x);
                     for x in (0..width).step_by(4) {
