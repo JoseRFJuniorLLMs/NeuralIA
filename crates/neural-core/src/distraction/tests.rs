@@ -18,6 +18,27 @@ fn web(text: &str, policy: &DistractionPolicy) -> Option<String> {
     distraction_config(&url(text), policy, DistractionSurface::Web).map(|config| config.site)
 }
 
+#[test]
+fn global_default_toggle_changes_future_sites_and_drops_redundant_overrides() {
+    let mut policy = DistractionPolicy::default();
+    assert!(web("https://news.example/article", &policy).is_some());
+
+    assert_eq!(
+        policy.set_site("quiet.example", false),
+        SiteChange::Changed
+    );
+    assert!(!policy.site_on("quiet.example"));
+
+    assert!(policy.set_default(false));
+    assert!(!policy.default_on);
+    assert!(policy.sites.is_empty());
+    assert!(web("https://news.example/article", &policy).is_none());
+    assert!(!policy.set_default(false));
+
+    assert!(policy.set_default(true));
+    assert!(web("https://news.example/article", &policy).is_some());
+}
+
 /// Um endereco por regra do registo dos provedores: o host, um
 /// subdominio quando a regra os aceita, e o `udm=50` quando ela o pede.
 fn provider_urls() -> Vec<String> {

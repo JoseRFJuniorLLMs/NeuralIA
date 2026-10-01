@@ -85,6 +85,8 @@ pub(in crate::windows_app) enum InputRoute {
     /// `pomodoro:`, `pomodoro:pausar`, `pomodoro:50`... (None: palavra
     /// desconhecida -> a ajuda).
     Pomodoro(Option<PomodoroCommand>),
+    /// `/distracoes [on|off|status]` e `distracoes:<ação>`.
+    Distraction(DistractionCommand),
     ResearchCompare,
     ResearchSynthesize,
     ResearchExport,
@@ -172,6 +174,9 @@ pub(in crate::windows_app) fn route_input(input: &str) -> InputRoute {
     if let Some(word) = strip_prefix_ignore_ascii_case(trimmed, "pomodoro:") {
         return InputRoute::Pomodoro(parse_pomodoro_command(word));
     }
+    if let Some(command) = parse_distraction_command(trimmed) {
+        return InputRoute::Distraction(command);
+    }
     if let Some(text) = strip_prefix_ignore_ascii_case(trimmed, TRANSLATE_COMMAND) {
         let text = text.trim();
         return InputRoute::Translate((!text.is_empty()).then(|| text.to_string()));
@@ -219,6 +224,8 @@ pub(in crate::windows_app) enum PaletteRoute {
     Pomodoro(Option<PomodoroCommand>),
     /// `tema:` -- o mesmo comando da omnibox da Home.
     Theme(Option<ThemeChoice>),
+    /// Anti-distração: comando local, nunca é enviado à página/provedor.
+    Distraction(DistractionCommand),
 }
 
 pub(in crate::windows_app) fn route_palette(
@@ -236,6 +243,7 @@ pub(in crate::windows_app) fn route_palette(
     match route_input(input) {
         InputRoute::Pomodoro(command) => return PaletteRoute::Pomodoro(command),
         InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
+        InputRoute::Distraction(command) => return PaletteRoute::Distraction(command),
         _ => {}
     }
     match parse_intent(input) {
@@ -461,6 +469,7 @@ impl App {
             InputRoute::Pomodoro(None) => {
                 self.show_splash(POMODORO_COMMAND_HELP.to_string(), 4);
             }
+            InputRoute::Distraction(command) => self.distraction_command(command),
             InputRoute::ResearchCompare => self.compare_current_research(),
             InputRoute::ResearchSynthesize => self.synthesize_current_research(),
             InputRoute::ResearchExport => self.export_current_research(),
@@ -515,6 +524,7 @@ impl App {
             }
             PaletteRoute::Theme(Some(choice)) => self.choose_theme(choice),
             PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
+            PaletteRoute::Distraction(command) => self.distraction_command(command),
             // allow_local: a URL foi digitada num controlo nativo, e entrada
             // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
             // abre privada: open_split_mode(private) nao grava memoria nem
@@ -1069,5 +1079,26 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod distraction_route_tests {
+    use super::*;
+
+    #[test]
+    fn distraction_command_stays_local_in_home_and_palette() {
+        assert_eq!(
+            route_input("/distracoes off"),
+            InputRoute::Distraction(DistractionCommand::Off)
+        );
+        assert_eq!(
+            route_palette("/distracoes on", 0, false),
+            PaletteRoute::Distraction(DistractionCommand::On)
+        );
+        assert_eq!(
+            route_palette("/distracoes status", 1, true),
+            PaletteRoute::Distraction(DistractionCommand::Status)
+        );
     }
 }

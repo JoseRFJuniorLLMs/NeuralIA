@@ -8,6 +8,38 @@ use neural_core::distraction::{
 };
 
 // ===================== anti-distracao (plano 2.4, §7) =====================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum DistractionCommand {
+    Status,
+    On,
+    Off,
+    Help,
+}
+
+pub(in crate::windows_app) const DISTRACTION_COMMAND_HELP: &str =
+    "/distracoes · /distracoes on · /distracoes off";
+
+pub(in crate::windows_app) fn parse_distraction_command(
+    input: &str,
+) -> Option<DistractionCommand> {
+    let normalized = input.trim().to_ascii_lowercase();
+    let rest = if normalized == "/distracoes" || normalized == "distracoes:" {
+        ""
+    } else {
+        normalized
+            .strip_prefix("/distracoes ")
+            .or_else(|| normalized.strip_prefix("distracoes:"))?
+            .trim()
+    };
+
+    Some(match rest {
+        "" | "status" => DistractionCommand::Status,
+        "on" | "ligar" | "ativar" => DistractionCommand::On,
+        "off" | "desligar" | "desativar" => DistractionCommand::Off,
+        _ => DistractionCommand::Help,
+    })
+}
 //
 // Modulo de feature: `UserEvent::Distraction(DistractionEvent)`, o braco
 // `distraction_event` no event loop, o slot `distraction` da tabela dos
@@ -979,7 +1011,56 @@ pub(in crate::windows_app) fn distraction_toggle_message(on: bool, private: bool
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DistractionReload {
+    Host(WebViewHost),
+    OpenExternalWeb,
+}
+
+impl DistractionReload {
+    fn applies_to(self, host: WebViewHost) -> bool {
+        match self {
+            Self::Host(expected) => host == expected,
+            // As colunas são as conversas com Gemini/ChatGPT/Claude. O
+            // toggle global não pode recarregá-las e perder estado só para
+            // aplicar um script que nelas já é no-op.
+            Self::OpenExternalWeb => matches!(
+                host,
+                WebViewHost::Split(_) | WebViewHost::PrivateSplit(_) | WebViewHost::External
+            ),
+        }
+    }
+}
+
 impl App {
+    pub(in crate::windows_app) fn distraction_command(&mut self, command: DistractionCommand) {
+        match command {
+            DistractionCommand::Help => {
+                self.show_splash(DISTRACTION_COMMAND_HELP.to_string(), 4);
+            }
+            DistractionCommand::Status => {
+                let text = if self.adblock.distraction_default_on() {
+                    "Ocultar distrações: ligado"
+                } else {
+                    "Ocultar distrações: desligado"
+                };
+                self.show_splash(text.to_string(), 3);
+            }
+            DistractionCommand::On | DistractionCommand::Off => {
+                let on = command == DistractionCommand::On;
+                if self.adblock.set_distraction_default(on) {
+                    self.distraction_rebind(DistractionReload::OpenExternalWeb);
+                }
+                let text = if on {
+                    "Ocultar distrações: ligado globalmente."
+                } else {
+                    "Ocultar distrações: desligado globalmente."
+                };
+                self.show_splash(text.to_string(), 3);
+            }
+        }
+    }
+
     /// O unico braco da anti-distracao no `user_event`.
     pub(in crate::windows_app) fn distraction_event(&mut self, event: DistractionEvent) {
         match event {
@@ -1005,14 +1086,14 @@ impl App {
             }
             DistractionToggle::Saved | DistractionToggle::MemoryOnly => {}
         }
-        self.distraction_rebind(Some(host));
+        self.distraction_rebind(DistractionReload::Host(host));
         self.show_splash(distraction_toggle_message(on, private), 3);
     }
 
     /// Volta a ligar o script em cada WebView aberta que tem o slot, com a
     /// politica de agora; a de `reload` recarrega quando o script novo ja
     /// esta registado.
-    fn distraction_rebind(&self, reload: Option<WebViewHost>) {
+    fn distraction_rebind(&self, reload: DistractionReload) {
         let mut open: Vec<&WebView> = Vec::new();
         if let Some(comparator) = &self.comparator {
             open.extend(comparator.views.iter().map(|view| &view.webview));
@@ -1033,7 +1114,7 @@ impl App {
             let script =
                 fill_distraction_script(NEURALIA_DISTRACTION_SCRIPT, &shared.policy_for(host));
             if let Err(error) =
-                bind_distraction_script(webview, &slot, script, reload == Some(host))
+                bind_distraction_script(webview, &slot, script, reload.applies_to(host))
             {
                 debug_log(format_args!(
                     "distraction: {} ficou com o script anterior ({error})",
@@ -1041,5 +1122,45 @@ impl App {
                 ));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod global_distraction_command_tests {
+    use super::*;
+
+    #[test]
+    fn parser_accepts_home_and_palette_forms_without_stealing_normal_searches() {
+        assert_eq!(
+            parse_distraction_command("/distracoes"),
+            Some(DistractionCommand::Status)
+        );
+        assert_eq!(
+            parse_distraction_command("/distracoes off"),
+            Some(DistractionCommand::Off)
+        );
+        assert_eq!(
+            parse_distraction_command("distracoes:ligar"),
+            Some(DistractionCommand::On)
+        );
+        assert_eq!(parse_distraction_command("distracoes no brasil"), None);
+        assert_eq!(
+            parse_distraction_command("/distracoes talvez"),
+            Some(DistractionCommand::Help)
+        );
+    }
+
+    #[test]
+    fn global_distraction_command_changes_the_shared_policy() {
+        AdblockState::test_global_distraction_toggle_updates_shared_policy();
+    }
+
+    #[test]
+    fn global_reload_never_reloads_provider_columns() {
+        let all = DistractionReload::OpenExternalWeb;
+        assert!(!all.applies_to(WebViewHost::Column(0)));
+        assert!(all.applies_to(WebViewHost::Split(0)));
+        assert!(all.applies_to(WebViewHost::PrivateSplit(0)));
+        assert!(all.applies_to(WebViewHost::External));
     }
 }
