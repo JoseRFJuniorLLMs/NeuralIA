@@ -140,7 +140,9 @@ impl ApplicationHandler<UserEvent> for App {
                         self.status = Some(format!("Baixando atualização v{new_ver}…"));
                         self.request_redraw();
 
-                        if let Some(download_url) = latest.installer_url {
+                        if let (Some(download_url), Some(expected_sha256)) =
+                            (latest.installer_url, latest.installer_sha256)
+                        {
                             let proxy = self.proxy.clone();
                             let temp_installer =
                                 std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
@@ -150,6 +152,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 .spawn(move || {
                                     let res = neural_core::update::download_installer(
                                         &download_url,
+                                        &expected_sha256,
                                         &temp_installer,
                                         |progress| {
                                             let _ = proxy.send_event(UserEvent::UpdateProgress {
@@ -173,8 +176,11 @@ impl ApplicationHandler<UserEvent> for App {
                                 .ok();
                         } else {
                             self.show_splash(
-                                format!("Nova versão v{new_ver} disponível em {}", latest.html_url),
-                                6,
+                                format!(
+                                    "Nova versão v{new_ver} disponível, mas a instalação automática foi recusada por falta de SHA-256 verificável. {}",
+                                    latest.html_url
+                                ),
+                                8,
                             );
                         }
                     }
