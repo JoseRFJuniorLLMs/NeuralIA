@@ -44,12 +44,12 @@ jobs:
           $path = 'crates/neural-app/src/windows_app/distraction.rs'
           $original = [IO.File]::ReadAllText($path, $utf8)
           $old = @'
-    unsafe { core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script.as_str()), &handler) }
-        .map_err(|error| format!("AddScriptToExecuteOnDocumentCreated: {error}"))
-'@
+              unsafe { core.AddScriptToExecuteOnDocumentCreated(&HSTRING::from(script.as_str()), &handler) }
+                  .map_err(|error| format!("AddScriptToExecuteOnDocumentCreated: {error}"))
+          '@
           $new = @'
-    Err("SABOTAGE: distraction COM registration disabled".into())
-'@
+              Err("SABOTAGE: distraction COM registration disabled".into())
+          '@
           if (($original.Split($old).Count - 1) -ne 1) { throw 'SPEC-0114 sabotage anchor' }
           try {
             [IO.File]::WriteAllText($path, $original.Replace($old, $new), $utf8)
