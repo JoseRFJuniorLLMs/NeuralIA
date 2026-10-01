@@ -65,7 +65,11 @@ fn model_pack_docs_match_lazy_lifecycle_without_claiming_inference_backend() {
     assert!(local_ai.contains("resident-model-byte evidence"));
     assert!(local_ai.contains("CI startup E2E launches the full `App`"));
     assert!(local_ai.contains("manager_initialized=false"));
+    assert!(local_ai.contains("product route refuses `model:activate:<id>`"));
     assert!(readme.contains("model:status"));
+    assert!(!readme.contains("`model:activate:<id>`, `model:deactivate`"));
+    assert!(readme.contains("model:activate:<id>"));
+    assert!(readme.contains("fica indisponível"));
     assert!(readme.contains("Nenhum backend de inferência"));
 }
 
