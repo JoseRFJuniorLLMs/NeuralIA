@@ -154,7 +154,7 @@ impl ApplicationHandler<UserEvent> for App {
                         UpdateDisposition::NotifyOnly => {
                             self.show_splash(
                                 format!(
-                                    "NeuralIA v{new_ver} disponível (atual: v{current_version}). Use Atualizar para instalar."
+                                    "NeuralIA v{new_ver} disponível (atual: v{current_version}). Use update:install ou /atualizar para instalar."
                                 ),
                                 6,
                             );
