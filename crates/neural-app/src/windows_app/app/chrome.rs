@@ -487,7 +487,8 @@ impl App {
         self.request_redraw();
     }
 
-    /// Verificação diária automática de atualização na inicialização.
+    /// Verificação diária: avisa se houver versão nova, mas nunca baixa nem
+    /// executa um instalador sem um pedido explícito do utilizador.
     pub(in crate::windows_app) fn check_daily_update(&mut self) {
         static LAST_CHECK_DAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let now_days = std::time::SystemTime::now()
@@ -497,14 +498,16 @@ impl App {
             / 86400;
         let prev = LAST_CHECK_DAY.swap(now_days, std::sync::atomic::Ordering::SeqCst);
         if prev == now_days {
-            return; // Já verificado hoje
+            return;
         }
         self.check_and_apply_update(false);
     }
 
-    /// Executa a checagem e atualização automática com barra de progresso na tela.
-    pub(in crate::windows_app) fn check_and_apply_update(&mut self, manual: bool) {
-        if manual {
+    /// Consulta a release. Com `apply=true` (comando explícito Atualizar),
+    /// uma versão nova pode seguir para download; a verificação diária usa
+    /// `false` e é somente notificação.
+    pub(in crate::windows_app) fn check_and_apply_update(&mut self, apply: bool) {
+        if apply {
             self.show_splash("Verificando atualizações no GitHub…".to_string(), 3);
             self.status = Some("Verificando atualizações no canal oficial…".to_string());
             self.request_redraw();
@@ -512,21 +515,23 @@ impl App {
         let proxy = self.proxy.clone();
         let current_version = env!("CARGO_PKG_VERSION").to_string();
         std::thread::Builder::new()
-            .name("neural-auto-update".into())
+            .name("neural-update-check".into())
             .spawn(move || {
-                match neural_core::update::fetch_latest_release(
+                let result = neural_core::update::fetch_latest_release(
                     neural_core::update::DEFAULT_GITHUB_REPO,
-                ) {
-                    Ok(latest) => {
-                        let status =
-                            neural_core::update::check_update_status(&current_version, latest);
-                        let _ = proxy.send_event(UserEvent::UpdateStatus(Ok(status)));
-                    }
-                    Err(err) => {
-                        if manual {
-                            let _ = proxy.send_event(UserEvent::UpdateStatus(Err(err.to_string())));
-                        }
-                    }
+                )
+                .and_then(|latest| {
+                    neural_core::update::check_update_status(&current_version, latest)
+                })
+                .map_err(|error| error.to_string());
+
+                let should_report = apply
+                    || matches!(
+                        &result,
+                        Ok(neural_core::update::UpdateStatus::UpdateAvailable { .. })
+                    );
+                if should_report {
+                    let _ = proxy.send_event(UserEvent::UpdateStatus { result, apply });
                 }
             })
             .ok();
