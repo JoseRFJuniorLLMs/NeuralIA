@@ -2,7 +2,7 @@
 
 All notable changes to NeuralIA are documented here.
 
-## [Unreleased]
+## [2.7.0] - 2026-10-01
 
 ### Added
 - **Verificador de atualizações in-app (`update:`, `update:check`, `/update`):** adicionado o módulo puro `neural_core::update` para parsing dos metadados de releases da API do GitHub e comparação semver determinística (`compare_semver`, `is_newer_version`). Na interface, a omnibox reconhece `update:`, `update:check`, `atualizar:`, `!update` e `/update`, exibindo o status do canal oficial de releases.
