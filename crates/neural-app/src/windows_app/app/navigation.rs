@@ -1210,6 +1210,47 @@ mod update_route_tests {
             );
         }
     }
+
+    #[test]
+    fn update_handlers_keep_check_and_install_authority_separate() {
+        let source = include_str!("navigation.rs");
+        let input_check = [
+            "InputRoute::UpdateCheck => self.",
+            "check_and_apply_update(false)",
+        ]
+        .concat();
+        let input_install = [
+            "InputRoute::UpdateInstall => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+        let palette_check = [
+            "PaletteRoute::UpdateCheck => self.",
+            "check_and_apply_update(false)",
+        ]
+        .concat();
+        let palette_install = [
+            "PaletteRoute::UpdateInstall => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+        let forbidden_input = [
+            "InputRoute::UpdateCheck => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+        let forbidden_palette = [
+            "PaletteRoute::UpdateCheck => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+
+        for expected in [input_check, input_install, palette_check, palette_install] {
+            assert_eq!(source.matches(&expected).count(), 1, "{expected}");
+        }
+        assert!(!source.contains(&forbidden_input));
+        assert!(!source.contains(&forbidden_palette));
+    }
 }
 
 #[cfg(test)]
