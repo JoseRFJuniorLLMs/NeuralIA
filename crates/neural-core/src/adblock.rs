@@ -86,6 +86,13 @@ pub struct DomainSet {
     bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DomainInsert {
+    Inserted,
+    Duplicate,
+    Full,
+}
+
 impl DomainSet {
     pub fn new() -> Self {
         Self::default()
@@ -117,9 +124,21 @@ impl DomainSet {
         self.domains.insert(domain.into())
     }
 
-    /// Cabe mais este dominio?
-    fn has_room_for(&self, domain: &str) -> bool {
-        self.domains.len() < MAX_DOMAINS && self.bytes + domain.len() <= MAX_DOMAIN_BYTES
+    /// Variante do parser: `normalize_domain` ja devolveu uma String, por
+    /// isso ela vira Box<str> diretamente em vez de copiar os bytes uma
+    /// segunda vez. O resultado distingue duplicado de tecto atingido.
+    fn insert_owned(&mut self, domain: String) -> DomainInsert {
+        if self.domains.contains(domain.as_str()) {
+            return DomainInsert::Duplicate;
+        }
+        if self.domains.len() >= MAX_DOMAINS
+            || self.bytes + domain.len() > MAX_DOMAIN_BYTES
+        {
+            return DomainInsert::Full;
+        }
+        self.bytes += domain.len();
+        self.domains.insert(domain.into_boxed_str());
+        DomainInsert::Inserted
     }
 
     /// O dominio da lista de que `host` (normalizado) e ele proprio ou um
@@ -225,12 +244,13 @@ pub fn parse_domain_list(text: &str) -> ParsedList {
             target.ignored += 1;
             return true;
         };
-        if !target.domains.has_room_for(&domain) {
-            target.truncated = true;
-            return false;
+        match target.domains.insert_owned(domain) {
+            DomainInsert::Inserted | DomainInsert::Duplicate => true,
+            DomainInsert::Full => {
+                target.truncated = true;
+                false
+            }
         }
-        target.domains.insert(&domain);
-        true
     };
 
     for line in text.lines() {
