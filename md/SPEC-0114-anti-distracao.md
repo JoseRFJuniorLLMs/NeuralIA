@@ -2,8 +2,8 @@
 
 **Status:** Implementada no `main` pela `release/2.4.0` (PR #169, após
 #168 e autorização do dono). Esta branch acrescenta o controle global local
-`/distracoes [on|off|status]`, persistido na política existente; a ligação
-pelo COM ainda não tem E2E que corra o exe (abaixo).
+`/distracoes [on|off|status]`, persistido na política existente, e fecha o
+gate da ligação COM com E2E no EXE/WebView2 real e sabotagem determinística.
 
 ## Objetivo
 
@@ -110,9 +110,16 @@ Amostrados: `scroll_is_restored_only_when_we_hid_the_cause`,
 `only_an_empty_backdrop_next_to_what_we_hid_goes`,
 `a_dialog_that_only_mentions_a_newsletter_stays`.
 
-Os gates correm o texto que embarca num DOM falso (`node:vm`), não num
-WebView2: a ligação pelo COM (`AddScriptToExecuteOnDocumentCreated`, o
-recarregar depois de uma escolha) não tem teste que corra o exe.
+Os gates de política continuam correndo o texto que embarca num DOM falso
+(`node:vm`), mas a ligação pelo COM deixou de ser inferida por esses testes:
+`scripts/test-distraction-e2e.ps1` abre o EXE real em WebView2 contra uma
+fixture presa a 127.0.0.1 por `news.distraction.test`. A fixture força uma
+segunda navegação para sair da corrida conhecida do primeiro documento e o
+próprio DOM informa se um `#cookie-banner` fixo foi realmente escondido. O CI
+também sabota `AddScriptToExecuteOnDocumentCreated`, recompila e exige o
+veredicto `visible`; depois restaura, recompila e exige verde novamente. O
+CI principal repete o E2E sobre `ci-tested/NeuralIA.exe`, exatamente o binário
+que `release.yml` empacota.
 
 ## Estado do controle global
 
@@ -134,4 +141,5 @@ sobrepor o padrão salvo durante a sessão.
 - A secção visual de Definições «Ocultar distrações (cookies, newsletter,
   barras fixas)». O comando já cobre o controle global sem criar uma segunda
   política.
-- Um teste E2E no exe (CI) que confirme a ligação pelo COM numa página real.
+- A secção visual de Definições continua fora desta fase; o controle global
+  já existe pela Home/paleta sem criar uma segunda política.
