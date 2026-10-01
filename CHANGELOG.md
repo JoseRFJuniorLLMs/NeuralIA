@@ -4,6 +4,19 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-10-01
+
+### Added
+- **Comparador — botão de recarregar por coluna:** adicionado o botão `↻` em cada pill de IA, seguindo a ordem `+` · `‹` · `›` · `↻` · `文A` · `☆`. O clique dispara recarregamento isolado (`UserEvent::ReloadColumn`), atualizando apenas a WebView da coluna correspondente sem afetar as outras.
+- **Comparador — barra de endereço nativa no título:** campo de texto nativo Win32 EDIT posicionado na faixa de título entre as abas e o cluster Pomodoro, preservando os 7 atalhos (Gemini Live, Meet, WhatsApp, YouTube, Gmail, Downloads e Privado) na linha 2. Em larguras estreitas (< 900 px ou largura útil < 80 px), a barra é recolhida e `Ctrl+L` abre a paleta flutuante.
+
+### Fixed
+- **Comparador — tela cheia sem bordas ao expandir coluna:** corrigir falha onde expandir ou maximizar um painel de IA deixava barras de título e controles da janela visíveis. A janela agora alterna para `Fullscreen::Borderless` real, cobrindo todo o monitor e ocultando a faixa de título (`bar_visible = false`). A saída pode ser feita via tecla `Esc`, tecla `0`, botão nativo flutuante de saída ou botão `#neuralia-comp-expand` ("✕ Sair da tela cheia").
+- **Trilho de rolagem:** corrigida a navegação da seta superior em proximidade de múltiplas âncoras para respeitar a direção do clique, adicionado `type="button"` aos botões do trilho para evitar submissão involuntária de formulários, e preservada a visibilidade de scrollbars de contêineres internos menores.
+
+### Testing
+- **Testes de geometria e comportamento:** 436 testes passando no módulo `windows_app`, cobrindo ordem de botões, recarregamento independente, invariantes de layout entre 700 px e 1920 px, foco e rota de submissão da barra de endereço.
+
 ## [2.6.0] - 2026-10-01
 
 ### Added
