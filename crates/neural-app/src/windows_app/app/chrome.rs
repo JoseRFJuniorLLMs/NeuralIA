@@ -476,7 +476,7 @@ impl App {
 
     pub(in crate::windows_app) fn show_about(&mut self) {
         const ABOUT_TITLE: &str = "Sobre o NeuralIA";
-        const ABOUT_TEXT: &str = "NeuralIA — O Navegador Voltado para IA\nVersão 2.7.1 (x64)\nCriador: Jose R F Junior\n\nA História do NeuralIA:\nJose R F Junior entrou no gerenciador de tarefas e viu o Chrome usando 6 GB de RAM e resolveu fazer seu próprio navegador, voltado para IA, com todos os recursos que não existiam no Chrome:\n\n• Comparador Multi-IA nativo em 3 colunas paralelas (Gemini, ChatGPT e Claude)\n• Modo de Leitura limpo, focado e sem distrações nem anúncios\n• Visualizador nativo de PDFs com TextLayer e leitor EPUB integrado\n• Bloqueador de anúncios de alta performance integrado\n• Memória semântica local com busca vetorial e privacidade total\n• Arquitetura ultraleve em Rust com zero alocação desnecessária.";
+        const ABOUT_TEXT: &str = "NeuralIA — O Navegador Voltado para IA\nVersão 2.7.1 (x64)\nCriador: Jose R F Junior\n\nA História do NeuralIA:\nJose R F Junior entrou no gerenciador de tarefas e viu o Chrome usando 6 GB de RAM e resolveu fazer seu próprio navegador, voltado para IA, com todos os recursos que não existiam no Chrome:\n\n• Comparador Multi-IA nativo em 3 colunas paralelas (Gemini, ChatGPT e Claude)\n• Modo de Leitura limpo, focado e sem distrações nem anúncios\n• Visualizador nativo de PDFs com TextLayer e leitor EPUB integrado\n• Bloqueador de anúncios de alta performance integrado\n• Memória semântica local com busca vetorial e privacidade total\n• Arquitetura em Rust com foco em baixo consumo de memória e recursos.";
 
         self.show_native_text(ABOUT_TITLE, ABOUT_TEXT);
         self.show_splash(
@@ -710,7 +710,7 @@ impl App {
                 SWP_NOACTIVATE,
             );
             show_popup_without_activation(splash);
-            InvalidateRect(splash, std::ptr::null(), 1);
+            InvalidateRect(splash, std::ptr::null(), 0);
         }
     }
 
@@ -771,7 +771,7 @@ impl App {
                 SWP_NOACTIVATE,
             );
             show_popup_without_activation(card);
-            InvalidateRect(card, std::ptr::null(), 1);
+            InvalidateRect(card, std::ptr::null(), 0);
         }
     }
 
@@ -884,7 +884,7 @@ impl App {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 ShowWindow(button, SW_SHOW);
-                InvalidateRect(button, std::ptr::null(), 1);
+                InvalidateRect(button, std::ptr::null(), 0);
             }
         }
     }
@@ -1145,7 +1145,7 @@ impl App {
             );
             if EXIT_REVEAL_INSIDE.load(Ordering::Acquire) {
                 show_popup_without_activation(button);
-                InvalidateRect(button, std::ptr::null(), 1);
+                InvalidateRect(button, std::ptr::null(), 0);
             } else {
                 ShowWindow(button, SW_HIDE);
             }
@@ -1331,7 +1331,7 @@ impl App {
         // Os popups owned nao sao filhos: o RDW_ALLCHILDREN nao os alcanca.
         for hwnd in self.splitters.iter().flatten() {
             unsafe {
-                InvalidateRect(*hwnd, std::ptr::null(), 1);
+                InvalidateRect(*hwnd, std::ptr::null(), 0);
             }
         }
         self.panel_eval(&format!(
