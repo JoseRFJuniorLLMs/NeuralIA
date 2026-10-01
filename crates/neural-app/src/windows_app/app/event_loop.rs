@@ -146,6 +146,17 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
 
+                        if !neural_core::update::may_install_update(true, &latest) {
+                            self.show_splash(
+                                format!(
+                                    "Nova versão v{new_ver} disponível, mas a instalação foi recusada por falta de asset ou SHA-256 verificável. {}",
+                                    latest.html_url
+                                ),
+                                8,
+                            );
+                            return;
+                        }
+
                         self.show_splash(
                             format!(
                                 "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização verificada…"
@@ -195,7 +206,7 @@ impl ApplicationHandler<UserEvent> for App {
                         } else {
                             self.show_splash(
                                 format!(
-                                    "Nova versão v{new_ver} disponível, mas a instalação automática foi recusada por falta de SHA-256 verificável. {}",
+                                    "Nova versão v{new_ver} disponível, mas a instalação foi recusada por metadados inválidos. {}",
                                     latest.html_url
                                 ),
                                 8,
