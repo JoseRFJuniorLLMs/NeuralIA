@@ -1,6 +1,6 @@
 # SPEC-0107 — Integração Nativa do ai-memory no NeuralIA
 
-**Status:** Fase 1 parcial — proveniência, SQLite/FTS5, retrieval, tombstones e rebuild operacionais; integração/UX/performance completas pendentes  
+**Status:** Integração parcial avançada — SQLite/FTS5, retrieval RRF lexical/entity/graph/semantic, tombstones/forget granular, Doctor/rebuild, captura assíncrona, escala e Ctrl+H semantic recall operacionais; backend local de embeddings/model packs e gates de startup-idle real ainda pendentes  
 **Alvo:** integração incremental pós-2.0; conclusão após os gates de produto/performance  
 **Upstream:** akitaonrails/ai-memory  
 **Licença upstream:** MIT  
@@ -33,20 +33,24 @@ sistema.
 
 ## 1.1. Estado verificado em 19/09/2026
 
-O repositório já passou da Fase 0. Estão em `main` um índice SQLite derivado,
-FTS5 para shortlist, rerank semântico local, tombstones duráveis, rebuild
-atômico/validado e integração assíncrona pelo `MemoryWorker` do produto.
+O repositório já passou da Fase 0 e de partes substanciais das fases seguintes.
+Estão em `main` um índice SQLite derivado, FTS5 para shortlist, fusão RRF
+lexical/entity/graph/semantic, extração de entidades, relações de fonte,
+tombstones duráveis, forget por documento/sessão/domínio/data/tudo, rebuild
+atômico/validado, Memory Doctor, integração assíncrona pelo `MemoryWorker` e
+a superfície de semantic recall do Ctrl+H.
 
 O teste `spec_0107_phase1_sqlite_retrieval_forget_and_rebuild_are_operational`
 prende num mesmo fluxo captura, consulta híbrida, forget por domínio,
 tombstone, bloqueio de recaptura e reconstrução do SQLite sem ressuscitar dados
 esquecidos. Testes adicionais cobrem custo de captura, ausência de vestígios
-após forget e recall PT/EN através do atalho FTS.
+após forget, recall PT/EN, Doctor e o gate de escala com sabotagem algorítmica.
 
-Isso **não** torna esta especificação inteira concluída. Permanecem, entre
-outros, os gates de lifecycle de model packs, UX completa, benchmarks de
-escala/idle e a decomposição arquitetural futura descrita abaixo. O status é
-portanto Fase 1 parcial, não "Implementada".
+Isso **não** torna esta especificação inteira concluída. Permanecem o backend
+local opcional de embeddings/model packs, compatibilidade de modelo/embedding no
+Doctor, gates de startup/idle com backend real e acabamento de UX para os
+controles granulares de retenção/manutenção. O status continua parcial, mas já
+não é correto descrevê-lo apenas como "Fase 1 parcial".
 
 ## 2. Não objetivos
 
@@ -646,8 +650,9 @@ no rebuild e precisa deixar o gate vermelho antes de restaurar o código. Assim 
 algorítmica sem confundir uma VM ocupada com código ruim.
 
 Este gate fecha a infraestrutura de benchmark de escala, mas não conclui a
-SPEC-0107: UX, entidades/grafo completos, embeddings opcionais de produto e
-startup idle com backend real continuam pendentes.
+SPEC-0107: embeddings opcionais de produto, compatibilidade de modelo no
+Doctor, acabamento dos controles granulares de UX e startup idle com backend
+real continuam pendentes.
 
 ## 23. Segurança
 
