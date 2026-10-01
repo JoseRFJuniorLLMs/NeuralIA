@@ -3935,10 +3935,7 @@ fn splash_question_keeps_the_yes_no_geometry_and_answers_by_button() {
             splash_button_at(&client, count, (yes.0 + yes.2) / 2),
             Some(0)
         );
-        assert_eq!(
-            splash_button_at(&client, count, (no.0 + no.2) / 2),
-            Some(1)
-        );
+        assert_eq!(splash_button_at(&client, count, (no.0 + no.2) / 2), Some(1));
         assert_eq!(splash_button_at(&client, count, yes.2), None, "o vao");
         assert_eq!(splash_button_at(&client, count, 5), None, "o texto");
     }
