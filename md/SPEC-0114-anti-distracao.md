@@ -1,9 +1,9 @@
 # SPEC-0114 — Anti-distração (avisos de cookies, newsletter e barras fixas)
 
-**Status:** Proposta. Código e gates na `release/2.4.0` (PR #168; plano
-2.4, item anti-distracao, cortável), verdes no CI do PR; o script injetado
-novo espera o sim do dono no §7 do `AGENTS.md` antes de entrar na `main`, e
-a ligação pelo COM ainda não tem teste que corra o exe (abaixo).
+**Status:** Implementada no `main` pela integração da `release/2.4.0`
+(PR #169, após o PR #168 e autorização do dono). Os gates de política/script
+estão ativos; continuam abertas a prova E2E do caminho COM num WebView2 real e
+a UI global de ativação/desativação descritas em "Fora desta fase".
 
 ## Objetivo
 
