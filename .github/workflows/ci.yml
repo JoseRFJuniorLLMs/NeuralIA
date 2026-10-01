@@ -228,17 +228,34 @@ jobs:
             @{
               Label = "agent-select-collapsed-into-generic-click"
               Test = "structured_select_keeps_the_native_reversible_class"
+              SourcePath = "crates/neural-app/src/windows_app.rs"
               Old = @'
-        AgentAction::Select { target, value } => AgentSecurityAction::Select {
-            origin,
-            description: format!("select {} = {}", target.name, value),
-        },
+                AgentSecurityAction::Select {
+                    origin,
+                    description: format!("select {} = {}", target.name, value),
+                }
           '@
               New = @'
-        AgentAction::Select { target, value } => AgentSecurityAction::Click {
-            origin,
-            label: format!("select {} = {}", target.name, value),
-        },
+                AgentSecurityAction::Click {
+                    origin,
+                    label: format!("select {} = {}", target.name, value),
+                }
+          '@
+            },
+            @{
+              Label = "agent-select-metadata-cannot-raise-risk"
+              Test = "structured_select_page_metadata_can_only_raise_risk"
+              SourcePath = "crates/neural-app/src/windows_app.rs"
+              Old = @'
+            let material = format!(
+                "{} {} {}",
+                target.role.to_lowercase(),
+                target.name.to_lowercase(),
+                value.to_lowercase()
+            );
+          '@
+              New = @'
+            let material = String::new(); // SABOTAGE: ignore page hints that should only raise risk.
           '@
             },
             @{
