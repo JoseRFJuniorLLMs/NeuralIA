@@ -26,13 +26,11 @@ pub(in crate::windows_app) fn parse_distraction_command(
     let normalized = input.trim().to_ascii_lowercase();
     let rest = if normalized == "/distracoes" || normalized == "distracoes:" {
         ""
-    } else if let Some(rest) = normalized
-        .strip_prefix("/distracoes ")
-        .or_else(|| normalized.strip_prefix("distracoes:"))
-    {
-        rest.trim()
     } else {
-        return None;
+        normalized
+            .strip_prefix("/distracoes ")
+            .or_else(|| normalized.strip_prefix("distracoes:"))?
+            .trim()
     };
 
     Some(match rest {
