@@ -272,11 +272,13 @@ pub(crate) fn parse_local_model_command(input: &str) -> Option<Result<LocalModel
     for prefix in ["activate:", "ativar:"] {
         if let Some(value) = rest.strip_prefix(prefix) {
             let id = value.trim();
-            return Some(
-                (!id.is_empty())
-                    .then(|| LocalModelCommand::Activate(id.to_string()))
-                    .ok_or_else(|| "informe o id do model pack".to_string()),
-            );
+            if id.is_empty() {
+                return Some(Err("informe o id do model pack".to_string()));
+            }
+            return Some(Err(
+                "model:activate indisponível: nenhum backend de inferência medido está ligado ao produto"
+                    .to_string(),
+            ));
         }
     }
     for prefix in ["uninstall:", "remover:"] {
@@ -291,7 +293,7 @@ pub(crate) fn parse_local_model_command(input: &str) -> Option<Result<LocalModel
     }
 
     Some(Err(
-        "Use model:status, model:install:<manifest>, model:activate:<id>, model:deactivate ou model:uninstall:<id>."
+        "Use model:status, model:install:<manifest>, model:deactivate ou model:uninstall:<id>. model:activate fica indisponível até existir backend medido."
             .to_string(),
     ))
 }
@@ -561,7 +563,19 @@ mod tests {
     }
 
     #[test]
-    fn shipped_executor_installs_without_auto_activation_and_requires_benchmark() {
+    fn product_parser_blocks_activation_without_measured_backend() {
+        let error = parse_local_model_command("model:activate:semantic-small")
+            .expect("model command")
+            .expect_err("activation must stay unavailable without a measured backend");
+        assert!(error.contains("nenhum backend de inferência medido"), "{error}");
+        let pt = parse_local_model_command("modelo:ativar:semantic-small")
+            .expect("model command")
+            .expect_err("Portuguese activation route must also stay unavailable");
+        assert!(pt.contains("nenhum backend de inferência medido"), "{pt}");
+    }
+
+    #[test]
+    fn activation_infrastructure_requires_benchmark_even_though_product_route_blocks_it() {
         let fixture = Fixture::new();
         let mut packs = fixture.packs();
         let manifest_path = fixture.write_import();
@@ -600,7 +614,7 @@ mod tests {
     }
 
     #[test]
-    fn shipped_executor_activates_then_uninstall_returns_to_fallback() {
+    fn internal_activation_fixture_uninstalls_to_fallback() {
         let fixture = Fixture::new();
         let mut packs = fixture.packs();
         let manifest_path = fixture.write_import();
