@@ -202,27 +202,27 @@ jobs:
               Test = "generic_click_never_inherits_a_reversible_grant_from_page_metadata"
               SourcePath = "crates/neural-core/src/agent_security.rs"
               Old = @'
-            Self::Select { .. }
-            | Self::TypeText {
-                field: FieldKind::Search,
-                ..
-            } => ActionRisk::Reversible,
-            // A generic click is ambiguous remote authority. The page owns its
-            // role/name/text, so those strings may raise the risk but can never
-            // lower it into the session-grant class. Likewise arbitrary text
-            // fields are not the SPEC-0104 "non-sensitive search field" class.
-            Self::Click { .. }
-            | Self::TypeText {
+                      Self::Select { .. }
+                      | Self::TypeText {
+                          field: FieldKind::Search,
+                          ..
+                      } => ActionRisk::Reversible,
+                      // A generic click is ambiguous remote authority. The page owns its
+                      // role/name/text, so those strings may raise the risk but can never
+                      // lower it into the session-grant class. Likewise arbitrary text
+                      // fields are not the SPEC-0104 "non-sensitive search field" class.
+                      Self::Click { .. }
+                      | Self::TypeText {
           '@
               New = @'
-            Self::Select { .. }
-            | Self::Click { .. }
-            | Self::TypeText {
-                field: FieldKind::Search,
-                ..
-            } => ActionRisk::Reversible,
-            // SABOTAGE: page-controlled generic clicks got the Class B grant.
-            Self::TypeText {
+                      Self::Select { .. }
+                      | Self::Click { .. }
+                      | Self::TypeText {
+                          field: FieldKind::Search,
+                          ..
+                      } => ActionRisk::Reversible,
+                      // SABOTAGE: page-controlled generic clicks got the Class B grant.
+                      Self::TypeText {
           '@
             },
             @{
@@ -230,16 +230,16 @@ jobs:
               Test = "structured_select_keeps_the_native_reversible_class"
               SourcePath = "crates/neural-app/src/windows_app.rs"
               Old = @'
-                AgentSecurityAction::Select {
-                    origin,
-                    description: format!("select {} = {}", target.name, value),
-                }
+                          AgentSecurityAction::Select {
+                              origin,
+                              description: format!("select {} = {}", target.name, value),
+                          }
           '@
               New = @'
-                AgentSecurityAction::Click {
-                    origin,
-                    label: format!("select {} = {}", target.name, value),
-                }
+                          AgentSecurityAction::Click {
+                              origin,
+                              label: format!("select {} = {}", target.name, value),
+                          }
           '@
             },
             @{
@@ -247,15 +247,15 @@ jobs:
               Test = "structured_select_page_metadata_can_only_raise_risk"
               SourcePath = "crates/neural-app/src/windows_app.rs"
               Old = @'
-            let material = format!(
-                "{} {} {}",
-                target.role.to_lowercase(),
-                target.name.to_lowercase(),
-                value.to_lowercase()
-            );
+                      let material = format!(
+                          "{} {} {}",
+                          target.role.to_lowercase(),
+                          target.name.to_lowercase(),
+                          value.to_lowercase()
+                      );
           '@
               New = @'
-            let material = String::new(); // SABOTAGE: ignore page hints that should only raise risk.
+                      let material = String::new(); // SABOTAGE: ignore page hints that should only raise risk.
           '@
             },
             @{
