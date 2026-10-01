@@ -12,7 +12,7 @@
 | 0102 | semântica determinística/hashed embeddings no produto; lifecycle de model packs ainda não está em `main` | core valida manifest/hash/licença/benchmark/fallback; `main` ainda guarda a ausência de wiring de produto | **parcial e honesto** | #220/#221: lifecycle lazy de produto; primeiro backend medido continua separado e não pode ser simulado por benchmark fictício |
 | 0103 | `semanticAnchors()` nos scripts JS de Reader/Split/Comparator | fixtures por fornecedor + gates sobre o JS que embarca + rácio de performance e sabotagem | **caminho real + comportamento/performance** | acompanhar drift de DOM e jank sem voltar a usar o parser Rust de referência como substituto do JS embarcado |
 | 0104 | `AgentPermissionPolicy` no caminho embarcado | policy tests + fixtures adversariais + wiring do produto + sabotagem dos gates críticos | **núcleo real + wiring** | revisão adversarial independente e prova ponta a ponta das confirmações/consentimento |
-| 0105 | `handle_agent_observation` → `decide_agent_step` | testes comportamentais e sabotagem sobre a decisão que embarca | **caminho real** | revisão adversarial independente; decidir o destino do `neural-core::AgentRuntime`, que permanece harness de referência |
+| 0105 | `handle_agent_observation` → `decide_agent_step` | testes comportamentais e sabotagem sobre a decisão que embarca | **caminho real** | revisão adversarial independente; o runtime paralelo já foi removido no PR #80 |
 | 0106 | composição de memória/pesquisa/timeline/IPC/agente | roadmap + wiring; não é um único runtime gate | **roadmap, não feature** | manter cada fase presa ao seu gate comportamental próprio |
 | 0107 | store SQLite/FTS5 derivado + retrieval/rerank + tombstones/rebuild | testes operacionais de Fase 1, escala e proveniência vendorizada | **Fase 1 parcial** | integração/UX/performance completas; critérios de startup/idle com backend real permanecem dependentes das fases posteriores |
 | 0108 | `neural-app/src/ipc.rs` + scripts/builders WebView2 | parser portátil, schema fechado, capability, limite de payload, child-frame guard e gates do produto | **caminho real + product-tested** | revisão adversarial independente/release gate; não há mais pendência de “release 2.1” como estado atual |
@@ -34,8 +34,9 @@ produto passou a mirar os scripts embarcados.
 ### SPEC-0105
 
 O antigo gate executava `AgentRuntime` com planner/executor mockados. Esse
-runtime não era chamado por `neural-app`. O produto usa
-`handle_agent_observation` e concentra a decisão testável em
+runtime não era chamado por `neural-app`. O PR #80 removeu o loop paralelo e
+manteve em `agent_protocol` apenas o vocabulário/configuração compartilhado.
+O produto usa `handle_agent_observation` e concentra a decisão testável em
 `decide_agent_step`. O gate comportamental tem de ser sabotável: retirar
 `policy.evaluate`, o orçamento ou a confirmação deve fazê-lo ficar vermelho.
 
