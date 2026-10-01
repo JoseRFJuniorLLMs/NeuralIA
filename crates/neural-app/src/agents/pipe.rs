@@ -309,12 +309,23 @@ fn user_only_directory_sddl(sid: &str) -> String {
 
 fn set_private_security(path: &Path, descriptor: &SecurityDescriptor) -> Result<(), String> {
     let wide = wide_path(path);
-    let info = OWNER_SECURITY_INFORMATION
+    let full_info = OWNER_SECURITY_INFORMATION
         | DACL_SECURITY_INFORMATION
         | PROTECTED_DACL_SECURITY_INFORMATION;
     // SAFETY: caminho terminado em zero; descriptor permanece vivo durante a chamada.
-    if unsafe { SetFileSecurityW(wide.as_ptr(), info, descriptor.0) } == 0 {
-        return Err(last_error("SetFileSecurityW"));
+    if unsafe { SetFileSecurityW(wide.as_ptr(), full_info, descriptor.0) } == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_ACCESS_DENIED {
+            // Se o processo atual não tem permissão de WRITE_OWNER (comum em sessões
+            // não-elevadas onde o usuário já é o dono nativo do arquivo/pasta),
+            // aplica a DACL protegida isolando o acesso estritamente a este usuário.
+            let dacl_info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+            if unsafe { SetFileSecurityW(wide.as_ptr(), dacl_info, descriptor.0) } == 0 {
+                return Err(last_error("SetFileSecurityW"));
+            }
+        } else {
+            return Err(last_error("SetFileSecurityW"));
+        }
     }
     Ok(())
 }
