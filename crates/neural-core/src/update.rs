@@ -343,7 +343,9 @@ pub fn parse_github_release_json(json_str: &str) -> Result<ReleaseInfo> {
 /// Estado do resultado da checagem de versão.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateStatus {
-    UpToDate { current_version: String },
+    UpToDate {
+        current_version: String,
+    },
     UpdateAvailable {
         current_version: String,
         latest: ReleaseInfo,
@@ -397,10 +399,7 @@ fn part_path(target_path: &Path) -> Result<PathBuf> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| NeuralError::Config("Nome de instalador inválido".to_string()))?;
     let sequence = PART_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-    Ok(target_path.with_file_name(format!(
-        ".{name}.part-{}-{sequence}",
-        std::process::id()
-    )))
+    Ok(target_path.with_file_name(format!(".{name}.part-{}-{sequence}", std::process::id())))
 }
 
 fn sha256_hex(digest: impl AsRef<[u8]>) -> String {
@@ -432,9 +431,7 @@ fn write_verified_installer(
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(|e| {
-                NeuralError::Config(format!("Falha ao criar arquivo temporário: {e}"))
-            })?;
+            .map_err(|e| NeuralError::Config(format!("Falha ao criar arquivo temporário: {e}")))?;
 
         let mut buffer = [0u8; DOWNLOAD_BUFFER_BYTES];
         let mut downloaded = 0u64;
@@ -612,7 +609,11 @@ mod tests {
             ("2.7.1+build.1", "2.7.1+build.9", Ordering::Equal),
         ];
         for (current, candidate, expected) in cases {
-            assert_eq!(compare_semver(current, candidate), Some(expected), "{current} -> {candidate}");
+            assert_eq!(
+                compare_semver(current, candidate),
+                Some(expected),
+                "{current} -> {candidate}"
+            );
         }
         for invalid in [
             "2.7",
