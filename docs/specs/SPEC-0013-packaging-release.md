@@ -38,6 +38,35 @@ and its GitHub Release already exist, a later main push with the same workspace
 version is a no-op. If only one of tag/release exists, automation MUST fail
 closed rather than repair, overwrite or clobber stable state.
 
+## In-app update consumption
+
+The installed application treats update discovery and update execution as
+different authorities:
+
+- the automatic daily startup check is **notification-only**;
+- `update:`, `update:check`, `atualizar:`, `!update` and `/update`
+  check the official channel but MUST NOT download or execute an installer;
+- applying an update requires an explicit install command
+  (`update:install`, `atualizar:instalar`, `!update-install`,
+  `/update-install` or `/atualizar`);
+- release JSON is accepted for installation only when the selected asset is
+  exactly `NeuralIA-Setup-<version>-x64.exe`, its URL is the corresponding
+  `https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/<tag>/...`
+  path, and GitHub reports a `sha256:...` digest for that asset;
+- the installer is streamed into a unique `.part` file with a 150 MiB cap,
+  hashed while it is written, flushed/synced, and renamed to the executable
+  target only after both the declared length (when present) and SHA-256 match.
+  A read/write/hash failure removes the partial file;
+- progress notifications are coalesced to percentage changes rather than one
+  UI event per network chunk.
+
+The GitHub asset digest is an integrity binding between the downloaded bytes
+and the release metadata returned by the official API. It is **not** a second,
+independent proof of publisher identity. Until the owner configures a trusted
+production Authenticode certificate and the client can pin/validate the
+expected signer, the updater MUST NOT describe the digest check as equivalent
+to Authenticode publisher verification.
+
 ## Windows installer and Authenticode
 
 The installer is `neural-setup` (`crates/neural-setup`): the project's own
