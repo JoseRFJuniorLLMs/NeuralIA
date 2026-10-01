@@ -44,11 +44,14 @@ The browser remains infrastructure. The product is the research workflow.
 | [SPEC-0105](SPEC-0105-agent-runtime.md) | DOM/accessibility-first web agent runtime | 2.0 |
 | [SPEC-0106](SPEC-0106-execution-roadmap.md) | Implementation order and release gates | 1.7 → 2.0 |
 | [SPEC-0107](SPEC-0107-ai-memory-native-integration.md) | Native import/adaptation of ai-memory into NeuralIA memory crates | 1.7–1.9 |
-| [SPEC-0114](SPEC-0114-anti-distracao.md) | Anti-distraction: cookie banners, newsletter modals, large fixed bars (reject-only on known CMPs) | 2.4 (preview) |
+| [SPEC-0108](SPEC-0108-secure-webview-ipc-channel.md) | Bounded authenticated page→native WebView2 IPC | 2.1 |
+| [SPEC-0109](SPEC-0109-webrtc-media-permissions.md) | WebRTC media permissions with native consent | 2.1 |
+| [SPEC-0110](SPEC-0110-pdf-text-reader.md) | Bounded PDF text extraction into semantic memory | 2.5 |
+| [SPEC-0114](SPEC-0114-anti-distracao.md) | Anti-distraction: cookie banners, newsletter modals, large fixed bars (reject-only on known CMPs) | 2.4 |
 
 A matriz que responde explicitamente “este teste exercita o caminho que
 embarca?” está em
-[AUDIT-SPEC-0100-0108](AUDIT-SPEC-0100-0108.md).
+[AUDIT-SPEC-0100-0108](AUDIT-SPEC-0100-0108.md), hoje ampliada até as SPECs existentes de 0114 (0111–0113 não existem no repositório).
 
 ## Implementation status
 
@@ -70,14 +73,23 @@ embarca?” está em
   protocol/configuration types remain in `agent_protocol`.
 - **SPEC-0106:** execution roadmap, not a runtime feature or a standalone "green"
   object-construction test.
-- **SPEC-0107:** Phase 0 is complete and Phase 1 is partial: SQLite/FTS5,
-  retrieval/rerank, tombstones and rebuild are operational and acceptance-tested;
-  the full integration/UX/performance criteria remain open.
+- **SPEC-0107:** partial advanced integration. SQLite/FTS5, RRF
+  lexical/entity/graph/semantic retrieval, granular forget/tombstones, Doctor/rebuild,
+  async capture, scale gates and Ctrl+H semantic recall ship. Optional local
+  embedding/model backend, model compatibility in Doctor, real-backend startup-idle
+  gates and some granular maintenance UX remain open.
 - **SPEC-0108:** bounded WebView2 IPC is implemented and product-tested; the
   independent adversarial/release gate remains pending.
-- **SPEC-0114:** proposal. Core, injected script and node:vm gates live on
-  `feat/anti-distracao`; it becomes implemented only with the PR CI green and
-  the owner's section-7 yes. The settings switch and `/distracoes` are not built.
+- **SPEC-0109:** WebRTC media capture uses the native WebView2 consent flow on
+  visible web surfaces; unrelated/sensitive permissions remain fail-closed.
+- **SPEC-0110:** bounded PDF TextLayer extraction is integrated into semantic
+  memory through the authenticated PDF-only IPC path; image-only PDFs remain
+  outside scope because there is no OCR.
+- **SPEC-0114:** integrated into `main` through release/2.4.0 (PR #169). The
+  node:vm/script policy gates ship; a real-WebView2 COM E2E and the global
+  settings/`/distracoes` controls remain open.
+- **SPEC-0111–0113:** no specification files exist under these numbers; this is
+  a numbering gap, not an implementation state.
 
 `crates/neural-core/tests/spec_010x_acceptance.rs` now keeps SPEC numbers only
 where the tested core is the same core used by the product. Reference-only checks for the Rust semantic-timeline parser and roadmap
