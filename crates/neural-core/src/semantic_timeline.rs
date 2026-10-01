@@ -46,7 +46,7 @@ pub fn semantic_anchors_html(input: &str) -> Vec<SemanticAnchor> {
             .attr("class")
             .unwrap_or_default()
             .to_lowercase();
-        let text = normalize_label(&element.text().collect::<Vec<_>>().join(" "), 96);
+        let text = normalize_element_text(&element, 96);
 
         if text.is_empty() {
             continue;
@@ -110,18 +110,22 @@ pub fn semantic_anchors_html(input: &str) -> Vec<SemanticAnchor> {
         .collect()
 }
 
-fn normalize_label(input: &str, limit: usize) -> String {
-    let clean = input.split_whitespace().collect::<Vec<_>>().join(" ");
+fn normalize_element_text(element: &scraper::ElementRef<'_>, limit: usize) -> String {
+    let mut clean = String::new();
+    for part in element.text() {
+        for word in part.split_whitespace() {
+            if !clean.is_empty() {
+                clean.push(' ');
+            }
+            clean.push_str(word);
+        }
+    }
     if clean.chars().count() <= limit {
         clean
     } else {
-        format!(
-            "{}…",
-            clean
-                .chars()
-                .take(limit.saturating_sub(1))
-                .collect::<String>()
-        )
+        let mut truncated: String = clean.chars().take(limit.saturating_sub(1)).collect();
+        truncated.push('…');
+        truncated
     }
 }
 

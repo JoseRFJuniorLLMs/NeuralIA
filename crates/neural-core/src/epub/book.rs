@@ -113,25 +113,24 @@ impl EpubMetadata {
     /// Nomes para exibir como autores: os criadores com papel `aut` ou sem
     /// papel; se nenhum servir, todos os criadores.
     pub fn authors(&self) -> Vec<String> {
-        let authors: Vec<String> = self
-            .creators
-            .iter()
-            .filter(|creator| {
-                creator
-                    .role
-                    .as_deref()
-                    .is_none_or(|role| role.eq_ignore_ascii_case("aut"))
-            })
-            .map(|creator| creator.name.clone())
-            .collect();
-        if authors.is_empty() {
-            self.creators
+        let mut authors = Vec::with_capacity(self.creators.len());
+        for creator in &self.creators {
+            if creator
+                .role
+                .as_deref()
+                .is_none_or(|role| role.eq_ignore_ascii_case("aut"))
+            {
+                authors.push(creator.name.clone());
+            }
+        }
+        if authors.is_empty() && !self.creators.is_empty() {
+            authors = self
+                .creators
                 .iter()
                 .map(|creator| creator.name.clone())
-                .collect()
-        } else {
-            authors
+                .collect();
         }
+        authors
     }
 }
 

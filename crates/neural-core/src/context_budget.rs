@@ -373,6 +373,9 @@ fn count_pretokens(chars: &[char], next: fn(&[char], usize) -> usize) -> usize {
 /// estimativa, que nunca fica abaixo deste numero, nunca fica abaixo de
 /// nenhum dos dois.
 pub fn pretoken_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
     let chars: Vec<char> = text.chars().collect();
     count_pretokens(&chars, o200k_next).max(count_pretokens(&chars, llama3_next))
 }
@@ -384,6 +387,9 @@ pub fn pretoken_count(text: &str) -> usize {
 /// e de `b` nunca sao menos do que os do texto junto. E isso que deixa a
 /// alocacao contar por partes e garantir a contagem do texto final.
 fn weight(text: &str) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
     (table_weight(text) * TOKEN_SAFETY_FACTOR).max(pretoken_count(text) as f64)
 }
 
@@ -417,6 +423,9 @@ fn tokens_from_weight(weight: f64) -> usize {
 /// x 1,10 (arredondada para cima) e o numero de pre-tokens. Zero para o
 /// texto vazio.
 pub fn estimate_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
     tokens_from_weight(weight(text))
 }
 

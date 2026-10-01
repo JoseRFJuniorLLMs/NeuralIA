@@ -141,9 +141,9 @@ impl<'a> Cursor<'a> {
 
     fn u64(&mut self) -> Result<u64, ArchiveError> {
         let raw = self.take(8)?;
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(raw);
-        Ok(u64::from_le_bytes(buf))
+        Ok(u64::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]))
     }
 }
 

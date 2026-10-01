@@ -845,12 +845,31 @@ fn text_of_first(document: &Html, selector: &str) -> Option<String> {
 }
 
 fn normalize_text(input: String) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut words = input.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(input.len());
+    out.push_str(first);
+    for word in words {
+        out.push(' ');
+        out.push_str(word);
+    }
+    out
 }
 
 fn normalize_code(input: String) -> String {
-    let newline = char::from(10).to_string();
-    input.lines().collect::<Vec<_>>().join(&newline)
+    let mut lines = input.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(input.len());
+    out.push_str(first);
+    for line in lines {
+        out.push('\n');
+        out.push_str(line);
+    }
+    out
 }
 
 fn truncate_chars(value: String, limit: usize) -> String {

@@ -180,18 +180,25 @@ pub fn install_root(local_app_data: &Path) -> PathBuf {
 /// nao distingue). So para comparar -- nunca para abrir.
 pub fn path_key(path: &Path) -> String {
     let mut key = String::new();
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts = Vec::new();
     for component in path.components() {
         match component {
             Component::Prefix(prefix) => {
                 let text = prefix.as_os_str().to_string_lossy();
-                key = text.strip_prefix(r"\\?\").unwrap_or(&text).to_string();
+                key = match text {
+                    std::borrow::Cow::Borrowed(s) => {
+                        s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
+                    }
+                    std::borrow::Cow::Owned(ref s) => {
+                        s.strip_prefix(r"\\?\").unwrap_or(s).to_string()
+                    }
+                };
             }
             Component::RootDir | Component::CurDir => {}
             Component::ParentDir => {
                 parts.pop();
             }
-            Component::Normal(name) => parts.push(name.to_string_lossy().into_owned()),
+            Component::Normal(name) => parts.push(name.to_string_lossy()),
         }
     }
     for part in parts {

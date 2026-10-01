@@ -1121,18 +1121,22 @@ fn remove_files_under(dir: &Path, removed: &mut usize, failures: &mut RemovalFai
     }
 }
 
+static MEMORY_TEMP_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(io::Error::other("path without parent"));
     };
     fs::create_dir_all(parent)?;
 
+    let nonce = MEMORY_TEMP_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temp = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("memory"),
-        std::process::id()
+        std::process::id(),
+        nonce
     ));
     fs::write(&temp, bytes)?;
 
@@ -1140,9 +1144,10 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         Ok(()) => Ok(()),
         Err(error) => {
             if path.exists() {
-                fs::remove_file(path)?;
-                fs::rename(temp, path)
+                let _ = fs::remove_file(path);
+                fs::rename(&temp, path)
             } else {
+                let _ = fs::remove_file(&temp);
                 Err(error)
             }
         }
