@@ -7,6 +7,7 @@ pub mod agent_protocol;
 pub mod agent_security;
 pub mod ai_policy;
 pub mod bookmarks;
+pub mod chat;
 pub mod config;
 pub mod context_budget;
 pub mod distraction;
@@ -30,9 +31,11 @@ pub mod safezip;
 pub mod search;
 pub mod security;
 pub mod semantic_timeline;
+pub mod speech;
 pub mod tissue;
 pub mod translate;
 pub mod untrusted;
+pub mod update;
 pub mod zettel;
 
 #[cfg(test)]

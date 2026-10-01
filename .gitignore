@@ -11,3 +11,4 @@ release/
 
 # Artefactos do instalador (scripts/build-windows-installer.ps1 -OutputDir dist).
 dist/
+graphify-out/

@@ -99,6 +99,8 @@ pub(in crate::windows_app) enum InputRoute {
     /// `epub:` sozinho abre o diálogo de arquivos; `epub:<caminho>` abre esse
     /// arquivo.
     OpenEpub(Option<PathBuf>),
+    /// `update:` (e `update:check`, `atualizar:`, `!update`, `/update`): verificação de versão.
+    UpdateCheck,
     /// Sem comando próprio: segue para o `parse_intent`.
     Intent,
 }
@@ -133,6 +135,11 @@ pub(in crate::windows_app) fn route_input(input: &str) -> InputRoute {
         ("research:export", InputRoute::ResearchExport),
         ("memory:rebuild", InputRoute::MemoryRebuild),
         ("mem:rebuild", InputRoute::MemoryRebuild),
+        ("update:", InputRoute::UpdateCheck),
+        ("update:check", InputRoute::UpdateCheck),
+        ("atualizar:", InputRoute::UpdateCheck),
+        ("!update", InputRoute::UpdateCheck),
+        ("/update", InputRoute::UpdateCheck),
         ("livros:", InputRoute::Library),
         ("biblioteca:", InputRoute::Library),
         ("books:", InputRoute::Library),
@@ -510,6 +517,13 @@ impl App {
             InputRoute::Library => self.open_library(),
             InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
             InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
+            InputRoute::UpdateCheck => {
+                let current_version = env!("CARGO_PKG_VERSION");
+                self.show_splash(
+                    format!("NeuralIA v{current_version} · Verificação de atualização: canal oficial GitHub Releases"),
+                    4,
+                );
+            }
             InputRoute::Intent => match parse_intent(&input) {
                 Ok(Intent::Home) => {
                     self.request_home();

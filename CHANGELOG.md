@@ -4,6 +4,12 @@ All notable changes to NeuralIA are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Verificador de atualizações in-app (`update:`, `update:check`, `/update`):** adicionado o módulo puro `neural_core::update` para parsing dos metadados de releases da API do GitHub e comparação semver determinística (`compare_semver`, `is_newer_version`). Na interface, a omnibox reconhece `update:`, `update:check`, `atualizar:`, `!update` e `/update`, exibindo o status do canal oficial de releases.
+- **Camada de domínio da Chat Surface Multi-Provedor (SPEC-0115):** implementadas as estruturas normativas de conversação no `neural_core::chat` (`ChatThread`, `ChatTurn`, `ChatMessage`, `ContentPart`, `MessageRole`, `ExtractionQuality`), permitindo turnos de chat estruturados, preservação de proveniência de citações e exportação completa para Markdown sem dependência direta da DOM web externa.
+- **Protocolo Edge TTS & Síntese de Leitura em Voz Alta (SPEC-0116):** adicionado o módulo `neural_core::speech` com suporte a vozes neurais brasileiras e internacionais (`pt-BR-FranciscaNeural`, `pt-BR-AntonioNeural`, etc.), construtor SSML com proteção contra injeção e escape XML, envelopes de protocolo WebSocket (`speech.config`, `ssml`) e parser de metadados `WordBoundary` para sincronização palavra por palavra no Leitor e no Visualizador de PDF.
+- **Organização e rastreamento de especificações:** renomeados e formalmente rastreados os rascunhos de especificações para evitar colisões numéricas (`md/SPEC-0115-chat-surface.md`, `md/SPEC-0116-neural-read-aloud.md`, `md/memoria-relatorio.md`), com matriz de auditoria atualizada em `md/AUDIT-SPEC-0100-0108.md`.
+
 ## [2.6.2] - 2026-10-01
 
 ### Added

@@ -32,6 +32,8 @@ pub enum NeuralError {
     Json(#[from] serde_json::Error),
     #[error("não foi possível extrair conteúdo legível")]
     ReaderExtraction,
+    #[error("configuração ou formato inválido: {0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, NeuralError>;

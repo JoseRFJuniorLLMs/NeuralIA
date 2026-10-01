@@ -6342,6 +6342,11 @@ fn route_input_sends_each_command_where_it_belongs() {
         route_input("model:activate:"),
         InputRoute::LocalModel(Err(_))
     ));
+    assert_eq!(route_input("update:"), InputRoute::UpdateCheck);
+    assert_eq!(route_input(" update:check "), InputRoute::UpdateCheck);
+    assert_eq!(route_input("ATUALIZAR:"), InputRoute::UpdateCheck);
+    assert_eq!(route_input("!update"), InputRoute::UpdateCheck);
+    assert_eq!(route_input("/update"), InputRoute::UpdateCheck);
     assert_eq!(route_input("o que é ownership"), InputRoute::Intent);
     assert_eq!(route_input("https://example.com"), InputRoute::Intent);
 }

@@ -20,6 +20,8 @@
 | 0110 | TextLayer/PDF-only IPC → `PrivacyGuard` → semantic memory | caps por página/documento, dispatch PDF-only e gates/sabotagem | **caminho real** | OCR não faz parte da SPEC; PDFs só-imagem continuam sem texto pesquisável |
 | 0111–0113 | não existem arquivos SPEC com esses números | — | **salto de numeração** | nenhuma lacuna de implementação inferida apenas pelo número |
 | 0114 | `distraction_config` + script injetado nas superfícies permitidas | core + node:vm + sabotagens da política/script, integrados via release/2.4.0 | **caminho embarcado, E2E COM incompleto** | testar `AddScriptToExecuteOnDocumentCreated` no exe/WebView2 real e expor controle global nas definições/`/distracoes` |
+| 0115 | `ChatThread` / `ChatTurn` / `ChatMessage` no `neural-core` | modelos de domínio e turnos estruturados | **proposta / fase de domínio** | ligar à interface nativa unificada do Comparador |
+| 0116 | síntese Edge TTS / SSML no `neural-core` | protocolo de mensagens e geração SSML determinística | **proposta / protocolo core** | pipeline de áudio nativo e sincronização WordBoundary no Reader/PDF |
 
 ## Achados que mudaram o desenho dos gates
 
