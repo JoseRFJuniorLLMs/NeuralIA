@@ -492,7 +492,7 @@ impl App {
         self.position_palette();
         unsafe {
             ShowWindow(popup, SW_SHOW);
-            InvalidateRect(popup, std::ptr::null(), 1);
+            InvalidateRect(popup, std::ptr::null(), 0);
             SetFocus(edit);
         }
     }

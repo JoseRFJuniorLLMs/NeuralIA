@@ -100,8 +100,12 @@ pub(in crate::windows_app) enum PageTarget {
 
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
-    /// Resultado da verificação de atualizações no GitHub.
-    UpdateStatus(Result<neural_core::update::UpdateStatus, String>),
+    /// Resultado da verificação de atualizações no GitHub. `apply` só é
+    /// verdadeiro quando o utilizador pediu explicitamente a atualização.
+    UpdateStatus {
+        result: Result<neural_core::update::UpdateStatus, String>,
+        apply: bool,
+    },
     /// Progresso de download da atualização (versão, fração 0.0..1.0).
     UpdateProgress {
         version: String,
@@ -1167,7 +1171,7 @@ fn place_caption_buttons(buttons: HWND, x: i32, width: i32, height: i32, visible
         // SW_SHOWNOACTIVATE: mostrar os botoes nunca rouba o foco a quem
         // esta a escrever.
         ShowWindow(buttons, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
-        InvalidateRect(buttons, std::ptr::null(), 1);
+        InvalidateRect(buttons, std::ptr::null(), 0);
     }
 }
 

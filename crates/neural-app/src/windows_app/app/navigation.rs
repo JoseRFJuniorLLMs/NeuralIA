@@ -99,8 +99,10 @@ pub(in crate::windows_app) enum InputRoute {
     /// `epub:` sozinho abre o diálogo de arquivos; `epub:<caminho>` abre esse
     /// arquivo.
     OpenEpub(Option<PathBuf>),
-    /// `update:` (e `update:check`, `atualizar:`, `!update`, `/update`): verificação de versão.
+    /// `update:` (e `update:check`, `atualizar:`, `!update`, `/update`): somente verifica.
     UpdateCheck,
+    /// Instalação explícita: `update:install`, `atualizar:instalar`, `/atualizar`.
+    UpdateInstall,
     /// `sobre:` (e `about:`, `/sobre`, `/about`, `historia:`): tela sobre o projeto e sua história.
     About,
     /// Sem comando próprio: segue para o `parse_intent`.
@@ -142,6 +144,11 @@ pub(in crate::windows_app) fn route_input(input: &str) -> InputRoute {
         ("atualizar:", InputRoute::UpdateCheck),
         ("!update", InputRoute::UpdateCheck),
         ("/update", InputRoute::UpdateCheck),
+        ("update:install", InputRoute::UpdateInstall),
+        ("atualizar:instalar", InputRoute::UpdateInstall),
+        ("!update-install", InputRoute::UpdateInstall),
+        ("/update-install", InputRoute::UpdateInstall),
+        ("/atualizar", InputRoute::UpdateInstall),
         ("sobre:", InputRoute::About),
         ("!sobre", InputRoute::About),
         ("/sobre", InputRoute::About),
@@ -246,6 +253,8 @@ pub(in crate::windows_app) enum PaletteRoute {
     Distraction(DistractionCommand),
     /// Verificação de atualizações in-app (`update:`, `/update`, `atualizar:`).
     UpdateCheck,
+    /// Aplicação explícita da atualização (`update:install`, `/atualizar`).
+    UpdateInstall,
     /// Tela sobre o projeto e sua história (`sobre:`, `about:`, `/sobre`, `/about`).
     About,
 }
@@ -267,6 +276,7 @@ pub(in crate::windows_app) fn route_palette(
         InputRoute::Theme(choice) => return PaletteRoute::Theme(choice),
         InputRoute::Distraction(command) => return PaletteRoute::Distraction(command),
         InputRoute::UpdateCheck => return PaletteRoute::UpdateCheck,
+        InputRoute::UpdateInstall => return PaletteRoute::UpdateInstall,
         InputRoute::About => return PaletteRoute::About,
         _ => {}
     }
@@ -542,7 +552,8 @@ impl App {
             InputRoute::OpenEpub(None) => self.open_epub_dialog(true),
             InputRoute::OpenEpub(Some(path)) => self.open_epub(path),
             InputRoute::About => self.show_about(),
-            InputRoute::UpdateCheck => self.check_and_apply_update(true),
+            InputRoute::UpdateCheck => self.check_and_apply_update(false),
+            InputRoute::UpdateInstall => self.check_and_apply_update(true),
             InputRoute::Intent => match parse_intent(&input) {
                 Ok(Intent::Home) => {
                     self.request_home();
@@ -607,7 +618,8 @@ impl App {
             PaletteRoute::Theme(None) => self.show_splash(THEME_COMMAND_HELP.to_string(), 3),
             PaletteRoute::Distraction(command) => self.distraction_command(command),
             PaletteRoute::About => self.show_about(),
-            PaletteRoute::UpdateCheck => self.check_and_apply_update(true),
+            PaletteRoute::UpdateCheck => self.check_and_apply_update(false),
+            PaletteRoute::UpdateInstall => self.check_and_apply_update(true),
             // allow_local: a URL foi digitada num controlo nativo, e entrada
             // do utilizador e nao da pagina (SPEC-0015). Em privado a fonte
             // abre privada: open_split_mode(private) nao grava memoria nem
@@ -1162,6 +1174,88 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod update_route_tests {
+    use super::*;
+
+    #[test]
+    fn check_commands_never_mean_install() {
+        for command in [
+            "update:",
+            "update:check",
+            "atualizar:",
+            "!update",
+            "/update",
+        ] {
+            assert_eq!(route_input(command), InputRoute::UpdateCheck, "{command}");
+            assert_eq!(
+                route_palette(command, 0, false),
+                PaletteRoute::UpdateCheck,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_requires_an_explicit_install_command() {
+        for command in [
+            "update:install",
+            "atualizar:instalar",
+            "!update-install",
+            "/update-install",
+            "/atualizar",
+        ] {
+            assert_eq!(route_input(command), InputRoute::UpdateInstall, "{command}");
+            assert_eq!(
+                route_palette(command, 0, false),
+                PaletteRoute::UpdateInstall,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_handlers_keep_check_and_install_authority_separate() {
+        let source = include_str!("navigation.rs");
+        let input_check = [
+            "InputRoute::UpdateCheck => self.",
+            "check_and_apply_update(false)",
+        ]
+        .concat();
+        let input_install = [
+            "InputRoute::UpdateInstall => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+        let palette_check = [
+            "PaletteRoute::UpdateCheck => self.",
+            "check_and_apply_update(false)",
+        ]
+        .concat();
+        let palette_install = [
+            "PaletteRoute::UpdateInstall => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+        let forbidden_input = [
+            "InputRoute::UpdateCheck => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+        let forbidden_palette = [
+            "PaletteRoute::UpdateCheck => self.",
+            "check_and_apply_update(true)",
+        ]
+        .concat();
+
+        for expected in [input_check, input_install, palette_check, palette_install] {
+            assert_eq!(source.matches(&expected).count(), 1, "{expected}");
+        }
+        assert!(!source.contains(&forbidden_input));
+        assert!(!source.contains(&forbidden_palette));
     }
 }
 

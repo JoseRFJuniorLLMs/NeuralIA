@@ -325,7 +325,7 @@ pub(in crate::windows_app) unsafe fn place_toast(
         SWP_NOACTIVATE,
     );
     show_popup_without_activation(toast);
-    InvalidateRect(toast, std::ptr::null(), 1);
+    InvalidateRect(toast, std::ptr::null(), 0);
 }
 
 /// Para onde um botao do aviso leva, fora dele.

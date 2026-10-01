@@ -162,15 +162,64 @@ pub fn parse_collected(raw: &str) -> Result<Collected, CollectError> {
 
 // ------------------------------------------------------------ ja em portugues
 
-/// Palavras que so o portugues usa assim (nem o ingles, nem o espanhol, nem
-/// o frances as tem como palavra comum).
-const PORTUGUESE_WORDS: &[&str] = &[
-    "não", "você", "vocês", "também", "está", "estão", "são", "então", "já", "só", "às", "é",
-    "uma", "umas", "um", "uns", "com", "pelo", "pela", "pelos", "pelas", "muito", "muita", "isso",
-    "isto", "essa", "esse", "ao", "aos", "da", "das", "na", "nas", "em", "foi", "têm", "seu",
-    "sua", "seus", "suas", "ele", "ela", "eles", "elas", "pode", "até", "depois", "ainda", "mais",
-    "ou",
-];
+/// Marcadores do português. Um `match` evita percorrer uma slice inteira
+/// para cada palavra da amostra e não cria uma tabela/hash no heap.
+fn portuguese_marker(word: &str) -> bool {
+    matches!(
+        word,
+        "não"
+            | "você"
+            | "vocês"
+            | "também"
+            | "está"
+            | "estão"
+            | "são"
+            | "então"
+            | "já"
+            | "só"
+            | "às"
+            | "é"
+            | "uma"
+            | "umas"
+            | "um"
+            | "uns"
+            | "com"
+            | "pelo"
+            | "pela"
+            | "pelos"
+            | "pelas"
+            | "muito"
+            | "muita"
+            | "isso"
+            | "isto"
+            | "essa"
+            | "esse"
+            | "ao"
+            | "aos"
+            | "da"
+            | "das"
+            | "na"
+            | "nas"
+            | "em"
+            | "foi"
+            | "têm"
+            | "seu"
+            | "sua"
+            | "seus"
+            | "suas"
+            | "ele"
+            | "ela"
+            | "eles"
+            | "elas"
+            | "pode"
+            | "até"
+            | "depois"
+            | "ainda"
+            | "mais"
+            | "ou"
+    ) || word.ends_with("ção")
+        || word.ends_with("ções")
+}
 
 /// Palavras a contar no maximo: uma pagina enorme nao custa mais do que isto.
 const LANGUAGE_SAMPLE_WORDS: usize = 4_000;
@@ -191,10 +240,7 @@ fn portuguese_share(texts: &[PageText]) -> (usize, usize) {
             } else {
                 word
             };
-            if PORTUGUESE_WORDS.contains(&lower)
-                || lower.ends_with("ção")
-                || lower.ends_with("ções")
-            {
+            if portuguese_marker(lower) {
                 marked += 1;
             }
             if words >= LANGUAGE_SAMPLE_WORDS {
