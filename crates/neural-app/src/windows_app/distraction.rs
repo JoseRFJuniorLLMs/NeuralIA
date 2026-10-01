@@ -23,22 +23,19 @@ pub(in crate::windows_app) const DISTRACTION_COMMAND_HELP: &str =
 pub(in crate::windows_app) fn parse_distraction_command(
     input: &str,
 ) -> Option<DistractionCommand> {
-    let input = input.trim();
-    let rest = if input.eq_ignore_ascii_case("/distracoes")
-        || input.eq_ignore_ascii_case("distracoes:")
-    {
+    let normalized = input.trim().to_ascii_lowercase();
+    let rest = if normalized == "/distracoes" || normalized == "distracoes:" {
         ""
-    } else if let Some(rest) = input
+    } else if let Some(rest) = normalized
         .strip_prefix("/distracoes ")
-        .or_else(|| input.strip_prefix("/DISTRAÇÕES "))
-        .or_else(|| input.strip_prefix("distracoes:"))
+        .or_else(|| normalized.strip_prefix("distracoes:"))
     {
         rest.trim()
     } else {
         return None;
     };
 
-    Some(match rest.to_ascii_lowercase().as_str() {
+    Some(match rest {
         "" | "status" => DistractionCommand::Status,
         "on" | "ligar" | "ativar" => DistractionCommand::On,
         "off" | "desligar" | "desativar" => DistractionCommand::Off,
