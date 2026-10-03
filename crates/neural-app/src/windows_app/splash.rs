@@ -148,10 +148,11 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                 SetBkMode(hdc, TRANSPARENT as i32);
                 SetTextColor(hdc, rgb3(theme.fg));
 
-                let text = SPLASH_TEXT
-                    .lock()
-                    .map(|value| value.clone())
-                    .unwrap_or_default();
+                let text_guard = SPLASH_TEXT.lock();
+                let text: &str = match text_guard {
+                    Ok(ref guard) => guard.as_str(),
+                    Err(_) => "",
+                };
 
                 if let Some(question) = question {
                     let buttons = splash_buttons(&client, question.buttons.len());
@@ -164,7 +165,7 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                     };
                     draw_text(
                         hdc,
-                        &text,
+                        text,
                         &mut asked,
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );
@@ -191,7 +192,7 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                     let mut rect = client;
                     draw_text(
                         hdc,
-                        &text,
+                        text,
                         &mut rect,
                         DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );

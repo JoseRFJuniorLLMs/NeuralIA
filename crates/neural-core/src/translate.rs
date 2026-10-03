@@ -163,13 +163,13 @@ pub fn parse_collected(raw: &str) -> Result<Collected, CollectError> {
 // ------------------------------------------------------------ ja em portugues
 
 /// Palavras que so o portugues usa assim (nem o ingles, nem o espanhol, nem
-/// o frances as tem como palavra comum).
+/// o frances as tem como palavra comum). Ordenadas em bytes UTF-8 para busca binaria O(log n).
 const PORTUGUESE_WORDS: &[&str] = &[
-    "não", "você", "vocês", "também", "está", "estão", "são", "então", "já", "só", "às", "é",
-    "uma", "umas", "um", "uns", "com", "pelo", "pela", "pelos", "pelas", "muito", "muita", "isso",
-    "isto", "essa", "esse", "ao", "aos", "da", "das", "na", "nas", "em", "foi", "têm", "seu",
-    "sua", "seus", "suas", "ele", "ela", "eles", "elas", "pode", "até", "depois", "ainda", "mais",
-    "ou",
+    "ainda", "ao", "aos", "até", "com", "da", "das", "depois", "ela", "elas", "ele", "eles", "em",
+    "então", "essa", "esse", "está", "estão", "foi", "isso", "isto", "já", "mais", "muita",
+    "muito", "na", "nas", "não", "ou", "pela", "pelas", "pelo", "pelos", "pode", "seu", "seus",
+    "sua", "suas", "são", "só", "também", "têm", "um", "uma", "umas", "uns", "você", "vocês",
+    "às", "é",
 ];
 
 /// Palavras a contar no maximo: uma pagina enorme nao custa mais do que isto.
@@ -178,20 +178,25 @@ const LANGUAGE_SAMPLE_WORDS: usize = 4_000;
 /// A parte das palavras (em milesimos) que sao marcas do portugues.
 fn portuguese_share(texts: &[PageText]) -> (usize, usize) {
     let (mut words, mut marked) = (0usize, 0usize);
+    let mut lower_buf = String::with_capacity(64);
     'texts: for text in texts {
         for word in text.text.split(|c: char| !c.is_alphabetic()) {
             if word.is_empty() {
                 continue;
             }
             words += 1;
-            let lower_buf: String;
             let lower: &str = if word.chars().any(char::is_uppercase) {
-                lower_buf = word.to_lowercase();
+                lower_buf.clear();
+                for c in word.chars() {
+                    for lc in c.to_lowercase() {
+                        lower_buf.push(lc);
+                    }
+                }
                 &lower_buf
             } else {
                 word
             };
-            if PORTUGUESE_WORDS.contains(&lower)
+            if PORTUGUESE_WORDS.binary_search(&lower).is_ok()
                 || lower.ends_with("ção")
                 || lower.ends_with("ções")
             {

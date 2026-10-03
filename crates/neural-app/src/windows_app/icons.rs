@@ -34,6 +34,13 @@ pub(in crate::windows_app) type IconCacheEntry = ((usize, u32), Arc<RgbaImage>);
 pub(in crate::windows_app) static ICON_SCALE_CACHE: Mutex<Vec<IconCacheEntry>> =
     Mutex::new(Vec::new());
 
+/// Capacidade do cache de bitmaps BGRX já com canal alfa misturado. Evita recalcular
+/// a fusão de pixels por software e alocar `Vec<u8>` a cada WM_PAINT/hover.
+pub(in crate::windows_app) const ICON_RENDER_CACHE_CAPACITY: usize = 32;
+pub(in crate::windows_app) type IconRenderKey = (usize, u32, Rgb, Option<Rgb>);
+pub(in crate::windows_app) static ICON_RENDER_CACHE: Mutex<Vec<(IconRenderKey, Arc<[u8]>)>> =
+    Mutex::new(Vec::new());
+
 /// LRU minimo sobre um vector: o fim e o mais recentemente usado, o inicio e o
 /// candidato a sair. Estao separadas do cache de icones de proposito — assim a
 /// politica de eviccao testa-se sem GDI, sem PNGs e sem estado global.
@@ -157,24 +164,39 @@ pub(in crate::windows_app) unsafe fn draw_icon(
         return;
     }
 
-    // O cache entrega o `Arc`; aqui so se le, por isso basta emprestar.
-    let scaled = icon_scaled(slot, size as u32);
-    let image: &RgbaImage = &scaled;
-    let mut pixels = Vec::with_capacity((size * size * 4) as usize);
-    for py in 0..size as u32 {
-        for px in 0..size as u32 {
-            let pixel = image.get_pixel(px, py);
-            let alpha = pixel[3] as f32 / 255.0;
-            let source = tint.unwrap_or((pixel[0], pixel[1], pixel[2]));
-            let channel = |value: u8, bg: u8| {
-                (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
-            };
-            pixels.push(channel(source.2, background.2));
-            pixels.push(channel(source.1, background.1));
-            pixels.push(channel(source.0, background.0));
-            pixels.push(0);
+    let key: IconRenderKey = (slot, size as u32, background, tint);
+    let pixels: Arc<[u8]> = {
+        let mut guard = ICON_RENDER_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(rendered) = lru_promote(&mut *guard, &key) {
+            rendered
+        } else {
+            let scaled = icon_scaled(slot, size as u32);
+            let image: &RgbaImage = &scaled;
+            let mut buf = Vec::with_capacity((size * size * 4) as usize);
+            for py in 0..size as u32 {
+                for px in 0..size as u32 {
+                    let pixel = image.get_pixel(px, py);
+                    let alpha = pixel[3] as f32 / 255.0;
+                    let source = tint.unwrap_or((pixel[0], pixel[1], pixel[2]));
+                    let channel = |value: u8, bg: u8| {
+                        (value as f32 * alpha + bg as f32 * (1.0 - alpha)).round() as u8
+                    };
+                    buf.push(channel(source.2, background.2));
+                    buf.push(channel(source.1, background.1));
+                    buf.push(channel(source.0, background.0));
+                    buf.push(0);
+                }
+            }
+            let rendered: Arc<[u8]> = Arc::from(buf.into_boxed_slice());
+            lru_insert(
+                &mut *guard,
+                key,
+                Arc::clone(&rendered),
+                ICON_RENDER_CACHE_CAPACITY,
+            );
+            rendered
         }
-    }
+    };
     blit_bgrx(hdc, &pixels, x, y, size, size);
 }
 
@@ -307,9 +329,31 @@ pub(in crate::windows_app) unsafe fn draw_text(
     rect: &mut RECT,
     format: u32,
 ) {
-    let wide: Vec<u16> = text.encode_utf16().collect();
-    if !wide.is_empty() {
-        DrawTextW(hdc, wide.as_ptr(), wide.len() as i32, rect, format);
+    if text.is_empty() {
+        return;
+    }
+    // Otimização: buffer na stack para até 128 unidades UTF-16 (cobre 99%+ dos textos
+    // de botões, abas e rótulos da UI sem disparar alocação no heap).
+    let mut buf = [0u16; 128];
+    let mut idx = 0;
+    let mut iter = text.encode_utf16();
+    let mut overflow = false;
+    for c in iter.by_ref() {
+        if idx < buf.len() {
+            buf[idx] = c;
+            idx += 1;
+        } else {
+            let mut wide = Vec::with_capacity(idx + iter.size_hint().0 + 1);
+            wide.extend_from_slice(&buf[..idx]);
+            wide.push(c);
+            wide.extend(iter);
+            DrawTextW(hdc, wide.as_ptr(), wide.len() as i32, rect, format);
+            overflow = true;
+            break;
+        }
+    }
+    if !overflow && idx > 0 {
+        DrawTextW(hdc, buf.as_ptr(), idx as i32, rect, format);
     }
 }
 

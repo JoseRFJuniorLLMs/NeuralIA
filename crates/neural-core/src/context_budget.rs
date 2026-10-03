@@ -376,8 +376,24 @@ pub fn pretoken_count(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    let chars: Vec<char> = text.chars().collect();
-    count_pretokens(&chars, o200k_next).max(count_pretokens(&chars, llama3_next))
+    let mut stack_chars = ['\0'; 256];
+    let mut len = 0;
+    let mut iter = text.chars();
+    for c in iter.by_ref() {
+        if len < stack_chars.len() {
+            stack_chars[len] = c;
+            len += 1;
+        } else {
+            let mut heap_chars = Vec::with_capacity(len + iter.size_hint().0 + 1);
+            heap_chars.extend_from_slice(&stack_chars);
+            heap_chars.push(c);
+            heap_chars.extend(iter);
+            return count_pretokens(&heap_chars, o200k_next)
+                .max(count_pretokens(&heap_chars, llama3_next));
+        }
+    }
+    count_pretokens(&stack_chars[..len], o200k_next)
+        .max(count_pretokens(&stack_chars[..len], llama3_next))
 }
 
 /// O custo de `text` em tokens, antes de arredondar e de calibrar: o maior
@@ -1202,16 +1218,18 @@ fn split_word(
 // ------------------------------------------------------------ pontuacao
 
 /// Palavras vazias, ja sem acentos (as palavras comparadas tambem o sao).
+/// Ordenadas alfabeticamente para permitir busca binaria O(log n).
 const STOPWORDS: &[&str] = &[
-    "de", "da", "do", "das", "dos", "em", "um", "uma", "uns", "umas", "para", "por", "com", "sem",
-    "que", "se", "no", "na", "nos", "nas", "os", "as", "ao", "aos", "nao", "mais", "como", "mas",
-    "foi", "ele", "ela", "eles", "elas", "tem", "seu", "sua", "seus", "suas", "ou", "ser",
-    "quando", "muito", "ha", "ja", "esta", "estao", "eu", "tambem", "so", "pelo", "pela", "pelos",
-    "pelas", "ate", "isso", "isto", "entre", "era", "depois", "mesmo", "ter", "quem", "me", "esse",
-    "essa", "este", "voce", "tinha", "foram", "num", "numa", "nem", "meu", "minha", "sobre",
-    "qual", "quais", "quanto", "the", "of", "and", "to", "in", "is", "an", "that", "it", "for",
-    "on", "with", "are", "this", "be", "by", "or", "at", "from", "was", "were", "which", "what",
-    "how", "does", "did", "not", "its", "into", "than", "then", "there", "these", "those", "their",
+    "an", "and", "ao", "aos", "are", "as", "at", "ate", "be", "by", "com", "como", "da", "das",
+    "de", "depois", "did", "do", "does", "dos", "ela", "elas", "ele", "eles", "em", "entre",
+    "era", "essa", "esse", "esta", "estao", "este", "eu", "foi", "for", "foram", "from", "ha",
+    "how", "in", "into", "is", "isso", "isto", "it", "its", "ja", "mais", "mas", "me", "mesmo",
+    "meu", "minha", "muito", "na", "nao", "nas", "nem", "no", "nos", "not", "num", "numa", "of",
+    "on", "or", "os", "ou", "para", "pela", "pelas", "pelo", "pelos", "por", "quais", "qual",
+    "quando", "quanto", "que", "quem", "se", "sem", "ser", "seu", "seus", "so", "sobre", "sua",
+    "suas", "tambem", "tem", "ter", "than", "that", "the", "their", "then", "there", "these",
+    "this", "those", "tinha", "to", "um", "uma", "umas", "uns", "voce", "was", "were", "what",
+    "which", "with",
 ];
 
 fn fold_char(c: char) -> char {
@@ -1238,7 +1256,7 @@ fn terms(text: &str) -> Vec<String> {
     folded
         .split(|c: char| !c.is_alphanumeric())
         .filter(|word| word.chars().count() >= 2)
-        .filter(|word| !STOPWORDS.contains(word))
+        .filter(|word| STOPWORDS.binary_search(word).is_err())
         .map(str::to_string)
         .collect()
 }

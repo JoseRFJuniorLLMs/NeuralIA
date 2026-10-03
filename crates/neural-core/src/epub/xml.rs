@@ -78,6 +78,27 @@ pub(crate) fn decode_document(bytes: &[u8]) -> String {
     utf8_or_latin1(bytes)
 }
 
+/// Versão com posse que reaproveita diretamente o `Vec<u8>` descomprimido
+/// para documentos UTF-8 sem BOM, eliminando a duplicação do buffer em memória.
+pub(crate) fn decode_document_owned(bytes: Vec<u8>) -> String {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+        || bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xFE, 0xFF])
+        || bytes.starts_with(&[b'<', 0, b'?', 0])
+        || bytes.starts_with(&[0, b'<', 0, b'?'])
+    {
+        return decode_document(&bytes);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => error
+            .into_bytes()
+            .iter()
+            .map(|&byte| char::from(byte))
+            .collect(),
+    }
+}
+
 fn utf16(bytes: &[u8], word: fn([u8; 2]) -> u16) -> String {
     let units = bytes.as_chunks::<2>().0.iter().map(|pair| word(*pair));
     char::decode_utf16(units)

@@ -117,6 +117,19 @@ impl DomainSet {
         self.domains.insert(domain.into())
     }
 
+    /// Acrescenta um dominio JA normalizado aproveitando o buffer de `String`
+    /// (via `into_boxed_str`), eliminando a alocacao duplicada de 45.000 dominios.
+    pub fn insert_owned(&mut self, domain: String) -> bool {
+        if self.domains.contains(domain.as_str())
+            || self.domains.len() >= MAX_DOMAINS
+            || self.bytes + domain.len() > MAX_DOMAIN_BYTES
+        {
+            return false;
+        }
+        self.bytes += domain.len();
+        self.domains.insert(domain.into_boxed_str())
+    }
+
     /// Cabe mais este dominio?
     fn has_room_for(&self, domain: &str) -> bool {
         self.domains.len() < MAX_DOMAINS && self.bytes + domain.len() <= MAX_DOMAIN_BYTES
@@ -229,7 +242,7 @@ pub fn parse_domain_list(text: &str) -> ParsedList {
             target.truncated = true;
             return false;
         }
-        target.domains.insert(&domain);
+        target.domains.insert_owned(domain);
         true
     };
 

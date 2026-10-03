@@ -2205,3 +2205,15 @@ fn split_for_map_reduce_pieces_fit_and_cover_the_text() {
         1
     );
 }
+
+#[test]
+fn test_stopwords_is_strictly_sorted() {
+    for window in STOPWORDS.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "STOPWORDS must be strictly sorted: {:?} should precede {:?}",
+            window[0],
+            window[1]
+        );
+    }
+}

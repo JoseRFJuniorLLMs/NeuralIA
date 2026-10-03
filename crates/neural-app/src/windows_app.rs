@@ -2295,10 +2295,11 @@ unsafe extern "system" fn palette_subclass(
                     let old_font = SelectObject(hdc, font as _);
                     SetBkMode(hdc, TRANSPARENT as i32);
                     SetTextColor(hdc, rgb3(theme.fg_muted));
-                    let text = PALETTE_HINT
-                        .lock()
-                        .map(|value| value.clone())
-                        .unwrap_or_default();
+                    let hint_guard = PALETTE_HINT.lock();
+                    let text: &str = match hint_guard {
+                        Ok(ref guard) => guard.as_str(),
+                        Err(_) => "",
+                    };
                     let mut hint = RECT {
                         left: (PALETTE_PAD_X * scale) as i32,
                         top: (PALETTE_HINT_TOP * scale) as i32,
@@ -2307,7 +2308,7 @@ unsafe extern "system" fn palette_subclass(
                     };
                     draw_text(
                         hdc,
-                        &text,
+                        text,
                         &mut hint,
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );
@@ -6561,7 +6562,12 @@ fn draw_comparator_bar<W>(
 
     let hwnd = handle.hwnd.get() as HWND;
     let scale = window.scale_factor().max(1.0);
-    let names: Vec<&str> = comp.views.iter().map(|view| view.name).collect();
+    let mut names_buf = [""; 8];
+    let count = comp.views.len().min(names_buf.len());
+    for (i, view) in comp.views.iter().take(count).enumerate() {
+        names_buf[i] = view.name;
+    }
+    let names = &names_buf[..count];
 
     unsafe {
         let hdc = GetDC(hwnd);
@@ -6598,7 +6604,7 @@ fn draw_comparator_bar<W>(
             target,
             width,
             scale,
-            &names,
+            names,
             bar_columns(comp, state.pomodoro_label),
             &comp.contexts,
             &comp.groups,

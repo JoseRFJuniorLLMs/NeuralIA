@@ -592,3 +592,15 @@ fn translate_batch_against_a_loopback_stub() {
     );
     assert!(idle.received().is_empty());
 }
+
+#[test]
+fn test_portuguese_words_is_strictly_sorted() {
+    for window in PORTUGUESE_WORDS.windows(2) {
+        assert!(
+            window[0] < window[1],
+            "PORTUGUESE_WORDS must be strictly sorted: {:?} should precede {:?}",
+            window[0],
+            window[1]
+        );
+    }
+}

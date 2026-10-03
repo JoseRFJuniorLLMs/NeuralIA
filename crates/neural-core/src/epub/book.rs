@@ -282,7 +282,8 @@ pub(crate) fn load_dom(archive: &EpubArchive, path: &str) -> EpubResult<Dom> {
             },
             other => other,
         })?;
-    xml::parse(&xml::decode_document(&bytes)).map_err(|fault| match fault {
+    let text = xml::decode_document_owned(bytes);
+    xml::parse(&text).map_err(|fault| match fault {
         XmlFault::Unsafe(reason) => EpubError::UnsafeXml {
             path: path.to_string(),
             reason,
