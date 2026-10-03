@@ -188,11 +188,15 @@ pub fn check_update_status(current_version: &str, latest: ReleaseInfo) -> Update
         }
     }
 }
+fn update_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(ureq::Agent::new_with_defaults)
+}
+
 /// Consulta a última release pública no GitHub através da API REST oficial.
 pub fn fetch_latest_release(repo: &str) -> Result<ReleaseInfo> {
     let url = github_latest_release_url(repo);
-    let agent = ureq::Agent::new_with_defaults();
-    let mut response = agent
+    let mut response = update_agent()
         .get(&url)
         .header("accept", "application/vnd.github.v3+json")
         .header("user-agent", "NeuralIA-App")
@@ -218,8 +222,7 @@ pub fn download_installer(
     mut on_progress: impl FnMut(f64),
 ) -> Result<()> {
     let download_result = (|| -> Result<()> {
-        let agent = ureq::Agent::new_with_defaults();
-        let mut response = agent
+        let mut response = update_agent()
             .get(installer_url)
             .header("user-agent", "NeuralIA-App")
             .call()

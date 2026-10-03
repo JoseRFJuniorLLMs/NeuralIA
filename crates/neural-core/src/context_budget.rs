@@ -1208,11 +1208,26 @@ fn split_word(
     tokens: &dyn Fn(&str) -> usize,
     out: &mut Vec<Range<usize>>,
 ) {
-    let chars: Vec<Range<usize>> = text[span.clone()]
-        .char_indices()
-        .map(|(index, c)| span.start + index..span.start + index + c.len_utf8())
-        .collect();
-    pack_units(text, &chars, limit, tokens, out);
+    let mut stack_chars: [Range<usize>; 64] = std::array::from_fn(|_| 0..0);
+    let mut len = 0;
+    let mut iter = text[span.clone()].char_indices();
+    for (index, c) in iter.by_ref() {
+        let range = span.start + index..span.start + index + c.len_utf8();
+        if len < stack_chars.len() {
+            stack_chars[len] = range;
+            len += 1;
+        } else {
+            let mut heap_chars = Vec::with_capacity(len + iter.size_hint().0 + 1);
+            heap_chars.extend_from_slice(&stack_chars);
+            heap_chars.push(range);
+            for (idx, ch) in iter {
+                heap_chars.push(span.start + idx..span.start + idx + ch.len_utf8());
+            }
+            pack_units(text, &heap_chars, limit, tokens, out);
+            return;
+        }
+    }
+    pack_units(text, &stack_chars[..len], limit, tokens, out);
 }
 
 // ------------------------------------------------------------ pontuacao

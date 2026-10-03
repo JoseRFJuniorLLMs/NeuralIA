@@ -862,7 +862,8 @@ fn image_in_page(
     manifest: &[ManifestItem],
 ) -> Option<CoverImage> {
     let bytes = archive.read_capped(page, MAX_COVER_PAGE_BYTES).ok()?;
-    let dom = xml::parse(&xml::decode_document(&bytes)).ok()?;
+    let text = xml::decode_document_owned(bytes);
+    let dom = xml::parse(&text).ok()?;
     dom.descendants(ROOT).into_iter().find_map(|node| {
         let href = if dom.is(node, "img") {
             dom.attr(node, "src")
