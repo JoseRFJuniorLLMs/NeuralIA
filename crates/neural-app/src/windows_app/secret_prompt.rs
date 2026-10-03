@@ -194,7 +194,7 @@ unsafe fn submit_secret_prompt(edit: HWND, host: &SecretPromptHost) {
         }
         None => {
             host.invalid.set(true);
-            InvalidateRect(GetParent(edit), std::ptr::null(), 1);
+            InvalidateRect(GetParent(edit), std::ptr::null(), 0);
         }
     }
 }

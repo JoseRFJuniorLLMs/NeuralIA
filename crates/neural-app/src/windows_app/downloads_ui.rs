@@ -1606,6 +1606,7 @@ impl App {
     /// A unica saida da janela: o rascunho das notas vai para o disco e o
     /// event loop acaba. So `request_close` e `leave_confirmed` a chamam.
     fn exit_now(&mut self, event_loop: &ActiveEventLoop) {
+        self.destroy_web_surfaces();
         self.save_notes_draft_before_exit();
         event_loop.exit();
     }
@@ -1931,7 +1932,7 @@ impl App {
                 SWP_NOACTIVATE,
             );
             show_popup_without_activation(card);
-            InvalidateRect(card, std::ptr::null(), 1);
+            InvalidateRect(card, std::ptr::null(), 0);
         }
     }
 }

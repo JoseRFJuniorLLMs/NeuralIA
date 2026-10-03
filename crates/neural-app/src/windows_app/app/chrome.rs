@@ -705,7 +705,7 @@ impl App {
                 SWP_NOACTIVATE,
             );
             show_popup_without_activation(splash);
-            InvalidateRect(splash, std::ptr::null(), 1);
+            InvalidateRect(splash, std::ptr::null(), 0);
         }
     }
 
@@ -766,7 +766,7 @@ impl App {
                 SWP_NOACTIVATE,
             );
             show_popup_without_activation(card);
-            InvalidateRect(card, std::ptr::null(), 1);
+            InvalidateRect(card, std::ptr::null(), 0);
         }
     }
 
@@ -879,7 +879,7 @@ impl App {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
                 ShowWindow(button, SW_SHOW);
-                InvalidateRect(button, std::ptr::null(), 1);
+                InvalidateRect(button, std::ptr::null(), 0);
             }
         }
     }
@@ -1140,7 +1140,7 @@ impl App {
             );
             if EXIT_REVEAL_INSIDE.load(Ordering::Acquire) {
                 show_popup_without_activation(button);
-                InvalidateRect(button, std::ptr::null(), 1);
+                InvalidateRect(button, std::ptr::null(), 0);
             } else {
                 ShowWindow(button, SW_HIDE);
             }
@@ -1326,7 +1326,7 @@ impl App {
         // Os popups owned nao sao filhos: o RDW_ALLCHILDREN nao os alcanca.
         for hwnd in self.splitters.iter().flatten() {
             unsafe {
-                InvalidateRect(*hwnd, std::ptr::null(), 1);
+                InvalidateRect(*hwnd, std::ptr::null(), 0);
             }
         }
         self.panel_eval(&format!(

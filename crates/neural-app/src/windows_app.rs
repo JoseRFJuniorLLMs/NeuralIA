@@ -1167,7 +1167,7 @@ fn place_caption_buttons(buttons: HWND, x: i32, width: i32, height: i32, visible
         // SW_SHOWNOACTIVATE: mostrar os botoes nunca rouba o foco a quem
         // esta a escrever.
         ShowWindow(buttons, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
-        InvalidateRect(buttons, std::ptr::null(), 1);
+        InvalidateRect(buttons, std::ptr::null(), 0);
     }
 }
 

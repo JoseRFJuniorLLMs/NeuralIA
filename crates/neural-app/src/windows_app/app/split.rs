@@ -638,7 +638,7 @@ impl App {
                     SWP_NOACTIVATE,
                 );
                 show_popup_without_activation(hwnd);
-                InvalidateRect(hwnd, std::ptr::null(), 1);
+                InvalidateRect(hwnd, std::ptr::null(), 0);
             }
         }
     }

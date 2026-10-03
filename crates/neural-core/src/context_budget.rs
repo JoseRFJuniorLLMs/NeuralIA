@@ -1130,7 +1130,7 @@ fn pack_units(
             let probe = (good + step).min(bad - 1);
             if fits(probe) {
                 good = probe;
-                step *= 2;
+                step = step.saturating_mul(2);
             } else {
                 bad = probe;
                 break;

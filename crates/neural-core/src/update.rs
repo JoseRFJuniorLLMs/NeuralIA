@@ -99,6 +99,51 @@ pub fn compare_semver(current: &str, candidate: &str) -> std::cmp::Ordering {
         (nums, pre_part)
     }
 
+    fn compare_prerelease(cur: &str, cand: &str) -> std::cmp::Ordering {
+        fn compare_ident(a: &str, b: &str) -> std::cmp::Ordering {
+            match (a.parse::<u64>(), b.parse::<u64>()) {
+                (Ok(num_a), Ok(num_b)) => num_a.cmp(&num_b),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => {
+                    fn split_digits(s: &str) -> (&str, Option<u64>) {
+                        let pos = s.find(|c: char| c.is_ascii_digit());
+                        match pos {
+                            Some(idx) => {
+                                let (prefix, rest) = s.split_at(idx);
+                                if let Ok(n) = rest.parse::<u64>() {
+                                    (prefix, Some(n))
+                                } else {
+                                    (s, None)
+                                }
+                            }
+                            None => (s, None),
+                        }
+                    }
+                    let (pref_a, num_a) = split_digits(a);
+                    let (pref_b, num_b) = split_digits(b);
+                    if pref_a == pref_b && num_a.is_some() && num_b.is_some() {
+                        num_a.cmp(&num_b)
+                    } else {
+                        a.cmp(b)
+                    }
+                }
+            }
+        }
+
+        let cur_parts = cur.split('.');
+        let cand_parts = cand.split('.');
+        for (c, k) in cur_parts.zip(cand_parts) {
+            let ord = compare_ident(k, c);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        let cand_count = cand.split('.').count();
+        let cur_count = cur.split('.').count();
+        cand_count.cmp(&cur_count)
+    }
+
     let (cur_nums, cur_pre) = parse_semver(current);
     let (cand_nums, cand_pre) = parse_semver(candidate);
 
@@ -107,7 +152,7 @@ pub fn compare_semver(current: &str, candidate: &str) -> std::cmp::Ordering {
             (None, None) => std::cmp::Ordering::Equal,
             (Some(_), None) => std::cmp::Ordering::Greater,
             (None, Some(_)) => std::cmp::Ordering::Less,
-            (Some(cur_p), Some(cand_p)) => cand_p.cmp(cur_p),
+            (Some(cur_p), Some(cand_p)) => compare_prerelease(cur_p, cand_p),
         },
         non_eq => non_eq,
     }
@@ -172,45 +217,53 @@ pub fn download_installer(
     target_path: &std::path::Path,
     mut on_progress: impl FnMut(f64),
 ) -> Result<()> {
-    let agent = ureq::Agent::new_with_defaults();
-    let mut response = agent
-        .get(installer_url)
-        .header("user-agent", "NeuralIA-App")
-        .call()
-        .map_err(|e| NeuralError::Config(format!("Falha ao conectar para download: {e}")))?;
+    let download_result = (|| -> Result<()> {
+        let agent = ureq::Agent::new_with_defaults();
+        let mut response = agent
+            .get(installer_url)
+            .header("user-agent", "NeuralIA-App")
+            .call()
+            .map_err(|e| NeuralError::Config(format!("Falha ao conectar para download: {e}")))?;
 
-    let total_bytes = response.body().content_length().unwrap_or(0);
-    let mut file = std::fs::File::create(target_path)
-        .map_err(|e| NeuralError::Config(format!("Falha ao criar arquivo de destino: {e}")))?;
+        let total_bytes = response.body().content_length().unwrap_or(0);
+        let mut file = std::fs::File::create(target_path)
+            .map_err(|e| NeuralError::Config(format!("Falha ao criar arquivo de destino: {e}")))?;
 
-    let mut reader = response
-        .body_mut()
-        .with_config()
-        .limit(150 * 1024 * 1024)
-        .reader();
+        let mut reader = response
+            .body_mut()
+            .with_config()
+            .limit(150 * 1024 * 1024)
+            .reader();
 
-    let mut buffer = [0u8; 32 * 1024];
-    let mut downloaded: u64 = 0;
-    use std::io::{Read, Write};
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|e| NeuralError::Config(format!("Erro no stream de download: {e}")))?;
-        if read == 0 {
-            break;
+        let mut buffer = [0u8; 32 * 1024];
+        let mut downloaded: u64 = 0;
+        use std::io::{Read, Write};
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|e| NeuralError::Config(format!("Erro no stream de download: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])
+                .map_err(|e| NeuralError::Config(format!("Erro ao gravar dados do instalador: {e}")))?;
+            downloaded += read as u64;
+            if total_bytes > 0 {
+                on_progress((downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0));
+            } else {
+                on_progress(0.5);
+            }
         }
-        file.write_all(&buffer[..read])
-            .map_err(|e| NeuralError::Config(format!("Erro ao gravar dados do instalador: {e}")))?;
-        downloaded += read as u64;
-        if total_bytes > 0 {
-            on_progress((downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0));
-        } else {
-            on_progress(0.5);
-        }
+        file.flush()
+            .map_err(|e| NeuralError::Config(format!("Erro ao finalizar instalador: {e}")))?;
+        on_progress(1.0);
+        Ok(())
+    })();
+
+    if let Err(e) = download_result {
+        let _ = std::fs::remove_file(target_path);
+        return Err(e);
     }
-    file.flush()
-        .map_err(|e| NeuralError::Config(format!("Erro ao finalizar instalador: {e}")))?;
-    on_progress(1.0);
     Ok(())
 }
 
@@ -260,6 +313,18 @@ mod tests {
         assert_eq!(
             compare_semver("2.7.0-rc1", "2.7.0-rc2"),
             std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("2.7.0-rc9", "2.7.0-rc10"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("2.7.0-beta.9", "2.7.0-beta.10"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_semver("2.7.0-rc10", "2.7.0-rc9"),
+            std::cmp::Ordering::Less
         );
     }
 

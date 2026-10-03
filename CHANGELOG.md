@@ -2,6 +2,17 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.7.2] - 2026-10-02
+
+### Fixed
+- **Destruição limpa de superfícies Web na saída (`exit_now` & `exiting`):** corrigido bug crítico onde instâncias de WebView2 e o painel do Gemini Live não eram destruídos formalmente no encerramento normal da janela (`exit_now`), eliminando o risco de processos filhos `msedgewebview2.exe` órfãos persistirem rodando em background no Windows.
+- **Eliminação de cintilação (Zero Flicker) em 14 componentes nativos Win32:** substituído `InvalidateRect(..., 1)` por `0` (`bErase = FALSE`) em todos os popups, botões de caption, divisor de splitters, cartões de pesquisa, cartões de download e toast, evitando que o Windows agende o preenchimento branco do fundo antes de `WM_PAINT`.
+- **Comparador SemVer 2.0.0 com precedência numérica em pre-releases:** corrigida a ordenação de release candidates e betas no verificador de atualizações (`update.rs`), garantindo que identificadores numéricos sejam comparados como inteiros (`rc10 > rc9`).
+- **Limpeza atômica de downloads corrompidos ou parciais:** adicionada rotina de exclusão automática do arquivo temporário do instalador em `%TEMP%` em caso de erro no socket ou interrupção prematura de conexão.
+- **Throttling inteligente no download de atualizações:** otimizada a frequência de despacho de eventos de progresso de download para a interface gráfica, limitando o redesenho apenas a mudanças de percentual inteiro (redução de mais de 350 redesenhos redundantes por ciclo de download).
+- **Proteção contra overflow em debug em `context_budget`:** aplicação de `saturating_mul` no avanço exponencial de bisseção de contexto.
+- **Guarda defensiva em `OwnedHandle::drop`:** proteção estrita contra desalocação de handles `NULL` ou `INVALID_HANDLE_VALUE` no IPC de agentes.
+
 ## [2.7.1] - 2026-10-01
 
 ### Added

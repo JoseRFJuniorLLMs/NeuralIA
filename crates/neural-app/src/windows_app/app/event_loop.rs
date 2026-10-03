@@ -105,6 +105,7 @@ impl ApplicationHandler<UserEvent> for App {
     /// Fechar a janela com o comparador aberto: as abas ficam gravadas. E
     /// cada download a verificar acaba antes de sair (com prazo).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.destroy_web_surfaces();
         self.local_models.finish_work();
         let _ = self.save_tab_session();
         self.finish_downloads_before_exit();
@@ -145,6 +146,7 @@ impl ApplicationHandler<UserEvent> for App {
                             let temp_installer =
                                 std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
                             let ver = new_ver.clone();
+                            let mut last_percent = usize::MAX;
                             std::thread::Builder::new()
                                 .name("neural-update-download".into())
                                 .spawn(move || {
@@ -152,10 +154,14 @@ impl ApplicationHandler<UserEvent> for App {
                                         &download_url,
                                         &temp_installer,
                                         |progress| {
-                                            let _ = proxy.send_event(UserEvent::UpdateProgress {
-                                                version: ver.clone(),
-                                                progress,
-                                            });
+                                            let percent = (progress * 100.0).clamp(0.0, 100.0) as usize;
+                                            if percent != last_percent {
+                                                last_percent = percent;
+                                                let _ = proxy.send_event(UserEvent::UpdateProgress {
+                                                    version: ver.clone(),
+                                                    progress,
+                                                });
+                                            }
                                         },
                                     );
                                     match res {

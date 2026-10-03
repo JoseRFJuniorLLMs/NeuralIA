@@ -93,9 +93,11 @@ impl OwnedHandle {
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        // SAFETY: o handle e nosso e so se fecha aqui.
-        unsafe {
-            CloseHandle(self.0);
+        // SAFETY: o handle e nosso e so se fecha aqui se for valido.
+        if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
     }
 }

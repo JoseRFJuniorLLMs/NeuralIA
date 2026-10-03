@@ -227,7 +227,7 @@ pub(in crate::windows_app) unsafe extern "system" fn wheel_hook(
                         EXIT_REVEAL_INSIDE.store(inside, Ordering::Release);
                         if inside {
                             ShowWindow(button, SW_SHOWNOACTIVATE);
-                            InvalidateRect(button, std::ptr::null(), 1);
+                            InvalidateRect(button, std::ptr::null(), 0);
                         } else {
                             ShowWindow(button, SW_HIDE);
                         }
