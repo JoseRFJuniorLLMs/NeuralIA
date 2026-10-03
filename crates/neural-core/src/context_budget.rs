@@ -1236,15 +1236,15 @@ fn split_word(
 /// Ordenadas alfabeticamente para permitir busca binaria O(log n).
 const STOPWORDS: &[&str] = &[
     "an", "and", "ao", "aos", "are", "as", "at", "ate", "be", "by", "com", "como", "da", "das",
-    "de", "depois", "did", "do", "does", "dos", "ela", "elas", "ele", "eles", "em", "entre",
-    "era", "essa", "esse", "esta", "estao", "este", "eu", "foi", "for", "foram", "from", "ha",
-    "how", "in", "into", "is", "isso", "isto", "it", "its", "ja", "mais", "mas", "me", "mesmo",
-    "meu", "minha", "muito", "na", "nao", "nas", "nem", "no", "nos", "not", "num", "numa", "of",
-    "on", "or", "os", "ou", "para", "pela", "pelas", "pelo", "pelos", "por", "quais", "qual",
-    "quando", "quanto", "que", "quem", "se", "sem", "ser", "seu", "seus", "so", "sobre", "sua",
-    "suas", "tambem", "tem", "ter", "than", "that", "the", "their", "then", "there", "these",
-    "this", "those", "tinha", "to", "um", "uma", "umas", "uns", "voce", "was", "were", "what",
-    "which", "with",
+    "de", "depois", "did", "do", "does", "dos", "ela", "elas", "ele", "eles", "em", "entre", "era",
+    "essa", "esse", "esta", "estao", "este", "eu", "foi", "for", "foram", "from", "ha", "how",
+    "in", "into", "is", "isso", "isto", "it", "its", "ja", "mais", "mas", "me", "mesmo", "meu",
+    "minha", "muito", "na", "nao", "nas", "nem", "no", "nos", "not", "num", "numa", "of", "on",
+    "or", "os", "ou", "para", "pela", "pelas", "pelo", "pelos", "por", "quais", "qual", "quando",
+    "quanto", "que", "quem", "se", "sem", "ser", "seu", "seus", "so", "sobre", "sua", "suas",
+    "tambem", "tem", "ter", "than", "that", "the", "their", "then", "there", "these", "this",
+    "those", "tinha", "to", "um", "uma", "umas", "uns", "voce", "was", "were", "what", "which",
+    "with",
 ];
 
 fn fold_char(c: char) -> char {

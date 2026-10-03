@@ -524,11 +524,17 @@ impl App {
                     Ok(latest) => {
                         let status =
                             neural_core::update::check_update_status(&current_version, latest);
-                        let _ = proxy.send_event(UserEvent::UpdateStatus(Ok(status)));
+                        let _ = proxy.send_event(UserEvent::UpdateStatus {
+                            result: Ok(status),
+                            install: manual,
+                        });
                     }
                     Err(err) => {
                         if manual {
-                            let _ = proxy.send_event(UserEvent::UpdateStatus(Err(err.to_string())));
+                            let _ = proxy.send_event(UserEvent::UpdateStatus {
+                                result: Err(err.to_string()),
+                                install: false,
+                            });
                         }
                     }
                 }

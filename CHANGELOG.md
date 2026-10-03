@@ -22,6 +22,16 @@ All notable changes to NeuralIA are documented here.
 - **Reutilização de pool de conexões HTTP e contextos TLS no atualizador (`update.rs`):**
   - Centralizado o cliente de rede através de `update_agent() -> &'static ureq::Agent` com `OnceLock`, compartilhando o pool TLS e de sockets entre a consulta da release no GitHub e o download do binário.
 
+### Security & Integrity
+- **Fronteira de consentimento no atualizador diário (`chrome.rs` e `event_loop.rs`):** a checagem diária automática em background passou a ser estritamente informativa (`notification-only`). O download e execução de atualizações agora exigem impreterivelmente ação manual explícita do usuário via comando de menu.
+- **Contrato estrito de artefatos de release (`update.rs`):** o parser de release agora rejeita qualquer executável arbitrário e exige conformidade exata com o padrão nominal do projeto (`NeuralIA-Setup-<version>-x64.exe`).
+- **Validação criptográfica SHA-256 e download transacional (`update.rs`):**
+  - Download transacional realizado para arquivo `.part` temporário com hashing incremental `Sha256` durante a transferência em streaming.
+  - Sincronização em disco (`file.sync_all()`) e validação estrita contra o digest `sha256:` fornecido pela API de releases do GitHub antes de qualquer publicação.
+  - Substituição atômica via `fs::rename` somente após validação criptográfica bem-sucedida, impedindo a execução de binários corrompidos ou adulterados.
+- **Parser SemVer 2.0.0 estrito e fail-closed (`update.rs`):** tratamento estrito com rejeição de identificadores com zeros à esquerda, precedência alfanumérica/numérica completa (`alpha.2 < alpha.10`, `rc.9 < rc.10`) e neutralidade de metadados de build (`+build`).
+- **Restauração do gate de estilo e formatação CI:** formatação integral padronizada via `cargo fmt --all`, assegurando 100% de conformidade com `cargo fmt --all -- --check`.
+
 ### Fixed
 - **Sincronização automática da versão na janela "Sobre o NeuralIA" (`chrome.rs`):** substituída a constante estática com versão fixa por `concat!` com `env!("CARGO_PKG_VERSION")`, garantindo consistência perpétua da versão apresentada ao usuário.
 

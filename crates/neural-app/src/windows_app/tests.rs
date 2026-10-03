@@ -25832,8 +25832,8 @@ fn no_raw_data_dir_write_outside_a_grant() {
         ),
         (
             "neural-core/src/update.rs",
-            1,
-            "o instalador baixado no temp do sistema, fora da pasta de dados",
+            2,
+            "o instalador baixado no temp do sistema, fora da pasta de dados (arquivo temporário .part e rename atômico)",
         ),
     ];
 

@@ -117,76 +117,113 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         };
         match event {
-            UserEvent::UpdateStatus(Ok(status)) => {
-                match status {
-                    neural_core::update::UpdateStatus::UpToDate { current_version } => {
-                        self.show_splash(
-                        format!("NeuralIA v{current_version} está atualizado na versão mais recente."),
+            UserEvent::UpdateStatus {
+                result: Ok(status),
+                install,
+            } => match status {
+                neural_core::update::UpdateStatus::UpToDate { current_version } => {
+                    self.show_splash(
+                        format!(
+                            "NeuralIA v{current_version} está atualizado na versão mais recente."
+                        ),
                         4,
                     );
-                        self.status = Some("NeuralIA está atualizado.".to_string());
-                        self.request_redraw();
-                    }
-                    neural_core::update::UpdateStatus::UpdateAvailable {
-                        current_version,
-                        latest,
-                    } => {
-                        let new_ver = latest.version.clone();
+                    self.status = Some("NeuralIA está atualizado.".to_string());
+                    self.request_redraw();
+                }
+                neural_core::update::UpdateStatus::UpdateAvailable {
+                    current_version,
+                    latest,
+                } => {
+                    let new_ver = latest.version.clone();
+                    if !install {
                         self.show_splash(
-                        format!(
-                            "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização…"
-                        ),
-                        5,
-                    );
-                        self.status = Some(format!("Baixando atualização v{new_ver}…"));
-                        self.request_redraw();
-
-                        if let Some(download_url) = latest.installer_url {
-                            let proxy = self.proxy.clone();
-                            let temp_installer =
-                                std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
-                            let ver = new_ver.clone();
-                            let mut last_percent = usize::MAX;
-                            std::thread::Builder::new()
-                                .name("neural-update-download".into())
-                                .spawn(move || {
-                                    let res = neural_core::update::download_installer(
-                                        &download_url,
-                                        &temp_installer,
-                                        |progress| {
-                                            let percent = (progress * 100.0).clamp(0.0, 100.0) as usize;
-                                            if percent != last_percent {
-                                                last_percent = percent;
-                                                let _ = proxy.send_event(UserEvent::UpdateProgress {
-                                                    version: ver.clone(),
-                                                    progress,
-                                                });
-                                            }
-                                        },
-                                    );
-                                    match res {
-                                        Ok(()) => {
-                                            let _ = proxy
-                                                .send_event(UserEvent::UpdateReady(temp_installer));
-                                        }
-                                        Err(err) => {
-                                            let _ = proxy.send_event(UserEvent::UpdateStatus(Err(
-                                                format!("Falha no download da atualização: {err}"),
-                                            )));
-                                        }
-                                    }
-                                })
-                                .ok();
-                        } else {
-                            self.show_splash(
-                                format!("Nova versão v{new_ver} disponível em {}", latest.html_url),
+                                format!(
+                                    "Nova versão v{new_ver} disponível (atual: v{current_version}). Use “Verificar atualizações” para instalar."
+                                ),
                                 6,
                             );
-                        }
+                        self.status = Some(format!("NeuralIA v{new_ver} disponível."));
+                        self.request_redraw();
+                        return;
+                    }
+
+                    if !neural_core::update::may_install_update(install, &latest) {
+                        self.show_splash(
+                                format!(
+                                    "Nova versão v{new_ver} disponível, mas a instalação foi recusada por falta de asset ou SHA-256 verificável. {}",
+                                    latest.html_url
+                                ),
+                                8,
+                            );
+                        return;
+                    }
+
+                    self.show_splash(
+                            format!(
+                                "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização verificada…"
+                            ),
+                            5,
+                        );
+                    self.status = Some(format!("Baixando atualização v{new_ver}…"));
+                    self.request_redraw();
+
+                    if let (Some(download_url), Some(expected_sha256)) =
+                        (latest.installer_url, latest.installer_sha256)
+                    {
+                        let proxy = self.proxy.clone();
+                        let temp_installer =
+                            std::env::temp_dir().join(format!("neuralia-setup-v{new_ver}.exe"));
+                        let ver = new_ver.clone();
+                        let mut last_percent = usize::MAX;
+                        std::thread::Builder::new()
+                            .name("neural-update-download".into())
+                            .spawn(move || {
+                                let res = neural_core::update::download_installer(
+                                    &download_url,
+                                    &expected_sha256,
+                                    &temp_installer,
+                                    |progress| {
+                                        let percent = (progress * 100.0).clamp(0.0, 100.0) as usize;
+                                        if percent != last_percent {
+                                            last_percent = percent;
+                                            let _ = proxy.send_event(UserEvent::UpdateProgress {
+                                                version: ver.clone(),
+                                                progress,
+                                            });
+                                        }
+                                    },
+                                );
+                                match res {
+                                    Ok(()) => {
+                                        let _ = proxy
+                                            .send_event(UserEvent::UpdateReady(temp_installer));
+                                    }
+                                    Err(err) => {
+                                        let _ = proxy.send_event(UserEvent::UpdateStatus {
+                                            result: Err(format!(
+                                                "Falha no download da atualização: {err}"
+                                            )),
+                                            install: true,
+                                        });
+                                    }
+                                }
+                            })
+                            .ok();
+                    } else {
+                        self.show_splash(
+                                format!(
+                                    "Nova versão v{new_ver} disponível, mas a instalação foi recusada por metadados inválidos. {}",
+                                    latest.html_url
+                                ),
+                                8,
+                            );
                     }
                 }
-            }
-            UserEvent::UpdateStatus(Err(err)) => {
+            },
+            UserEvent::UpdateStatus {
+                result: Err(err), ..
+            } => {
                 self.show_splash(format!("Atualização: {err}"), 5);
                 self.status = Some(format!("Erro ao verificar atualização: {err}"));
                 self.request_redraw();

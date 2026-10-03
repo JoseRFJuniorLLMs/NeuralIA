@@ -101,7 +101,11 @@ pub(in crate::windows_app) enum PageTarget {
 #[derive(Debug)]
 pub(in crate::windows_app) enum UserEvent {
     /// Resultado da verificação de atualizações no GitHub.
-    UpdateStatus(Result<neural_core::update::UpdateStatus, String>),
+    /// `install` só é verdadeiro para uma ação manual do utilizador.
+    UpdateStatus {
+        result: Result<neural_core::update::UpdateStatus, String>,
+        install: bool,
+    },
     /// Progresso de download da atualização (versão, fração 0.0..1.0).
     UpdateProgress {
         version: String,

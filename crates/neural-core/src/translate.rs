@@ -168,8 +168,8 @@ const PORTUGUESE_WORDS: &[&str] = &[
     "ainda", "ao", "aos", "até", "com", "da", "das", "depois", "ela", "elas", "ele", "eles", "em",
     "então", "essa", "esse", "está", "estão", "foi", "isso", "isto", "já", "mais", "muita",
     "muito", "na", "nas", "não", "ou", "pela", "pelas", "pelo", "pelos", "pode", "seu", "seus",
-    "sua", "suas", "são", "só", "também", "têm", "um", "uma", "umas", "uns", "você", "vocês",
-    "às", "é",
+    "sua", "suas", "são", "só", "também", "têm", "um", "uma", "umas", "uns", "você", "vocês", "às",
+    "é",
 ];
 
 /// Palavras a contar no maximo: uma pagina enorme nao custa mais do que isto.

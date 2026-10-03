@@ -24,6 +24,9 @@ pub struct ReleaseInfo {
     pub version: String,
     pub html_url: String,
     pub installer_url: Option<String>,
+    /// SHA-256 do asset, vindo do campo `digest` da API do GitHub.
+    /// O updater falha fechado quando o digest não está disponível.
+    pub installer_sha256: Option<String>,
     pub published_at: Option<String>,
     pub body: String,
 }
@@ -42,6 +45,7 @@ struct RawGithubRelease {
 struct RawGithubAsset {
     name: Option<String>,
     browser_download_url: Option<String>,
+    digest: Option<String>,
 }
 
 /// Parseia o JSON retornado pela API de releases do GitHub.
@@ -59,14 +63,21 @@ pub fn parse_github_release_json(json_str: &str) -> Result<ReleaseInfo> {
     let body = raw.body.unwrap_or_default();
     let published_at = raw.published_at;
 
-    // Localiza o instalador executável nos assets (ex: NeuralIA-Setup.exe)
-    let installer_url = raw.assets.into_iter().find_map(|asset| {
-        let name = asset.name.as_deref().unwrap_or_default();
-        if name.to_ascii_lowercase().ends_with(".exe") {
-            asset.browser_download_url
-        } else {
-            None
-        }
+    // O contrato de release publica exatamente o instalador versionado.
+    // Nunca aceite "o primeiro .exe": um asset extra não pode virar código executado.
+    let expected_name = format!("NeuralIA-Setup-{version}-x64.exe");
+    let installer = raw
+        .assets
+        .into_iter()
+        .find(|asset| asset.name.as_deref() == Some(expected_name.as_str()));
+    let (installer_url, installer_sha256) = installer.map_or((None, None), |asset| {
+        let digest = asset
+            .digest
+            .as_deref()
+            .and_then(|value| value.strip_prefix("sha256:"))
+            .filter(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
+        (asset.browser_download_url, digest)
     });
 
     Ok(ReleaseInfo {
@@ -74,86 +85,102 @@ pub fn parse_github_release_json(json_str: &str) -> Result<ReleaseInfo> {
         version,
         html_url,
         installer_url,
+        installer_sha256,
         published_at,
         body,
     })
 }
 
-/// Compara duas versões em formato semver (ex: "2.6.2" vs "2.6.3", ou "2.7.0" vs "2.7.0-rc1").
-/// Segue a especificação SemVer 2.0.0:
-/// - Uma versão com pré-release (ex: "2.7.0-beta.1") é inferior à versão final ("2.7.0").
-/// - Retorna `Ordering::Greater` se `candidate` for estritamente mais recente que `current`.
+/// Compara duas versões SemVer 2.0.0.
+/// Entradas inválidas são tratadas de forma conservadora como iguais: o updater
+/// nunca instala algo só porque um identificador malformado foi interpretado como zero.
 pub fn compare_semver(current: &str, candidate: &str) -> std::cmp::Ordering {
-    fn parse_semver(s: &str) -> ([u64; 3], Option<&str>) {
-        let clean = s.trim().trim_start_matches('v');
-        let (num_part, pre_part) = match clean.split_once('-') {
-            Some((num, pre)) => (num, Some(pre)),
-            None => (clean, None),
-        };
-        let mut nums = [0u64; 3];
-        for (i, part) in num_part.split('.').take(3).enumerate() {
-            if let Ok(val) = part.parse::<u64>() {
-                nums[i] = val;
-            }
-        }
-        (nums, pre_part)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Identifier<'a> {
+        Numeric(u64),
+        Alpha(&'a str),
     }
 
-    fn compare_prerelease(cur: &str, cand: &str) -> std::cmp::Ordering {
-        fn compare_ident(a: &str, b: &str) -> std::cmp::Ordering {
-            match (a.parse::<u64>(), b.parse::<u64>()) {
-                (Ok(num_a), Ok(num_b)) => num_a.cmp(&num_b),
-                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-                (Err(_), Err(_)) => {
-                    fn split_digits(s: &str) -> (&str, Option<u64>) {
-                        let pos = s.find(|c: char| c.is_ascii_digit());
-                        match pos {
-                            Some(idx) => {
-                                let (prefix, rest) = s.split_at(idx);
-                                if let Ok(n) = rest.parse::<u64>() {
-                                    (prefix, Some(n))
-                                } else {
-                                    (s, None)
-                                }
-                            }
-                            None => (s, None),
-                        }
+    fn valid_identifier(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }
+
+    fn parse<'a>(input: &'a str) -> Option<([u64; 3], Vec<Identifier<'a>>)> {
+        let clean = input.trim().strip_prefix('v').unwrap_or(input.trim());
+        let (without_build, build) = clean
+            .split_once('+')
+            .map_or((clean, None), |(left, right)| (left, Some(right)));
+        if build.is_some_and(|b| b.split('.').any(|id| !valid_identifier(id))) {
+            return None;
+        }
+        let (core, pre) = without_build
+            .split_once('-')
+            .map_or((without_build, None), |(left, right)| (left, Some(right)));
+
+        let mut parts = core.split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next()?.parse::<u64>().ok()?;
+        let patch = parts.next()?.parse::<u64>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+
+        let mut identifiers = Vec::new();
+        if let Some(pre) = pre {
+            if pre.is_empty() {
+                return None;
+            }
+            for id in pre.split('.') {
+                if !valid_identifier(id) {
+                    return None;
+                }
+                if id.bytes().all(|b| b.is_ascii_digit()) {
+                    if id.len() > 1 && id.starts_with('0') {
+                        return None;
                     }
-                    let (pref_a, num_a) = split_digits(a);
-                    let (pref_b, num_b) = split_digits(b);
-                    if pref_a == pref_b && num_a.is_some() && num_b.is_some() {
-                        num_a.cmp(&num_b)
-                    } else {
-                        a.cmp(b)
-                    }
+                    identifiers.push(Identifier::Numeric(id.parse::<u64>().ok()?));
+                } else {
+                    identifiers.push(Identifier::Alpha(id));
                 }
             }
         }
+        Some(([major, minor, patch], identifiers))
+    }
 
-        let cur_parts = cur.split('.');
-        let cand_parts = cand.split('.');
-        for (c, k) in cur_parts.zip(cand_parts) {
-            let ord = compare_ident(k, c);
-            if ord != std::cmp::Ordering::Equal {
+    fn cmp_pre(left: &[Identifier<'_>], right: &[Identifier<'_>]) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (left.is_empty(), right.is_empty()) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Greater,
+            (false, true) => return Ordering::Less,
+            (false, false) => {}
+        }
+        for (l, r) in left.iter().zip(right) {
+            let ord = match (l, r) {
+                (Identifier::Numeric(a), Identifier::Numeric(b)) => a.cmp(b),
+                (Identifier::Numeric(_), Identifier::Alpha(_)) => Ordering::Less,
+                (Identifier::Alpha(_), Identifier::Numeric(_)) => Ordering::Greater,
+                (Identifier::Alpha(a), Identifier::Alpha(b)) => a.cmp(b),
+            };
+            if ord != Ordering::Equal {
                 return ord;
             }
         }
-        let cand_count = cand.split('.').count();
-        let cur_count = cur.split('.').count();
-        cand_count.cmp(&cur_count)
+        left.len().cmp(&right.len())
     }
 
-    let (cur_nums, cur_pre) = parse_semver(current);
-    let (cand_nums, cand_pre) = parse_semver(candidate);
+    let Some((cur_core, cur_pre)) = parse(current) else {
+        return std::cmp::Ordering::Equal;
+    };
+    let Some((cand_core, cand_pre)) = parse(candidate) else {
+        return std::cmp::Ordering::Equal;
+    };
 
-    match cand_nums.cmp(&cur_nums) {
-        std::cmp::Ordering::Equal => match (cur_pre, cand_pre) {
-            (None, None) => std::cmp::Ordering::Equal,
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (Some(cur_p), Some(cand_p)) => compare_prerelease(cur_p, cand_p),
-        },
+    match cand_core.cmp(&cur_core) {
+        std::cmp::Ordering::Equal => cmp_pre(&cand_pre, &cur_pre),
         non_eq => non_eq,
     }
 }
@@ -161,6 +188,13 @@ pub fn compare_semver(current: &str, candidate: &str) -> std::cmp::Ordering {
 /// Verdadeiro se `candidate` for uma versão superior a `current`.
 pub fn is_newer_version(current: &str, candidate: &str) -> bool {
     compare_semver(current, candidate) == std::cmp::Ordering::Greater
+}
+
+/// Política de aplicação do updater.
+/// Uma checagem automática nunca autoriza execução; somente uma ação manual
+/// com asset e digest verificáveis pode iniciar o download executável.
+pub fn may_install_update(user_requested: bool, latest: &ReleaseInfo) -> bool {
+    user_requested && latest.installer_url.is_some() && latest.installer_sha256.is_some()
 }
 
 /// Estado do resultado da checagem de versão.
@@ -188,6 +222,7 @@ pub fn check_update_status(current_version: &str, latest: ReleaseInfo) -> Update
         }
     }
 }
+
 fn update_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(ureq::Agent::new_with_defaults)
@@ -215,13 +250,33 @@ pub fn fetch_latest_release(repo: &str) -> Result<ReleaseInfo> {
     parse_github_release_json(&body_str)
 }
 
-/// Faz o download do instalador da release reportando o progresso (de 0.0 a 1.0).
+/// Faz o download do instalador, verifica o SHA-256 esperado e só então
+/// publica o arquivo no caminho final. Um erro nunca deixa um EXE parcial no alvo.
 pub fn download_installer(
     installer_url: &str,
+    expected_sha256: &str,
     target_path: &std::path::Path,
     mut on_progress: impl FnMut(f64),
 ) -> Result<()> {
-    let download_result = (|| -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(NeuralError::Config(
+            "Atualização recusada: SHA-256 ausente ou inválido".to_string(),
+        ));
+    }
+
+    let part_path = target_path.with_extension(format!(
+        "part.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+
+    let result = (|| -> Result<()> {
         let mut response = update_agent()
             .get(installer_url)
             .header("user-agent", "NeuralIA-App")
@@ -229,8 +284,11 @@ pub fn download_installer(
             .map_err(|e| NeuralError::Config(format!("Falha ao conectar para download: {e}")))?;
 
         let total_bytes = response.body().content_length().unwrap_or(0);
-        let mut file = std::fs::File::create(target_path)
-            .map_err(|e| NeuralError::Config(format!("Falha ao criar arquivo de destino: {e}")))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
+            .map_err(|e| NeuralError::Config(format!("Falha ao criar arquivo temporário: {e}")))?;
 
         let mut reader = response
             .body_mut()
@@ -240,7 +298,12 @@ pub fn download_installer(
 
         let mut buffer = [0u8; 32 * 1024];
         let mut downloaded: u64 = 0;
-        use std::io::{Read, Write};
+        let mut hasher = Sha256::new();
+        let mut last_progress = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let mut last_percent = u64::MAX;
+
         loop {
             let read = reader
                 .read(&mut buffer)
@@ -248,26 +311,62 @@ pub fn download_installer(
             if read == 0 {
                 break;
             }
-            file.write_all(&buffer[..read])
-                .map_err(|e| NeuralError::Config(format!("Erro ao gravar dados do instalador: {e}")))?;
+            file.write_all(&buffer[..read]).map_err(|e| {
+                NeuralError::Config(format!("Erro ao gravar dados do instalador: {e}"))
+            })?;
+            hasher.update(&buffer[..read]);
             downloaded += read as u64;
-            if total_bytes > 0 {
-                on_progress((downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0));
-            } else {
-                on_progress(0.5);
+
+            let percent = downloaded
+                .saturating_mul(100)
+                .checked_div(total_bytes)
+                .unwrap_or(0)
+                .min(100);
+            if percent != last_percent && last_progress.elapsed() >= Duration::from_millis(200) {
+                let frac = if total_bytes > 0 {
+                    (downloaded as f64 / total_bytes as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                on_progress(frac);
+                last_progress = Instant::now();
+                last_percent = percent;
             }
         }
+
         file.flush()
             .map_err(|e| NeuralError::Config(format!("Erro ao finalizar instalador: {e}")))?;
+        file.sync_all()
+            .map_err(|e| NeuralError::Config(format!("Erro ao sincronizar instalador: {e}")))?;
+
+        let digest = hasher.finalize();
+        let mut actual = String::with_capacity(digest.len() * 2);
+        for byte in digest.iter() {
+            std::fmt::Write::write_fmt(&mut actual, format_args!("{byte:02x}"))
+                .map_err(|_| NeuralError::Config("Falha ao formatar SHA-256".to_string()))?;
+        }
+        if !actual.eq_ignore_ascii_case(expected_sha256) {
+            return Err(NeuralError::Config(format!(
+                "Atualização recusada: SHA-256 divergente (esperado {expected_sha256}, obtido {actual})"
+            )));
+        }
+
+        if target_path.exists() {
+            std::fs::remove_file(target_path).map_err(|e| {
+                NeuralError::Config(format!("Falha ao substituir instalador anterior: {e}"))
+            })?;
+        }
+        std::fs::rename(&part_path, target_path).map_err(|e| {
+            NeuralError::Config(format!("Falha ao publicar instalador verificado: {e}"))
+        })?;
         on_progress(1.0);
         Ok(())
     })();
 
-    if let Err(e) = download_result {
-        let _ = std::fs::remove_file(target_path);
-        return Err(e);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part_path);
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -299,7 +398,8 @@ mod tests {
         assert_eq!(compare_semver("2.6.2", "2.6.2"), std::cmp::Ordering::Equal);
         assert_eq!(compare_semver("2.6.2", "2.6.1"), std::cmp::Ordering::Less);
         assert_eq!(compare_semver("3.0.0", "2.9.9"), std::cmp::Ordering::Less);
-        assert_eq!(compare_semver("2.6", "2.6.1"), std::cmp::Ordering::Greater);
+        // SemVer 2.0.0 exige major.minor.patch; entrada inválida não dispara update.
+        assert_eq!(compare_semver("2.6", "2.6.1"), std::cmp::Ordering::Equal);
         // Regra SemVer 2.0.0: pré-release é estritamente menor que versão final
         assert_eq!(
             compare_semver("2.7.0", "2.7.0-rc1"),
@@ -318,16 +418,20 @@ mod tests {
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            compare_semver("2.7.0-rc9", "2.7.0-rc10"),
+            compare_semver("2.7.0-rc.9", "2.7.0-rc.10"),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            compare_semver("2.7.0-beta.9", "2.7.0-beta.10"),
+            compare_semver("2.7.0-alpha.2", "2.7.0-alpha.10"),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            compare_semver("2.7.0-rc10", "2.7.0-rc9"),
-            std::cmp::Ordering::Less
+            compare_semver("2.7.1+build.1", "2.7.1+build.9"),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_semver("2.7.1", "2.7.1-01"),
+            std::cmp::Ordering::Equal
         );
     }
 
@@ -353,8 +457,9 @@ mod tests {
                     "browser_download_url": "https://example.com/NeuralIA.exe.sha256"
                 },
                 {
-                    "name": "NeuralIA-Setup-2.7.0.exe",
-                    "browser_download_url": "https://example.com/NeuralIA-Setup-2.7.0.exe"
+                    "name": "NeuralIA-Setup-2.7.0-x64.exe",
+                    "browser_download_url": "https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v2.7.0/NeuralIA-Setup-2.7.0-x64.exe",
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 }
             ]
         }"#;
@@ -368,7 +473,13 @@ mod tests {
         );
         assert_eq!(
             info.installer_url.as_deref(),
-            Some("https://example.com/NeuralIA-Setup-2.7.0.exe")
+            Some(
+                "https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v2.7.0/NeuralIA-Setup-2.7.0-x64.exe"
+            )
+        );
+        assert_eq!(
+            info.installer_sha256.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
         assert_eq!(info.body, "Novas funcionalidades implementadas.");
 
@@ -386,12 +497,50 @@ mod tests {
     }
 
     #[test]
+    fn release_parser_rejects_unexpected_executable_asset() {
+        let json = r#"{
+            "tag_name":"v9.9.9",
+            "html_url":"https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/tag/v9.9.9",
+            "assets":[{
+                "name":"evil.exe",
+                "browser_download_url":"https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v9.9.9/evil.exe",
+                "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]
+        }"#;
+        let info = parse_github_release_json(json).expect("parse");
+        assert!(info.installer_url.is_none());
+        assert!(info.installer_sha256.is_none());
+    }
+
+    #[test]
+    fn updater_install_policy_requires_user_action_and_verified_asset() {
+        let mut info = ReleaseInfo {
+            tag: "v2.8.0".to_string(),
+            version: "2.8.0".to_string(),
+            html_url: "https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/tag/v2.8.0".to_string(),
+            installer_url: Some(
+                "https://github.com/JoseRFJuniorLLMs/NeuralIA/releases/download/v2.8.0/NeuralIA-Setup-2.8.0-x64.exe"
+                    .to_string(),
+            ),
+            installer_sha256: Some("a".repeat(64)),
+            published_at: None,
+            body: String::new(),
+        };
+        assert!(!may_install_update(false, &info));
+        assert!(may_install_update(true, &info));
+
+        info.installer_sha256 = None;
+        assert!(!may_install_update(true, &info));
+    }
+
+    #[test]
     fn test_check_update_status_up_to_date() {
         let info = ReleaseInfo {
             tag: "v2.6.2".to_string(),
             version: "2.6.2".to_string(),
             html_url: "https://example.com".to_string(),
             installer_url: None,
+            installer_sha256: None,
             published_at: None,
             body: String::new(),
         };
