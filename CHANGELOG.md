@@ -2,6 +2,29 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.7.3] - 2026-10-03
+
+### Performance & Memory
+- **Eliminação de churn de alocações no heap em hot paths Win32 GDI:**
+  - `draw_text`: introduzido buffer na stack (`[u16; 128]`) em passada única para conversão UTF-16, eliminando alocações dinâmicas de heap em 99%+ dos textos, títulos de abas e botões da interface.
+  - `draw_icon`: criado cache LRU de bitmaps BGRX (`ICON_RENDER_CACHE`) com capacidade de 32 itens, memoizando imagens já combinadas com transparência alfa em software e eliminando alocações de `Vec<u8>` e loops CPU de float math em eventos de mouse e hover.
+  - Janelas pop-up (`splash.rs` e `windows_app.rs:palette_subclass`): eliminado o clone de `String` no evento `WM_PAINT`, utilizando empréstimo direto `as_str()` sob guarda de mutex.
+  - Barra do comparador (`windows_app.rs:draw_comparator_bar`): substituída a alocação de `Vec<&str>` dos nomes de visualizações por array estático na stack (`[""; 8]`).
+- **Otimização de memória no leitor EPUB (`book.rs` e `xml.rs`):**
+  - Implementado `decode_document_owned`, convertendo o buffer `Vec<u8>` de capítulos descomprimidos diretamente em `String` via `from_utf8` sem alocar cópias duplicadas na RAM (redução de 50% no pico de memória por página).
+  - Aplicada a mesma otimização na extração de imagens de capa em `image_in_page`.
+- **Eliminação de 45.000 alocações duplas no bloqueador de anúncios (`adblock.rs`):**
+  - Adicionado `DomainSet::insert_owned(String)`, reaproveitando diretamente o buffer existente da string (`into_boxed_str()`) e evitando a alocação e desalocação redundante de 45 mil instâncias.
+- **Aceleração algorítmica de $O(N) \to O(\log N)$ em processamento de linguagem natural:**
+  - `translate.rs`: lista `PORTUGUESE_WORDS` ordenada lexicograficamente em bytes UTF-8 com consulta via `binary_search()`, reduzindo as comparações de string de 50 sequenciais para ~5 binárias por palavra, somado ao reuso de `lower_buf` com `.clear()` que evita até 800 alocações de `String` por página analisada.
+  - `context_budget.rs`: lista `STOPWORDS` com 113 termos ordenada alfabeticamente e consultada via `binary_search().is_err()`, reduzindo o custo por termo de 113 comparações para $\le 7$.
+  - `split_word`: introduzido buffer local na stack `[Range<usize>; 64]` para quebra de palavras em caracteres sem alocação de heap.
+- **Reutilização de pool de conexões HTTP e contextos TLS no atualizador (`update.rs`):**
+  - Centralizado o cliente de rede através de `update_agent() -> &'static ureq::Agent` com `OnceLock`, compartilhando o pool TLS e de sockets entre a consulta da release no GitHub e o download do binário.
+
+### Fixed
+- **Sincronização automática da versão na janela "Sobre o NeuralIA" (`chrome.rs`):** substituída a constante estática com versão fixa por `concat!` com `env!("CARGO_PKG_VERSION")`, garantindo consistência perpétua da versão apresentada ao usuário.
+
 ## [2.7.2] - 2026-10-02
 
 ### Fixed
