@@ -20684,6 +20684,14 @@ fn whatsapp_background_notifications_are_scoped_to_exact_origin() {
     }
 }
 
+#[test]
+fn minimized_gmail_notice_text_stays_valid_utf16_and_null_terminated() {
+    let text = shell_notice_text::<4>("😀ab");
+    assert_eq!(text[3], 0);
+    assert_eq!(String::from_utf16(&text[..3]).unwrap(), "😀a");
+    assert_eq!(shell_notice_text::<1>("mensagem"), [0]);
+}
+
 /// Gate (so de ausencia, como o §4.3 permite): o caminho que abre os
 /// paineis de servico -- a Respiracao incluida -- nao grava historico nem
 /// memoria e nao liga IPC nem scripts injetados. E so por isso que nada

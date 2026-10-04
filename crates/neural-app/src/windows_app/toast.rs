@@ -24,6 +24,77 @@ pub(in crate::windows_app) const TOAST_WIDTH: f64 = 390.0;
 pub(in crate::windows_app) const TOAST_HEIGHT: f64 = 68.0;
 /// Distancia ao canto inferior direito da janela.
 pub(in crate::windows_app) const TOAST_MARGIN: f64 = 18.0;
+pub(in crate::windows_app) const GMAIL_TRAY_ICON_ID: u32 = 0x4E47;
+
+/// O Shell exige buffers UTF-16 terminados em zero; preservar os pares
+/// substitutos evita deixar metade de um emoji no fim do aviso.
+pub(in crate::windows_app) fn shell_notice_text<const N: usize>(text: &str) -> [u16; N] {
+    let mut result = [0; N];
+    let mut used = 0;
+    for ch in text.chars() {
+        let mut pair = [0u16; 2];
+        let units = ch.encode_utf16(&mut pair);
+        if used + units.len() >= N {
+            break;
+        }
+        result[used..used + units.len()].copy_from_slice(units);
+        used += units.len();
+    }
+    result
+}
+
+/// O popup owned some com a janela minimizada. O Shell mostra um aviso do
+/// Gmail independente da janela, usando o texto ja filtrado pelo NotifyCentre.
+pub(in crate::windows_app) fn show_minimized_gmail_notice(
+    owner: HWND,
+    notice: &Notice,
+    icon_added: bool,
+) -> bool {
+    use windows_sys::Win32::UI::{
+        Shell::{
+            NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            NOTIFYICONDATAW, Shell_NotifyIconW,
+        },
+        WindowsAndMessaging::{IDI_APPLICATION, LoadIconW},
+    };
+
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: owner,
+        uID: GMAIL_TRAY_ICON_ID,
+        ..Default::default()
+    };
+    if !icon_added {
+        data.uFlags = NIF_ICON | NIF_TIP;
+        data.hIcon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+        data.szTip = shell_notice_text("NeuralIA");
+        if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
+            return false;
+        }
+    }
+    data.uFlags = NIF_INFO;
+    data.szInfoTitle = shell_notice_text(&notice.title);
+    data.szInfo = shell_notice_text(&notice.body);
+    data.dwInfoFlags = NIIF_INFO;
+    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) } == 0 {
+        if !icon_added {
+            unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+        }
+        return false;
+    }
+    true
+}
+
+pub(in crate::windows_app) fn remove_gmail_tray_icon(owner: HWND) {
+    use windows_sys::Win32::UI::Shell::{NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
+    let data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: owner,
+        uID: GMAIL_TRAY_ICON_ID,
+        ..Default::default()
+    };
+    unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+}
 
 /// O que o feature do aviso recebe pelo event loop (o padrao do `theme.rs`:
 /// uma variante `UserEvent::Notify`, o resto aqui).
@@ -417,6 +488,15 @@ impl ToastHost for App {
         let Some(owner) = window_hwnd(window) else {
             return;
         };
+        if frame.notice.kind == NoticeKind::Gmail
+            && window.is_minimized() == Some(true)
+            && show_minimized_gmail_notice(owner, &frame.notice, self.notify_tray_added)
+        {
+            self.notify_tray_added = true;
+            // Um popup anterior ainda vivo voltaria com texto velho ao restaurar.
+            self.hide_toast_window();
+            return;
+        }
         let scale = window.scale_factor().max(1.0);
         let width = (TOAST_WIDTH * scale).round() as i32;
         let height = (TOAST_HEIGHT * scale).round() as i32;

@@ -3261,6 +3261,8 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) splash_board: SplashBoard,
     /// A janela do aviso do canto (`toast.rs`), enquanto existe.
     pub(in crate::windows_app) toast: Option<HWND>,
+    /// Icone temporario da area de notificacoes, usado pelo Gmail minimizado.
+    pub(in crate::windows_app) notify_tray_added: bool,
     /// O centro de avisos: o aviso a vista, o token dele e a fila.
     pub(in crate::windows_app) notify: crate::notify::NotifyCentre,
     /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
@@ -3506,6 +3508,7 @@ impl App {
             splash: None,
             splash_board: SplashBoard::default(),
             toast: None,
+            notify_tray_added: false,
             notify: crate::notify::NotifyCentre::default(),
             search_card: SearchCard::default(),
             bar_notes: BarNoteGuard::default(),

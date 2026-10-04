@@ -105,6 +105,12 @@ impl ApplicationHandler<UserEvent> for App {
     /// Fechar a janela com o comparador aberto: as abas ficam gravadas. E
     /// cada download a verificar acaba antes de sair (com prazo).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.notify_tray_added {
+            if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+                remove_gmail_tray_icon(owner);
+            }
+            self.notify_tray_added = false;
+        }
         self.destroy_web_surfaces();
         self.local_models.finish_work();
         let _ = self.save_tab_session();
@@ -326,7 +332,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
                     self.maybe_start_gmail_monitor();
                     if self.gmail_monitor.is_none()
-                        && (self.webview.is_some() || self.comparator.is_some())
+                        && (self.webview.is_some()
+                            || self.comparator.is_some()
+                            || self
+                                .service_panel
+                                .as_ref()
+                                .is_some_and(|panel| panel.service == Service::Gmail))
                     {
                         self.schedule_gmail_probe(60);
                     }

@@ -142,7 +142,7 @@ pub(in crate::windows_app) fn service_transition_input(
     service: Service,
     state: ServicePanelState,
 ) -> Option<ServiceInput> {
-    if matches!(service, Service::YouTube | Service::WhatsApp) {
+    if service.keeps_running_in_background() {
         (!state.minimized()).then_some(ServiceInput::Minimize)
     } else {
         Some(ServiceInput::Close)
@@ -239,6 +239,9 @@ impl App {
                     generation,
                 });
                 self.apply_service_frame();
+                if service == Service::Gmail {
+                    self.schedule_gmail_probe(4);
+                }
             }
             Err(error) => {
                 self.show_splash(
@@ -250,7 +253,7 @@ impl App {
     }
 
     /// Uma transicao interna (Ctrl+H, Home, nova pesquisa, EPUB) preserva o
-    /// YouTube e WhatsApp continuam vivos como abas de fundo minimizadas.
+    /// WhatsApp e YouTube continuam vivos como abas de fundo minimizadas.
     pub(in crate::windows_app) fn service_panel_for_transition(&mut self) {
         let Some(panel) = self.service_panel.as_ref() else {
             return;
@@ -260,7 +263,7 @@ impl App {
         }
     }
 
-    /// Outro painel da direita precisa do espaco. YouTube e WhatsApp minimizam;
+    /// Outro painel da direita precisa do espaco. Os servicos persistentes minimizam;
     /// os demais servicos fecham como antes.
     pub(in crate::windows_app) fn close_docked_service_panel(&mut self) {
         if self
@@ -276,6 +279,11 @@ impl App {
         let Some(service) = self.service_panel.as_ref().map(|panel| panel.service) else {
             return;
         };
+        // O Gmail usa outro WebView para avisos. Antes de descartar o painel,
+        // aproveita a sessao que a pessoa acabou de abrir nele.
+        if service == Service::Gmail {
+            self.maybe_start_gmail_monitor();
+        }
         if service.keeps_running_in_background() {
             let mut panel = self.service_panel.take().expect("painel conferido acima");
             let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
@@ -1240,7 +1248,7 @@ mod youtube_transition_tests {
     use super::*;
 
     #[test]
-    fn only_whatsapp_and_youtube_keep_their_webviews_when_hidden() {
+    fn account_services_keep_their_webviews_when_hidden() {
         for service in [Service::WhatsApp, Service::YouTube] {
             assert!(service.keeps_running_in_background());
             assert_eq!(
@@ -1257,7 +1265,7 @@ mod youtube_transition_tests {
     }
 
     #[test]
-    fn internal_transitions_keep_youtube_and_whatsapp_alive() {
+    fn internal_transitions_keep_account_services_alive() {
         for service in [Service::YouTube, Service::WhatsApp] {
             assert_eq!(
                 service_transition_input(service, ServicePanelState::default()),
