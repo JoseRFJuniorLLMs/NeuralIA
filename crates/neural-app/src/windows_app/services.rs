@@ -346,7 +346,102 @@ pub(in crate::windows_app) fn service_panel_permission(
     if service.private() {
         return PermissionResponse::Deny;
     }
+    // A origem e conferida no evento nativo, que tem acesso ao URI do pedido.
+    // O handler do wry recebe apenas o tipo; nunca pode conceder aqui.
+    if service == Service::WhatsApp && kind == PermissionKind::Notifications {
+        return PermissionResponse::Default;
+    }
     web_media_permission(kind, true)
+}
+
+/// O evento nativo inclui a origem do pedido; o handler generico do wry nao.
+/// Apenas o WhatsApp Web pode enviar avisos por esta WebView.
+pub(in crate::windows_app) fn whatsapp_notification_origin_allows(uri: &str) -> bool {
+    Url::parse(uri).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("web.whatsapp.com")
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+/// Regista a permissao de notificacao por origem antes de carregar o site.
+/// O perfil pode conter um Deny antigo, gravado pelas versoes anteriores:
+/// SetPermissionState substitui so a entrada desta origem, sem limpar o perfil.
+pub(in crate::windows_app) fn start_whatsapp_with_notifications(
+    webview: &WebView,
+) -> Result<(), String> {
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
+            COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
+            ICoreWebView2_13, ICoreWebView2Profile4,
+        },
+        PermissionRequestedEventHandler, SetPermissionStateCompletedHandler, take_pwstr,
+    };
+    use windows_core::{Interface, PWSTR, w};
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let handler = PermissionRequestedEventHandler::create(Box::new(|_, args| {
+        let Some(args) = args else { return Ok(()) };
+        let mut kind = COREWEBVIEW2_PERMISSION_KIND::default();
+        unsafe { args.PermissionKind(&mut kind)? };
+        if kind != COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS {
+            return Ok(());
+        }
+        let mut uri = PWSTR::null();
+        unsafe { args.Uri(&mut uri)? };
+        let origin = take_pwstr(uri);
+        let state = if whatsapp_notification_origin_allows(&origin) {
+            COREWEBVIEW2_PERMISSION_STATE_ALLOW
+        } else {
+            COREWEBVIEW2_PERMISSION_STATE_DENY
+        };
+        unsafe { args.SetState(state)? };
+        Ok(())
+    }));
+    let mut token = 0i64;
+    if let Err(error) = unsafe { core.add_PermissionRequested(&handler, &mut token) } {
+        let _ = unsafe { core.Navigate(w!("https://web.whatsapp.com/")) };
+        return Err(format!("WhatsApp PermissionRequested: {error}"));
+    }
+
+    // O WebView comeca em about:blank. Quando a atualizacao assincrona do
+    // perfil termina, a navegacao inicia ja com a permissao correta.
+    let profile = core
+        .cast::<ICoreWebView2_13>()
+        .and_then(|core| unsafe { core.Profile() })
+        .and_then(|profile| profile.cast::<ICoreWebView2Profile4>());
+    match profile {
+        Ok(profile) => {
+            let navigate = core.clone();
+            let completed = SetPermissionStateCompletedHandler::create(Box::new(move |result| {
+                if !result.is_ok() {
+                    debug_log(format_args!("WhatsApp: permissao no perfil: {result:?}"));
+                }
+                let _ = unsafe { navigate.Navigate(w!("https://web.whatsapp.com/")) };
+                Ok(())
+            }));
+            if let Err(error) = unsafe {
+                profile.SetPermissionState(
+                    COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
+                    w!("https://web.whatsapp.com"),
+                    COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+                    &completed,
+                )
+            } {
+                let _ = unsafe { core.Navigate(w!("https://web.whatsapp.com/")) };
+                return Err(format!("WhatsApp SetPermissionState: {error}"));
+            }
+        }
+        Err(error) => {
+            let _ = unsafe { core.Navigate(w!("https://web.whatsapp.com/")) };
+            return Err(format!("WhatsApp Profile4: {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// Largura logica que o painel aberto tira ao comparador (0 fora dele ou

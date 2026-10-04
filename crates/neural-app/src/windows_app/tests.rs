@@ -20644,6 +20644,46 @@ fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
     ));
 }
 
+#[test]
+fn whatsapp_background_notifications_are_scoped_to_exact_origin() {
+    assert_eq!(
+        service_panel_permission(Service::WhatsApp, PermissionKind::Notifications),
+        PermissionResponse::Default,
+        "o evento nativo decide pela origem; o handler generico nao pode negar antes"
+    );
+    for service in [
+        Service::Meet,
+        Service::YouTube,
+        Service::Gmail,
+        Service::Breath,
+    ] {
+        assert_eq!(
+            service_panel_permission(service, PermissionKind::Notifications),
+            PermissionResponse::Deny,
+            "{service:?} nao recebeu permissao de notificacao"
+        );
+    }
+    for uri in [
+        "https://web.whatsapp.com/",
+        "https://web.whatsapp.com/path?q=1",
+        "https://web.whatsapp.com:443/",
+    ] {
+        assert!(whatsapp_notification_origin_allows(uri), "{uri}");
+    }
+    for uri in [
+        "http://web.whatsapp.com/",
+        "https://web.whatsapp.com:444/",
+        "https://web.whatsapp.com.evil.example/",
+        "https://web.whatsapp.com@evil.example/",
+        "https://evil.example/?url=https://web.whatsapp.com/",
+        "https://whatsapp.com/",
+        "file:///C:/Windows/win.ini",
+        "about:blank",
+    ] {
+        assert!(!whatsapp_notification_origin_allows(uri), "{uri}");
+    }
+}
+
 /// Gate (so de ausencia, como o §4.3 permite): o caminho que abre os
 /// paineis de servico -- a Respiracao incluida -- nao grava historico nem
 /// memoria e nao liga IPC nem scripts injetados. E so por isso que nada

@@ -40,7 +40,7 @@ use crate::windows_app::{
     services::{
         Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
         raise_webview_host, register_service_panel_events, service_event_is_current,
-        service_panel_permission,
+        service_panel_permission, start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
@@ -132,7 +132,7 @@ pub(in crate::windows_app) fn service_transition_input(
     service: Service,
     state: ServicePanelState,
 ) -> Option<ServiceInput> {
-    if service == Service::YouTube {
+    if matches!(service, Service::YouTube | Service::WhatsApp) {
         (!state.minimized()).then_some(ServiceInput::Minimize)
     } else {
         Some(ServiceInput::Close)
@@ -177,7 +177,11 @@ impl App {
         // de `hooked_builder`, como em todas as WebViews.
         let builder = themed_webview_builder()
             .with_incognito(service.private())
-            .with_url(service.url())
+            .with_url(if service == Service::WhatsApp {
+                "about:blank"
+            } else {
+                service.url()
+            })
             .with_bounds(logical_rect(area))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
             // Caminho A do WebRTC: camera e microfone pelo aviso do
@@ -199,6 +203,11 @@ impl App {
                 {
                     debug_log(format_args!("service panel: sem avisos ({error})"));
                 }
+                if service == Service::WhatsApp
+                    && let Err(error) = start_whatsapp_with_notifications(&panel)
+                {
+                    debug_log(format_args!("service panel: {error}"));
+                }
                 debug_log(format_args!("service panel: {service:?}"));
                 self.service_panel = Some(ServicePanel {
                     service,
@@ -219,8 +228,7 @@ impl App {
     }
 
     /// Uma transicao interna (Ctrl+H, Home, nova pesquisa, EPUB) preserva o
-    /// YouTube como uma aba de fundo minimizada. Os outros servicos mantem o
-    /// comportamento anterior e fecham.
+    /// YouTube e WhatsApp continuam vivos como abas de fundo minimizadas.
     pub(in crate::windows_app) fn service_panel_for_transition(&mut self) {
         let Some(panel) = self.service_panel.as_ref() else {
             return;
@@ -230,8 +238,8 @@ impl App {
         }
     }
 
-    /// Outro painel da direita precisa do espaco. YouTube minimiza; os demais
-    /// servicos fecham como antes.
+    /// Outro painel da direita precisa do espaco. YouTube e WhatsApp minimizam;
+    /// os demais servicos fecham como antes.
     pub(in crate::windows_app) fn close_docked_service_panel(&mut self) {
         if self
             .service_panel
@@ -1193,18 +1201,22 @@ mod youtube_transition_tests {
     use super::*;
 
     #[test]
-    fn internal_transitions_minimize_youtube_instead_of_closing_it() {
-        assert_eq!(
-            service_transition_input(Service::YouTube, ServicePanelState::default()),
-            Some(ServiceInput::Minimize)
-        );
+    fn internal_transitions_keep_youtube_and_whatsapp_alive() {
+        for service in [Service::YouTube, Service::WhatsApp] {
+            assert_eq!(
+                service_transition_input(service, ServicePanelState::default()),
+                Some(ServiceInput::Minimize)
+            );
+        }
     }
 
     #[test]
-    fn an_already_minimized_youtube_needs_no_second_transition() {
+    fn an_already_minimized_background_service_needs_no_second_transition() {
         let mut state = ServicePanelState::default();
         assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
-        assert_eq!(service_transition_input(Service::YouTube, state), None);
+        for service in [Service::YouTube, Service::WhatsApp] {
+            assert_eq!(service_transition_input(service, state), None);
+        }
     }
 
     #[test]
@@ -1227,13 +1239,8 @@ mod youtube_transition_tests {
     }
 
     #[test]
-    fn non_youtube_services_keep_the_old_close_policy() {
-        for service in [
-            Service::Meet,
-            Service::WhatsApp,
-            Service::Gmail,
-            Service::Breath,
-        ] {
+    fn other_services_keep_the_old_close_policy() {
+        for service in [Service::Meet, Service::Gmail, Service::Breath] {
             assert_eq!(
                 service_transition_input(service, ServicePanelState::default()),
                 Some(ServiceInput::Close)
