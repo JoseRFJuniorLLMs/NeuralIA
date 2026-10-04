@@ -349,6 +349,7 @@ impl ApplicationHandler<UserEvent> for App {
                 subject,
                 key,
             } => self.handle_gmail_state(unread, sender, subject, key),
+            UserEvent::GmailTrayOpen => self.open_gmail_from_tray(),
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::Theme(event) => self.theme_event(event),
             UserEvent::Keys(event) => self.keys_event(event),

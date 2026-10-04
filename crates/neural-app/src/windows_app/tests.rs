@@ -20692,6 +20692,19 @@ fn minimized_gmail_notice_text_stays_valid_utf16_and_null_terminated() {
     assert_eq!(shell_notice_text::<1>("mensagem"), [0]);
 }
 
+#[test]
+fn only_a_click_on_the_minimized_gmail_notice_opens_gmail() {
+    use crate::windows_app::native::gmail_tray_opens_gmail;
+    // NIN_BALLOONUSERCLICK e WM_LBUTTONUP abrem; a palavra alta e ignorada.
+    assert!(gmail_tray_opens_gmail(0x0405));
+    assert!(gmail_tray_opens_gmail(0x0202));
+    assert!(gmail_tray_opens_gmail(0x7_0405));
+    // Mostrar, esconder ou expirar o balao e passar o rato nao abrem nada.
+    for event in [0x0402, 0x0403, 0x0404, 0x0200, 0x0201, 0x0204, 0x0205] {
+        assert!(!gmail_tray_opens_gmail(event), "evento {event:#06x}");
+    }
+}
+
 /// Gate (so de ausencia, como o §4.3 permite): o caminho que abre os
 /// paineis de servico -- a Respiracao incluida -- nao grava historico nem
 /// memoria e nao liga IPC nem scripts injetados. E so por isso que nada

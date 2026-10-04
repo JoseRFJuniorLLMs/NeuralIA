@@ -220,6 +220,8 @@ pub(in crate::windows_app) enum UserEvent {
     PomodoroTick(u64),
     HideSplash(u64),
     GmailProbe(u64),
+    /// Clique no aviso do Gmail mostrado pelo Shell com a janela minimizada.
+    GmailTrayOpen,
     GmailInboxState {
         unread: u32,
         sender: String,

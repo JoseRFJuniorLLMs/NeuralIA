@@ -78,6 +78,26 @@ impl App {
         self.notify(gmail_notice(sender, subject));
     }
 
+    /// O «Abrir» do aviso do Shell: devolve a janela e mostra o Gmail. Um
+    /// painel do Gmail ja a vista fica como esta (o clique no icone dele
+    /// alternaria o estado).
+    pub(in crate::windows_app) fn open_gmail_from_tray(&mut self) {
+        if let Some(window) = &self.window {
+            window.set_minimized(false);
+            window.focus_window();
+        }
+        if self.notify.current_kind() == Some(NoticeKind::Gmail) {
+            self.hide_toast_window();
+        }
+        let gmail_visible = self.service_panel.as_ref().is_some_and(|panel| {
+            panel.service == crate::windows_app::services::Service::Gmail
+                && !panel.state.minimized()
+        });
+        if !gmail_visible {
+            self.open_service_panel(crate::windows_app::services::Service::Gmail);
+        }
+    }
+
     pub(in crate::windows_app) fn google_session_available(&self) -> bool {
         let source = self
             .comparator

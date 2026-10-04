@@ -52,7 +52,7 @@ pub(in crate::windows_app) fn show_minimized_gmail_notice(
 ) -> bool {
     use windows_sys::Win32::UI::{
         Shell::{
-            NIF_ICON, NIF_INFO, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
             NOTIFYICONDATAW, Shell_NotifyIconW,
         },
         WindowsAndMessaging::{IDI_APPLICATION, LoadIconW},
@@ -65,7 +65,9 @@ pub(in crate::windows_app) fn show_minimized_gmail_notice(
         ..Default::default()
     };
     if !icon_added {
-        data.uFlags = NIF_ICON | NIF_TIP;
+        // O clique volta pela `window_subclass` (`native.rs`) como GmailTrayOpen.
+        data.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+        data.uCallbackMessage = crate::windows_app::native::gmail_tray_message();
         data.hIcon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
         data.szTip = shell_notice_text("NeuralIA");
         if unsafe { Shell_NotifyIconW(NIM_ADD, &data) } == 0 {
