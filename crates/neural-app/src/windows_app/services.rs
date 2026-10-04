@@ -51,6 +51,12 @@ impl Service {
             Self::Meet | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
         }
     }
+
+    /// Uma instancia destes servicos continua viva quando o painel e ocultado
+    /// ou outro servico toma o seu lugar. O Gmail usa um monitor proprio.
+    pub(in crate::windows_app) fn keeps_running_in_background(self) -> bool {
+        matches!(self, Self::WhatsApp | Self::YouTube)
+    }
 }
 
 /// Para onde vai o teclado quando um painel ao lado fecha.
@@ -782,7 +788,11 @@ pub(in crate::windows_app) fn draw_service_chrome(
                         width: rect.width,
                         height: rect.height,
                     },
-                    button.label(),
+                    if button == StripButton::Close && service.keeps_running_in_background() {
+                        "× Ocultar"
+                    } else {
+                        button.label()
+                    },
                     style,
                     scale,
                     font,

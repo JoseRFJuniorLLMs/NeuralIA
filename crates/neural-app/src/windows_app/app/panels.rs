@@ -80,9 +80,19 @@ pub(in crate::windows_app) fn service_panel_hint(
     badge: Option<ServiceBadge>,
 ) -> Option<String> {
     match hit {
+        BarHit::ServiceStrip(StripButton::Close) if service.keeps_running_in_background() => Some(
+            format!("Ocultar {}: continua em segundo plano", service.label()),
+        ),
         BarHit::ServiceStrip(button) => Some(button.hint(service.label())),
         BarHit::Service(hit_service) if hit_service == service => {
-            Some(service_icon_hint(service.label(), badge))
+            if badge.is_none() && service.keeps_running_in_background() {
+                Some(format!(
+                    "{} aberto ao lado · clique para ocultar, continua em segundo plano",
+                    service.label()
+                ))
+            } else {
+                Some(service_icon_hint(service.label(), badge))
+            }
         }
         BarHit::Tool(Tool::Breath) if service == Service::Breath => {
             Some(service_icon_hint(service.label(), badge))
@@ -160,6 +170,18 @@ impl App {
         // Um painel de cada vez.
         self.close_side_panel(PanelExit::OtherPanel);
         self.close_live_panel();
+        if let Some(index) = self
+            .background_services
+            .iter()
+            .position(|panel| panel.service == service)
+        {
+            let mut panel = self.background_services.remove(index);
+            panel.state = ServicePanelState::default();
+            let _ = panel.webview.focus();
+            self.service_panel = Some(panel);
+            self.apply_service_frame();
+            return;
+        }
         let Some(area) = self
             .service_frame_for(ServicePanelState::default())
             .and_then(|frame| frame.panel)
@@ -251,12 +273,29 @@ impl App {
     }
 
     pub(in crate::windows_app) fn close_service_panel(&mut self) {
-        // O teclado volta a omnibox (Home) ou a janela: `release_panel`
-        // (gate `closing_a_panel_gives_the_keyboard_back`).
-        if !close_service_panel_in(&mut self.service_panel, self.surface, self.omnibox) {
+        let Some(service) = self.service_panel.as_ref().map(|panel| panel.service) else {
             return;
+        };
+        if service.keeps_running_in_background() {
+            let mut panel = self.service_panel.take().expect("painel conferido acima");
+            let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+            let _ = panel.webview.set_visible(false);
+            let _ = panel.webview.focus_parent();
+            if self.surface == Surface::Home
+                && let Some(edit) = self.omnibox
+            {
+                unsafe { SetFocus(edit) };
+            }
+            panel.state = ServicePanelState::default();
+            let _ = panel.state.step(ServiceInput::Minimize);
+            self.background_services.push(panel);
+            debug_log(format_args!("service panel: {service:?} em segundo plano"));
+        } else {
+            // O teclado volta a omnibox (Home) ou a janela: `release_panel`
+            // (gate `closing_a_panel_gives_the_keyboard_back`).
+            close_service_panel_in(&mut self.service_panel, self.surface, self.omnibox);
+            debug_log(format_args!("service panel: fechado"));
         }
-        debug_log(format_args!("service panel: fechado"));
         let window_fullscreen = self
             .window
             .as_ref()
@@ -1199,6 +1238,23 @@ impl App {
 #[cfg(test)]
 mod youtube_transition_tests {
     use super::*;
+
+    #[test]
+    fn only_whatsapp_and_youtube_keep_their_webviews_when_hidden() {
+        for service in [Service::WhatsApp, Service::YouTube] {
+            assert!(service.keeps_running_in_background());
+            assert_eq!(
+                service_panel_hint(BarHit::ServiceStrip(StripButton::Close), service, None),
+                Some(format!(
+                    "Ocultar {}: continua em segundo plano",
+                    service.label()
+                ))
+            );
+        }
+        for service in [Service::Meet, Service::Gmail, Service::Breath] {
+            assert!(!service.keeps_running_in_background());
+        }
+    }
 
     #[test]
     fn internal_transitions_keep_youtube_and_whatsapp_alive() {

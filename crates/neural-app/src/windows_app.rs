@@ -3332,6 +3332,8 @@ pub(in crate::windows_app) struct App {
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
     /// video da respiracao, este em InPrivate).
     pub(in crate::windows_app) service_panel: Option<ServicePanel>,
+    /// WhatsApp e YouTube ocultos: WebViews vivas enquanto o processo existir.
+    pub(in crate::windows_app) background_services: Vec<ServicePanel>,
     /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
     /// um painel ja fechado chegam com o numero dele e caem.
     pub(in crate::windows_app) service_generation: u64,
@@ -3538,6 +3540,7 @@ impl App {
             side_panel: side_panel::SidePanel::closed(notes.clone()),
             panel_suggestion_query: None,
             service_panel: None,
+            background_services: Vec::new(),
             service_generation: 0,
             panel_window_fullscreen: PanelWindowFullscreen::default(),
             column_hint: None,

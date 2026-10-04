@@ -1371,6 +1371,13 @@ impl App {
         {
             return Some(hint);
         }
+        for panel in &self.background_services {
+            if let Some(hint) =
+                service_panel_hint(hit, panel.service, panel.state.badge(panel.audio))
+            {
+                return Some(hint);
+            }
+        }
         let comp = self.comparator.as_ref();
         let column = match hit {
             BarHit::Column(index)

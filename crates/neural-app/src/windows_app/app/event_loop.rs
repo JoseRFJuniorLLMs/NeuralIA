@@ -308,6 +308,13 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     panel.audio = playing;
                     self.request_redraw();
+                } else if let Some(panel) = self
+                    .background_services
+                    .iter_mut()
+                    .find(|panel| panel.generation == generation)
+                {
+                    panel.audio = playing;
+                    self.request_redraw();
                 }
             }
             UserEvent::ServiceEscape(generation) => {
@@ -648,6 +655,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 )
                             });
                             draw_comparator_bar(window, comp, state, &self.live_panel);
+                            for panel in &self.background_services {
+                                draw_service_chrome(
+                                    window,
+                                    comp.split.is_some(),
+                                    panel.service,
+                                    panel.state.badge(panel.audio),
+                                    None,
+                                    self.bar_hover,
+                                );
+                            }
                             if let Some((service, badge, strip)) = service {
                                 draw_service_chrome(
                                     window,
