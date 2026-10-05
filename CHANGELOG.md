@@ -2,6 +2,16 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.8.0] - 2026-10-04
+
+### Added
+- **WhatsApp e YouTube continuam ativos em segundo plano enquanto o NeuralIA está aberto** (5733f85, c71d2ce): fechar o painel com ×, ocultá-lo, abrir outro serviço ou voltar à Home esconde a WebView em vez de a destruir; o ícone recupera a mesma sessão sem recarregar a página. O som do YouTube, os avisos do WhatsApp, o estado de áudio e o ponto de atividade continuam com outro painel à vista. Gates: `account_services_keep_their_webviews_when_hidden`, `internal_transitions_keep_account_services_alive`.
+- **Avisos do WhatsApp Web só para a origem exata** (5733f85): a permissão de notificações é concedida apenas a `https://web.whatsapp.com` (porta 443, sem credenciais no URL); qualquer outra origem é negada. Uma recusa antiga gravada no perfil é substituída sem apagar cookies. Gate: `whatsapp_background_notifications_are_scoped_to_exact_origin`.
+- **Avisos do Gmail com a janela minimizada** (38b76d7, 0badc99): o aviso do canto pertence à janela principal e some com ela minimizada; nesse caso o aviso de correio novo sai pela área de notificações do Windows, com o texto já filtrado pelo modo privado. Clicar no aviso restaura o NeuralIA e abre o Gmail. Gates: `minimized_gmail_notice_text_stays_valid_utf16_and_null_terminated`, `only_a_click_on_the_minimized_gmail_notice_opens_gmail`.
+
+### Fixed
+- **O monitor do Gmail passa a arrancar a partir do painel do Gmail** (38b76d7): antes só usava uma sessão Google vista noutra página; entrar pelo painel e fechá-lo podia deixar os avisos parados.
+
 ## [2.7.3] - 2026-10-03
 
 ### Performance & Memory

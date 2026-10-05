@@ -220,6 +220,8 @@ pub(in crate::windows_app) enum UserEvent {
     PomodoroTick(u64),
     HideSplash(u64),
     GmailProbe(u64),
+    /// Clique no aviso do Gmail mostrado pelo Shell com a janela minimizada.
+    GmailTrayOpen,
     GmailInboxState {
         unread: u32,
         sender: String,
@@ -3261,6 +3263,8 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) splash_board: SplashBoard,
     /// A janela do aviso do canto (`toast.rs`), enquanto existe.
     pub(in crate::windows_app) toast: Option<HWND>,
+    /// Icone temporario da area de notificacoes, usado pelo Gmail minimizado.
+    pub(in crate::windows_app) notify_tray_added: bool,
     /// O centro de avisos: o aviso a vista, o token dele e a fila.
     pub(in crate::windows_app) notify: crate::notify::NotifyCentre,
     /// O pedido da barra (Mandar para IA, Traduzir) a espera do clique no
@@ -3332,6 +3336,8 @@ pub(in crate::windows_app) struct App {
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
     /// video da respiracao, este em InPrivate).
     pub(in crate::windows_app) service_panel: Option<ServicePanel>,
+    /// WhatsApp e YouTube ocultos: WebViews vivas enquanto o processo existir.
+    pub(in crate::windows_app) background_services: Vec<ServicePanel>,
     /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
     /// um painel ja fechado chegam com o numero dele e caem.
     pub(in crate::windows_app) service_generation: u64,
@@ -3504,6 +3510,7 @@ impl App {
             splash: None,
             splash_board: SplashBoard::default(),
             toast: None,
+            notify_tray_added: false,
             notify: crate::notify::NotifyCentre::default(),
             search_card: SearchCard::default(),
             bar_notes: BarNoteGuard::default(),
@@ -3538,6 +3545,7 @@ impl App {
             side_panel: side_panel::SidePanel::closed(notes.clone()),
             panel_suggestion_query: None,
             service_panel: None,
+            background_services: Vec::new(),
             service_generation: 0,
             panel_window_fullscreen: PanelWindowFullscreen::default(),
             column_hint: None,

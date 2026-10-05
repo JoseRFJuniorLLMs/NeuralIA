@@ -40,7 +40,7 @@ use crate::windows_app::{
     services::{
         Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
         raise_webview_host, register_service_panel_events, service_event_is_current,
-        service_panel_permission,
+        service_panel_permission, start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
@@ -80,9 +80,19 @@ pub(in crate::windows_app) fn service_panel_hint(
     badge: Option<ServiceBadge>,
 ) -> Option<String> {
     match hit {
+        BarHit::ServiceStrip(StripButton::Close) if service.keeps_running_in_background() => Some(
+            format!("Ocultar {}: continua em segundo plano", service.label()),
+        ),
         BarHit::ServiceStrip(button) => Some(button.hint(service.label())),
         BarHit::Service(hit_service) if hit_service == service => {
-            Some(service_icon_hint(service.label(), badge))
+            if badge.is_none() && service.keeps_running_in_background() {
+                Some(format!(
+                    "{} aberto ao lado · clique para ocultar, continua em segundo plano",
+                    service.label()
+                ))
+            } else {
+                Some(service_icon_hint(service.label(), badge))
+            }
         }
         BarHit::Tool(Tool::Breath) if service == Service::Breath => {
             Some(service_icon_hint(service.label(), badge))
@@ -132,7 +142,7 @@ pub(in crate::windows_app) fn service_transition_input(
     service: Service,
     state: ServicePanelState,
 ) -> Option<ServiceInput> {
-    if service == Service::YouTube {
+    if service.keeps_running_in_background() {
         (!state.minimized()).then_some(ServiceInput::Minimize)
     } else {
         Some(ServiceInput::Close)
@@ -160,6 +170,18 @@ impl App {
         // Um painel de cada vez.
         self.close_side_panel(PanelExit::OtherPanel);
         self.close_live_panel();
+        if let Some(index) = self
+            .background_services
+            .iter()
+            .position(|panel| panel.service == service)
+        {
+            let mut panel = self.background_services.remove(index);
+            panel.state = ServicePanelState::default();
+            let _ = panel.webview.focus();
+            self.service_panel = Some(panel);
+            self.apply_service_frame();
+            return;
+        }
         let Some(area) = self
             .service_frame_for(ServicePanelState::default())
             .and_then(|frame| frame.panel)
@@ -177,7 +199,11 @@ impl App {
         // de `hooked_builder`, como em todas as WebViews.
         let builder = themed_webview_builder()
             .with_incognito(service.private())
-            .with_url(service.url())
+            .with_url(if service == Service::WhatsApp {
+                "about:blank"
+            } else {
+                service.url()
+            })
             .with_bounds(logical_rect(area))
             .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
             // Caminho A do WebRTC: camera e microfone pelo aviso do
@@ -199,6 +225,11 @@ impl App {
                 {
                     debug_log(format_args!("service panel: sem avisos ({error})"));
                 }
+                if service == Service::WhatsApp
+                    && let Err(error) = start_whatsapp_with_notifications(&panel)
+                {
+                    debug_log(format_args!("service panel: {error}"));
+                }
                 debug_log(format_args!("service panel: {service:?}"));
                 self.service_panel = Some(ServicePanel {
                     service,
@@ -208,6 +239,9 @@ impl App {
                     generation,
                 });
                 self.apply_service_frame();
+                if service == Service::Gmail {
+                    self.schedule_gmail_probe(4);
+                }
             }
             Err(error) => {
                 self.show_splash(
@@ -219,8 +253,7 @@ impl App {
     }
 
     /// Uma transicao interna (Ctrl+H, Home, nova pesquisa, EPUB) preserva o
-    /// YouTube como uma aba de fundo minimizada. Os outros servicos mantem o
-    /// comportamento anterior e fecham.
+    /// WhatsApp e YouTube continuam vivos como abas de fundo minimizadas.
     pub(in crate::windows_app) fn service_panel_for_transition(&mut self) {
         let Some(panel) = self.service_panel.as_ref() else {
             return;
@@ -230,8 +263,8 @@ impl App {
         }
     }
 
-    /// Outro painel da direita precisa do espaco. YouTube minimiza; os demais
-    /// servicos fecham como antes.
+    /// Outro painel da direita precisa do espaco. Os servicos persistentes minimizam;
+    /// os demais servicos fecham como antes.
     pub(in crate::windows_app) fn close_docked_service_panel(&mut self) {
         if self
             .service_panel
@@ -243,12 +276,34 @@ impl App {
     }
 
     pub(in crate::windows_app) fn close_service_panel(&mut self) {
-        // O teclado volta a omnibox (Home) ou a janela: `release_panel`
-        // (gate `closing_a_panel_gives_the_keyboard_back`).
-        if !close_service_panel_in(&mut self.service_panel, self.surface, self.omnibox) {
+        let Some(service) = self.service_panel.as_ref().map(|panel| panel.service) else {
             return;
+        };
+        // O Gmail usa outro WebView para avisos. Antes de descartar o painel,
+        // aproveita a sessao que a pessoa acabou de abrir nele.
+        if service == Service::Gmail {
+            self.maybe_start_gmail_monitor();
         }
-        debug_log(format_args!("service panel: fechado"));
+        if service.keeps_running_in_background() {
+            let mut panel = self.service_panel.take().expect("painel conferido acima");
+            let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+            let _ = panel.webview.set_visible(false);
+            let _ = panel.webview.focus_parent();
+            if self.surface == Surface::Home
+                && let Some(edit) = self.omnibox
+            {
+                unsafe { SetFocus(edit) };
+            }
+            panel.state = ServicePanelState::default();
+            let _ = panel.state.step(ServiceInput::Minimize);
+            self.background_services.push(panel);
+            debug_log(format_args!("service panel: {service:?} em segundo plano"));
+        } else {
+            // O teclado volta a omnibox (Home) ou a janela: `release_panel`
+            // (gate `closing_a_panel_gives_the_keyboard_back`).
+            close_service_panel_in(&mut self.service_panel, self.surface, self.omnibox);
+            debug_log(format_args!("service panel: fechado"));
+        }
         let window_fullscreen = self
             .window
             .as_ref()
@@ -1193,18 +1248,39 @@ mod youtube_transition_tests {
     use super::*;
 
     #[test]
-    fn internal_transitions_minimize_youtube_instead_of_closing_it() {
-        assert_eq!(
-            service_transition_input(Service::YouTube, ServicePanelState::default()),
-            Some(ServiceInput::Minimize)
-        );
+    fn account_services_keep_their_webviews_when_hidden() {
+        for service in [Service::WhatsApp, Service::YouTube] {
+            assert!(service.keeps_running_in_background());
+            assert_eq!(
+                service_panel_hint(BarHit::ServiceStrip(StripButton::Close), service, None),
+                Some(format!(
+                    "Ocultar {}: continua em segundo plano",
+                    service.label()
+                ))
+            );
+        }
+        for service in [Service::Meet, Service::Gmail, Service::Breath] {
+            assert!(!service.keeps_running_in_background());
+        }
     }
 
     #[test]
-    fn an_already_minimized_youtube_needs_no_second_transition() {
+    fn internal_transitions_keep_account_services_alive() {
+        for service in [Service::YouTube, Service::WhatsApp] {
+            assert_eq!(
+                service_transition_input(service, ServicePanelState::default()),
+                Some(ServiceInput::Minimize)
+            );
+        }
+    }
+
+    #[test]
+    fn an_already_minimized_background_service_needs_no_second_transition() {
         let mut state = ServicePanelState::default();
         assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
-        assert_eq!(service_transition_input(Service::YouTube, state), None);
+        for service in [Service::YouTube, Service::WhatsApp] {
+            assert_eq!(service_transition_input(service, state), None);
+        }
     }
 
     #[test]
@@ -1227,13 +1303,8 @@ mod youtube_transition_tests {
     }
 
     #[test]
-    fn non_youtube_services_keep_the_old_close_policy() {
-        for service in [
-            Service::Meet,
-            Service::WhatsApp,
-            Service::Gmail,
-            Service::Breath,
-        ] {
+    fn other_services_keep_the_old_close_policy() {
+        for service in [Service::Meet, Service::Gmail, Service::Breath] {
             assert_eq!(
                 service_transition_input(service, ServicePanelState::default()),
                 Some(ServiceInput::Close)

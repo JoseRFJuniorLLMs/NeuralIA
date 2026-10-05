@@ -11,7 +11,8 @@ use crate::windows_app::{
     remote_capability,
     services::{GMAIL_NOTIFICATIONS, gmail_field, gmail_is_new_mail, save_gmail_setting},
     theme::themed_webview_builder,
-    toast::ToastHost,
+    toast::{ToastHost, remove_gmail_tray_icon},
+    window_hwnd,
 };
 
 /// Quanto tempo o aviso de correio novo fica no canto.
@@ -77,12 +78,38 @@ impl App {
         self.notify(gmail_notice(sender, subject));
     }
 
+    /// O «Abrir» do aviso do Shell: devolve a janela e mostra o Gmail. Um
+    /// painel do Gmail ja a vista fica como esta (o clique no icone dele
+    /// alternaria o estado).
+    pub(in crate::windows_app) fn open_gmail_from_tray(&mut self) {
+        if let Some(window) = &self.window {
+            window.set_minimized(false);
+            window.focus_window();
+        }
+        if self.notify.current_kind() == Some(NoticeKind::Gmail) {
+            self.hide_toast_window();
+        }
+        let gmail_visible = self.service_panel.as_ref().is_some_and(|panel| {
+            panel.service == crate::windows_app::services::Service::Gmail
+                && !panel.state.minimized()
+        });
+        if !gmail_visible {
+            self.open_service_panel(crate::windows_app::services::Service::Gmail);
+        }
+    }
+
     pub(in crate::windows_app) fn google_session_available(&self) -> bool {
         let source = self
             .comparator
             .as_ref()
             .and_then(|comp| comp.views.first().map(|view| &view.webview))
-            .or(self.webview.as_ref());
+            .or(self.webview.as_ref())
+            .or_else(|| {
+                self.service_panel
+                    .as_ref()
+                    .filter(|panel| panel.service == crate::windows_app::services::Service::Gmail)
+                    .map(|panel| &panel.webview)
+            });
         let Some(source) = source else {
             return false;
         };
@@ -205,6 +232,12 @@ impl App {
         } else {
             // Desligar e mesmo desligar: sem WebView escondida a ler o Gmail.
             self.gmail_monitor = None;
+            if self.notify_tray_added {
+                if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+                    remove_gmail_tray_icon(owner);
+                }
+                self.notify_tray_added = false;
+            }
             // O aviso do Gmail a vista sai com eles.
             if self.notify.current_kind() == Some(NoticeKind::Gmail) {
                 self.hide_toast_window();

@@ -105,6 +105,12 @@ impl ApplicationHandler<UserEvent> for App {
     /// Fechar a janela com o comparador aberto: as abas ficam gravadas. E
     /// cada download a verificar acaba antes de sair (com prazo).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.notify_tray_added {
+            if let Some(owner) = self.window.as_ref().and_then(window_hwnd) {
+                remove_gmail_tray_icon(owner);
+            }
+            self.notify_tray_added = false;
+        }
         self.destroy_web_surfaces();
         self.local_models.finish_work();
         let _ = self.save_tab_session();
@@ -308,6 +314,13 @@ impl ApplicationHandler<UserEvent> for App {
                 {
                     panel.audio = playing;
                     self.request_redraw();
+                } else if let Some(panel) = self
+                    .background_services
+                    .iter_mut()
+                    .find(|panel| panel.generation == generation)
+                {
+                    panel.audio = playing;
+                    self.request_redraw();
                 }
             }
             UserEvent::ServiceEscape(generation) => {
@@ -319,7 +332,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
                     self.maybe_start_gmail_monitor();
                     if self.gmail_monitor.is_none()
-                        && (self.webview.is_some() || self.comparator.is_some())
+                        && (self.webview.is_some()
+                            || self.comparator.is_some()
+                            || self
+                                .service_panel
+                                .as_ref()
+                                .is_some_and(|panel| panel.service == Service::Gmail))
                     {
                         self.schedule_gmail_probe(60);
                     }
@@ -331,6 +349,7 @@ impl ApplicationHandler<UserEvent> for App {
                 subject,
                 key,
             } => self.handle_gmail_state(unread, sender, subject, key),
+            UserEvent::GmailTrayOpen => self.open_gmail_from_tray(),
             UserEvent::ShowHistory => self.toggle_side_panel(),
             UserEvent::Theme(event) => self.theme_event(event),
             UserEvent::Keys(event) => self.keys_event(event),
@@ -648,6 +667,16 @@ impl ApplicationHandler<UserEvent> for App {
                                 )
                             });
                             draw_comparator_bar(window, comp, state, &self.live_panel);
+                            for panel in &self.background_services {
+                                draw_service_chrome(
+                                    window,
+                                    comp.split.is_some(),
+                                    panel.service,
+                                    panel.state.badge(panel.audio),
+                                    None,
+                                    self.bar_hover,
+                                );
+                            }
                             if let Some((service, badge, strip)) = service {
                                 draw_service_chrome(
                                     window,

@@ -65,6 +65,25 @@ pub(in crate::windows_app) fn lifecycle_probe_home_ready_message() -> u32 {
         RegisterWindowMessageW(windows_sys::w!("NeuralIA.LifecycleProbe.HomeReady"))
     })
 }
+/// O retorno do icone de aviso do Gmail (`toast.rs`), registado pelo mesmo
+/// motivo das mensagens acima: nada de IDs fixos em WM_APP.
+pub(in crate::windows_app) static GMAIL_TRAY_MESSAGE: OnceLock<u32> = OnceLock::new();
+
+pub(in crate::windows_app) fn gmail_tray_message() -> u32 {
+    *GMAIL_TRAY_MESSAGE
+        .get_or_init(|| unsafe { RegisterWindowMessageW(windows_sys::w!("NeuralIA.GmailTray")) })
+}
+
+/// Sem NOTIFYICON_VERSION_4 o Shell manda o evento inteiro em `lparam`. So o
+/// clique no balao ou no icone abre o Gmail; passar o rato por cima, o fecho
+/// do balao ou o prazo dele nao.
+pub(in crate::windows_app) fn gmail_tray_opens_gmail(lparam: LPARAM) -> bool {
+    const NIN_BALLOONUSERCLICK: u32 = 0x0405;
+    matches!(
+        (lparam & 0xFFFF) as u32,
+        NIN_BALLOONUSERCLICK | WM_LBUTTONUP
+    )
+}
 pub(in crate::windows_app) const EXIT_BUTTON_SUBCLASS_ID: usize = 0x4E4B;
 pub(in crate::windows_app) const HOME_BUTTON_SUBCLASS_ID: usize = 0x4E4C;
 pub(in crate::windows_app) const CAPTION_BUTTONS_SUBCLASS_ID: usize = 0x4E70;
@@ -529,6 +548,14 @@ pub(in crate::windows_app) unsafe extern "system" fn window_subclass(
                     }
                 }
             }
+        }
+        return 0;
+    }
+
+    if message == gmail_tray_message() {
+        if reference_data != 0 && gmail_tray_opens_gmail(lparam) {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            let _ = proxy.send_event(UserEvent::GmailTrayOpen);
         }
         return 0;
     }
