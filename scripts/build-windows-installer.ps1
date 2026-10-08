@@ -186,6 +186,10 @@ $sourceExe = (Resolve-Path -LiteralPath $ExePath).Path
 if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
     throw "-ExePath '$ExePath' is not a file."
 }
+$exeVersion = (Get-Item -LiteralPath $sourceExe).VersionInfo.ProductVersion
+if (-not [string]::IsNullOrEmpty($exeVersion) -and $exeVersion -ne $Version) {
+    throw "-ExePath '$sourceExe' has ProductVersion '$exeVersion', which does not match requested Version '$Version'. (Check if cargo build placed the binary in CARGO_TARGET_DIR)."
+}
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
     throw "Version '$Version' is not a supported semantic version."
 }
