@@ -2,6 +2,14 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.8.3] - 2026-10-08
+
+### Added
+- **Botão "Sobre" na barra de título (ferramentas):**
+  - Adicionado o botão Sobre (`Tool::About`) no canto superior ao lado das ferramentas na barra de título e tela inicial.
+  - Janela de informações nativa com dados do autor (`Jose R F Junior`, `web2ajax@gmail.com`, data `02/06/2025` e `VERSÃO: 2.8.3`).
+  - Opção interativa `<verificar atualização>` que dispara a busca e instalação automática de atualizações oficiais do GitHub com barra de progresso.
+
 ## [2.8.2] - 2026-10-08
 
 ### Added
