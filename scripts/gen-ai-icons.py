@@ -444,6 +444,38 @@ def downloads() -> None:
     finish(mask, solid((255, 255, 255)), "downloads.png")
 
 
+# ------------------------------------------------------------------ Obsidian
+def obsidian() -> None:
+    """Cristal facetado / grafo de nós e arestas: representa o Obsidian e o
+    segundo cérebro. Contorno branco (a barra pinta-o com o tema); nenhuma
+    marca de terceiros."""
+    stroke = N * 0.065
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+
+    top = (CENTER, N * 0.12)
+    bottom = (CENTER, N * 0.88)
+    mid_left = (N * 0.18, N * 0.46)
+    mid_right = (N * 0.82, N * 0.46)
+    top_left = (N * 0.32, N * 0.28)
+    top_right = (N * 0.68, N * 0.28)
+    center_hub = (CENTER, N * 0.52)
+
+    outline = [top, top_right, mid_right, bottom, mid_left, top_left, top]
+    for a, b in zip(outline, outline[1:]):
+        stroked(draw, a, b, stroke)
+
+    stroked(draw, top, center_hub, stroke)
+    stroked(draw, center_hub, bottom, stroke)
+    stroked(draw, mid_left, center_hub, stroke)
+    stroked(draw, center_hub, mid_right, stroke)
+    stroked(draw, top_left, center_hub, stroke)
+    stroked(draw, top_right, center_hub, stroke)
+    stroked(draw, top_left, top_right, stroke)
+
+    finish(mask, solid((255, 255, 255)), "obsidian.png")
+
+
 ICONS = {
     "gemini": gemini,
     "chatgpt": chatgpt,
@@ -457,6 +489,7 @@ ICONS = {
     "live": live,
     "pomodoro": pomodoro,
     "notes": notes,
+    "obsidian": obsidian,
     "breath": breath,
     "downloads": downloads,
 }

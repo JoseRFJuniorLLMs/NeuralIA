@@ -172,6 +172,12 @@ impl PrivacyGuard {
         self.history.recent(limit)
     }
 
+    /// As `limit` entradas mais recentes lidas diretamente de disco.
+    /// Usado pelo grafo Obsidian no worker de notas em background.
+    pub(crate) fn recent_history_sync(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
+        self.history.recent_sync(limit)
+    }
+
     /// "Apagar historico": apaga em qualquer modo (e privacidade).
     pub(crate) fn clear_history(&self) -> Option<Result<(), String>> {
         self.history.clear()

@@ -41,7 +41,8 @@
   window.__neuraliaObsidian = {
     render: obsidian.render,
     refresh: obsidian.refresh,
-    open: obsidian.open
+    open: obsidian.open,
+    button() { if (views.obsidian.hidden) showSection('obsidian'); else close(); }
   };
   window.__neuraliaBookmarks = { receive: bookmarks.receive };
   window.__neuraliaDownloads = {

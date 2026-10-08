@@ -1426,7 +1426,7 @@ fn obsidian_graph_builds_correlated_nodes_and_edges() {
     let note2 = neural_core::Note {
         id: "20261008120100".to_string(),
         title: "Compilador Rust".to_string(),
-        body: "Detalhes do compilador #programacao".to_string(),
+        body: "Detalhes do compilador #programacao #arquitetura e documentação em https://doc.rust-lang.org/book/".to_string(),
         tags: vec!["programacao".to_string()],
         source: None,
         created_unix: 2,
@@ -1445,6 +1445,12 @@ fn obsidian_graph_builds_correlated_nodes_and_edges() {
             kind: HistoryKind::Ask,
             input: "o que e rust".to_string(),
             target: String::new(),
+        },
+        HistoryEntry {
+            timestamp_unix: 3,
+            kind: HistoryKind::Web,
+            input: "livro oficial de rust".to_string(),
+            target: "https://doc.rust-lang.org/book/".to_string(),
         },
     ];
     let graph = notes::build_obsidian_graph(&[note1, note2], &history);
@@ -1474,7 +1480,19 @@ fn obsidian_graph_builds_correlated_nodes_and_edges() {
         graph
             .nodes
             .iter()
+            .any(|n| n.id == "tag:arquitetura" && n.kind == "tag")
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
             .any(|n| n.id == "site:https://rust-lang.org/" && n.kind == "site")
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "site:https://doc.rust-lang.org/book/" && n.kind == "site")
     );
     assert!(graph.nodes.iter().any(|n| n.kind == "history"));
 
@@ -1489,13 +1507,33 @@ fn obsidian_graph_builds_correlated_nodes_and_edges() {
         graph
             .edges
             .iter()
+            .any(|e| e.from == "note:20261008120100" && e.to == "tag:arquitetura")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
             .any(|e| e.from == "note:20261008120000" && e.to == "site:https://rust-lang.org/")
     );
     assert!(
         graph
             .edges
             .iter()
+            .any(|e| e.from == "note:20261008120100"
+                && e.to == "site:https://doc.rust-lang.org/book/")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
             .any(|e| e.from == "note:20261008120000" && e.to == "note:20261008120100")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|e| e.from == "hist:livro oficial de rust"
+                && e.to == "site:https://doc.rust-lang.org/book/")
     );
 
     let script = notes::obsidian_graph_script(&graph);
@@ -1504,6 +1542,10 @@ fn obsidian_graph_builds_correlated_nodes_and_edges() {
     assert_eq!(
         page_scripts::PANEL_SHOW_OBSIDIAN_SCRIPT,
         "window.neuraliaShowSection && window.neuraliaShowSection('obsidian')"
+    );
+    assert_eq!(
+        page_scripts::PANEL_OBSIDIAN_BUTTON_SCRIPT,
+        "window.__neuraliaObsidian && window.__neuraliaObsidian.button()"
     );
 }
 
@@ -20030,8 +20072,9 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                         }
                     }
 
-                    let [pomodoro, notes, breath] = controls.tools;
+                    let [pomodoro, notes, obsidian, breath] = controls.tools;
                     assert_eq!(notes.width, notes.height, "{at}");
+                    assert_eq!(obsidian.width, obsidian.height, "{at}");
                     assert_eq!(breath.width, breath.height, "{at}");
                     if pomodoro_label.is_none() {
                         assert_eq!(pomodoro.width, pomodoro.height, "{at}");
@@ -20395,6 +20438,10 @@ fn tool_hints_say_what_the_click_does() {
             "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
         ),
         (
+            Tool::Obsidian,
+            "Obsidian (Segundo Cérebro) — grafo de notas, sites e histórico",
+        ),
+        (
             Tool::Breath,
             "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
         ),
@@ -20442,7 +20489,7 @@ Clique: pausar · botão direito: opções";
         session,
         "a Home"
     );
-    for tool in [Tool::Notes, Tool::Breath] {
+    for tool in [Tool::Notes, Tool::Obsidian, Tool::Breath] {
         assert_eq!(
             bar(BarHit::Tool(tool), &pomodoro, at).as_deref(),
             Some(tool.tooltip()),
@@ -20867,10 +20914,15 @@ fn tool_clicks_route_to_their_action() {
     );
     assert_eq!(tool_action(Tool::Notes, ToolClick::Left), Some(ToggleNotes));
     assert_eq!(
+        tool_action(Tool::Obsidian, ToolClick::Left),
+        Some(ToggleObsidian)
+    );
+    assert_eq!(
         tool_action(Tool::Breath, ToolClick::Left),
         Some(ToggleBreath)
     );
     assert_eq!(tool_action(Tool::Notes, ToolClick::Right), None);
+    assert_eq!(tool_action(Tool::Obsidian, ToolClick::Right), None);
     assert_eq!(tool_action(Tool::Breath, ToolClick::Right), None);
     assert_eq!(
         bar_tool_action(Some(BarHit::Service(Service::Meet)), ToolClick::Right),
@@ -21243,7 +21295,7 @@ fn the_button_that_opened_a_service_panel_hints_its_state() {
             "{tool:?}"
         );
     }
-    for tool in [Tool::Pomodoro, Tool::Notes] {
+    for tool in [Tool::Pomodoro, Tool::Notes, Tool::Obsidian] {
         assert_eq!(
             service_panel_hint(BarHit::Tool(tool), Service::Breath, None),
             None,

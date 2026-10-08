@@ -1026,11 +1026,7 @@ impl App {
             )),
             PanelMessage::Bookmarks(request) => self.bookmark_panel_request(request),
             PanelMessage::ObsidianGraph => {
-                let history = self
-                    .privacy
-                    .recent_history(PANEL_RECENT_LIMIT)
-                    .and_then(|res| res.ok())
-                    .unwrap_or_default();
+                let history = self.privacy.recent_history_sync(150).unwrap_or_default();
                 self.submit_notes(NotesCommand::Graph(history), NotesOrigin::Panel);
             }
             notes @ (PanelMessage::NotesList

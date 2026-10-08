@@ -30,20 +30,23 @@ pub(in crate::windows_app) enum ToolAction {
     PomodoroMenu,
     /// Abre o painel do Ctrl+H nas notas; aberto, fecha-o.
     ToggleNotes,
+    /// Abre o painel do Ctrl+H no Obsidian; aberto, fecha-o.
+    ToggleObsidian,
     /// Abre o video da respiracao no painel anonimo; aberto, fecha-o.
     ToggleBreath,
 }
 
 /// A unica tabela clique -> accao das ferramentas. O botao direito so faz
-/// alguma coisa no Pomodoro: nas outras duas nao ha menu, e um clique direito
+/// alguma coisa no Pomodoro: nas outras ferramentas nao ha menu, e um clique direito
 /// perdido nao pode abrir nem fechar paineis.
 pub(in crate::windows_app) fn tool_action(tool: Tool, click: ToolClick) -> Option<ToolAction> {
     match (tool, click) {
         (Tool::Pomodoro, ToolClick::Left) => Some(ToolAction::PomodoroClick),
         (Tool::Pomodoro, ToolClick::Right) => Some(ToolAction::PomodoroMenu),
         (Tool::Notes, ToolClick::Left) => Some(ToolAction::ToggleNotes),
+        (Tool::Obsidian, ToolClick::Left) => Some(ToolAction::ToggleObsidian),
         (Tool::Breath, ToolClick::Left) => Some(ToolAction::ToggleBreath),
-        (Tool::Notes | Tool::Breath, ToolClick::Right) => None,
+        (Tool::Notes | Tool::Obsidian | Tool::Breath, ToolClick::Right) => None,
     }
 }
 
@@ -119,24 +122,28 @@ impl std::fmt::Debug for BarLabel {
     }
 }
 
-/// Os tres botoes das ferramentas, encostados a `right`: Respiracao na ponta,
-/// Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
-/// com a etiqueta, para os outros dois nao saltarem quando ela aparece.
+/// Os quatro botoes das ferramentas, encostados a `right`: Respiracao na ponta,
+/// Obsidian antes, Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
+/// com a etiqueta, para os outros nao saltarem quando ela aparece.
 pub(in crate::windows_app) fn tool_button_row(
     right: f64,
     y: f64,
     size: f64,
     gap: f64,
     label_width: f64,
-) -> [UiRect; 3] {
+) -> [UiRect; 4] {
     let breath = UiRect {
         x: right - size,
         y,
         width: size,
         height: size,
     };
-    let notes = UiRect {
+    let obsidian = UiRect {
         x: breath.x - gap - size,
+        ..breath
+    };
+    let notes = UiRect {
+        x: obsidian.x - gap - size,
         ..breath
     };
     let pomodoro = UiRect {
@@ -144,7 +151,7 @@ pub(in crate::windows_app) fn tool_button_row(
         width: size + label_width,
         ..breath
     };
-    [pomodoro, notes, breath]
+    [pomodoro, notes, obsidian, breath]
 }
 
 /// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
@@ -1134,10 +1141,10 @@ pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) downloads: UiRect,
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
     pub(in crate::windows_app) live: UiRect,
-    /// Pomodoro, Notas e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
+    /// Pomodoro, Notas, Obsidian e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
     /// antes dos botoes da janela -- o mesmo sitio da Home
     /// (`home_tool_buttons`).
-    pub(in crate::windows_app) tools: [UiRect; 3],
+    pub(in crate::windows_app) tools: [UiRect; 4],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.

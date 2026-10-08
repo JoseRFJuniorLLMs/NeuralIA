@@ -567,6 +567,125 @@ pub(super) fn obsidian_graph_script(data: &ObsidianGraphData) -> String {
     format!("window.__neuraliaObsidian && window.__neuraliaObsidian.render({payload});")
 }
 
+fn extract_inline_tags(body: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut in_fence = false;
+    for line in body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let chars: Vec<(usize, char)> = line.char_indices().collect();
+        let len = chars.len();
+        for i in 0..len {
+            if chars[i].1 == '#' {
+                // Precedido por espaco, inicio de linha ou parenteses/chaves
+                if i > 0 {
+                    let prev = chars[i - 1].1;
+                    if !prev.is_whitespace() && prev != '(' && prev != '[' && prev != '{' {
+                        continue;
+                    }
+                }
+                // Proximo caractere deve ser alfanumerico ou underscore
+                if i + 1 < len {
+                    let next = chars[i + 1].1;
+                    if next.is_alphanumeric() || next == '_' {
+                        let mut end_idx = line.len();
+                        for &(idx, ch) in &chars[(i + 1)..] {
+                            if !ch.is_alphanumeric() && ch != '_' && ch != '-' {
+                                end_idx = idx;
+                                break;
+                            }
+                        }
+                        let start_byte = chars[i + 1].0;
+                        if start_byte < end_idx {
+                            let tag = &line[start_byte..end_idx];
+                            let tag_lower = tag.to_lowercase();
+                            if tag_lower.len() >= 2 && seen.insert(tag_lower) {
+                                tags.push(tag.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    tags
+}
+
+fn extract_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for word in text.split_whitespace() {
+        let trimmed = word.trim_matches(|c| {
+            c == '('
+                || c == ')'
+                || c == '['
+                || c == ']'
+                || c == '<'
+                || c == '>'
+                || c == '"'
+                || c == '\''
+        });
+        if let Some(pos) = trimmed.find("http://").or_else(|| trimmed.find("https://")) {
+            let candidate = &trimmed[pos..];
+            let clean = candidate.trim_end_matches(|c| {
+                c == '.' || c == ',' || c == ';' || c == ')' || c == ']' || c == '>'
+            });
+            if (clean.starts_with("http://") || clean.starts_with("https://"))
+                && seen.insert(clean.to_string())
+            {
+                urls.push(clean.to_string());
+            }
+        }
+    }
+    urls
+}
+
+fn add_site_node(
+    nodes_map: &mut std::collections::HashMap<String, GraphNode>,
+    url_str: &str,
+) -> String {
+    let site_id = format!("site:{url_str}");
+    let domain = url::Url::parse(url_str)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_else(|| url_str.to_string());
+    nodes_map
+        .entry(site_id.clone())
+        .or_insert_with(|| GraphNode {
+            id: site_id.clone(),
+            label: domain,
+            kind: "site".to_string(),
+            target: Some(url_str.to_string()),
+            subtitle: Some(url_str.to_string()),
+        });
+    site_id
+}
+
+fn add_tag_node(
+    nodes_map: &mut std::collections::HashMap<String, GraphNode>,
+    tag_str: &str,
+) -> String {
+    let clean = tag_str.trim().trim_start_matches('#');
+    let tag_id = format!("tag:{}", clean.to_lowercase());
+    nodes_map
+        .entry(tag_id.clone())
+        .or_insert_with(|| GraphNode {
+            id: tag_id.clone(),
+            label: format!("#{clean}"),
+            kind: "tag".to_string(),
+            target: None,
+            subtitle: Some("Tag".to_string()),
+        });
+    tag_id
+}
+
 pub(super) fn build_obsidian_graph(
     notes: &[Note],
     history: &[neural_core::HistoryEntry],
@@ -610,102 +729,128 @@ pub(super) fn build_obsidian_graph(
             add_edge(note_node_id.clone(), target_node_id, "link");
         }
 
-        // Tags (#tag)
+        // Tags de frontmatter (YAML)
         for tag in &note.tags {
             let clean = tag.trim().trim_start_matches('#');
-            if clean.is_empty() {
-                continue;
+            if !clean.is_empty() {
+                let tag_id = add_tag_node(&mut nodes_map, clean);
+                add_edge(note_node_id.clone(), tag_id, "tag");
             }
-            let tag_id = format!("tag:{}", clean.to_lowercase());
-            nodes_map
-                .entry(tag_id.clone())
-                .or_insert_with(|| GraphNode {
-                    id: tag_id.clone(),
-                    label: format!("#{clean}"),
-                    kind: "tag".to_string(),
-                    target: None,
-                    subtitle: Some("Tag".to_string()),
-                });
+        }
+
+        // Tags inline no corpo (#tag)
+        for inline_tag in extract_inline_tags(&note.body) {
+            let tag_id = add_tag_node(&mut nodes_map, &inline_tag);
             add_edge(note_node_id.clone(), tag_id, "tag");
         }
 
-        // Fontes / Sites lidos
+        // Fonte da nota (URL nos metadados)
         if let Some(src) = &note.source {
             let trimmed = src.trim();
-            if !trimmed.is_empty() {
-                let site_id = format!("site:{trimmed}");
-                let domain = url::Url::parse(trimmed)
-                    .ok()
-                    .and_then(|u| u.host_str().map(|h| h.to_string()))
-                    .unwrap_or_else(|| trimmed.to_string());
-                nodes_map
-                    .entry(site_id.clone())
-                    .or_insert_with(|| GraphNode {
-                        id: site_id.clone(),
-                        label: domain,
-                        kind: "site".to_string(),
-                        target: Some(trimmed.to_string()),
-                        subtitle: Some(trimmed.to_string()),
-                    });
+            if !trimmed.is_empty()
+                && (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+            {
+                let site_id = add_site_node(&mut nodes_map, trimmed);
                 add_edge(note_node_id.clone(), site_id, "source");
             }
+        }
+
+        // Links de URLs presentes no corpo da nota
+        for url in extract_urls(&note.body) {
+            let site_id = add_site_node(&mut nodes_map, &url);
+            add_edge(note_node_id.clone(), site_id, "source");
         }
     }
 
     // 2. Processar histórico recente e pesquisas
     for entry in history {
         let input = entry.input.trim();
-        if input.is_empty() {
+        let target = entry.target.trim();
+        if input.is_empty() && target.is_empty() {
             continue;
         }
 
-        if input.starts_with("http://") || input.starts_with("https://") {
-            let site_id = format!("site:{input}");
-            let domain = url::Url::parse(input)
-                .ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-                .unwrap_or_else(|| input.to_string());
-            nodes_map
-                .entry(site_id.clone())
-                .or_insert_with(|| GraphNode {
-                    id: site_id.clone(),
-                    label: domain,
-                    kind: "site".to_string(),
-                    target: Some(input.to_string()),
-                    subtitle: Some(input.to_string()),
-                });
-        } else {
-            let hist_id = format!("hist:{input}");
-            nodes_map
-                .entry(hist_id.clone())
-                .or_insert_with(|| GraphNode {
-                    id: hist_id.clone(),
-                    label: input.to_string(),
-                    kind: "history".to_string(),
-                    target: Some(input.to_string()),
-                    subtitle: Some(
-                        match entry.kind {
-                            neural_core::HistoryKind::Ask => "Pesquisa IA",
-                            neural_core::HistoryKind::Read => "Leitor",
-                            neural_core::HistoryKind::Web => "Web",
-                        }
-                        .to_string(),
-                    ),
-                });
+        let input_is_url = input.starts_with("http://") || input.starts_with("https://");
+        let target_is_url = target.starts_with("http://") || target.starts_with("https://");
 
-            // Conectar histórico a notas e tags relevantes por palavras-chave
+        let mut site_node_id = None;
+        if target_is_url {
+            site_node_id = Some(add_site_node(&mut nodes_map, target));
+        } else if input_is_url {
+            site_node_id = Some(add_site_node(&mut nodes_map, input));
+        }
+
+        // Criar nó de histórico se input for uma pesquisa / texto não-URL ou se input != target
+        let hist_node_id =
+            if !input.is_empty() && (!input_is_url || (target_is_url && input != target)) {
+                let hist_id = format!("hist:{input}");
+                nodes_map
+                    .entry(hist_id.clone())
+                    .or_insert_with(|| GraphNode {
+                        id: hist_id.clone(),
+                        label: input.to_string(),
+                        kind: "history".to_string(),
+                        target: Some(input.to_string()),
+                        subtitle: Some(
+                            match entry.kind {
+                                neural_core::HistoryKind::Ask => "Pesquisa IA",
+                                neural_core::HistoryKind::Read => "Leitor",
+                                neural_core::HistoryKind::Web => "Web",
+                            }
+                            .to_string(),
+                        ),
+                    });
+                Some(hist_id)
+            } else {
+                None
+            };
+
+        // Se tiver histórico e site visitado associado, conectar
+        if let (Some(h_id), Some(s_id)) = (&hist_node_id, &site_node_id) {
+            add_edge(h_id.clone(), s_id.clone(), "visit");
+        }
+
+        // 3. Correlacionar histórico e sites com notas e tags
+        let search_terms: Vec<&str> = input.split_whitespace().filter(|w| w.len() >= 3).collect();
+
+        for note in notes {
+            let note_node = format!("note:{}", note.id);
+            let title_lower = note.title.to_lowercase();
             let input_lower = input.to_lowercase();
-            for note in notes {
-                let title_lower = note.title.to_lowercase();
-                if !title_lower.is_empty()
-                    && (input_lower.contains(&title_lower) || title_lower.contains(&input_lower))
-                {
-                    add_edge(hist_id.clone(), format!("note:{}", note.id), "match");
+
+            // Match entre histórico e notas (por título ou palavras-chave)
+            if !title_lower.is_empty() {
+                let matches_title = input_lower.contains(&title_lower)
+                    || title_lower.contains(&input_lower)
+                    || search_terms
+                        .iter()
+                        .any(|term| title_lower.contains(&term.to_lowercase()));
+                if matches_title {
+                    if let Some(h_id) = &hist_node_id {
+                        add_edge(h_id.clone(), note_node.clone(), "match");
+                    }
+                    if let Some(s_id) = &site_node_id {
+                        add_edge(note_node.clone(), s_id.clone(), "source");
+                    }
                 }
-                for tag in &note.tags {
-                    let tag_clean = tag.trim().trim_start_matches('#').to_lowercase();
-                    if !tag_clean.is_empty() && input_lower.contains(&tag_clean) {
-                        add_edge(hist_id.clone(), format!("tag:{tag_clean}"), "match");
+            }
+
+            // Match entre histórico e tags
+            let inline_tags = extract_inline_tags(&note.body);
+            for tag in note.tags.iter().chain(inline_tags.iter()) {
+                let tag_clean = tag.trim().trim_start_matches('#').to_lowercase();
+                if !tag_clean.is_empty()
+                    && (input_lower.contains(&tag_clean)
+                        || search_terms
+                            .iter()
+                            .any(|term| term.to_lowercase() == tag_clean))
+                {
+                    let tag_node = format!("tag:{tag_clean}");
+                    if let Some(h_id) = &hist_node_id {
+                        add_edge(h_id.clone(), tag_node.clone(), "match");
+                    }
+                    if let Some(s_id) = &site_node_id {
+                        add_edge(s_id.clone(), tag_node.clone(), "topic");
                     }
                 }
             }
