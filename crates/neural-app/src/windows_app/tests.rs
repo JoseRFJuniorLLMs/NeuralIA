@@ -20072,10 +20072,11 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                         }
                     }
 
-                    let [pomodoro, notes, obsidian, breath] = controls.tools;
+                    let [pomodoro, notes, obsidian, breath, about] = controls.tools;
                     assert_eq!(notes.width, notes.height, "{at}");
                     assert_eq!(obsidian.width, obsidian.height, "{at}");
                     assert_eq!(breath.width, breath.height, "{at}");
+                    assert_eq!(about.width, about.height, "{at}");
                     if pomodoro_label.is_none() {
                         assert_eq!(pomodoro.width, pomodoro.height, "{at}");
                     } else if logical_width >= 700.0 {
@@ -20445,6 +20446,7 @@ fn tool_hints_say_what_the_click_does() {
             Tool::Breath,
             "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
         ),
+        (Tool::About, "Sobre o NeuralIA — versão e atualizações"),
     ];
     for (tool, text) in expected {
         assert_eq!(
@@ -20489,7 +20491,7 @@ Clique: pausar · botão direito: opções";
         session,
         "a Home"
     );
-    for tool in [Tool::Notes, Tool::Obsidian, Tool::Breath] {
+    for tool in [Tool::Notes, Tool::Obsidian, Tool::Breath, Tool::About] {
         assert_eq!(
             bar(BarHit::Tool(tool), &pomodoro, at).as_deref(),
             Some(tool.tooltip()),
@@ -20921,9 +20923,11 @@ fn tool_clicks_route_to_their_action() {
         tool_action(Tool::Breath, ToolClick::Left),
         Some(ToggleBreath)
     );
+    assert_eq!(tool_action(Tool::About, ToolClick::Left), Some(ShowAbout));
     assert_eq!(tool_action(Tool::Notes, ToolClick::Right), None);
     assert_eq!(tool_action(Tool::Obsidian, ToolClick::Right), None);
     assert_eq!(tool_action(Tool::Breath, ToolClick::Right), None);
+    assert_eq!(tool_action(Tool::About, ToolClick::Right), None);
     assert_eq!(
         bar_tool_action(Some(BarHit::Service(Service::Meet)), ToolClick::Right),
         None
@@ -21295,7 +21299,7 @@ fn the_button_that_opened_a_service_panel_hints_its_state() {
             "{tool:?}"
         );
     }
-    for tool in [Tool::Pomodoro, Tool::Notes, Tool::Obsidian] {
+    for tool in [Tool::Pomodoro, Tool::Notes, Tool::Obsidian, Tool::About] {
         assert_eq!(
             service_panel_hint(BarHit::Tool(tool), Service::Breath, None),
             None,

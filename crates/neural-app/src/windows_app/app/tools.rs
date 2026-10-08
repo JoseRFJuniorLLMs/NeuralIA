@@ -11,7 +11,9 @@ use crate::windows_app::{
     App, BarHit, Surface, Timers,
     bar_layout::{BarLabel, ToolAction},
     bar_tooltip_label, hover_tooltip,
-    icons::{ICON_SLOT_BREATH, ICON_SLOT_NOTES, ICON_SLOT_OBSIDIAN, ICON_SLOT_POMODORO},
+    icons::{
+        ICON_SLOT_ABOUT, ICON_SLOT_BREATH, ICON_SLOT_NOTES, ICON_SLOT_OBSIDIAN, ICON_SLOT_POMODORO,
+    },
     native::{flash_taskbar, window_hwnd},
     page_scripts::{PANEL_NOTES_BUTTON_SCRIPT, PANEL_OBSIDIAN_BUTTON_SCRIPT},
     refresh_hint_text,
@@ -35,11 +37,18 @@ pub(in crate::windows_app) enum Tool {
     Obsidian,
     /// Respiracao guiada (metodo Wim Hof): o video no painel anonimo.
     Breath,
+    /// Sobre o NeuralIA: dados do criador, versão e atualização.
+    About,
 }
 
 impl Tool {
-    pub(in crate::windows_app) const ALL: [Tool; 4] =
-        [Tool::Pomodoro, Tool::Notes, Tool::Obsidian, Tool::Breath];
+    pub(in crate::windows_app) const ALL: [Tool; 5] = [
+        Tool::Pomodoro,
+        Tool::Notes,
+        Tool::Obsidian,
+        Tool::Breath,
+        Tool::About,
+    ];
 
     pub(in crate::windows_app) fn icon_slot(self) -> usize {
         match self {
@@ -47,6 +56,7 @@ impl Tool {
             Self::Notes => ICON_SLOT_NOTES,
             Self::Obsidian => ICON_SLOT_OBSIDIAN,
             Self::Breath => ICON_SLOT_BREATH,
+            Self::About => ICON_SLOT_ABOUT,
         }
     }
 
@@ -55,7 +65,7 @@ impl Tool {
     pub(in crate::windows_app) fn icon_tint(self, theme: &Theme) -> Option<Rgb> {
         match self {
             Self::Pomodoro => None,
-            Self::Notes | Self::Obsidian | Self::Breath => Some(theme.fg),
+            Self::Notes | Self::Obsidian | Self::Breath | Self::About => Some(theme.fg),
         }
     }
 
@@ -68,6 +78,7 @@ impl Tool {
             Self::Notes => "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
             Self::Obsidian => "Obsidian (Segundo Cérebro) — grafo de notas, sites e histórico",
             Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
+            Self::About => "Sobre o NeuralIA — versão e atualizações",
         }
     }
 }
@@ -92,7 +103,7 @@ pub(in crate::windows_app) fn tool_hint_at(
 ) -> String {
     let session = match tool {
         Tool::Pomodoro => pomodoro.hint(now),
-        Tool::Notes | Tool::Obsidian | Tool::Breath => None,
+        Tool::Notes | Tool::Obsidian | Tool::Breath | Tool::About => None,
     };
     tool_hint(tool, session.as_deref())
 }
@@ -337,6 +348,7 @@ impl App {
             ToolAction::ToggleNotes => self.open_notes(),
             ToolAction::ToggleObsidian => self.open_obsidian(),
             ToolAction::ToggleBreath => self.open_service_panel(Service::Breath),
+            ToolAction::ShowAbout => self.show_about(),
         }
     }
 

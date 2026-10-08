@@ -476,6 +476,35 @@ def obsidian() -> None:
     finish(mask, solid((255, 255, 255)), "obsidian.png")
 
 
+# --------------------------------------------------------------------- About
+def about() -> None:
+    """Círculo com a letra 'i' (informação/sobre): contorno branco
+    (a barra pinta-o com o tema)."""
+    stroke = N * 0.075
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+
+    r_outer = N * 0.38
+    draw.ellipse(
+        [CENTER - r_outer, CENTER - r_outer, CENTER + r_outer, CENTER + r_outer],
+        outline=255,
+        width=int(stroke),
+    )
+
+    dot_r = stroke * 0.75
+    dot_y = CENTER - N * 0.16
+    draw.ellipse(
+        [CENTER - dot_r, dot_y - dot_r, CENTER + dot_r, dot_y + dot_r],
+        fill=255,
+    )
+
+    stem_top = CENTER - N * 0.04
+    stem_bottom = CENTER + N * 0.20
+    stroked(draw, (CENTER, stem_top), (CENTER, stem_bottom), stroke)
+
+    finish(mask, solid((255, 255, 255)), "about.png")
+
+
 ICONS = {
     "gemini": gemini,
     "chatgpt": chatgpt,
@@ -492,6 +521,7 @@ ICONS = {
     "obsidian": obsidian,
     "breath": breath,
     "downloads": downloads,
+    "about": about,
 }
 
 

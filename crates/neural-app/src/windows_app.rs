@@ -1213,7 +1213,7 @@ fn home_tool_buttons(
     client_width: f64,
     scale: f64,
     pomodoro_label: Option<BarLabel>,
-) -> [UiRect; 4] {
+) -> [UiRect; 5] {
     let scale = scale.max(1.0);
     let caption_left = client_width - 3.0 * 46.0 * scale;
     let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
@@ -6536,7 +6536,7 @@ fn draw_home(
 
         // Ferramentas no canto de cima, a esquerda dos botoes da janela.
         let tools = home_tool_buttons(width, scale, pomodoro_label);
-        let labels = [pomodoro_label, None, None, None];
+        let labels = [pomodoro_label, None, None, None, None];
         for ((rect, tool), label) in tools.iter().zip(Tool::ALL).zip(labels) {
             draw_tool_button(
                 target,
@@ -7124,7 +7124,7 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     );
     // Ferramentas, num grupo a esquerda do Gemini Live. O Pomodoro leva o tempo
     // ao lado do icone quando `right_controls` lhe deu largura para isso.
-    let labels = [columns.pomodoro_label, None, None, None];
+    let labels = [columns.pomodoro_label, None, None, None, None];
     for ((rect, tool), label) in controls.tools.iter().zip(Tool::ALL).zip(labels) {
         draw_tool_button(
             target,

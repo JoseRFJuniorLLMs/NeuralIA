@@ -476,20 +476,35 @@ impl App {
     }
 
     pub(in crate::windows_app) fn show_about(&mut self) {
+        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
         const ABOUT_TITLE: &str = "Sobre o NeuralIA";
-        const ABOUT_TEXT: &str = concat!(
-            "NeuralIA — O Navegador Voltado para IA\nVersão ",
-            env!("CARGO_PKG_VERSION"),
-            " (x64)\nCriador: Jose R F Junior\n\nA História do NeuralIA:\nJose R F Junior entrou no gerenciador de tarefas e viu o Chrome usando 6 GB de RAM e resolveu fazer seu próprio navegador, voltado para IA, com todos os recursos que não existiam no Chrome:\n\n• Comparador Multi-IA nativo em 3 colunas paralelas (Gemini, ChatGPT e Claude)\n• Modo de Leitura limpo, focado e sem distrações nem anúncios\n• Visualizador nativo de PDFs com TextLayer e leitor EPUB integrado\n• Bloqueador de anúncios de alta performance integrado\n• Memória semântica local com busca vetorial e privacidade total\n• Arquitetura ultraleve em Rust com zero alocação desnecessária."
+        let version = env!("CARGO_PKG_VERSION");
+        let body = format!(
+            "Jose R F Junior\nweb2ajax@gmail.com\n02/06/2025\nVERSÃO: {version}\n\n<verificar atualização>\nDeseja verificar atualizações agora?"
         );
-
-        self.show_native_text(ABOUT_TITLE, ABOUT_TEXT);
+        let body_w = wide_null(&body);
+        let title_w = wide_null(ABOUT_TITLE);
+        let answer = unsafe {
+            MessageBoxW(
+                hwnd,
+                body_w.as_ptr(),
+                title_w.as_ptr(),
+                MB_YESNO | MB_ICONINFORMATION,
+            )
+        };
         self.show_splash(
-            "NeuralIA: Criado por Jose R F Junior (voltado para IA e ultraleve).".to_string(),
+            format!("NeuralIA v{version} — Jose R F Junior (web2ajax@gmail.com)"),
             4,
         );
-        self.status = Some("NeuralIA — Criado por Jose R F Junior (voltado para IA)".to_string());
+        self.status = Some(format!(
+            "NeuralIA v{version} — Jose R F Junior · web2ajax@gmail.com · 02/06/2025"
+        ));
         self.request_redraw();
+        if answer == IDYES {
+            self.check_and_apply_update(true);
+        }
     }
 
     /// Verificação automática de atualização na inicialização (tela inicial).

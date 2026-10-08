@@ -18,8 +18,10 @@ pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 10
 /// A seta dos downloads (downloads-ui): o seu lugar no canto
 /// (`RIGHT_CLUSTER`).
 pub(in crate::windows_app) const ICON_SLOT_DOWNLOADS: usize = COMPARATOR_COLUMNS + 11;
-pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 11] =
-    [const { OnceLock::new() }; 11];
+/// Informacoes sobre o navegador e atualizacoes.
+pub(in crate::windows_app) const ICON_SLOT_ABOUT: usize = COMPARATOR_COLUMNS + 12;
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 12] =
+    [const { OnceLock::new() }; 12];
 
 pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -118,6 +120,7 @@ pub(in crate::windows_app) fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_BREATH => include_bytes!("../../../../assets/ai/breath.png"),
             ICON_SLOT_LIVE => include_bytes!("../../../../assets/ai/live.png"),
             ICON_SLOT_DOWNLOADS => include_bytes!("../../../../assets/ai/downloads.png"),
+            ICON_SLOT_ABOUT => include_bytes!("../../../../assets/ai/about.png"),
             _ => include_bytes!("../../../../assets/ai/incognito.png"),
         };
         image::load_from_memory(raw)

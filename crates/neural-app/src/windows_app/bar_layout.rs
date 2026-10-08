@@ -34,6 +34,8 @@ pub(in crate::windows_app) enum ToolAction {
     ToggleObsidian,
     /// Abre o video da respiracao no painel anonimo; aberto, fecha-o.
     ToggleBreath,
+    /// Mostra informacoes do autor, versao e opcao de verificar atualizacao.
+    ShowAbout,
 }
 
 /// A unica tabela clique -> accao das ferramentas. O botao direito so faz
@@ -46,7 +48,8 @@ pub(in crate::windows_app) fn tool_action(tool: Tool, click: ToolClick) -> Optio
         (Tool::Notes, ToolClick::Left) => Some(ToolAction::ToggleNotes),
         (Tool::Obsidian, ToolClick::Left) => Some(ToolAction::ToggleObsidian),
         (Tool::Breath, ToolClick::Left) => Some(ToolAction::ToggleBreath),
-        (Tool::Notes | Tool::Obsidian | Tool::Breath, ToolClick::Right) => None,
+        (Tool::About, ToolClick::Left) => Some(ToolAction::ShowAbout),
+        (Tool::Notes | Tool::Obsidian | Tool::Breath | Tool::About, ToolClick::Right) => None,
     }
 }
 
@@ -122,8 +125,8 @@ impl std::fmt::Debug for BarLabel {
     }
 }
 
-/// Os quatro botoes das ferramentas, encostados a `right`: Respiracao na ponta,
-/// Obsidian antes, Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
+/// Os cinco botoes das ferramentas, encostados a `right`: Sobre na ponta,
+/// Respiracao antes, Obsidian antes, Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
 /// com a etiqueta, para os outros nao saltarem quando ela aparece.
 pub(in crate::windows_app) fn tool_button_row(
     right: f64,
@@ -131,27 +134,31 @@ pub(in crate::windows_app) fn tool_button_row(
     size: f64,
     gap: f64,
     label_width: f64,
-) -> [UiRect; 4] {
-    let breath = UiRect {
+) -> [UiRect; 5] {
+    let about = UiRect {
         x: right - size,
         y,
         width: size,
         height: size,
     };
+    let breath = UiRect {
+        x: about.x - gap - size,
+        ..about
+    };
     let obsidian = UiRect {
         x: breath.x - gap - size,
-        ..breath
+        ..about
     };
     let notes = UiRect {
         x: obsidian.x - gap - size,
-        ..breath
+        ..about
     };
     let pomodoro = UiRect {
         x: notes.x - gap - size - label_width,
         width: size + label_width,
-        ..breath
+        ..about
     };
-    [pomodoro, notes, obsidian, breath]
+    [pomodoro, notes, obsidian, breath, about]
 }
 
 /// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
@@ -1141,10 +1148,10 @@ pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) downloads: UiRect,
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
     pub(in crate::windows_app) live: UiRect,
-    /// Pomodoro, Notas, Obsidian e Respiracao (ordem de `Tool::ALL`) na linha de CIMA,
+    /// Pomodoro, Notas, Obsidian, Respiracao e Sobre (ordem de `Tool::ALL`) na linha de CIMA,
     /// antes dos botoes da janela -- o mesmo sitio da Home
     /// (`home_tool_buttons`).
-    pub(in crate::windows_app) tools: [UiRect; 4],
+    pub(in crate::windows_app) tools: [UiRect; 5],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
@@ -1197,7 +1204,11 @@ pub(in crate::windows_app) fn title_tools_left(
         BarLabel::new(POMODORO_LABEL_RESERVE),
     );
     let actual = right_controls(client_width, scale, false, pomodoro_label);
-    reserved.live.x.min(actual.live.x)
+    if pomodoro_label.is_some() || client_width / scale >= 760.0 {
+        reserved.live.x.min(actual.live.x)
+    } else {
+        actual.live.x
+    }
 }
 
 /// EDIT da barra de titulo; o espaco restante fica para as abas, sem sobreposicao.
