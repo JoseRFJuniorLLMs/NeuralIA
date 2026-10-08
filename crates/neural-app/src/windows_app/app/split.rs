@@ -506,15 +506,11 @@ impl App {
             return;
         };
 
-        if !fullscreen {
-            if let Some(comp) = &mut self.comparator {
-                let all_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
-                if all_minimized {
-                    if let Some(split) = &comp.split {
-                        let src = split.source_index.min(comp.views.len().saturating_sub(1));
-                        comp.minimized[src] = false;
-                    }
-                }
+        if !fullscreen && let Some(comp) = &mut self.comparator {
+            let all_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
+            if all_minimized && let Some(split) = &comp.split {
+                let src = split.source_index.min(comp.views.len().saturating_sub(1));
+                comp.minimized[src] = false;
             }
         }
 

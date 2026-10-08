@@ -406,11 +406,11 @@ impl App {
         {
             comp.minimized[idx] = false;
             comp.expanded = None;
-            if let Some(split) = &mut comp.split {
-                if split.fullscreen {
-                    split.fullscreen = false;
-                    split.source_index = idx;
-                }
+            if let Some(split) = &mut comp.split
+                && split.fullscreen
+            {
+                split.fullscreen = false;
+                split.source_index = idx;
             }
             self.bar_hover = None;
             self.forget_tab_gesture();
@@ -503,12 +503,11 @@ impl App {
                 if let Some(split) = &mut comp.split {
                     split.fullscreen = true;
                 }
-            } else if let Some(split) = &mut comp.split {
-                if split.source_index == idx {
-                    if let Some(other) = (0..comp.views.len()).find(|&i| !comp.minimized[i]) {
-                        split.source_index = other;
-                    }
-                }
+            } else if let Some(split) = &mut comp.split
+                && split.source_index == idx
+                && let Some(other) = (0..comp.views.len()).find(|&i| !comp.minimized[i])
+            {
+                split.source_index = other;
             }
         }
 
