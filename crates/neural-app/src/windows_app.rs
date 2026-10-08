@@ -320,6 +320,14 @@ pub(in crate::windows_app) enum UserEvent {
     },
     /// Escape ou perda de foco no EDIT da palette; traz a geracao que viu.
     ClosePalette(u64),
+    /// Submissão do novo nome de um grupo de abas.
+    GroupRenameSubmit {
+        source_index: usize,
+        group_id: u64,
+        name: String,
+    },
+    /// Fecho do editor de renomear grupo.
+    CloseGroupRename(u64),
     ExpandComparator(usize),
     MinimizeComparator(usize),
     /// Voltar a olhar para os botoes da janela na Home: o rato saiu deles,
@@ -437,6 +445,8 @@ const GMAIL_FIELD_MAX_CHARS: usize = 180;
 
 const PALETTE_SUBCLASS_ID: usize = 0x4E4E;
 const PALETTE_EDIT_SUBCLASS_ID: usize = 0x4E4F;
+const GROUP_RENAME_SUBCLASS_ID: usize = 0x4E80;
+const GROUP_RENAME_EDIT_SUBCLASS_ID: usize = 0x4E81;
 /// Palette nativa, em pixeis logicos: nunca mais larga que isto nem que a
 /// coluna a que pertence menos as margens; a altura e fixa.
 const PALETTE_MAX_WIDTH: f64 = 680.0;
@@ -631,6 +641,19 @@ struct PaletteHost {
     /// Sobe a cada abertura. O pedido de fecho traz o valor que viu: se a
     /// palette entretanto ja e outra, o pedido vem de uma janela morta.
     generation: Cell<u64>,
+}
+
+/// Janelas do editor nativo para renomear grupo de abas.
+pub(in crate::windows_app) struct GroupRenameWindow {
+    pub(in crate::windows_app) popup: HWND,
+    pub(in crate::windows_app) edit: HWND,
+    pub(in crate::windows_app) font: *mut core::ffi::c_void,
+}
+
+pub(in crate::windows_app) struct GroupRenameHost {
+    pub(in crate::windows_app) proxy: EventLoopProxy<UserEvent>,
+    pub(in crate::windows_app) target: Cell<Option<(usize, u64)>>,
+    pub(in crate::windows_app) generation: Cell<u64>,
 }
 
 /// O que a barra precisa de saber sobre o comparador, tirado do proprio
@@ -3291,6 +3314,9 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) palette: Option<PaletteWindow>,
     /// Estado nativo lido pela subclasse do EDIT da palette.
     pub(in crate::windows_app) palette_host: Box<PaletteHost>,
+    /// Popup nativo para renomear grupo de abas.
+    pub(in crate::windows_app) group_rename: Option<GroupRenameWindow>,
+    pub(in crate::windows_app) group_rename_host: Box<GroupRenameHost>,
     pub(in crate::windows_app) config: CoreConfig,
     /// SPEC-0102: raiz + slot lazy do manager. O produto so toca neste
     /// estado depois de um comando model:/modelo: explicitamente submetido.
@@ -3458,6 +3484,11 @@ impl App {
             source: Cell::new(None),
             generation: Cell::new(0),
         });
+        let group_rename_host = Box::new(GroupRenameHost {
+            proxy: proxy.clone(),
+            target: Cell::new(None),
+            generation: Cell::new(0),
+        });
         let document = DocumentWorker::new(
             ReaderClient::new(PDF_TIMEOUT_SECS, PDF_MAX_BYTES),
             proxy.clone(),
@@ -3527,6 +3558,8 @@ impl App {
             omnibox_proxy,
             palette: None,
             palette_host,
+            group_rename: None,
+            group_rename_host,
             config,
             local_models,
             privacy,

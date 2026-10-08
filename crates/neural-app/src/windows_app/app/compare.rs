@@ -400,20 +400,18 @@ impl App {
     /// isso vira "sair da tela cheia" quando a coluna ja esta expandida. Sem a
     /// barra nativa em tela cheia, esse botao e o Esc sao o caminho de volta.
     pub(in crate::windows_app) fn expand_comparator(&mut self, idx: usize) {
-        if self
-            .comparator
-            .as_ref()
-            .is_some_and(|comp| comp.split.is_some())
-        {
-            self.close_split();
-        }
-
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
             && comp.minimized[idx]
         {
             comp.minimized[idx] = false;
             comp.expanded = None;
+            if let Some(split) = &mut comp.split {
+                if split.fullscreen {
+                    split.fullscreen = false;
+                    split.source_index = idx;
+                }
+            }
             self.bar_hover = None;
             self.forget_tab_gesture();
             self.needs_clear = true;
@@ -422,6 +420,14 @@ impl App {
             self.sync_comparator_buttons();
             self.request_redraw();
             return;
+        }
+
+        if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some())
+        {
+            self.close_split();
         }
 
         let mut is_now_expanded = false;
@@ -463,36 +469,47 @@ impl App {
             return;
         }
 
-        let can_minimize = self
-            .comparator
-            .as_ref()
-            .is_some_and(|comp| can_minimize_column(&comp.minimized, comp.views.len(), idx));
-        if !can_minimize {
-            self.show_splash(
-                "Pelo menos um painel precisa continuar visível.".to_string(),
-                2,
-            );
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        if idx >= comp.views.len() || comp.minimized[idx] {
             return;
         }
 
-        // So agora a operacao foi validada. Antes, um pedido impossivel para a
-        // ultima coluna visivel fechava a fonte lateral e depois dizia que nao
-        // podia minimizar: o clique rejeitado destruia estado.
-        if self
-            .comparator
-            .as_ref()
-            .is_some_and(|comp| comp.split.is_some())
-        {
-            self.close_split();
+        let has_split = comp.split.is_some();
+        let can_minimize_without_split =
+            can_minimize_column(&comp.minimized, comp.views.len(), idx);
+
+        if !has_split && !can_minimize_without_split {
+            // Se nao tem barra lateral e este e o ultimo painel de IA visivel:
+            // "3 - se eu minimizar os 3 paineis de ia, e a barra lateral, ele volta para home sozinho."
+            if let Some(comp) = &mut self.comparator {
+                comp.expanded = None;
+                comp.minimized[idx] = true;
+            }
+            self.request_home();
+            return;
         }
 
         let mut was_expanded = false;
-        if let Some(comp) = &mut self.comparator
-            && idx < comp.views.len()
-        {
+        if let Some(comp) = &mut self.comparator {
             was_expanded = comp.expanded == Some(idx);
             comp.expanded = None;
             comp.minimized[idx] = true;
+
+            let all_ai_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
+            if all_ai_minimized {
+                // "2 - quando eu minimizar o ultimo painel , a barra lateral maximiza."
+                if let Some(split) = &mut comp.split {
+                    split.fullscreen = true;
+                }
+            } else if let Some(split) = &mut comp.split {
+                if split.source_index == idx {
+                    if let Some(other) = (0..comp.views.len()).find(|&i| !comp.minimized[i]) {
+                        split.source_index = other;
+                    }
+                }
+            }
         }
 
         if was_expanded && let Some(window) = &self.window {

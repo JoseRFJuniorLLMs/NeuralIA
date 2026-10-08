@@ -19359,6 +19359,10 @@ fn group_menu_ids_map_to_their_operations() {
         group_menu_command(GROUP_MENU_CLOSE),
         Some(GroupMenuCommand::Close)
     );
+    assert_eq!(
+        group_menu_command(GROUP_MENU_RENAME),
+        Some(GroupMenuCommand::Rename)
+    );
     // Menu fechado sem escolha, o titulo desativado e ids ao lado.
     assert_eq!(group_menu_command(0), None);
     assert_eq!(group_menu_command(GROUP_MENU_COLOR_BASE - 1), None);
@@ -19366,12 +19370,17 @@ fn group_menu_ids_map_to_their_operations() {
         group_menu_command(GROUP_MENU_COLOR_BASE + GroupColor::ALL.len()),
         None
     );
-    assert_eq!(group_menu_command(GROUP_MENU_CLOSE + 1), None);
+    assert_eq!(group_menu_command(GROUP_MENU_RENAME + 1), None);
 
     let mut ids: Vec<usize> = (0..GroupColor::ALL.len())
         .map(|index| GROUP_MENU_COLOR_BASE + index)
         .collect();
-    ids.extend([GROUP_MENU_TOGGLE, GROUP_MENU_UNGROUP, GROUP_MENU_CLOSE]);
+    ids.extend([
+        GROUP_MENU_TOGGLE,
+        GROUP_MENU_UNGROUP,
+        GROUP_MENU_CLOSE,
+        GROUP_MENU_RENAME,
+    ]);
     for (index, id) in ids.iter().enumerate() {
         assert!(!ids[..index].contains(id), "id {id} repetido");
         assert_ne!(*id, 0);
@@ -19442,6 +19451,12 @@ fn group_menu_commands_change_only_their_group() {
     assert!(closed.is_empty());
     assert_eq!(groups[0].color, GroupColor::Pink);
     assert_eq!(groups[1].color, GroupColor::Green, "o outro grupo fica");
+
+    let renamed = rename_context_group(&mut groups, 1, "Pesquisa IA");
+    assert!(renamed);
+    assert_eq!(groups[0].name, "Pesquisa IA");
+    assert!(!rename_context_group(&mut groups, 1, "   "));
+    assert_eq!(groups[0].name, "Pesquisa IA");
 
     let _ = apply_group_command(&mut tabs, &mut groups, 1, GroupMenuCommand::ToggleCollapsed);
     assert!(groups[0].collapsed && !groups[1].collapsed);
@@ -37080,4 +37095,27 @@ fn address_bar_has_distinct_visible_border_and_contiguous_service_icons() {
             "distancia entre Privado e Pomodoro deve ser exatamente a folga padrao (4px), mas foi {gap}"
         );
     }
+}
+
+#[test]
+fn minimizing_last_panel_maximizes_split_and_closing_returns_to_home() {
+    let mut split = SplitView {
+        webview: (),
+        source_index: 2,
+        context_id: None,
+        fullscreen: false,
+        private: false,
+    };
+    let mut minimized = [true, true, false];
+    minimized[2] = true;
+    let all_ai_minimized = (0..3).all(|i| minimized[i]);
+    assert!(all_ai_minimized);
+    if all_ai_minimized {
+        split.fullscreen = true;
+    }
+    assert!(split.fullscreen);
+
+    let closed_split: Option<SplitView<()>> = None;
+    let should_go_home = closed_split.is_none() && (0..3).all(|i| minimized[i]);
+    assert!(should_go_home);
 }

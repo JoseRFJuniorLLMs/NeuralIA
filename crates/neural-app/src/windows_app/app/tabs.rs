@@ -2,6 +2,7 @@
 //! aba e de grupo, gestos, pressionar/largar/clicar na barra
 //! (split-windows-app-c).
 use crate::windows_app::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WS_BORDER};
 
 impl App {
     /// Corre depois de cada lote de eventos: se as abas ou os grupos mudaram,
@@ -625,6 +626,8 @@ impl App {
         // O nome do grupo por cima, cinzento: um titulo, nao um comando.
         menu.push(MenuCommand::new(0, format!("Grupo \u{201C}{name}\u{201D}")).disabled(""));
         menu.separator();
+        menu.push(MenuCommand::new(GROUP_MENU_RENAME, "Renomear grupo"));
+        menu.separator();
         menu.entries.extend(group_color_items(current));
         menu.separator();
         menu.push(MenuCommand::new(
@@ -639,6 +642,11 @@ impl App {
         menu.push(MenuCommand::new(GROUP_MENU_CLOSE, "Fechar grupo"));
 
         let selected = self.track_menu(&menu, point, MenuButton::Right);
+
+        if selected == GROUP_MENU_RENAME {
+            self.open_group_rename(source_index, group_index, group_id);
+            return;
+        }
 
         if let Some(command) = group_menu_command(selected) {
             self.apply_group_menu(source_index, group_id, command);
@@ -668,6 +676,157 @@ impl App {
             self.close_split();
         }
         self.request_redraw();
+    }
+
+    /// Abre o editor nativo para renomear o grupo por baixo da pilula dele.
+    pub(in crate::windows_app) fn open_group_rename(
+        &mut self,
+        source_index: usize,
+        group_index: usize,
+        group_id: u64,
+    ) {
+        self.close_group_rename();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let Some(group_name) = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.groups.get(source_index))
+            .and_then(|groups| groups.iter().find(|g| g.id == group_id))
+            .map(|g| g.name.clone())
+        else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let point = self
+            .group_chip_point(owner, source_index, group_index)
+            .unwrap_or_else(|| self.bar_menu_point(owner));
+
+        let width = (200.0 * scale).round() as i32;
+        let height = (32.0 * scale).round() as i32;
+
+        let created = unsafe {
+            let popup = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!(""),
+                WS_POPUP | WS_BORDER,
+                point.x,
+                point.y + (2.0 * scale).round() as i32,
+                width,
+                height,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if popup.is_null() {
+                return;
+            }
+            if SetWindowSubclass(
+                popup,
+                Some(group_rename_subclass),
+                GROUP_RENAME_SUBCLASS_ID,
+                0,
+            ) == 0
+            {
+                DestroyWindow(popup);
+                return;
+            }
+            let pad = (3.0 * scale).round() as i32;
+            let edit = CreateWindowExW(
+                0,
+                windows_sys::w!("EDIT"),
+                windows_sys::w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+                pad,
+                pad,
+                width - 2 * pad,
+                height - 2 * pad,
+                popup,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if edit.is_null() {
+                DestroyWindow(popup);
+                return;
+            }
+            let text = wide_null(&group_name);
+            SetWindowTextW(edit, text.as_ptr());
+            let cue = wide_null("Nome do grupo");
+            SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+            SendMessageW(edit, EM_SETLIMITTEXT, 64, 0);
+            let host_ptr = (&*self.group_rename_host as *const GroupRenameHost) as usize;
+            if SetWindowSubclass(
+                edit,
+                Some(group_rename_edit_subclass),
+                GROUP_RENAME_EDIT_SUBCLASS_ID,
+                host_ptr,
+            ) == 0
+            {
+                DestroyWindow(popup);
+                return;
+            }
+            let font = create_font(-((13.0 * scale).round() as i32), FW_NORMAL as i32);
+            if !font.is_null() {
+                SendMessageW(edit, WM_SETFONT, font as usize, 1);
+            }
+            SendMessageW(edit, EM_SETSEL, 0, -1);
+            GroupRenameWindow { popup, edit, font }
+        };
+
+        let (popup, edit) = (created.popup, created.edit);
+        self.group_rename = Some(created);
+        self.group_rename_host
+            .target
+            .set(Some((source_index, group_id)));
+        self.group_rename_host
+            .generation
+            .set(self.group_rename_host.generation.get().wrapping_add(1));
+        unsafe {
+            ShowWindow(popup, SW_SHOW);
+            InvalidateRect(popup, std::ptr::null(), 0);
+            SetFocus(edit);
+        }
+    }
+
+    /// Fecha o editor de renomear grupo se estiver aberto.
+    pub(in crate::windows_app) fn close_group_rename(&mut self) {
+        self.group_rename_host.target.set(None);
+        let Some(rename) = self.group_rename.take() else {
+            return;
+        };
+        unsafe {
+            DestroyWindow(rename.popup);
+            if !rename.font.is_null() {
+                DeleteObject(rename.font as _);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Aplica o novo nome ao grupo e persiste a sessao de abas.
+    pub(in crate::windows_app) fn rename_context_group(
+        &mut self,
+        source_index: usize,
+        group_id: u64,
+        name: String,
+    ) {
+        let Some(comp) = &mut self.comparator else {
+            return;
+        };
+        if source_index >= COMPARATOR_COLUMNS {
+            return;
+        }
+        if rename_context_group(&mut comp.groups[source_index], group_id, &name) {
+            self.request_redraw();
+            self.observe_tab_session();
+        }
     }
 
     /// Botao esquerdo em baixo na barra. Abas, o x delas e as pilulas dos
@@ -1005,4 +1164,83 @@ pub(in crate::windows_app) fn group_color_items(current: GroupColor) -> Vec<Menu
                 .into()
         })
         .collect()
+}
+
+unsafe extern "system" fn group_rename_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> LRESULT {
+    match message {
+        WM_NCHITTEST => return HTCLIENT as LRESULT,
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut paint);
+            if !hdc.is_null() {
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client) != 0 {
+                    let theme = Theme::system();
+                    let bg = CreateSolidBrush(rgb3(theme.bar_bg));
+                    FillRect(hdc, &client, bg);
+                    DeleteObject(bg as _);
+                }
+                EndPaint(hwnd, &paint);
+            }
+            return 0;
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn group_rename_edit_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    reference_data: usize,
+) -> LRESULT {
+    let host = &*(reference_data as *const GroupRenameHost);
+    match message {
+        WM_KEYDOWN => {
+            let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+            match wparam as u16 {
+                VK_RETURN => {
+                    let name = window_text(hwnd);
+                    if let Some((source_index, group_id)) = host.target.get() {
+                        let _ = host.proxy.send_event(UserEvent::GroupRenameSubmit {
+                            source_index,
+                            group_id,
+                            name,
+                        });
+                    }
+                    return 0;
+                }
+                VK_ESCAPE => {
+                    let _ = host
+                        .proxy
+                        .send_event(UserEvent::CloseGroupRename(host.generation.get()));
+                    return 0;
+                }
+                0x41 if ctrl => {
+                    SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+        WM_CHAR if wparam == 13 || wparam == 27 => return 0,
+        WM_KILLFOCUS => {
+            let _ = host
+                .proxy
+                .send_event(UserEvent::CloseGroupRename(host.generation.get()));
+            return 0;
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
 }

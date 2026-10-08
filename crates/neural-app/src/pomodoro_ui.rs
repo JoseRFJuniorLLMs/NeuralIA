@@ -234,6 +234,8 @@ pub(crate) struct PhaseEnd {
     /// `FLASHW_TRAY | FLASHW_TIMERNOFG`: nao ativa nada nem rouba o foco, e
     /// para sozinho quando a janela volta a frente).
     pub(crate) flash: bool,
+    /// Se acabou um foco: o Wim Hof (Respiracao) abre para a pausa.
+    pub(crate) open_breath: bool,
 }
 
 /// O `App` visto pelo tique do Pomodoro: o motor, quem agenda, a janela e o
@@ -256,6 +258,8 @@ pub(crate) trait PomodoroHost {
     fn notice(&mut self, message: String);
     /// O tempo mudou: repinta o botao (e a dica, se estiver a vista).
     fn repaint(&mut self);
+    /// Abre a respiracao guiada (metodo Wim Hof).
+    fn open_breath(&mut self);
 }
 
 /// Um tique do Pomodoro pelo caminho da app (`App::pomodoro_tick`): so o da
@@ -269,13 +273,21 @@ pub(crate) fn pomodoro_tick(host: &mut impl PomodoroHost, token: u64, now: Insta
     let Some(tick) = pomodoro.run_tick(token, now, timers, window) else {
         return;
     };
-    if let Some(PhaseEnd { show, flash }) = tick.phase_end {
+    if let Some(PhaseEnd {
+        show,
+        flash,
+        open_breath,
+    }) = tick.phase_end
+    {
         host.chime();
         if flash {
             host.flash_taskbar();
         }
         if let Some(message) = show {
             host.notice(message);
+        }
+        if open_breath && !window.minimized {
+            host.open_breath();
         }
     }
     host.repaint();
@@ -308,8 +320,8 @@ enum PomodoroTick {
     Stale,
     Live {
         next: Option<TickSchedule>,
-        /// Fim de fase neste tique: o aviso e o som.
-        finished: Option<String>,
+        /// Fim de fase neste tique: o aviso, o som e se abre Wim Hof.
+        finished: Option<(PomodoroEvent, String)>,
     },
 }
 
@@ -406,6 +418,7 @@ pub(crate) struct PomodoroController {
     /// O ultimo fim de fase que a janela pode nao ter visto (estava
     /// minimizada ou atras de outra): volta a aparecer quando ela voltar.
     unseen: Option<String>,
+    unseen_breath: bool,
 }
 
 impl PomodoroController {
@@ -414,6 +427,7 @@ impl PomodoroController {
             timer: Pomodoro::new(settings),
             generation: 0,
             unseen: None,
+            unseen_breath: false,
         }
     }
 
@@ -449,14 +463,17 @@ impl PomodoroController {
         if let Some(tick) = next {
             timers.schedule(tick);
         }
-        let phase_end = finished.map(|message| {
+        let phase_end = finished.map(|(event, message)| {
+            let is_focus = matches!(event, PomodoroEvent::FocusFinished { .. });
             // Fora da frente nao ha garantia de que o aviso foi visto (o
             // popup owned fica atras de outra janela, ou some com a dona
             // minimizada): guarda-se para quando ela voltar.
             self.unseen = (!window.foreground).then(|| message.clone());
+            self.unseen_breath = !window.foreground && is_focus;
             PhaseEnd {
                 show: (!window.minimized).then_some(message),
                 flash: !window.foreground,
+                open_breath: is_focus,
             }
         });
         Some(LiveTick { phase_end })
@@ -466,6 +483,10 @@ impl PomodoroController {
     /// ela nao viu, uma vez.
     pub(crate) fn window_back(&mut self) -> Option<String> {
         self.unseen.take()
+    }
+
+    pub(crate) fn take_unseen_breath(&mut self) -> bool {
+        std::mem::take(&mut self.unseen_breath)
     }
 
     pub(crate) fn state(&self) -> PomodoroState {
@@ -562,6 +583,7 @@ impl PomodoroController {
                 PomodoroState::Stopped => Some("O Pomodoro já está parado.".to_string()),
                 PomodoroState::Running | PomodoroState::Paused => {
                     self.timer.stop();
+                    self.unseen_breath = false;
                     Some("Pomodoro parado.".to_string())
                 }
             },
@@ -615,7 +637,7 @@ impl PomodoroController {
         let finished = self
             .timer
             .tick(now)
-            .map(|event| phase_end_message(event, self.timer.settings()));
+            .map(|event| (event, phase_end_message(event, self.timer.settings())));
         PomodoroTick::Live {
             next: self.next_tick(token, now),
             finished,
@@ -1120,6 +1142,10 @@ mod tests {
         fn repaint(&mut self) {
             self.log.push("repinta".to_string());
         }
+
+        fn open_breath(&mut self) {
+            self.log.push("breath".to_string());
+        }
     }
 
     /// Gate: o tique que a app corre (`pomodoro_tick`, o corpo inteiro do
@@ -1131,7 +1157,7 @@ mod tests {
     fn the_app_tick_announces_a_phase_end_as_the_window_can_see_it() {
         let notice = "aviso: Foco concluído! Pausa curta de 5 min";
         for (window, expected) in [
-            (FRONT, vec!["som", notice]),
+            (FRONT, vec!["som", notice, "breath"]),
             (
                 WindowAttention {
                     minimized: true,
@@ -1144,7 +1170,7 @@ mod tests {
                     minimized: false,
                     foreground: false,
                 },
-                vec!["som", "pisca", notice],
+                vec!["som", "pisca", notice, "breath"],
             ),
         ] {
             let t0 = Instant::now();
@@ -1256,7 +1282,13 @@ mod tests {
                     token,
                     delay: secs(1)
                 }),
-                finished: Some("4 focos concluídos! Pausa longa de 15 min".to_string()),
+                finished: Some((
+                    PomodoroEvent::FocusFinished {
+                        completed_focus: 4,
+                        next: Phase::LongBreak,
+                    },
+                    "4 focos concluídos! Pausa longa de 15 min".to_string(),
+                )),
             }
         );
         assert_eq!(pomodoro.0.phase(), Phase::LongBreak);

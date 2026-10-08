@@ -797,6 +797,7 @@ pub(in crate::windows_app) enum GroupMenuCommand {
     ToggleCollapsed,
     Ungroup,
     Close,
+    Rename,
 }
 
 /// As cores ocupam `GROUP_MENU_COLOR_BASE + indice em GroupColor::ALL`.
@@ -804,6 +805,7 @@ pub(in crate::windows_app) const GROUP_MENU_COLOR_BASE: usize = 200;
 pub(in crate::windows_app) const GROUP_MENU_TOGGLE: usize = 220;
 pub(in crate::windows_app) const GROUP_MENU_UNGROUP: usize = 221;
 pub(in crate::windows_app) const GROUP_MENU_CLOSE: usize = 222;
+pub(in crate::windows_app) const GROUP_MENU_RENAME: usize = 223;
 
 /// Id devolvido pelo `TrackPopupMenu` do grupo -> operacao. Zero (menu
 /// fechado sem escolha) e ids fora da lista nao fazem nada.
@@ -812,6 +814,7 @@ pub(in crate::windows_app) fn group_menu_command(id: usize) -> Option<GroupMenuC
         GROUP_MENU_TOGGLE => Some(GroupMenuCommand::ToggleCollapsed),
         GROUP_MENU_UNGROUP => Some(GroupMenuCommand::Ungroup),
         GROUP_MENU_CLOSE => Some(GroupMenuCommand::Close),
+        GROUP_MENU_RENAME => Some(GroupMenuCommand::Rename),
         _ => id
             .checked_sub(GROUP_MENU_COLOR_BASE)
             .and_then(|index| GroupColor::ALL.get(index))
@@ -841,6 +844,7 @@ pub(in crate::windows_app) fn apply_group_command(
             groups[position].collapsed = !groups[position].collapsed;
             Vec::new()
         }
+        GroupMenuCommand::Rename => Vec::new(),
         // As abas ficam onde estao, soltas: o troco era seguido, continua.
         GroupMenuCommand::Ungroup => {
             for tab in tabs.iter_mut().filter(|tab| tab.group == Some(group_id)) {
@@ -859,6 +863,24 @@ pub(in crate::windows_app) fn apply_group_command(
             prune_empty_groups(tabs, groups);
             closed
         }
+    }
+}
+
+/// Renomeia o grupo indicado se o novo nome nao for vazio (depois de trim).
+pub(in crate::windows_app) fn rename_context_group(
+    groups: &mut [ContextGroup],
+    group_id: u64,
+    new_name: &str,
+) -> bool {
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(group) = groups.iter_mut().find(|group| group.id == group_id) {
+        group.name = trimmed.to_string();
+        true
+    } else {
+        false
     }
 }
 

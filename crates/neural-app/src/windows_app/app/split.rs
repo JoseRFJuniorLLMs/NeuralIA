@@ -482,6 +482,15 @@ impl App {
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.request_redraw();
+
+        // Se os paineis de IA estiverem todos minimizados, fechar a barra lateral volta para a Home:
+        // "3 - se eu minimizar os 3 paineis de ia, e a barra lateral, ele volta para home sozinho."
+        if let Some(comp) = &self.comparator {
+            let all_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
+            if all_minimized {
+                self.request_home();
+            }
+        }
     }
 
     pub(in crate::windows_app) fn toggle_split_fullscreen(&mut self) {
@@ -496,6 +505,18 @@ impl App {
         else {
             return;
         };
+
+        if !fullscreen {
+            if let Some(comp) = &mut self.comparator {
+                let all_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
+                if all_minimized {
+                    if let Some(split) = &comp.split {
+                        let src = split.source_index.min(comp.views.len().saturating_sub(1));
+                        comp.minimized[src] = false;
+                    }
+                }
+            }
+        }
 
         if let Some(window) = &self.window {
             window.set_fullscreen(if fullscreen {

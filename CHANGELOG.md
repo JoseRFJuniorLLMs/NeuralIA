@@ -2,6 +2,25 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.8.1] - 2026-10-08
+
+### Added
+- **Renomeação nativa de grupos de abas na barra de títulos:**
+  - Adicionada opção "Renomear grupo..." no menu de contexto de abas (`GROUP_MENU_RENAME`).
+  - Implementado pop-up nativo Win32 inline com campo de edição estilizado em dark mode (`GroupRenameWindow`), suporte a confirmação com Enter, cancelamento com Esc ou clique externo e atualização em tempo real do nome customizado do grupo.
+- **Integração do Pomodoro com Respiração Guiada (Wim Hof):**
+  - Ao término de uma sessão de foco do Pomodoro, o assistente agora aciona automaticamente a ferramenta de respiração guiada (`Service::Breath`).
+  - Implementado despacho de eventos thread-safe (`UserEvent::BreathRequest`) com suporte a ativação diferida (`take_unseen_breath`) quando a janela principal é restaurada da bandeja ou reativada.
+
+### Changed & Improved
+- **Layout inteligente e retorno automático à Home no Comparador:**
+  - Quando a barra lateral (Split View) está aberta e o usuário minimiza o último painel de IA visível, a barra lateral é maximizada automaticamente para ocupar toda a largura da janela, preservando a proporção original para restauração.
+  - Se todos os 3 painéis de IA forem minimizados e a barra lateral for fechada (ou se todos os 4 forem minimizados), o aplicativo retorna automaticamente para a tela Home inicial.
+  - Alternar a tela cheia ou reabrir painéis restaura a visualização de IA de origem caso todos tenham sido minimizados previamente.
+- **Resiliência e gestão de credenciais no Gemini Live:**
+  - Expandida a detecção de erros para cobrir falhas de faturamento/dunning da Google Cloud (`Lightning dunning decision is deny`) e credenciais de autenticação inválidas (código 1008).
+  - O botão "Trocar chave" permanece acessível e operável mesmo após a chave de API já ter sido previamente configurada, permitindo renovação imediata sem necessidade de limpar o armazenamento local manualmente.
+
 ## [2.8.0] - 2026-10-04
 
 ### Added

@@ -496,6 +496,19 @@ impl ApplicationHandler<UserEvent> for App {
                     self.close_palette();
                 }
             }
+            UserEvent::GroupRenameSubmit {
+                source_index,
+                group_id,
+                name,
+            } => {
+                self.rename_context_group(source_index, group_id, name);
+                self.close_group_rename();
+            }
+            UserEvent::CloseGroupRename(generation) => {
+                if generation == self.group_rename_host.generation.get() {
+                    self.close_group_rename();
+                }
+            }
             UserEvent::ExpandComparator(idx) => {
                 if self.surface == Surface::Comparator {
                     self.expand_comparator(idx);

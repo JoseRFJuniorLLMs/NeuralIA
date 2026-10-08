@@ -280,14 +280,17 @@
   function describeClose(code, reason) {
     const text = String(reason || '').trim();
     const detail = text.replace(/[\s.]+$/, '');
-    const keyProblem = /api[ _-]?key|permission|unauthori[sz]ed|forbidden|unregistered/i.test(text);
+    const keyProblem =
+      /api[ _-]?key|permission|unauthori[sz]ed|forbidden|unregistered|authenticat|credential|oauth/i.test(
+        text
+      );
     let message;
     if (keyProblem) {
       message = 'O Google recusou a chave. Use «Trocar chave» e tente de novo.';
-    } else if (/quota|resource[ _-]?exhausted|billing|rate[ _-]?limit/i.test(text)) {
+    } else if (/quota|resource[ _-]?exhausted|billing|dunning|rate[ _-]?limit/i.test(text)) {
       message =
-        'A cota da API do Gemini acabou ou falta configurar o faturamento. ' +
-        'Confira o plano em aistudio.google.com.';
+        'A cota da API do Gemini acabou ou há pendência de faturamento no Google Cloud. ' +
+        'Confira o plano e cobrança em aistudio.google.com ou console.cloud.google.com.';
     } else if (/model/i.test(text) && /not (found|supported)|unsupported/i.test(text)) {
       message = 'O modelo do Gemini Live não está disponível para esta chave.';
     } else if (code === 1000) {

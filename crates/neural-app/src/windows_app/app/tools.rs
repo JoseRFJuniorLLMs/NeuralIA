@@ -242,6 +242,23 @@ impl App {
         if let Some(message) = self.pomodoro.window_back() {
             self.show_background_splash(message, POMODORO_PHASE_END_SECONDS);
         }
+        if self.pomodoro.take_unseen_breath() {
+            self.open_breath();
+        }
+    }
+
+    /// Abre a respiracao guiada (Wim Hof) no painel de servico.
+    /// Se ja estiver aberto e nao-minimizado, mantem aberto sem fechar.
+    pub(in crate::windows_app) fn open_breath(&mut self) {
+        if let Some(panel) = &mut self.service_panel {
+            if panel.service == Service::Breath {
+                if panel.state.minimized() {
+                    self.open_service_panel(Service::Breath);
+                }
+                return;
+            }
+        }
+        self.open_service_panel(Service::Breath);
     }
 
     /// Minimizada e a da frente, para o fim de uma fase do Pomodoro.
@@ -623,5 +640,9 @@ impl PomodoroHost for App {
 
     fn repaint(&mut self) {
         self.pomodoro_changed();
+    }
+
+    fn open_breath(&mut self) {
+        self.open_breath();
     }
 }

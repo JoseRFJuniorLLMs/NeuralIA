@@ -308,6 +308,7 @@ impl App {
         }
         self.mark_dirty();
         self.close_palette();
+        self.close_group_rename();
         self.finish_agent(AgentTermination::UserStopped);
 
         // Derruba as superfícies WebView ANTES de alterar fullscreen/decoração.
