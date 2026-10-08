@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use super::*;
 
 /// O que o editor do painel manda gravar. `id: None` e uma nota nova; um id
@@ -115,6 +117,7 @@ pub(super) fn track_note_draft(draft: &mut Option<NoteEdit>, message: &PanelMess
         | PanelMessage::Search(_)
         | PanelMessage::Open(_)
         | PanelMessage::Close
+        | PanelMessage::ObsidianGraph
         | PanelMessage::NotesList
         | PanelMessage::NotesSearch(_)
         | PanelMessage::NoteOpen(_)
@@ -169,6 +172,7 @@ pub(super) enum NotesCommand {
     Save(NoteEdit),
     Delete(String),
     Create(NoteDraft),
+    Graph(Vec<neural_core::HistoryEntry>),
 }
 
 /// Porque e que uma nota vai para o editor.
@@ -209,6 +213,30 @@ impl NoteSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct GraphNode {
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) subtitle: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct GraphEdge {
+    pub(super) from: String,
+    pub(super) to: String,
+    pub(super) kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ObsidianGraphData {
+    pub(super) nodes: Vec<GraphNode>,
+    pub(super) edges: Vec<GraphEdge>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum NotesReply {
     Listed {
@@ -236,6 +264,7 @@ pub(super) enum NotesReply {
         original: String,
         note: Note,
     },
+    Graph(ObsidianGraphData),
     Failed(String),
 }
 
@@ -321,7 +350,8 @@ pub(super) fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
         | PanelMessage::Open(_)
         | PanelMessage::Close
         | PanelMessage::Downloads(_)
-        | PanelMessage::Bookmarks(_) => {
+        | PanelMessage::Bookmarks(_)
+        | PanelMessage::ObsidianGraph => {
             return None;
         }
     })
@@ -433,6 +463,12 @@ pub(super) fn run_notes_command_in(
                 Err(error) => NotesReply::Failed(format!("Não foi possível criar a nota: {error}")),
             }
         }
+        NotesCommand::Graph(history) => match store.list() {
+            Ok(notes) => NotesReply::Graph(build_obsidian_graph(&notes, &history)),
+            Err(error) => NotesReply::Failed(format!(
+                "Não foi possível ler as notas para o grafo: {error}"
+            )),
+        },
     }
 }
 
@@ -516,12 +552,168 @@ pub(super) fn notes_reply_script(reply: &NotesReply) -> String {
             "original": original,
             "note": note_json(note),
         }),
+        NotesReply::Graph(graph) => return obsidian_graph_script(graph),
         NotesReply::Deleted { id } => serde_json::json!({ "kind": "deleted", "id": id }),
         NotesReply::Missing { id } => serde_json::json!({ "kind": "missing", "id": id }),
         NotesReply::Failed(message) => serde_json::json!({ "kind": "failed", "message": message }),
     };
     let payload = serde_json::to_string(&data).unwrap_or_else(|_| "null".to_string());
     format!("window.__neuraliaNotes && window.__neuraliaNotes.receive({payload});")
+}
+
+pub(super) fn obsidian_graph_script(data: &ObsidianGraphData) -> String {
+    let payload =
+        serde_json::to_string(data).unwrap_or_else(|_| r#"{"nodes":[],"edges":[]}"#.to_string());
+    format!("window.__neuraliaObsidian && window.__neuraliaObsidian.render({payload});")
+}
+
+pub(super) fn build_obsidian_graph(
+    notes: &[Note],
+    history: &[neural_core::HistoryEntry],
+) -> ObsidianGraphData {
+    let mut nodes_map = std::collections::HashMap::new();
+    let mut edges = Vec::new();
+    let mut edge_set = std::collections::HashSet::new();
+
+    let mut add_edge = |from: String, to: String, kind: &'static str| {
+        if from != to && !edge_set.contains(&(from.clone(), to.clone())) {
+            edge_set.insert((from.clone(), to.clone()));
+            edges.push(GraphEdge {
+                from,
+                to,
+                kind: kind.to_string(),
+            });
+        }
+    };
+
+    // 1. Processar notas do Obsidian (Zettelkasten)
+    for note in notes {
+        let note_node_id = format!("note:{}", note.id);
+        nodes_map.insert(
+            note_node_id.clone(),
+            GraphNode {
+                id: note_node_id.clone(),
+                label: if note.title.trim().is_empty() {
+                    note.id.clone()
+                } else {
+                    note.title.clone()
+                },
+                kind: "note".to_string(),
+                target: Some(note.id.clone()),
+                subtitle: Some("Nota Zettelkasten".to_string()),
+            },
+        );
+
+        // Wikilinks ([[id]])
+        for target_id in zettel::links(note) {
+            let target_node_id = format!("note:{target_id}");
+            add_edge(note_node_id.clone(), target_node_id, "link");
+        }
+
+        // Tags (#tag)
+        for tag in &note.tags {
+            let clean = tag.trim().trim_start_matches('#');
+            if clean.is_empty() {
+                continue;
+            }
+            let tag_id = format!("tag:{}", clean.to_lowercase());
+            nodes_map
+                .entry(tag_id.clone())
+                .or_insert_with(|| GraphNode {
+                    id: tag_id.clone(),
+                    label: format!("#{clean}"),
+                    kind: "tag".to_string(),
+                    target: None,
+                    subtitle: Some("Tag".to_string()),
+                });
+            add_edge(note_node_id.clone(), tag_id, "tag");
+        }
+
+        // Fontes / Sites lidos
+        if let Some(src) = &note.source {
+            let trimmed = src.trim();
+            if !trimmed.is_empty() {
+                let site_id = format!("site:{trimmed}");
+                let domain = url::Url::parse(trimmed)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_else(|| trimmed.to_string());
+                nodes_map
+                    .entry(site_id.clone())
+                    .or_insert_with(|| GraphNode {
+                        id: site_id.clone(),
+                        label: domain,
+                        kind: "site".to_string(),
+                        target: Some(trimmed.to_string()),
+                        subtitle: Some(trimmed.to_string()),
+                    });
+                add_edge(note_node_id.clone(), site_id, "source");
+            }
+        }
+    }
+
+    // 2. Processar histórico recente e pesquisas
+    for entry in history {
+        let input = entry.input.trim();
+        if input.is_empty() {
+            continue;
+        }
+
+        if input.starts_with("http://") || input.starts_with("https://") {
+            let site_id = format!("site:{input}");
+            let domain = url::Url::parse(input)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                .unwrap_or_else(|| input.to_string());
+            nodes_map
+                .entry(site_id.clone())
+                .or_insert_with(|| GraphNode {
+                    id: site_id.clone(),
+                    label: domain,
+                    kind: "site".to_string(),
+                    target: Some(input.to_string()),
+                    subtitle: Some(input.to_string()),
+                });
+        } else {
+            let hist_id = format!("hist:{input}");
+            nodes_map
+                .entry(hist_id.clone())
+                .or_insert_with(|| GraphNode {
+                    id: hist_id.clone(),
+                    label: input.to_string(),
+                    kind: "history".to_string(),
+                    target: Some(input.to_string()),
+                    subtitle: Some(
+                        match entry.kind {
+                            neural_core::HistoryKind::Ask => "Pesquisa IA",
+                            neural_core::HistoryKind::Read => "Leitor",
+                            neural_core::HistoryKind::Web => "Web",
+                        }
+                        .to_string(),
+                    ),
+                });
+
+            // Conectar histórico a notas e tags relevantes por palavras-chave
+            let input_lower = input.to_lowercase();
+            for note in notes {
+                let title_lower = note.title.to_lowercase();
+                if !title_lower.is_empty()
+                    && (input_lower.contains(&title_lower) || title_lower.contains(&input_lower))
+                {
+                    add_edge(hist_id.clone(), format!("note:{}", note.id), "match");
+                }
+                for tag in &note.tags {
+                    let tag_clean = tag.trim().trim_start_matches('#').to_lowercase();
+                    if !tag_clean.is_empty() && input_lower.contains(&tag_clean) {
+                        add_edge(hist_id.clone(), format!("tag:{tag_clean}"), "match");
+                    }
+                }
+            }
+        }
+    }
+
+    let nodes = nodes_map.into_values().collect();
+    ObsidianGraphData { nodes, edges }
 }
 
 pub(super) fn unix_now() -> u64 {

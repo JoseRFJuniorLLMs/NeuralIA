@@ -1106,6 +1106,10 @@ fn side_panel_messages_are_a_closed_list_with_limits() {
         parse_panel_message(r#"{"action":"open","args":{"input":"https://exemplo.pt"}}"#),
         Some(PanelMessage::Open("https://exemplo.pt".to_string()))
     );
+    assert_eq!(
+        parse_panel_message(r#"{"action":"obsidian-graph"}"#),
+        Some(PanelMessage::ObsidianGraph)
+    );
     for bad in [
         r#"{"action":"clearhistory"}"#,
         r#"{"action":"search","args":{"query":"   "}}"#,
@@ -1352,11 +1356,13 @@ fn panel_html_is_assembled_from_its_section_assets() {
         "panel.css",
         "history.html",
         "notes.html",
+        "obsidian.html",
         "bookmarks.html",
         "downloads.html",
         "core.js",
         "history.js",
         "notes.js",
+        "obsidian.js",
         "bookmarks.js",
         "downloads.js",
         "tabs.js",
@@ -1403,6 +1409,102 @@ fn side_panel_only_ever_shows_its_local_page() {
     ] {
         assert!(!panel_allows_navigation(target), "{target}");
     }
+}
+
+#[test]
+fn obsidian_graph_builds_correlated_nodes_and_edges() {
+    let note1 = neural_core::Note {
+        id: "20261008120000".to_string(),
+        title: "Pesquisa sobre Rust".to_string(),
+        body: "Estudos em [[20261008120100]] e #programacao".to_string(),
+        tags: vec!["programacao".to_string(), "rust".to_string()],
+        source: Some("https://rust-lang.org/".to_string()),
+        created_unix: 1,
+        updated_unix: 2,
+        extra_front_matter: Vec::new(),
+    };
+    let note2 = neural_core::Note {
+        id: "20261008120100".to_string(),
+        title: "Compilador Rust".to_string(),
+        body: "Detalhes do compilador #programacao".to_string(),
+        tags: vec!["programacao".to_string()],
+        source: None,
+        created_unix: 2,
+        updated_unix: 3,
+        extra_front_matter: Vec::new(),
+    };
+    let history = vec![
+        HistoryEntry {
+            timestamp_unix: 1,
+            kind: HistoryKind::Web,
+            input: "https://rust-lang.org/".to_string(),
+            target: "https://rust-lang.org/".to_string(),
+        },
+        HistoryEntry {
+            timestamp_unix: 2,
+            kind: HistoryKind::Ask,
+            input: "o que e rust".to_string(),
+            target: String::new(),
+        },
+    ];
+    let graph = notes::build_obsidian_graph(&[note1, note2], &history);
+    assert!(!graph.nodes.is_empty());
+    assert!(!graph.edges.is_empty());
+
+    // Verifica que nos de notas, tags e sites foram criados
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "note:20261008120000" && n.kind == "note")
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "note:20261008120100" && n.kind == "note")
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "tag:programacao" && n.kind == "tag")
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|n| n.id == "site:https://rust-lang.org/" && n.kind == "site")
+    );
+    assert!(graph.nodes.iter().any(|n| n.kind == "history"));
+
+    // Verifica que as conexoes esperadas existem
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|e| e.from == "note:20261008120000" && e.to == "tag:programacao")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|e| e.from == "note:20261008120000" && e.to == "site:https://rust-lang.org/")
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .any(|e| e.from == "note:20261008120000" && e.to == "note:20261008120100")
+    );
+
+    let script = notes::obsidian_graph_script(&graph);
+    assert!(script.starts_with("window.__neuraliaObsidian && window.__neuraliaObsidian.render("));
+    assert!(script.ends_with(");"));
+    assert_eq!(
+        page_scripts::PANEL_SHOW_OBSIDIAN_SCRIPT,
+        "window.neuraliaShowSection && window.neuraliaShowSection('obsidian')"
+    );
 }
 
 #[test]

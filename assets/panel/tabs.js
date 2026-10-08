@@ -1,14 +1,17 @@
-  // Abas: Historico, Notas, Favoritos e Downloads.
+  // Abas: Historico, Notas, Obsidian, Favoritos e Downloads.
   const tabs = {
     history: byId('tab-history'), notes: byId('tab-notes'),
+    obsidian: byId('tab-obsidian'),
     bookmarks: byId('tab-bookmarks'), downloads: byId('tab-downloads')
   };
   const views = {
     history: byId('view-history'), notes: byId('view-notes'),
+    obsidian: byId('view-obsidian'),
     bookmarks: byId('view-bookmarks'), downloads: byId('view-downloads')
   };
   function showSection(name) {
     const key = name === 'notes' || name === 'notas' ? 'notes'
+      : name === 'obsidian' || name === 'grafo' ? 'obsidian'
       : name === 'history' || name === 'historico' ? 'history'
       : name === 'bookmarks' || name === 'favoritos' ? 'bookmarks'
       : name === 'downloads' ? 'downloads' : '';
@@ -20,6 +23,7 @@
       tabs[other].setAttribute('aria-selected', other === key ? 'true' : 'false');
     }
     if (key === 'notes') { notes.refresh(); notes.focus(); }
+    else if (key === 'obsidian') { obsidian.refresh(); }
     else if (key === 'bookmarks') { bookmarks.refresh(); bookmarks.focus(); }
     else if (key === 'downloads') { downloads.refresh(); }
     else { q.focus(); }
@@ -34,6 +38,11 @@
     // (como o X, salvando antes), noutra seccao mostra as Notas.
     button() { if (views.notes.hidden) showSection('notes'); else close(); }
   };
+  window.__neuraliaObsidian = {
+    render: obsidian.render,
+    refresh: obsidian.refresh,
+    open: obsidian.open
+  };
   window.__neuraliaBookmarks = { receive: bookmarks.receive };
   window.__neuraliaDownloads = {
     render: downloads.render,
@@ -43,6 +52,7 @@
   };
   tabs.history.addEventListener('click', () => showSection('history'));
   tabs.notes.addEventListener('click', () => showSection('notes'));
+  tabs.obsidian.addEventListener('click', () => showSection('obsidian'));
   tabs.bookmarks.addEventListener('click', () => showSection('bookmarks'));
   tabs.downloads.addEventListener('click', () => showSection('downloads'));
   byId('close').addEventListener('click', close);

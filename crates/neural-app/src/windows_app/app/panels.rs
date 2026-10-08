@@ -35,8 +35,11 @@ use crate::windows_app::{
         WHEEL_APP_HWND, WHEEL_PANEL_ACTIVE, WHEEL_PANEL_BOTTOM, WHEEL_PANEL_HOST, WHEEL_PANEL_LEFT,
         WHEEL_PANEL_RIGHT, WHEEL_PANEL_TOP, panel_handle_subclass, uninstall_wheel_hook,
     },
-    notes::{NOTE_SAVE_REFUSED, NotesOrigin, NotesReply, notes_command_for, notes_reply_script},
-    page_scripts::{PANEL_NEW_NOTE_SCRIPT, PANEL_SHOW_NOTES_SCRIPT},
+    notes::{
+        NOTE_SAVE_REFUSED, NotesCommand, NotesOrigin, NotesReply, notes_command_for,
+        notes_reply_script,
+    },
+    page_scripts::{PANEL_NEW_NOTE_SCRIPT, PANEL_SHOW_NOTES_SCRIPT, PANEL_SHOW_OBSIDIAN_SCRIPT},
     services::{
         Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
         raise_webview_host, register_service_panel_events, service_event_is_current,
@@ -963,6 +966,18 @@ impl App {
         self.show_notes_panel(vec![PANEL_NEW_NOTE_SCRIPT.to_string()]);
     }
 
+    /// Abre o painel lateral na aba Obsidian e carrega o grafo.
+    #[allow(dead_code)]
+    pub(in crate::windows_app) fn show_obsidian_panel(&mut self) {
+        if !self.side_panel.is_open() {
+            self.open_side_panel();
+        }
+        if !self.side_panel.is_open() {
+            return;
+        }
+        self.panel_run(PANEL_SHOW_OBSIDIAN_SCRIPT.to_string());
+    }
+
     pub(in crate::windows_app) fn handle_panel_message(&mut self, post: side_panel::PanelPost) {
         // `receive` segue a copia do editor; um pedido de uma pagina que ja
         // saiu nao chega aqui (o texto que trazia ja foi gravado).
@@ -1010,6 +1025,14 @@ impl App {
                 &NotesReply::Failed(NOTE_SAVE_REFUSED.to_string()),
             )),
             PanelMessage::Bookmarks(request) => self.bookmark_panel_request(request),
+            PanelMessage::ObsidianGraph => {
+                let history = self
+                    .privacy
+                    .recent_history(PANEL_RECENT_LIMIT)
+                    .and_then(|res| res.ok())
+                    .unwrap_or_default();
+                self.submit_notes(NotesCommand::Graph(history), NotesOrigin::Panel);
+            }
             notes @ (PanelMessage::NotesList
             | PanelMessage::NotesSearch(_)
             | PanelMessage::NoteOpen(_)
@@ -1108,7 +1131,8 @@ impl App {
                 NotesReply::Listed { .. }
                 | NotesReply::Deleted { .. }
                 | NotesReply::Missing { .. }
-                | NotesReply::Conflict { .. } => {}
+                | NotesReply::Conflict { .. }
+                | NotesReply::Graph(_) => {}
             },
             // O "Salvar nota": so o aviso, sem abrir o painel.
             NotesOrigin::Bar { private } => match &reply {
@@ -1119,7 +1143,8 @@ impl App {
                 NotesReply::Listed { .. }
                 | NotesReply::Deleted { .. }
                 | NotesReply::Missing { .. }
-                | NotesReply::Conflict { .. } => {}
+                | NotesReply::Conflict { .. }
+                | NotesReply::Graph(_) => {}
             },
             NotesOrigin::Closed => match &reply {
                 NotesReply::Opened { note, .. } => {
@@ -1137,7 +1162,8 @@ impl App {
                 NotesReply::Failed(error) => self.show_splash(error.clone(), 6),
                 NotesReply::Listed { .. }
                 | NotesReply::Deleted { .. }
-                | NotesReply::Missing { .. } => {}
+                | NotesReply::Missing { .. }
+                | NotesReply::Graph(_) => {}
             },
         }
     }

@@ -80,6 +80,11 @@ pub(in crate::windows_app) const PANEL_SHOW_NOTES_SCRIPT: &str =
 pub(in crate::windows_app) const PANEL_SHOW_BOOKMARKS_SCRIPT: &str =
     "window.neuraliaShowSection && window.neuraliaShowSection('bookmarks')";
 
+/// Corre no painel do Ctrl+H quando ele foi aberto pela secao Obsidian.
+#[allow(dead_code)]
+pub(in crate::windows_app) const PANEL_SHOW_OBSIDIAN_SCRIPT: &str =
+    "window.neuraliaShowSection && window.neuraliaShowSection('obsidian')";
+
 /// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
 /// caminho do X, que salva o editor antes), no Historico mostra as Notas.
 pub(in crate::windows_app) const PANEL_NOTES_BUTTON_SCRIPT: &str =

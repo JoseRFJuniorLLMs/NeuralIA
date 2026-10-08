@@ -2,6 +2,20 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.8.2] - 2026-10-08
+
+### Added
+- **Aba Obsidian no painel lateral (Ctrl+H) com grafo de conhecimento 2D (Segundo Cérebro):**
+  - Adicionada aba "Obsidian" integrada ao painel lateral ao lado de Histórico, Notas, Favoritos e Downloads.
+  - Implementado motor de grafo em HTML5 Canvas 2D nativo (sem bibliotecas externas) com simulação física de forças (repulsão coulombiana, atração de molas e amortecimento).
+  - **Correlação automática contínua**:
+    - **Notas Zettelkasten** (roxo `#a855f7`): cada nota criada ou editada vira nó no grafo, conectando-se a outras notas por wikilinks `[[id]]`.
+    - **Tags** (âmbar `#f59e0b`): extraídas das notas e do texto (`#tag`), correlacionando conceitos e temas em comum.
+    - **Sites e Fontes** (azul `#3b82f6`): URLs de onde as notas foram geradas e páginas web acessadas.
+    - **Histórico e Pesquisas** (verde `#10b981`): pesquisas recentes e páginas lidas conectadas por palavras-chave às notas e tags correspondentes.
+  - **Interatividade completa**: arrastar nós (drag-and-drop), pan e zoom com roda do mouse, hover com iluminação de conexões vizinhas, card flutuante de detalhes e clique duplo para abrir notas no editor ou navegar diretamente para URLs e buscas.
+  - Respeito integral aos gates de segurança contra injeção e XSS (manipulação de DOM estritamente segura e sem `innerHTML`).
+
 ## [2.8.1] - 2026-10-08
 
 ### Added
