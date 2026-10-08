@@ -1142,8 +1142,8 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
 #[derive(Debug, Clone, Copy)]
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
-    /// Videochamada, WhatsApp, YouTube e Gmail, a esquerda dos downloads (na barra de titulo).
-    pub(in crate::windows_app) services: [UiRect; 4],
+    /// Videochamada, Teams, WhatsApp, YouTube e Gmail, a esquerda dos downloads (na barra de titulo).
+    pub(in crate::windows_app) services: [UiRect; 5],
     /// A seta dos downloads (downloads-ui), logo a esquerda do Privado.
     pub(in crate::windows_app) downloads: UiRect,
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
@@ -1297,8 +1297,8 @@ pub(in crate::windows_app) fn right_controls(
     } else {
         private.x
     };
-    let services: [UiRect; 4] = std::array::from_fn(|index| UiRect {
-        x: services_right - (4 - index) as f64 * (title_size + icon_gap),
+    let services: [UiRect; 5] = std::array::from_fn(|index| UiRect {
+        x: services_right - (5 - index) as f64 * (title_size + icon_gap),
         y: title_y,
         width: title_size,
         height: title_size,
@@ -1389,9 +1389,9 @@ pub(in crate::windows_app) struct ClusterSlot {
     pub(in crate::windows_app) icon: usize,
 }
 
-/// O grupo dos 7 atalhos da barra de titulo, da esquerda para a direita:
-/// o Gemini Live, os quatro servicos, os downloads (downloads-ui) e o Privado.
-pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 7] = [
+/// O grupo dos 8 atalhos da barra de titulo, da esquerda para a direita:
+/// o Gemini Live, os cinco servicos, os downloads (downloads-ui) e o Privado.
+pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 8] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
         icon: ICON_SLOT_LIVE,
@@ -1399,6 +1399,10 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 7] = [
     ClusterSlot {
         hit: BarHit::Service(Service::Meet),
         icon: ICON_SLOT_VIDEO,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::Teams),
+        icon: ICON_SLOT_TEAMS,
     },
     ClusterSlot {
         hit: BarHit::Service(Service::WhatsApp),
@@ -1448,6 +1452,7 @@ impl RightControls {
             self.services[1],
             self.services[2],
             self.services[3],
+            self.services[4],
             self.downloads,
             self.private,
         ]

@@ -88,6 +88,10 @@ pub(in crate::windows_app) const PANEL_SHOW_OBSIDIAN_SCRIPT: &str =
 pub(in crate::windows_app) const PANEL_OBSIDIAN_BUTTON_SCRIPT: &str =
     "window.__neuraliaObsidian && window.__neuraliaObsidian.button()";
 
+/// Corre no painel quando ele foi aberto pela secao Sobre.
+pub(in crate::windows_app) const PANEL_SHOW_ABOUT_SCRIPT: &str =
+    "window.neuraliaShowSection && window.neuraliaShowSection('about')";
+
 /// O botao Notas com o painel ja aberto: nas Notas fecha (pelo mesmo
 /// caminho do X, que salva o editor antes), no Historico mostra as Notas.
 pub(in crate::windows_app) const PANEL_NOTES_BUTTON_SCRIPT: &str =

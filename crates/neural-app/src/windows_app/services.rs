@@ -8,6 +8,8 @@ use super::*;
 pub(in crate::windows_app) enum Service {
     /// Videochamada: o Google Meet.
     Meet,
+    /// Videochamada / reuniões: o Microsoft Teams.
+    Teams,
     WhatsApp,
     YouTube,
     Gmail,
@@ -24,6 +26,7 @@ impl Service {
     pub(in crate::windows_app) fn url(self) -> &'static str {
         match self {
             Self::Meet => "https://meet.google.com/",
+            Self::Teams => "https://teams.microsoft.com/",
             Self::WhatsApp => "https://web.whatsapp.com/",
             Self::YouTube => "https://www.youtube.com/",
             Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
@@ -34,6 +37,7 @@ impl Service {
     pub(in crate::windows_app) fn label(self) -> &'static str {
         match self {
             Self::Meet => "Videochamada (Google Meet)",
+            Self::Teams => "Microsoft Teams",
             Self::WhatsApp => "WhatsApp",
             Self::YouTube => "YouTube",
             Self::Gmail => "Gmail",
@@ -48,7 +52,7 @@ impl Service {
     pub(in crate::windows_app) fn private(self) -> bool {
         match self {
             Self::Breath => true,
-            Self::Meet | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
+            Self::Meet | Self::Teams | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
         }
     }
 
@@ -337,7 +341,7 @@ pub(in crate::windows_app) fn breath_panel_allows_navigation(target: &str) -> bo
 pub(in crate::windows_app) fn service_panel_navigation(service: Service, target: &str) -> bool {
     match service {
         Service::Breath => breath_panel_allows_navigation(target),
-        Service::Meet | Service::WhatsApp | Service::YouTube | Service::Gmail => {
+        Service::Meet | Service::Teams | Service::WhatsApp | Service::YouTube | Service::Gmail => {
             service_panel_allows_navigation(target)
         }
     }

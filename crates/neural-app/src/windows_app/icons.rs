@@ -4,24 +4,25 @@ use super::*;
 pub(in crate::windows_app) const ICON_SLOT_HOME: usize = COMPARATOR_COLUMNS;
 /// Icones dos botoes do canto direito (gerados por scripts/gen-ai-icons.py).
 pub(in crate::windows_app) const ICON_SLOT_VIDEO: usize = COMPARATOR_COLUMNS + 1;
-pub(in crate::windows_app) const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 2;
-pub(in crate::windows_app) const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 3;
-pub(in crate::windows_app) const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 4;
-pub(in crate::windows_app) const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 5;
+pub(in crate::windows_app) const ICON_SLOT_TEAMS: usize = COMPARATOR_COLUMNS + 2;
+pub(in crate::windows_app) const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 3;
+pub(in crate::windows_app) const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 4;
+pub(in crate::windows_app) const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 5;
+pub(in crate::windows_app) const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 6;
 /// Ferramentas: Pomodoro, Notas, Obsidian e Respiracao.
-pub(in crate::windows_app) const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 6;
-pub(in crate::windows_app) const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 7;
-pub(in crate::windows_app) const ICON_SLOT_OBSIDIAN: usize = COMPARATOR_COLUMNS + 8;
-pub(in crate::windows_app) const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 9;
+pub(in crate::windows_app) const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 7;
+pub(in crate::windows_app) const ICON_SLOT_NOTES: usize = COMPARATOR_COLUMNS + 8;
+pub(in crate::windows_app) const ICON_SLOT_OBSIDIAN: usize = COMPARATOR_COLUMNS + 9;
+pub(in crate::windows_app) const ICON_SLOT_BREATH: usize = COMPARATOR_COLUMNS + 10;
 /// O olho do Gemini Live.
-pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 10;
+pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 11;
 /// A seta dos downloads (downloads-ui): o seu lugar no canto
 /// (`RIGHT_CLUSTER`).
-pub(in crate::windows_app) const ICON_SLOT_DOWNLOADS: usize = COMPARATOR_COLUMNS + 11;
+pub(in crate::windows_app) const ICON_SLOT_DOWNLOADS: usize = COMPARATOR_COLUMNS + 12;
 /// Informacoes sobre o navegador e atualizacoes.
-pub(in crate::windows_app) const ICON_SLOT_ABOUT: usize = COMPARATOR_COLUMNS + 12;
-pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 12] =
-    [const { OnceLock::new() }; 12];
+pub(in crate::windows_app) const ICON_SLOT_ABOUT: usize = COMPARATOR_COLUMNS + 13;
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 13] =
+    [const { OnceLock::new() }; 13];
 
 pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -111,6 +112,7 @@ pub(in crate::windows_app) fn extra_icon(slot: usize) -> &'static RgbaImage {
     EXTRA_ICON_IMAGES[index].get_or_init(|| {
         let raw: &[u8] = match slot {
             ICON_SLOT_VIDEO => include_bytes!("../../../../assets/ai/video.png"),
+            ICON_SLOT_TEAMS => include_bytes!("../../../../assets/ai/teams.png"),
             ICON_SLOT_WHATSAPP => include_bytes!("../../../../assets/ai/whatsapp.png"),
             ICON_SLOT_YOUTUBE => include_bytes!("../../../../assets/ai/youtube.png"),
             ICON_SLOT_MAIL => include_bytes!("../../../../assets/ai/mail.png"),

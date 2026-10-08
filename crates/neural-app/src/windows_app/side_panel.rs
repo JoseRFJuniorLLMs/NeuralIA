@@ -39,6 +39,8 @@ pub(in crate::windows_app) enum PanelMessage {
     Downloads(DownloadsPanelRequest),
     /// Grafo do Obsidian: correlacao automatica de notas, sites e historico.
     ObsidianGraph,
+    /// Pedido de verificacao de atualizacao a partir da secao Sobre.
+    CheckUpdate,
 }
 
 pub(in crate::windows_app) const PANEL_MESSAGE_MAX_BYTES: usize = 4 * 1024;
@@ -88,6 +90,11 @@ pub(in crate::windows_app) const PANEL_SECTIONS: &[PanelSection] = &[
         prefixes: &["obsidian"],
         max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
         parse: parse_obsidian_action,
+    },
+    PanelSection {
+        prefixes: &["about", "check"],
+        max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
+        parse: parse_about_action,
     },
 ];
 
@@ -193,6 +200,16 @@ fn parse_core_action(action: &str, args: Option<&serde_json::Value>) -> Option<P
 fn parse_obsidian_action(action: &str, args: Option<&serde_json::Value>) -> Option<PanelMessage> {
     match action {
         "obsidian-graph" => exact_keys(args, &[]).map(|_| PanelMessage::ObsidianGraph),
+        _ => None,
+    }
+}
+
+/// As acoes da secao Sobre.
+fn parse_about_action(action: &str, args: Option<&serde_json::Value>) -> Option<PanelMessage> {
+    match action {
+        "about-check-update" | "check-update" => {
+            exact_keys(args, &[]).map(|_| PanelMessage::CheckUpdate)
+        }
         _ => None,
     }
 }
@@ -415,7 +432,8 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
             | PanelMessage::NoteDelete(_)
             | PanelMessage::Bookmarks(_)
             | PanelMessage::Downloads(_)
-            | PanelMessage::ObsidianGraph => None,
+            | PanelMessage::ObsidianGraph
+            | PanelMessage::CheckUpdate => None,
         };
         Received::Late(text.map(|edit| self.notes.rescue(NotesCommand::Save(edit))))
     }
@@ -706,13 +724,14 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
 "#,
     include_str!("../../../../assets/panel/panel.css"),
     r#"</style></head><body>
-<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
 "#,
     include_str!("../../../../assets/panel/history.html"),
     include_str!("../../../../assets/panel/notes.html"),
     include_str!("../../../../assets/panel/obsidian.html"),
     include_str!("../../../../assets/panel/bookmarks.html"),
     include_str!("../../../../assets/panel/downloads.html"),
+    include_str!("../../../../assets/panel/about.html"),
     "<script>\n",
     include_str!("../../../../assets/panel/core.js"),
     include_str!("../../../../assets/panel/history.js"),
@@ -720,6 +739,7 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
     include_str!("../../../../assets/panel/obsidian.js"),
     include_str!("../../../../assets/panel/bookmarks.js"),
     include_str!("../../../../assets/panel/downloads.js"),
+    include_str!("../../../../assets/panel/about.js"),
     include_str!("../../../../assets/panel/tabs.js"),
     "</script></body></html>"
 );

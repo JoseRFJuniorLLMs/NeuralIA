@@ -4,6 +4,13 @@
   <button id="obsidian-reset" class="btn" title="Centralizar visualização">Centralizar</button>
   <button id="obsidian-refresh" class="btn primary" title="Atualizar dados">Atualizar</button>
 </div>
+<div class="obsidian-filters">
+  <button id="filter-kind-note" class="obsidian-chip active" data-kind="note">🟣 Notas</button>
+  <button id="filter-kind-site" class="obsidian-chip active" data-kind="site">🔵 Sites</button>
+  <button id="filter-kind-history" class="obsidian-chip active" data-kind="history">🟢 Histórico</button>
+  <button id="filter-kind-tag" class="obsidian-chip active" data-kind="tag">🟡 Tags</button>
+  <button class="obsidian-chip" id="filter-orphans" title="Ocultar nós que não possuem conexões (Órfãos)">Ocultar Órfãos</button>
+</div>
 <div id="obsidian-stats" class="meta" style="padding:0 18px 6px;display:flex;justify-content:space-between;align-items:center;">
   <span id="obsidian-counts">Carregando grafo...</span>
   <span class="obsidian-legend">
@@ -15,6 +22,13 @@
 </div>
 <div id="obsidian-container">
   <canvas id="obsidian-canvas"></canvas>
+  <div class="obsidian-hud">
+    <button class="obsidian-hud-btn" id="hud-zoom-in" title="Aproximar (+)">＋</button>
+    <button class="obsidian-hud-btn" id="hud-zoom-out" title="Afastar (-)">－</button>
+    <button class="obsidian-hud-btn" id="hud-center" title="Centralizar visualização">⟲</button>
+    <button class="obsidian-hud-btn" id="hud-freeze" title="Pausar ou continuar física">⏸</button>
+    <button class="obsidian-hud-btn active" id="hud-labels" title="Alternar exibição de rótulos">Aa</button>
+  </div>
   <div id="obsidian-card" class="confirm" hidden>
     <div style="flex:1;min-width:0;">
       <div id="obsidian-card-title" class="title" style="font-weight:600;"></div>

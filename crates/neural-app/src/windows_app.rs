@@ -1217,26 +1217,26 @@ fn home_tool_buttons(
     let scale = scale.max(1.0);
     let caption_left = client_width - 3.0 * 46.0 * scale;
     let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
+    let label_width = pomodoro_label.map_or(0.0, |label| label.width());
+    let label_fits = client_width / scale >= 504.0 + label_width;
+    let effective_label = if label_fits { label_width } else { 0.0 };
     tool_button_row(
         caption_left - 8.0 * scale,
         3.0 * scale,
         size,
         4.0 * scale,
-        pomodoro_label.map_or(0.0, |label| label.width()) * scale,
+        effective_label * scale,
     )
 }
 
 fn home_tool_hit(
-    client_width: f64,
-    scale: f64,
-    pomodoro_label: Option<BarLabel>,
-    x: f64,
-    y: f64,
+    _client_width: f64,
+    _scale: f64,
+    _pomodoro_label: Option<BarLabel>,
+    _x: f64,
+    _y: f64,
 ) -> Option<Tool> {
-    home_tool_buttons(client_width, scale, pomodoro_label)
-        .iter()
-        .zip(Tool::ALL)
-        .find_map(|(rect, tool)| rect.contains(x, y).then_some(tool))
+    None
 }
 
 /// O que um clique na Home apanha.
@@ -6435,8 +6435,8 @@ fn draw_home(
     window: &Window,
     status: Option<&str>,
     go_hover: bool,
-    tool_hover: Option<Tool>,
-    pomodoro_label: Option<BarLabel>,
+    _tool_hover: Option<Tool>,
+    _pomodoro_label: Option<BarLabel>,
 ) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -6532,24 +6532,6 @@ fn draw_home(
             draw_go_gradient(target, layout.go, phase, body_font, &theme);
         } else {
             draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
-        }
-
-        // Ferramentas no canto de cima, a esquerda dos botoes da janela.
-        let tools = home_tool_buttons(width, scale, pomodoro_label);
-        let labels = [pomodoro_label, None, None, None, None];
-        for ((rect, tool), label) in tools.iter().zip(Tool::ALL).zip(labels) {
-            draw_tool_button(
-                target,
-                *rect,
-                tool,
-                label.as_ref().map(BarLabel::as_str),
-                label.and_then(|label| label.phase),
-                tool_hover == Some(tool),
-                scale,
-                small_font,
-                &theme,
-                theme.page_bg,
-            );
         }
 
         if let Some(message) = status {
@@ -7159,7 +7141,9 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             }
             hit => {
                 let tint = match hit {
-                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
+                    BarHit::Service(Service::Meet)
+                    | BarHit::Service(Service::Teams)
+                    | BarHit::Private => Some(theme.fg),
                     BarHit::GmailToggle => Some(gmail_tint),
                     BarHit::Downloads if state.downloads.active > 0 => Some(theme.accent),
                     BarHit::Downloads => Some(theme.fg),

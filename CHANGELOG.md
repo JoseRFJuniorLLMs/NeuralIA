@@ -2,6 +2,26 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.8.4] - 2026-10-08
+
+### Added
+- **Microsoft Teams na barra de títulos:**
+  - Adicionado atalho para o Microsoft Teams (`Service::Teams`) imediatamente à direita do Google Meet na barra de títulos (`[Live] [Meet] [Teams] [WhatsApp] [YouTube] [Gmail] [Downloads] [Privado]`).
+- **Novo painel "Sobre" moderno no painel lateral:**
+  - Substituição da caixa de diálogo antiga por uma visualização completa, moderna e integrada à barra lateral (`side_panel`).
+  - Exibição de distintivo institucional oficial do autor (José Ribamar Ferreira Junior, INSS / Poder Executivo, Matrícula 1.634.972, BRASÍLIA/DF), e-mail (`web2ajax@gmail.com`), data (`02/06/2025`) e versão (`2.8.4`).
+  - Links diretos para LinkedIn, GitHub e Hugging Face.
+  - Botão de ação `<verificar atualização>` que dispara a busca e instalação automática de atualizações do GitHub com barra de progresso.
+- **Melhorias e filtros no grafo do Obsidian (Segundo Cérebro):**
+  - Chips de filtro dinâmicos para alternar visualização por tipo de nó (Notas, Sites, Histórico e Tags).
+  - Filtro para ocultar nós órfãos (`Ocultar Órfãos`).
+  - HUD interativo no canvas com controles de zoom in/out (`＋`/`－`), centralização (`⟲`), congelamento/pausa da física (`⏸`/`▶`) e alternância de exibição de rótulos de texto (`Aa`).
+  - Métricas e contadores dinâmicos de nós e conexões ativas.
+
+### Changed & Improved
+- **Interface da tela inicial (Home) minimalista:**
+  - Remoção de todos os botões de ferramentas da tela Home, preservando apenas os controles de janela que surgem sob aproximação do cursor do mouse, mantendo a experiência focada na busca.
+
 ## [2.8.3] - 2026-10-08
 
 ### Added

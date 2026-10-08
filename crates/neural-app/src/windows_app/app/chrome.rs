@@ -476,35 +476,7 @@ impl App {
     }
 
     pub(in crate::windows_app) fn show_about(&mut self) {
-        let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
-            return;
-        };
-        const ABOUT_TITLE: &str = "Sobre o NeuralIA";
-        let version = env!("CARGO_PKG_VERSION");
-        let body = format!(
-            "Jose R F Junior\nweb2ajax@gmail.com\n02/06/2025\nVERSÃO: {version}\n\n<verificar atualização>\nDeseja verificar atualizações agora?"
-        );
-        let body_w = wide_null(&body);
-        let title_w = wide_null(ABOUT_TITLE);
-        let answer = unsafe {
-            MessageBoxW(
-                hwnd,
-                body_w.as_ptr(),
-                title_w.as_ptr(),
-                MB_YESNO | MB_ICONINFORMATION,
-            )
-        };
-        self.show_splash(
-            format!("NeuralIA v{version} — Jose R F Junior (web2ajax@gmail.com)"),
-            4,
-        );
-        self.status = Some(format!(
-            "NeuralIA v{version} — Jose R F Junior · web2ajax@gmail.com · 02/06/2025"
-        ));
-        self.request_redraw();
-        if answer == IDYES {
-            self.check_and_apply_update(true);
-        }
+        self.show_about_panel();
     }
 
     /// Verificação automática de atualização na inicialização (tela inicial).

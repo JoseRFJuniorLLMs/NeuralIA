@@ -39,7 +39,10 @@ use crate::windows_app::{
         NOTE_SAVE_REFUSED, NotesCommand, NotesOrigin, NotesReply, notes_command_for,
         notes_reply_script,
     },
-    page_scripts::{PANEL_NEW_NOTE_SCRIPT, PANEL_SHOW_NOTES_SCRIPT, PANEL_SHOW_OBSIDIAN_SCRIPT},
+    page_scripts::{
+        PANEL_NEW_NOTE_SCRIPT, PANEL_SHOW_ABOUT_SCRIPT, PANEL_SHOW_NOTES_SCRIPT,
+        PANEL_SHOW_OBSIDIAN_SCRIPT,
+    },
     services::{
         Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
         raise_webview_host, register_service_panel_events, service_event_is_current,
@@ -978,6 +981,17 @@ impl App {
         self.panel_run(PANEL_SHOW_OBSIDIAN_SCRIPT.to_string());
     }
 
+    /// Abre o painel lateral na aba Sobre.
+    pub(in crate::windows_app) fn show_about_panel(&mut self) {
+        if !self.side_panel.is_open() {
+            self.open_side_panel();
+        }
+        if !self.side_panel.is_open() {
+            return;
+        }
+        self.panel_run(PANEL_SHOW_ABOUT_SCRIPT.to_string());
+    }
+
     pub(in crate::windows_app) fn handle_panel_message(&mut self, post: side_panel::PanelPost) {
         // `receive` segue a copia do editor; um pedido de uma pagina que ja
         // saiu nao chega aqui (o texto que trazia ja foi gravado).
@@ -1028,6 +1042,9 @@ impl App {
             PanelMessage::ObsidianGraph => {
                 let history = self.privacy.recent_history_sync(150).unwrap_or_default();
                 self.submit_notes(NotesCommand::Graph(history), NotesOrigin::Panel);
+            }
+            PanelMessage::CheckUpdate => {
+                self.check_and_apply_update(true);
             }
             notes @ (PanelMessage::NotesList
             | PanelMessage::NotesSearch(_)

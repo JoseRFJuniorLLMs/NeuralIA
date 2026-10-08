@@ -211,6 +211,38 @@ def video() -> None:
     finish(mask, solid((255, 255, 255)), "video.png")
 
 
+# ------------------------------------------------------------- Teams
+def teams() -> None:
+    """Icone do Microsoft Teams: contorno branco (a barra pinta-o com o tema)."""
+    stroke = N * 0.065
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+
+    # Figura do fundo (participante de reuniao)
+    head_r = N * 0.10
+    head_cx, head_cy = N * 0.70, N * 0.28
+    draw.ellipse([head_cx - head_r, head_cy - head_r, head_cx + head_r, head_cy + head_r], outline=255, width=int(stroke))
+    draw.arc([N * 0.52, N * 0.42, N * 0.88, N * 0.78], start=190, end=350, fill=255, width=int(stroke))
+    draw.line([(N * 0.88, N * 0.60), (N * 0.88, N * 0.75)], fill=255, width=int(stroke))
+
+    # Badge/bloco da frente com o 'T'
+    tile_l, tile_t = N * 0.12, N * 0.25
+    tile_r, tile_b = N * 0.58, N * 0.75
+    draw.rounded_rectangle([tile_l, tile_t, tile_r, tile_b], radius=N * 0.08, outline=255, width=int(stroke))
+
+    # Letra 'T'
+    t_top = tile_t + (tile_b - tile_t) * 0.28
+    t_l = tile_l + (tile_r - tile_l) * 0.24
+    t_r = tile_r - (tile_r - tile_l) * 0.24
+    draw.line([(t_l, t_top), (t_r, t_top)], fill=255, width=int(stroke * 1.1))
+
+    t_cx = (t_l + t_r) / 2.0
+    t_bot = tile_b - (tile_b - tile_t) * 0.26
+    draw.line([(t_cx, t_top), (t_cx, t_bot)], fill=255, width=int(stroke * 1.1))
+
+    finish(mask, solid((255, 255, 255)), "teams.png")
+
+
 # ------------------------------------------------------------------ WhatsApp
 def whatsapp() -> None:
     """Balao redondo verde com cauda e um auscultador branco dentro."""
@@ -511,6 +543,7 @@ ICONS = {
     "claude": claude,
     "home": home,
     "video": video,
+    "teams": teams,
     "whatsapp": whatsapp,
     "youtube": youtube,
     "mail": mail,

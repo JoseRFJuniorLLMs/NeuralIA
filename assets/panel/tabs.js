@@ -1,20 +1,23 @@
-  // Abas: Historico, Notas, Obsidian, Favoritos e Downloads.
+  // Abas: Historico, Notas, Obsidian, Favoritos, Downloads e Sobre.
   const tabs = {
     history: byId('tab-history'), notes: byId('tab-notes'),
     obsidian: byId('tab-obsidian'),
-    bookmarks: byId('tab-bookmarks'), downloads: byId('tab-downloads')
+    bookmarks: byId('tab-bookmarks'), downloads: byId('tab-downloads'),
+    about: byId('tab-about')
   };
   const views = {
     history: byId('view-history'), notes: byId('view-notes'),
     obsidian: byId('view-obsidian'),
-    bookmarks: byId('view-bookmarks'), downloads: byId('view-downloads')
+    bookmarks: byId('view-bookmarks'), downloads: byId('view-downloads'),
+    about: byId('view-about')
   };
   function showSection(name) {
     const key = name === 'notes' || name === 'notas' ? 'notes'
       : name === 'obsidian' || name === 'grafo' ? 'obsidian'
       : name === 'history' || name === 'historico' ? 'history'
       : name === 'bookmarks' || name === 'favoritos' ? 'bookmarks'
-      : name === 'downloads' ? 'downloads' : '';
+      : name === 'downloads' ? 'downloads'
+      : name === 'about' || name === 'sobre' ? 'about' : '';
     if (!key) return false;
     // Sair das Notas salva o editor; se nao der agora, fica-se nas Notas.
     if (key !== 'notes' && !views.notes.hidden && !notes.leave()) return false;
@@ -26,6 +29,7 @@
     else if (key === 'obsidian') { obsidian.refresh(); }
     else if (key === 'bookmarks') { bookmarks.refresh(); bookmarks.focus(); }
     else if (key === 'downloads') { downloads.refresh(); }
+    else if (key === 'about') { /* Sobre não precisa focar */ }
     else { q.focus(); }
     return true;
   }
@@ -51,11 +55,16 @@
     // (como o X), noutra seccao mostra os Downloads.
     button() { if (views.downloads.hidden) showSection('downloads'); else close(); }
   };
+  window.__neuraliaAbout = {
+    show() { showSection('about'); },
+    button() { if (views.about.hidden) showSection('about'); else close(); }
+  };
   tabs.history.addEventListener('click', () => showSection('history'));
   tabs.notes.addEventListener('click', () => showSection('notes'));
   tabs.obsidian.addEventListener('click', () => showSection('obsidian'));
   tabs.bookmarks.addEventListener('click', () => showSection('bookmarks'));
   tabs.downloads.addEventListener('click', () => showSection('downloads'));
+  tabs.about.addEventListener('click', () => showSection('about'));
   byId('close').addEventListener('click', close);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.preventDefault(); close(); }

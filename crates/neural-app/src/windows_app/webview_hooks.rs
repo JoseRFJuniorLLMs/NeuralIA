@@ -1660,6 +1660,7 @@ mod service_visual_tests {
         );
         for service in [
             Service::Meet,
+            Service::Teams,
             Service::WhatsApp,
             Service::Gmail,
             Service::Breath,

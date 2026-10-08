@@ -1359,12 +1359,14 @@ fn panel_html_is_assembled_from_its_section_assets() {
         "obsidian.html",
         "bookmarks.html",
         "downloads.html",
+        "about.html",
         "core.js",
         "history.js",
         "notes.js",
         "obsidian.js",
         "bookmarks.js",
         "downloads.js",
+        "about.js",
         "tabs.js",
     ] {
         let asset = std::fs::read_to_string(root.join(name))
@@ -1890,20 +1892,21 @@ fn column_buttons_fit_or_vanish() {
 /// dos downloads (downloads-ui) logo antes do Privado.
 #[test]
 fn right_cluster_slots_never_overlap_and_hit_back() {
-    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..5].iter().map(|slot| slot.hit).collect();
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..6].iter().map(|slot| slot.hit).collect();
     assert_eq!(
         service_hits,
         [
             BarHit::Service(Service::Meet),
+            BarHit::Service(Service::Teams),
             BarHit::Service(Service::WhatsApp),
             BarHit::Service(Service::YouTube),
             BarHit::GmailToggle,
         ]
     );
     assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
-    assert_eq!(RIGHT_CLUSTER[5].hit, BarHit::Downloads);
-    assert_eq!(RIGHT_CLUSTER[5].icon, ICON_SLOT_DOWNLOADS);
-    assert_eq!(RIGHT_CLUSTER[6].hit, BarHit::Private);
+    assert_eq!(RIGHT_CLUSTER[6].hit, BarHit::Downloads);
+    assert_eq!(RIGHT_CLUSTER[6].icon, ICON_SLOT_DOWNLOADS);
+    assert_eq!(RIGHT_CLUSTER[7].hit, BarHit::Private);
     let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
     icons.sort_unstable();
     icons.dedup();
@@ -1976,7 +1979,7 @@ fn downloads_slot_fits_or_vanishes() {
                     assert!(hits_it, "{at}: a seta nao se clica");
                     assert!(rect.x + rect.width <= controls.private.x, "{at}");
                     assert!(
-                        controls.services[3].x + controls.services[3].width <= rect.x,
+                        controls.services[4].x + controls.services[4].width <= rect.x,
                         "{at}"
                     );
                 } else {
@@ -1985,7 +1988,7 @@ fn downloads_slot_fits_or_vanishes() {
                     assert!(!hits_it, "{at}: um clique acerta a seta que nao existe");
                     // O Gmail encosta ao Privado, como antes da seta.
                     let gap =
-                        controls.private.x - (controls.services[3].x + controls.services[3].width);
+                        controls.private.x - (controls.services[4].x + controls.services[4].width);
                     assert!((gap - 4.0 * scale).abs() < 1e-6, "{at}: {gap}");
                 }
             }
@@ -2474,6 +2477,7 @@ fn service_icons_sit_left_of_private_without_overlap_and_hit_their_service() {
     let controls = right_controls(1600.0, 1.0, false, None);
     let order = [
         BarHit::Service(Service::Meet),
+        BarHit::Service(Service::Teams),
         BarHit::Service(Service::WhatsApp),
         BarHit::Service(Service::YouTube),
         BarHit::GmailToggle,
@@ -8953,6 +8957,7 @@ fn the_webview_hooks_table() {
     );
     for service in [
         Service::Meet,
+        Service::Teams,
         Service::WhatsApp,
         Service::YouTube,
         Service::Gmail,
@@ -9069,6 +9074,7 @@ fn every_webview_gets_the_hooks() {
     managed.push(WebViewHost::External);
     for service in [
         Service::Meet,
+        Service::Teams,
         Service::WhatsApp,
         Service::YouTube,
         Service::Gmail,
@@ -9458,6 +9464,7 @@ fn navigation_verdicts_are_the_ones_the_builders_gave() {
     ];
     for kind in [
         Service::Meet,
+        Service::Teams,
         Service::WhatsApp,
         Service::YouTube,
         Service::Gmail,
@@ -9735,6 +9742,7 @@ fn the_adblock_gate_is_installed_on_columns_split_and_external_only() {
     }
     for service in [
         Service::Meet,
+        Service::Teams,
         Service::WhatsApp,
         Service::YouTube,
         Service::Gmail,
@@ -10151,6 +10159,7 @@ fn every_host() -> Vec<WebViewHost> {
     ]);
     for service in [
         Service::Meet,
+        Service::Teams,
         Service::WhatsApp,
         Service::YouTube,
         Service::Gmail,
@@ -20368,7 +20377,7 @@ fn each_tool_button_hits_its_tool_in_the_bar_and_on_home() {
                     );
                 }
 
-                // Home: mesmas ferramentas, na faixa de cima.
+                // Home: ferramentas nao aparecem na tela Home; a faixa de cima arrasta a janela.
                 let height = 800.0 * scale;
                 let caption = BarLayout::new(client_width, scale, true, COMPARATOR_COLUMNS);
                 let tools = home_tool_buttons(client_width, scale, pomodoro_label);
@@ -20376,8 +20385,8 @@ fn each_tool_button_hits_its_tool_in_the_bar_and_on_home() {
                     let (x, y) = center_of(*rect);
                     assert_eq!(
                         home_click_target((client_width, height), scale, pomodoro_label, x, y),
-                        HomeClick::Tool(tool),
-                        "Home: {tool:?} em {logical_width}px @{scale}x"
+                        HomeClick::Drag,
+                        "Home: arrasto em {logical_width}px @{scale}x ({tool:?})"
                     );
                     assert!(
                         rect.y >= 0.0 && rect.y + rect.height <= TITLE_TAB_HEIGHT * scale,
@@ -20743,6 +20752,7 @@ fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
     assert!(Service::Breath.private());
     for service in [
         Service::Meet,
+        Service::Teams,
         Service::WhatsApp,
         Service::YouTube,
         Service::Gmail,
@@ -20766,12 +20776,14 @@ fn breath_panel_is_private_denies_media_and_stays_on_youtube() {
             "{kind:?}"
         );
     }
-    // O Meet continua a perguntar pelo aviso do WebView2.
-    for kind in [PermissionKind::Microphone, PermissionKind::Camera] {
-        assert_eq!(
-            service_panel_permission(Service::Meet, kind),
-            PermissionResponse::Default
-        );
+    // O Meet e o Teams continuam a perguntar pelo aviso do WebView2.
+    for service in [Service::Meet, Service::Teams] {
+        for kind in [PermissionKind::Microphone, PermissionKind::Camera] {
+            assert_eq!(
+                service_panel_permission(service, kind),
+                PermissionResponse::Default
+            );
+        }
     }
 
     for target in [
@@ -20819,6 +20831,7 @@ fn whatsapp_background_notifications_are_scoped_to_exact_origin() {
     );
     for service in [
         Service::Meet,
+        Service::Teams,
         Service::YouTube,
         Service::Gmail,
         Service::Breath,
@@ -20980,7 +20993,7 @@ fn tool_clicks_route_to_their_action() {
                         HomeClick::Tool(tool) => tool_action(tool, ToolClick::Right),
                         _ => None,
                     };
-                    assert_eq!(right, home.contains(x, strip_y).then_some(PomodoroMenu));
+                    assert_eq!(right, None, "ferramentas nao sao clicaveis na Home");
                 }
             }
         }
@@ -21224,7 +21237,12 @@ fn a_minimized_service_marks_the_button_that_opened_it() {
                 right_controls_hit(running, x, y),
                 Some(BarHit::Tool(Tool::Breath))
             );
-            for service in [Service::Meet, Service::WhatsApp, Service::YouTube] {
+            for service in [
+                Service::Meet,
+                Service::Teams,
+                Service::WhatsApp,
+                Service::YouTube,
+            ] {
                 let icon_bare = service_icon_rect(bare, service).expect("icone do servico");
                 let (bx, by) = center_of(icon_bare);
                 assert_eq!(
@@ -26752,6 +26770,7 @@ mod downloads_gates {
         }
         for service in [
             Service::Meet,
+            Service::Teams,
             Service::WhatsApp,
             Service::YouTube,
             Service::Gmail,
@@ -37200,6 +37219,7 @@ fn native_zoom_is_installed_in_every_visible_webview() {
     hosts.extend(
         [
             Service::Meet,
+            Service::Teams,
             Service::WhatsApp,
             Service::Gmail,
             Service::Breath,
