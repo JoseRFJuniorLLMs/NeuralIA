@@ -15,6 +15,9 @@ All notable changes to NeuralIA are documented here.
     - **Histórico e Pesquisas** (verde `#10b981`): pesquisas recentes e páginas lidas conectadas por palavras-chave às notas e tags correspondentes.
   - **Interatividade completa**: arrastar nós (drag-and-drop), pan e zoom com roda do mouse, hover com iluminação de conexões vizinhas, card flutuante de detalhes e clique duplo para abrir notas no editor ou navegar diretamente para URLs e buscas.
   - Respeito integral aos gates de segurança contra injeção e XSS (manipulação de DOM estritamente segura e sem `innerHTML`).
+- **Atualização automática com barra de progresso na tela inicial:**
+  - Ao inicializar na tela inicial (Home), se houver uma nova versão disponível no GitHub, o download e a verificação SHA-256 iniciam automaticamente em segundo plano.
+  - A tela inicial e o splash exibem a barra de progresso visual de download em tempo real (`Baixando NeuralIA v... [██████░░░░] %`). Ao finalizar com sucesso, o instalador verificado é acionado e reinicia a aplicação automaticamente.
 
 ## [2.8.1] - 2026-10-08
 

@@ -125,52 +125,42 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::UpdateStatus {
                 result: Ok(status),
-                install,
+                install: manual,
             } => match status {
                 neural_core::update::UpdateStatus::UpToDate { current_version } => {
-                    self.show_splash(
-                        format!(
-                            "NeuralIA v{current_version} está atualizado na versão mais recente."
-                        ),
-                        4,
-                    );
-                    self.status = Some("NeuralIA está atualizado.".to_string());
-                    self.request_redraw();
+                    if manual {
+                        self.show_splash(
+                            format!(
+                                "NeuralIA v{current_version} está atualizado na versão mais recente."
+                            ),
+                            4,
+                        );
+                        self.status = Some("NeuralIA está atualizado.".to_string());
+                        self.request_redraw();
+                    }
                 }
                 neural_core::update::UpdateStatus::UpdateAvailable {
                     current_version,
                     latest,
                 } => {
                     let new_ver = latest.version.clone();
-                    if !install {
+                    if !neural_core::update::may_install_update(true, &latest) {
                         self.show_splash(
-                                format!(
-                                    "Nova versão v{new_ver} disponível (atual: v{current_version}). Use “Verificar atualizações” para instalar."
-                                ),
-                                6,
-                            );
-                        self.status = Some(format!("NeuralIA v{new_ver} disponível."));
-                        self.request_redraw();
-                        return;
-                    }
-
-                    if !neural_core::update::may_install_update(install, &latest) {
-                        self.show_splash(
-                                format!(
-                                    "Nova versão v{new_ver} disponível, mas a instalação foi recusada por falta de asset ou SHA-256 verificável. {}",
-                                    latest.html_url
-                                ),
-                                8,
-                            );
+                            format!(
+                                "Nova versão v{new_ver} disponível, mas a instalação foi recusada por falta de asset ou SHA-256 verificável. {}",
+                                latest.html_url
+                            ),
+                            8,
+                        );
                         return;
                     }
 
                     self.show_splash(
-                            format!(
-                                "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização verificada…"
-                            ),
-                            5,
-                        );
+                        format!(
+                            "Nova versão disponível: v{new_ver} (atual: v{current_version}). Baixando atualização automaticamente…"
+                        ),
+                        5,
+                    );
                     self.status = Some(format!("Baixando atualização v{new_ver}…"));
                     self.request_redraw();
 

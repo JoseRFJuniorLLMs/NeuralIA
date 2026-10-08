@@ -492,17 +492,12 @@ impl App {
         self.request_redraw();
     }
 
-    /// Verificação diária automática de atualização na inicialização.
+    /// Verificação automática de atualização na inicialização (tela inicial).
     pub(in crate::windows_app) fn check_daily_update(&mut self) {
-        static LAST_CHECK_DAY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let now_days = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            / 86400;
-        let prev = LAST_CHECK_DAY.swap(now_days, std::sync::atomic::Ordering::SeqCst);
-        if prev == now_days {
-            return; // Já verificado hoje
+        static CHECKED_IN_SESSION: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if CHECKED_IN_SESSION.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return; // Já verificado nesta sessão
         }
         self.check_and_apply_update(false);
     }
