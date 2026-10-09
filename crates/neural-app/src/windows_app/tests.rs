@@ -14468,8 +14468,8 @@ fn a_selected_search_is_a_question_never_an_omnibox_command() {
         .expect("compare_selection");
     assert_eq!(squash(compare), "{ self.compare(request); }");
     // No codigo que embarca, `compare` so e chamado pela omnibox (uma
-    // pergunta ou um `traduzir:` escritos, ou reabertos do Historico) e
-    // pelo host do cartao.
+    // pergunta ou um `traduzir:` escritos, ou reabertos do Historico),
+    // pelo botao azul da Home («Pesquisar com IA») e pelo host do cartao.
     let shipped = source
         .split("#[cfg(test)]\nmod tests {")
         .next()
@@ -14484,6 +14484,7 @@ fn a_selected_search_is_a_question_never_an_omnibox_command() {
         vec![
             "InputRoute::Translate(Some(text)) => self.compare(CompareRequest::translate(&text)),",
             "Ok(Intent::Compare(query)) => self.compare(CompareRequest::ask(query)),",
+            "self.compare(CompareRequest::ask(query));",
             "self.compare(request);"
         ],
         "um caminho novo chama o compare sem o cartao"
@@ -20642,7 +20643,10 @@ fn tool_hints_say_what_the_click_does() {
             Tool::Breath,
             "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
         ),
-        (Tool::About, "Sobre o NeuralIA — versão e atualizações"),
+        (
+            Tool::About,
+            "Sobre o NeuralIA — versão, atualizações, Zettelkasten e Obsidian",
+        ),
     ];
     for (tool, text) in expected {
         assert_eq!(
