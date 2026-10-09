@@ -186,18 +186,21 @@ $sourceExe = (Resolve-Path -LiteralPath $ExePath).Path
 if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf)) {
     throw "-ExePath '$ExePath' is not a file."
 }
-$exeVersion = (Get-Item -LiteralPath $sourceExe).VersionInfo.ProductVersion
-if (-not [string]::IsNullOrEmpty($exeVersion) -and $exeVersion -ne $Version) {
-    throw "-ExePath '$sourceExe' has ProductVersion '$exeVersion', which does not match requested Version '$Version'. (Check if cargo build placed the binary in CARGO_TARGET_DIR)."
-}
 if ($Version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
     throw "Version '$Version' is not a supported semantic version."
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $workspaceVersion = Get-WorkspaceVersion -RepoRoot $repoRoot
+# Workspace first. The CI smoke test asks for 0.0.1 against an exe whose
+# ProductVersion is already the workspace version. Checking the exe first
+# hides this refusal, and the installer never gets published.
 if ($Version -ne $workspaceVersion) {
     throw "Version '$Version' does not match the workspace version '$workspaceVersion'. neural-setup registers the workspace version in Windows Apps, so an installer named $Version would report $workspaceVersion."
+}
+$exeVersion = (Get-Item -LiteralPath $sourceExe).VersionInfo.ProductVersion
+if (-not [string]::IsNullOrEmpty($exeVersion) -and $exeVersion -ne $Version) {
+    throw "-ExePath '$sourceExe' has ProductVersion '$exeVersion', which does not match requested Version '$Version'. (Check if cargo build placed the binary in CARGO_TARGET_DIR)."
 }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null

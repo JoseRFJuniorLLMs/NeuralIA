@@ -5,7 +5,7 @@ All notable changes to NeuralIA are documented here.
 ## [2.9.2] - 2026-10-09
 
 ### Fixed
-- **O CI volta a empacotar o instalador:** o Clippy do leitor e o inventário de fontes passam a ver os módulos novos.
+- **O CI volta a empacotar o instalador:** o Clippy do leitor e o inventário de fontes passam a ver os módulos novos. A recusa de uma versão que não é a do workspace corre antes da conferência do ProductVersion do executável, que é o que o teste do instalador exige.
 - **Cancelar a abertura de um EPUB novo não o deixa na biblioteca.** Um livro que já existia, com os mesmos bytes, permanece.
 
 ## [2.9.1] - 2026-10-09
