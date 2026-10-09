@@ -7999,8 +7999,8 @@ unsafe fn draw_go_gradient(
 
 /// Rotulos do botao injetado no comparador. Em tela cheia a barra nativa some,
 /// por isso este botao tem de anunciar a saida.
-const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\\u{2715} Sair da tela cheia';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
-const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
+const COMPARATOR_BUTTON_EXPANDED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.style.width='max-content';b.style.maxWidth='240px';b.textContent='\\u{2715} Sair da tela cheia';}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='none';}})();";
+const COMPARATOR_BUTTON_COLLAPSED: &str = "(function(){var b=document.querySelector('#neuralia-comp-expand');if(b){b.style.display='block';b.style.width='max-content';b.style.maxWidth='240px';b.textContent='\u{26F6} ' + (window.__neuralia_col_name || 'IA');}var m=document.querySelector('#neuralia-comp-minimize');if(m){m.style.display='block';}})();";
 
 const AGENT_OBSERVER_SCRIPT: &str = concat!(
     r#"

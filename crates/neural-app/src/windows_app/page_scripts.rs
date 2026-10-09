@@ -1922,6 +1922,15 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   if (window.top !== window) return;
   function mountTimeline() {
     if (document.getElementById('neuralia-split-scroll-rail')) return;
+    // Um PDF (o visor do Chromium, o PDF.js ou o nosso) já tem a sua rolagem.
+    // Esta barra escondia a dele com scrollbar-width:none e os cliques
+    // caíam numa timeline que media o documento HTML vazio (Pág. 1/1).
+    const pdfPath = String(location.pathname || '') + String(location.search || '');
+    if (document.contentType === 'application/pdf'
+        || /\.pdf($|[?#])/i.test(pdfPath)
+        || location.host === 'neuralia-pdf.localhost'
+        || document.getElementById('viewerContainer')
+        || document.querySelector('embed[type="application/pdf"]')) return;
 
   const style = document.createElement('style');
   style.id = 'neuralia-split-scroll-style';
@@ -1929,7 +1938,8 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
     '*{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
     '*::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}',
     '.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
-    '.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}'
+    '.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;background:transparent!important;}',
+    '#neuralia-split-scroll-rail button:hover,#neuralia-split-scroll-rail button:focus,#neuralia-split-scroll-rail button:focus-visible{color:#3d9bff!important;outline:none!important;}'
   ].join('');
   document.documentElement.appendChild(style);
 
@@ -2054,15 +2064,13 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   const rail = document.createElement('div');
   rail.id = 'neuralia-split-scroll-rail';
   Object.assign(rail.style, {
-    position:'fixed', top:'50%', right:'10px', transform:'translateY(-50%)',
-    zIndex:'2147483646', pointerEvents:'auto', width:'64px',
-    height:'min(65vh,600px)', minHeight:'min(300px,65vh)', maxHeight:'calc(100vh - 100px)',
+    position:'fixed', top:'50%', right:'8px', transform:'translateY(-50%)',
+    zIndex:'2147483646', pointerEvents:'auto', width:'16px',
+    height:'min(65vh,600px)', minHeight:'min(220px,65vh)', maxHeight:'calc(100vh - 100px)',
     display:'flex', flexDirection:'column', alignItems:'center',
     justifyContent:'space-between', opacity:'1',
-    transition:'opacity .18s ease', fontFamily:'Segoe UI, system-ui, sans-serif'
+    fontFamily:'Segoe UI, system-ui, sans-serif'
   });
-  rail.onmouseenter = () => { rail.style.opacity = '1'; };
-  rail.onmouseleave = () => { rail.style.opacity = '1'; };
 
   function arrow(symbol, title, direction) {
     const button = document.createElement('button');
@@ -2071,16 +2079,18 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
     button.title = title;
     button.setAttribute('aria-label', title);
     Object.assign(button.style, {
-      width:'44px', flex:'none',
-      height:'40px',
-      border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
-      borderRadius:'50%', padding:'0',
-      background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
-      color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.46)',
-      boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
-      fontSize:'21px', lineHeight: direction > 0 ? '38px' : '26px',
-      cursor:'pointer'
+      width:'16px', flex:'none', height:'22px',
+      border:'0', borderRadius:'0', padding:'0', margin:'0',
+      background:'transparent', color:'rgba(255,255,255,.72)',
+      boxShadow:'none', fontSize:'16px', lineHeight:'22px', cursor:'pointer'
     });
+    const rest = 'rgba(255,255,255,.72)';
+    const hot = '#3d9bff';
+    const paint = (on) => { button.style.color = on ? hot : rest; };
+    button.onmouseenter = () => paint(true);
+    button.onmouseleave = () => paint(document.activeElement === button);
+    button.onfocus = () => paint(true);
+    button.onblur = () => paint(false);
     button.onclick = (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -2093,10 +2103,20 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 
   const ticks = document.createElement('div');
   Object.assign(ticks.style, {
-    width:'48px', flex:'1', minHeight:'0', overflowY:'auto', margin:'8px 0 10px',
+    width:'16px', flex:'1', minHeight:'0', position:'relative', margin:'4px 0',
     display:'flex', flexDirection:'column',
-    justifyContent:'space-evenly', alignItems:'flex-end'
+    justifyContent:'space-evenly', alignItems:'center', cursor:'pointer',
+    background:'linear-gradient(rgba(255,255,255,.28),rgba(255,255,255,.28)) center / 2px 100% no-repeat'
   });
+  ticks.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = ticks.getBoundingClientRect();
+    const height = (rect && rect.height) || ticks.clientHeight || 1;
+    const y = (typeof event.clientY === 'number' ? event.clientY : 0) - (rect.top || 0);
+    const fraction = Math.max(0, Math.min(1, y / Math.max(1, height)));
+    scrollToPosition(metrics().max * fraction);
+  };
 
   function rebuildTicks() {
     const state = metrics();
@@ -2121,10 +2141,10 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
       tick.dataset.top = item ? String(item.top) : '';
       tick.dataset.fraction = item ? '' : String(count <= 1 ? 0 : i / (count - 1));
       Object.assign(tick.style, {
-        display:'block', height:'8px', width:i === 0 ? '44px' : '24px',
-        minHeight:'8px', border:'0', borderRadius:'2px', padding:'0',
+        display:'block', height:'2px', width:'10px',
+        minHeight:'2px', border:'0', borderRadius:'1px', padding:'0',
         background:'rgba(255,255,255,.30)', cursor:'pointer',
-        transition:'width .16s ease, background .16s ease, opacity .16s ease'
+        transition:'background .16s ease, opacity .16s ease'
       });
       tick.onclick = (event) => {
         event.preventDefault();
@@ -2143,10 +2163,14 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   const progressStatus = document.createElement('div');
   progressStatus.className = 'neuralia-reading-progress';
   Object.assign(progressStatus.style, {
-    flex:'none', width:'112px', boxSizing:'border-box', alignSelf:'flex-end', padding:'6px 8px', borderRadius:'8px',
+    position:'absolute', right:'22px', top:'50%', transform:'translateY(-50%)',
+    width:'112px', boxSizing:'border-box', padding:'6px 8px', borderRadius:'8px',
     background:'rgba(17,19,20,.94)', color:'#fff', fontSize:'12px',
-    lineHeight:'18px', textAlign:'center', whiteSpace:'pre-line', pointerEvents:'none'
+    lineHeight:'18px', textAlign:'center', whiteSpace:'pre-line',
+    pointerEvents:'none', opacity:'0', transition:'opacity .15s ease'
   });
+  rail.onmouseenter = () => { progressStatus.style.opacity = '1'; };
+  rail.onmouseleave = () => { progressStatus.style.opacity = '0'; };
 
   function syncTicks() {
     rebuildTicks();
@@ -2183,9 +2207,10 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 
     children.forEach((tick, i) => {
       const selected = i === active;
-      tick.style.width = selected ? '46px' : (Math.abs(i - active) === 1 ? '34px' : '24px');
+      tick.style.width = '10px';
+      tick.style.height = '2px';
       tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
-      tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
+      tick.style.opacity = selected ? '1' : '.45';
     });
   }
 
@@ -2578,12 +2603,21 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
     function mountControls() {
       if (byId('neuralia-comp-controls')) return;
+      const pdfPath = String(location.pathname || '') + String(location.search || '');
+      const pdfDocument = document.contentType === 'application/pdf'
+          || /\.pdf($|[?#])/i.test(pdfPath)
+          || location.host === 'neuralia-pdf.localhost'
+          || byId('viewerContainer')
+          || document.querySelector('embed[type="application/pdf"]');
+      if (pdfDocument) return;
 
       const style = createElement('style');
       style.id = 'neuralia-scroll-style';
       style.textContent = [
         'html,body,.neuralia-scroll-root{scrollbar-width:none!important;-ms-overflow-style:none!important;}',
-        'html::-webkit-scrollbar,body::-webkit-scrollbar,.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}'
+        'html::-webkit-scrollbar,body::-webkit-scrollbar,.neuralia-scroll-root::-webkit-scrollbar{width:0!important;height:0!important;display:none!important;}',
+        '#neuralia-comp-expand,#neuralia-comp-minimize{width:max-content!important;max-width:240px!important;box-sizing:border-box!important;}',
+        '#neuralia-response-rail button:hover,#neuralia-response-rail button:focus,#neuralia-response-rail button:focus-visible{color:#3d9bff!important;outline:none!important;}'
       ].join('');
       append(document.documentElement, style);
 
@@ -2646,7 +2680,8 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       expand.type = 'button';
       expand.textContent = '⛶ ' + colName;
       assign(expand.style, {
-        position:'absolute', top:'10px', right:'10px',
+        position:'absolute', top:'10px', right:'10px', left:'auto',
+        width:'max-content', maxWidth:'240px', boxSizing:'border-box',
         pointerEvents:'auto', border:'1px solid rgba(255,255,255,.12)',
         borderRadius:'999px', padding:'6px 11px', background:'rgba(17,19,20,.90)',
         color:'#fff', fontSize:'11px', fontWeight:'600',
@@ -2667,10 +2702,11 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       // com os dois, apareciam duas dicas diferentes ao mesmo tempo.
       minimize.ariaLabel = 'Minimizar ' + colName;
       assign(minimize.style, {
-        position:'absolute', top:'10px', right:'112px',
-        pointerEvents:'auto', width:'30px', height:'28px',
+        position:'absolute', top:'10px', right:'112px', left:'auto',
+        pointerEvents:'auto', width:'max-content', maxWidth:'240px',
+        minWidth:'30px', height:'28px', boxSizing:'border-box',
         border:'1px solid rgba(255,255,255,.12)',
-        borderRadius:'999px', padding:'0',
+        borderRadius:'999px', padding:'0 8px',
         background:'rgba(17,19,20,.90)', color:'#fff',
         fontSize:'18px', fontWeight:'600', lineHeight:'24px',
         boxShadow:'0 5px 18px rgba(0,0,0,.28)', cursor:'pointer'
@@ -2701,14 +2737,11 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       const rail = createElement('div');
       rail.id = 'neuralia-response-rail';
       assign(rail.style, {
-        position:'absolute', top:'50%', right:'10px', transform:'translateY(-50%)',
-        pointerEvents:'auto', width:'64px', height:'min(65vh,600px)', minHeight:'min(300px,65vh)', maxHeight:'calc(100vh - 100px)',
+        position:'absolute', top:'50%', right:'8px', transform:'translateY(-50%)',
+        pointerEvents:'auto', width:'16px', height:'min(65vh,600px)', minHeight:'min(220px,65vh)', maxHeight:'calc(100vh - 100px)',
         display:'flex', flexDirection:'column', alignItems:'center',
-        justifyContent:'space-between', opacity:'1',
-        transition:'opacity .18s ease'
+        justifyContent:'space-between', opacity:'1'
       });
-      rail.onmouseenter = () => { rail.style.opacity = '1'; };
-      rail.onmouseleave = () => { rail.style.opacity = '1'; };
 
       function arrow(symbol, title, direction) {
         const button = createElement('button');
@@ -2716,16 +2749,18 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
         button.textContent = symbol;
         button.title = title;
         assign(button.style, {
-          width:'44px', flex:'none',
-          height:'40px',
-          border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
-          borderRadius:'50%', padding:'0',
-          background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
-          color: direction > 0 ? '#f4f4f4' : 'rgba(255,255,255,.46)',
-          boxShadow: direction > 0 ? '0 6px 20px rgba(0,0,0,.28)' : 'none',
-          fontSize:'21px', lineHeight: direction > 0 ? '38px' : '26px',
-          cursor:'pointer'
+          width:'16px', flex:'none', height:'22px',
+          border:'0', borderRadius:'0', padding:'0', margin:'0',
+          background:'transparent', color:'rgba(255,255,255,.72)',
+          boxShadow:'none', fontSize:'16px', lineHeight:'22px', cursor:'pointer'
         });
+        const rest = 'rgba(255,255,255,.72)';
+        const hot = '#3d9bff';
+        const paint = (on) => { button.style.color = on ? hot : rest; };
+        button.onmouseenter = () => paint(true);
+        button.onmouseleave = () => paint(document.activeElement === button);
+        button.onfocus = () => paint(true);
+        button.onblur = () => paint(false);
         button.onclick = (event) => {
           event.preventDefault(); event.stopPropagation();
           if (semanticStep(direction)) return;
@@ -2739,10 +2774,19 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       const ticks = createElement('div');
       ticks.id = 'neuralia-response-ticks';
       assign(ticks.style, {
-        width:'48px', flex:'1', minHeight:'0', overflowY:'auto', margin:'8px 0 10px', display:'flex',
+        width:'16px', flex:'1', minHeight:'0', position:'relative', margin:'4px 0', display:'flex',
         flexDirection:'column', justifyContent:'space-evenly',
-        alignItems:'flex-end', cursor:'pointer'
+        alignItems:'center', cursor:'pointer',
+        background:'linear-gradient(rgba(255,255,255,.28),rgba(255,255,255,.28)) center / 2px 100% no-repeat'
       });
+      ticks.onclick = (event) => {
+        event.preventDefault(); event.stopPropagation();
+        const rect = ticks.getBoundingClientRect();
+        const height = (rect && rect.height) || ticks.clientHeight || 1;
+        const y = (typeof event.clientY === 'number' ? event.clientY : 0) - (rect.top || 0);
+        const fraction = Math.max(0, Math.min(1, y / Math.max(1, height)));
+        scrollToPosition(metrics().max * fraction);
+      };
 
       let semantic = [];
 
@@ -2802,17 +2846,11 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
         semantic = semanticAnchors();
         if (!semantic.length) return false;
         const state = metrics();
-        const view = state.root ? state.root.clientHeight : window.innerHeight;
-        const pivot = state.top + Math.max(24, view * .24);
-        let current = 0;
-        for (let i = 0; i < semantic.length; i++) {
-          if (semantic[i].top <= pivot) current = i;
-          else break;
-        }
-        const target = Math.max(0, Math.min(semantic.length - 1, current + direction));
-        if (target === current && ((direction < 0 && current === 0)
-            || (direction > 0 && current === semantic.length - 1))) return false;
-        scrollToPosition(semantic[target].top);
+        const ordered = direction < 0 ? [...semantic].reverse() : semantic;
+        const target = ordered.find((item) => direction < 0
+          ? item.top < state.top - 24 : item.top > state.top + 24);
+        if (!target) return false;
+        scrollToPosition(target.top);
         return true;
       }
 
@@ -2840,10 +2878,10 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
           tick.dataset.top = item ? String(item.top) : '';
           tick.dataset.fraction = item ? '' : String(count <= 1 ? 0 : i / (count - 1));
           assign(tick.style, {
-            display:'block', height:'8px', minHeight:'8px',
-            width:i === 0 ? '44px' : '24px', border:'0', borderRadius:'2px',
+            display:'block', height:'2px', minHeight:'2px',
+            width:'10px', border:'0', borderRadius:'1px',
             padding:'0', background:'rgba(255,255,255,.30)', cursor:'pointer',
-            transition:'width .16s ease, background .16s ease, opacity .16s ease'
+            transition:'background .16s ease, opacity .16s ease'
           });
           tick.onclick = (event) => {
             event.preventDefault(); event.stopPropagation();
@@ -2860,10 +2898,14 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       const progressStatus = createElement('div');
       progressStatus.className = 'neuralia-reading-progress';
       assign(progressStatus.style, {
-        flex:'none', width:'112px', boxSizing:'border-box', alignSelf:'flex-end', padding:'6px 8px', borderRadius:'8px',
+        position:'absolute', right:'22px', top:'50%', transform:'translateY(-50%)',
+        width:'112px', boxSizing:'border-box', padding:'6px 8px', borderRadius:'8px',
         background:'rgba(17,19,20,.94)', color:'#fff', fontSize:'12px',
-        lineHeight:'18px', textAlign:'center', whiteSpace:'pre-line', pointerEvents:'none'
+        lineHeight:'18px', textAlign:'center', whiteSpace:'pre-line',
+        pointerEvents:'none', opacity:'0', transition:'opacity .15s ease'
       });
+      rail.onmouseenter = () => { progressStatus.style.opacity = '1'; };
+      rail.onmouseleave = () => { progressStatus.style.opacity = '0'; };
 
       function syncTicks() {
         rebuildTicks();
@@ -2902,9 +2944,10 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
         children.forEach((tick, i) => {
           const selected = i === active;
-          tick.style.width = selected ? '46px' : (Math.abs(i - active) === 1 ? '34px' : '24px');
+          tick.style.width = '10px';
+          tick.style.height = '2px';
           tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
-          tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
+          tick.style.opacity = selected ? '1' : '.45';
         });
       }
 
@@ -2912,12 +2955,8 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       append(rail, ticks);
       append(rail, progressStatus);
       append(rail, arrow('⌄', 'Próxima resposta', 1));
-      const pdfDocument = /\.pdf$/i.test(location.pathname)
-        || location.host === 'neuralia-pdf.localhost';
-      if (!pdfDocument) {
-        append(controls, minimize);
-        append(controls, expand);
-      }
+      append(controls, minimize);
+      append(controls, expand);
       append(controls, rail);
       append(document.documentElement, controls);
 

@@ -3,6 +3,23 @@
 //! chrome nativo (split-windows-app-c).
 use crate::windows_app::*;
 
+/// A coluna expandida e a página ao lado em tela cheia escondem a mesma barra.
+/// Olhar só para `expanded` deixava o chrome da esquerda pintado por cima da
+/// página que já ocupava o monitor.
+pub(in crate::windows_app) fn chrome_hidden(expanded: bool, split_fullscreen: bool) -> bool {
+    expanded || split_fullscreen
+}
+
+/// Em tela cheia a WebView cobre o cliente inteiro. Uma faixa no topo
+/// (`TITLE_TAB_HEIGHT`) ou a largura menos o painel deixavam a barra nativa
+/// visível à esquerda e o botão da página por cima dela.
+pub(in crate::windows_app) fn fullscreen_page_bounds(
+    logical_w: f64,
+    logical_h: f64,
+) -> (f64, f64, f64, f64) {
+    (0.0, 0.0, logical_w.max(1.0), logical_h.max(1.0))
+}
+
 impl App {
     /// Toda a navegacao passa por aqui: a thread do Reader observa este contador
     /// para saber que o resultado que esta a buscar ja nao interessa a ninguem.
@@ -765,9 +782,12 @@ impl App {
     }
 
     pub(in crate::windows_app) fn is_fullscreen_column(&self) -> bool {
-        self.comparator
-            .as_ref()
-            .is_some_and(|comp| comp.expanded.is_some())
+        self.comparator.as_ref().is_some_and(|comp| {
+            chrome_hidden(
+                comp.expanded.is_some(),
+                comp.split.as_ref().is_some_and(|split| split.fullscreen),
+            )
+        })
     }
 
     /// O chrome permanece visível apenas quando nenhuma IA está em tela cheia.

@@ -78,21 +78,42 @@ function fixture({ nested = false, anchors = [], iframe = false, comparator = fa
 
 let cases = 0;
 for (const nested of [false, true]) {
-  // Several anchors below the current top but inside the old 24%-viewport pivot:
-  // the old up handler selected 1100 and moved DOWN from 1000.
-  const dense = fixture({ nested, anchors: [800, 1000, 1100, 1200, 1600] });
-  assert.equal(dense.click(-1), 800, 'up must select an anchor above the current top');
-  assert.equal(dense.click(1), 1000, 'down must select an anchor below the current top');
-  const fallback = fixture({ nested });
-  assert.ok(Math.abs(fallback.click(-1) - 508) < 1e-6, 'up without headings moves upward');
-  assert.equal(fallback.click(1), 1000, 'down without headings moves downward');
-  if (nested) fallback.main.scrollTop = 0; else fallback.window.scrollY = 0;
-  assert.equal(fallback.click(-1), 0, 'upper bound');
-  if (nested) fallback.main.scrollTop = 2400; else fallback.window.scrollY = 2400;
-  assert.equal(fallback.click(1), 2400, 'lower bound');
-  assert.ok((nested ? fallback.main : fallback.html).classes.has('neuralia-scroll-root'));
-  assert.ok(!fallback.other.classes.has('neuralia-scroll-root'), 'independent panel scrollbar preserved');
-  cases += 8;
+  for (const comparator of [false, true]) {
+    // Several anchors below the current top but inside the old 24%-viewport pivot:
+    // the old up handler selected 1100 and moved DOWN from 1000.
+    const dense = fixture({ nested, comparator, anchors: [800, 1000, 1100, 1200, 1600] });
+    assert.equal(dense.click(-1), 800, 'up must select an anchor above the current top');
+    assert.equal(dense.click(1), 1000, 'down must select an anchor below the current top');
+    const fallback = fixture({ nested, comparator });
+    assert.ok(Math.abs(fallback.click(-1) - 508) < 1e-6, 'up without headings moves upward');
+    assert.equal(fallback.click(1), 1000, 'down without headings moves downward');
+    if (nested) fallback.main.scrollTop = 0; else fallback.window.scrollY = 0;
+    assert.equal(fallback.click(-1), 0, 'upper bound');
+    if (nested) fallback.main.scrollTop = 2400; else fallback.window.scrollY = 2400;
+    assert.equal(fallback.click(1), 2400, 'lower bound');
+    assert.ok((nested ? fallback.main : fallback.html).classes.has('neuralia-scroll-root'));
+    assert.ok(!fallback.other.classes.has('neuralia-scroll-root'), 'independent panel scrollbar preserved');
+    const ticks = fallback.rail.children[1];
+    const clickTrack = (fraction) => {
+      const track = ticks.getBoundingClientRect();
+      const trackHeight = track.height || ticks.clientHeight;
+      ticks.onclick({
+        clientY: track.top + trackHeight * fraction,
+        preventDefault() {},
+        stopPropagation() {},
+      });
+    };
+    clickTrack(0);
+    assert.equal(fallback.calls.at(-1), 0, 'a click at the top of the timeline scrolls up');
+    clickTrack(1);
+    assert.equal(fallback.calls.at(-1), 2400, 'a click at the bottom of the timeline scrolls to the end');
+    const up = fallback.rail.children[0];
+    up.onfocus();
+    assert.equal(up.style.color, '#3d9bff', 'focused arrow glyph turns blue');
+    up.onblur();
+    assert.equal(up.style.color, 'rgba(255,255,255,.72)');
+    cases += 12;
+  }
 }
 assert.equal(fixture({ iframe: true }).rail, undefined, 'child frame must not mount a rail');
 console.log(`scroll rail: ${cases + 1} behavior checks passed (document, nested root, direction, bounds, buttons, iframe)`);
@@ -103,10 +124,14 @@ for (const comparator of [false, true]) {
     const status = p.rail.children.find(el => el.className === 'neuralia-reading-progress');
     const ticks = p.rail.children[1];
     assert.match(status.textContent, /Pág\. 2\/5\n≈3 min restantes/);
-    assert.equal(p.rail.style.width, '64px');
-    assert.equal(status.style.alignSelf, 'flex-end', 'status must fit to left of rail without viewport clipping');
+    assert.equal(status.style.opacity, '0', 'page and time stay hidden until hover');
+    p.rail.onmouseenter();
+    assert.equal(status.style.opacity, '1');
+    p.rail.onmouseleave();
+    assert.equal(status.style.opacity, '0');
+    assert.equal(p.rail.style.width, '16px');
     assert.equal(ticks.style.minHeight, '0', 'short windows must allow tick area to shrink');
-    assert.ok(ticks.children.every(el => Number.parseFloat(el.style.minHeight) >= 8));
+    assert.ok(ticks.children.every(el => Number.parseFloat(el.style.height) <= 2));
     p.observers.forEach(fn => fn([{ target: status }]));
     assert.equal(p.scheduled.length, 0, 'rail DOM changes must not recursively schedule frames');
     if (nested) p.main.scrollTop = 2400; else p.window.scrollY = 2400;
@@ -120,7 +145,26 @@ for (const comparator of [false, true]) {
     assert.match(status.textContent, /Pág\. 1\/5\n≈10 min restantes/);
   }
 }
-const pdf = fixture({ comparator: true, pdf: true });
-const controls = pdf.html.children.find(el => el.id === 'neuralia-comp-controls');
-assert.ok(!controls.children.some(el => ['neuralia-comp-minimize', 'neuralia-comp-expand'].includes(el.id)), 'PDF viewer toolbar must not have overlaid page controls');
-console.log('scroll rail: size, page/time, dynamic text, self-mutation and PDF toolbar checks passed for both rails');
+for (const comparator of [false, true]) {
+  const page = fixture({ comparator });
+  if (comparator) {
+    const expand = findId(page.html, 'neuralia-comp-expand');
+    assert.equal(expand.style.width, 'max-content', 'maximize pill must not stretch across the page');
+    assert.equal(expand.style.maxWidth, '240px');
+  }
+  const pdf = fixture({ comparator, pdf: true });
+  assert.equal(pdf.rail, undefined, 'a PDF keeps the viewer scrollbar; the timeline must not cover it');
+  assert.equal(pdf.html.children.some(el => el.id === 'neuralia-scroll-style' || el.id === 'neuralia-split-scroll-style'), false, 'PDF scrollbar must stay visible');
+  const controls = pdf.html.children.find(el => el.id === 'neuralia-comp-controls');
+  assert.equal(controls, undefined, 'PDF viewer must not get the column overlay');
+}
+console.log('scroll rail: size, page/time, dynamic text, self-mutation and PDF scrollbar checks passed for both rails');
+
+function findId(el, id) {
+  if (el.id === id) return el;
+  for (const child of el.children || []) {
+    const found = findId(child, id);
+    if (found) return found;
+  }
+  return undefined;
+}

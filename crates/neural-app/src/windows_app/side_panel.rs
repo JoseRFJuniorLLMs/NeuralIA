@@ -711,7 +711,9 @@ pub(in crate::windows_app) fn panel_theme_vars(theme: &Theme) -> serde_json::Val
 }
 
 pub(in crate::windows_app) fn panel_html(theme: &Theme) -> String {
-    PANEL_HTML.replace("__THEME__", &panel_theme_vars(theme).to_string())
+    PANEL_HTML
+        .replace("__THEME__", &panel_theme_vars(theme).to_string())
+        .replace("__NEURALIA_VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
 /// A pagina do painel, montada em tempo de compilacao a partir de

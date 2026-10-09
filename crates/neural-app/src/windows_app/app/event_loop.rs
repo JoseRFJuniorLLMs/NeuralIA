@@ -574,8 +574,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::RestoreComparator => {
                 if self.service_frame().is_some_and(|frame| frame.exit_button) {
                     self.service_input(ServiceInput::ToggleFullscreen);
-                } else if self.surface == Surface::Comparator {
-                    self.restore_comparator();
+                } else {
+                    self.leave_column_fullscreen();
                 }
             }
             UserEvent::PdfReady {
@@ -698,6 +698,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Surface::Comparator => {
                         let state = self.bar_state();
+                        let show_bar = self.bar_visible();
                         if let Some(window) = &self.window
                             && let Some(comp) = &self.comparator
                         {
@@ -708,7 +709,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.service_strip_physical(),
                                 )
                             });
-                            draw_comparator_bar(window, comp, state, &self.live_panel);
+                            if show_bar {
+                                draw_comparator_bar(window, comp, state, &self.live_panel);
+                            }
                             for panel in &self.background_services {
                                 draw_service_chrome(
                                     window,

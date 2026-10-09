@@ -1397,6 +1397,26 @@ fn panel_html_is_assembled_from_its_section_assets() {
     assert!(PANEL_HTML.starts_with("<!doctype html>\n"));
 }
 
+/// O Sobre não leva a versão escrita no HTML. O asset guarda o marcador; a
+/// página que embarca recebe `CARGO_PKG_VERSION`. Uma versão fixa no asset
+/// faz este teste falhar no bump seguinte, e esquecer o replace deixa o
+/// marcador visível.
+#[test]
+fn about_panel_shows_the_compiled_package_version() {
+    let version = env!("CARGO_PKG_VERSION");
+    assert!(
+        PANEL_HTML.contains("NeuralIA v__NEURALIA_VERSION__"),
+        "o asset do Sobre perdeu o marcador da versão"
+    );
+    assert!(
+        !PANEL_HTML.contains(&format!("NeuralIA v{version}")),
+        "a versão compilada ficou escrita no asset"
+    );
+    let html = panel_html(&Theme::dark((0, 120, 212)));
+    assert!(html.contains(&format!(">NeuralIA v{version}<")));
+    assert!(!html.contains("__NEURALIA_VERSION__"));
+}
+
 #[test]
 fn side_panel_only_ever_shows_its_local_page() {
     assert!(panel_allows_navigation("about:blank"));
@@ -16401,6 +16421,21 @@ fn native_controls_follow_the_effective_hwnd_after_decoration_changes() {
 
 #[test]
 fn expanded_column_takes_fullscreen_and_hides_chrome() {
+    assert!(
+        !chrome_hidden(false, false),
+        "com as colunas lado a lado a barra continua visível"
+    );
+    assert!(chrome_hidden(true, false));
+    assert!(
+        chrome_hidden(false, true),
+        "a página ao lado em tela cheia também esconde a barra"
+    );
+    assert_eq!(
+        fullscreen_page_bounds(1600.0, 900.0),
+        (0.0, 0.0, 1600.0, 900.0)
+    );
+    assert_eq!(fullscreen_page_bounds(-4.0, 0.0), (0.0, 0.0, 1.0, 1.0));
+
     let source = shipped_source();
     let expand = source
         .split("fn expand_comparator")
@@ -16417,8 +16452,25 @@ fn expanded_column_takes_fullscreen_and_hides_chrome() {
         .nth(1)
         .and_then(|part| part.split("fn column_ipc_event_impl").next())
         .expect("layout body");
-    assert!(layout.contains("LogicalPosition::new(0.0, TITLE_TAB_HEIGHT)"));
-    assert!(layout.contains("logical_h - TITLE_TAB_HEIGHT"));
+    assert!(layout.contains("fullscreen_page_bounds(window_w, logical_h)"));
+    assert!(
+        !layout.contains("LogicalPosition::new(0.0, TITLE_TAB_HEIGHT)"),
+        "tela cheia não pode deixar uma faixa da barra nativa à vista"
+    );
+    assert!(
+        source.contains("fn leave_column_fullscreen"),
+        "Esc e o botão de saída têm de sair da página ao lado e da coluna pelo mesmo caminho"
+    );
+    let leave = source
+        .split("fn leave_column_fullscreen")
+        .nth(1)
+        .and_then(|part| part.split("fn sync_comparator_buttons").next())
+        .expect("leave_column_fullscreen body");
+    let toggle = leave
+        .find("toggle_split_fullscreen()")
+        .expect("sai da página");
+    let restore = leave.find("restore_comparator()").expect("sai da coluna");
+    assert!(toggle < restore);
 
     let bar = BarLayout::new(1600.0, 1.0, true, 3);
     assert!(bar.window_minimize.width > 0.0);

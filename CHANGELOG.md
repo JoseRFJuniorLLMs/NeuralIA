@@ -2,6 +2,14 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.3] - 2026-10-09
+
+### Fixed
+- **O Sobre mostra a versão que foi compilada.** O distintivo deixa de trazer um número escrito no HTML e passa a usar a versão do pacote.
+- **A timeline volta a ser uma linha.** O clique no trilho sobe ou desce conforme o ponto, o cartão de página e tempo só aparece com o rato por cima, e a seta com foco fica azul. O clique para cima na coluna deixa de saltar para a mesma posição.
+- **Tela cheia cobre a janela.** A página expandida e a página ao lado deixam de mostrar a barra nativa à esquerda, e o botão de maximizar deixa de esticar pela largura da página.
+- **Um PDF mantém a rolagem do leitor.** A timeline deixa de se montar por cima do visor e de esconder a barra dele.
+
 ## [2.9.2] - 2026-10-09
 
 ### Fixed

@@ -550,6 +550,22 @@ impl App {
         self.request_redraw();
     }
 
+    /// Sai da tela cheia da coluna ou da página ao lado. O Esc e o botão
+    /// nativo de saída passam por aqui: tratar os dois do mesmo modo evita
+    /// que a página ao lado fique em tela cheia com a janela já restaurada.
+    pub(in crate::windows_app) fn leave_column_fullscreen(&mut self) {
+        let split_fullscreen = self
+            .comparator
+            .as_ref()
+            .and_then(|comp| comp.split.as_ref())
+            .is_some_and(|split| split.fullscreen);
+        if split_fullscreen {
+            self.toggle_split_fullscreen();
+        } else if self.surface == Surface::Comparator {
+            self.restore_comparator();
+        }
+    }
+
     /// O botao vive dentro da pagina e nao sabe o estado; o app diz-lho.
     pub(in crate::windows_app) fn sync_comparator_buttons(&self) {
         let Some(comp) = &self.comparator else {
@@ -571,7 +587,8 @@ impl App {
         };
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
-        let logical_w = comparator_logical_width(size.width as f64 / scale, comp.panel_width);
+        let window_w = size.width as f64 / scale;
+        let logical_w = comparator_logical_width(window_w, comp.panel_width);
         let logical_h = size.height as f64 / scale;
 
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
@@ -584,9 +601,10 @@ impl App {
                 for view in &comp.views {
                     let _ = view.webview.set_visible(false);
                 }
+                let (x, y, width, height) = fullscreen_page_bounds(window_w, logical_h);
                 let _ = split.webview.set_bounds(wry::Rect {
-                    position: LogicalPosition::new(0.0, content_y).into(),
-                    size: LogicalSize::new(logical_w, content_h).into(),
+                    position: LogicalPosition::new(x, y).into(),
+                    size: LogicalSize::new(width, height).into(),
                 });
                 let _ = split.webview.set_visible(true);
                 return;
@@ -617,16 +635,14 @@ impl App {
                 // Fullscreen fica geometricamente estavel. A versao anterior
                 // mudava o bounds do WebView toda vez que o cursor tocava o
                 // topo para mostrar/esconder chrome, causando flicker e pump
-                // de layout em cascata no WebView2.
+                // de layout em cascata no WebView2. A página cobre o cliente
+                // inteiro: uma faixa de título deixava a barra nativa à vista.
+                let (x, y, width, height) = fullscreen_page_bounds(window_w, logical_h);
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, TITLE_TAB_HEIGHT).into(),
-                            size: LogicalSize::new(
-                                logical_w,
-                                (logical_h - TITLE_TAB_HEIGHT).max(1.0),
-                            )
-                            .into(),
+                            position: LogicalPosition::new(x, y).into(),
+                            size: LogicalSize::new(width, height).into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {

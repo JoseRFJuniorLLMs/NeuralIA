@@ -521,8 +521,12 @@ impl App {
                 None
             });
         }
+        self.needs_clear = true;
         self.update_comparator_layout();
         self.sync_comparator_splitters();
+        self.sync_exit_button();
+        self.sync_home_button();
+        self.sync_caption_buttons();
         self.request_redraw();
     }
 

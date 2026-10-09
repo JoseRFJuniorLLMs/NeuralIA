@@ -990,7 +990,7 @@ impl App {
             return;
         }
         if self.is_fullscreen_column() {
-            self.restore_comparator();
+            self.leave_column_fullscreen();
             return;
         }
         if self.tab_gesture(TabGestureInput::Escape) == TabGestureEffect::Ignored {

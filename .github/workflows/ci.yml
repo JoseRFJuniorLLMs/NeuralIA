@@ -45,6 +45,8 @@ jobs:
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
         run: node scripts/test-link-routing.mjs
+      - name: Exercise shipped scroll timeline
+        run: node scripts/test-scroll-rail.mjs
       - name: Verify release asset contract
         run: node scripts/test-release-contract.mjs
       - run: cargo clippy --locked -p neural-core --all-targets -- -D warnings
@@ -1536,6 +1538,8 @@ jobs:
         run: node scripts/test-ai-auto-submit.mjs
       - name: Exercise shipped provider link routing
         run: node scripts/test-link-routing.mjs
+      - name: Exercise shipped scroll timeline
+        run: node scripts/test-scroll-rail.mjs
       - run: cargo clippy --locked -p neural-app --all-targets -- -D warnings
       - run: cargo build --locked -p neural-app --bin NeuralIA --release
       # Release contract of the CI-only feature test-stores (infra-settings-keys):
