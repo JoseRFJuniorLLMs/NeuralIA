@@ -1676,7 +1676,7 @@ dependencies = [
 
 [[package]]
 name = "neural-app"
-version = "2.9.3"
+version = "2.9.4"
 dependencies = [
  "flate2",
  "image",
@@ -1694,7 +1694,7 @@ dependencies = [
 
 [[package]]
 name = "neural-core"
-version = "2.9.3"
+version = "2.9.4"
 dependencies = [
  "flate2",
  "quick-xml 0.42.0",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "neural-setup"
-version = "2.9.3"
+version = "2.9.4"
 dependencies = [
  "image",
  "neural-core",
