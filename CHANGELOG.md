@@ -2,6 +2,14 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.5] - 2026-10-09
+
+### Fixed
+- **A auditoria de dependências no CI passa sem erro de API:** substituído o action do Checks por `cargo audit` direto para que avisos informativos não interrompam o pipeline.
+- **Os testes de interface conhecem o botão «Pesquisar com IA» e a dica do Sobre.**
+- **O timeout do job Windows no CI sobe para 85 minutos**, permitindo a conclusão da suite completa com os gates de sabotagem.
+- **Alinhamento do Cargo.lock** com a versão do workspace.
+
 ## [2.9.4] - 2026-10-09
 
 ### Changed

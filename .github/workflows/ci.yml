@@ -58,7 +58,7 @@ jobs:
     # With the 2.3 E2E steps and a sabotage matrix of ~35 entries (18 min on
     # its own) a green run of PR 161 took 35m01s and was cut at the 35-minute
     # mark after every step passed - a timeout, not a gate result.
-    timeout-minutes: 50
+    timeout-minutes: 85
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
