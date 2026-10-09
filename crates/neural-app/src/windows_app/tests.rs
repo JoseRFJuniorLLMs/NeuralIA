@@ -1594,6 +1594,65 @@ fn obsidian_graph_builds_correlated_nodes_and_edges() {
 }
 
 #[test]
+fn obsidian_graph_stays_small_enough_to_paint_and_the_ui_thread_does_not_read_history() {
+    let notes: Vec<neural_core::Note> = (0..150)
+        .map(|i| neural_core::Note {
+            id: format!("n{i}"),
+            title: format!("Nota {i}"),
+            body: "https://example.com/a https://example.com/b https://example.com/c https://example.com/d https://example.com/e".into(),
+            tags: vec!["rust".into()],
+            source: None,
+            created_unix: i,
+            updated_unix: i,
+            extra_front_matter: Vec::new(),
+        })
+        .collect();
+    let history: Vec<HistoryEntry> = (0..100)
+        .map(|i| HistoryEntry {
+            timestamp_unix: i,
+            kind: HistoryKind::Ask,
+            input: format!("pesquisa {i} rust"),
+            target: String::new(),
+        })
+        .collect();
+    let graph = notes::build_obsidian_graph(&notes, &history);
+    let note_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "note")
+        .count();
+    let hist_nodes = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == "history")
+        .count();
+    assert_eq!(note_nodes, notes::GRAPH_NOTE_LIMIT);
+    assert_eq!(hist_nodes, notes::GRAPH_HISTORY_LIMIT);
+    assert!(graph.nodes.iter().any(|node| node.id == "note:n149"));
+    assert!(graph.nodes.iter().all(|node| node.id != "note:n0"));
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "site:https://example.com/d")
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.id != "site:https://example.com/e")
+    );
+    let panels = include_str!("app/panels.rs");
+    let arm = panels
+        .split("PanelMessage::ObsidianGraph")
+        .nth(1)
+        .and_then(|tail| tail.split("PanelMessage::").next())
+        .expect("braço do grafo");
+    assert!(!arm.contains("recent_history_sync"));
+    assert!(arm.contains("history_store()"));
+}
+
+#[test]
 fn side_panel_sits_on_the_right_below_the_bar() {
     // 34% de 1440 = 489.6, limitado a 440; por baixo da barra do comparador.
     assert_eq!(
@@ -23247,6 +23306,7 @@ process.stdout.write(JSON.stringify({
                 rev: Some(opened_rev.clone()),
             }),
             T0 + 30,
+            None,
         );
         assert!(matches!(other, NotesReply::Opened { .. }), "{other:?}");
 
@@ -23257,6 +23317,7 @@ process.stdout.write(JSON.stringify({
             &store,
             notes_command_for(mine).expect("comando"),
             T0 + 60,
+            None,
         );
         let NotesReply::Conflict {
             original,
@@ -23319,6 +23380,7 @@ process.stdout.write(JSON.stringify({
                     rev: Some(rev.clone()),
                 }),
                 at,
+                None,
             );
             assert!(
                 matches!(

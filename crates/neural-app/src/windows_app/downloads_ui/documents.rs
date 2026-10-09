@@ -243,7 +243,7 @@ impl App {
                         }
                     })
                     .with_url(reader_url(&id).expect("library returned valid book id"));
-                self.install_document_panel(builder, WebViewHost::Epub, ticket);
+                self.install_document_panel(builder, WebViewHost::Epub, ticket, generation);
                 return;
             }
         };
@@ -254,7 +254,7 @@ impl App {
                 let _ = proxy.send_event(UserEvent::Panel(post));
             }
         });
-        self.install_document_panel(builder, host, ticket);
+        self.install_document_panel(builder, host, ticket, generation);
     }
 
     fn install_document_panel(
@@ -262,6 +262,7 @@ impl App {
         builder: wry::WebViewBuilder<'static>,
         host: WebViewHost,
         ticket: side_panel::PanelTicket,
+        generation: u64,
     ) {
         let Some(window) = &self.window else {
             return;
@@ -276,6 +277,7 @@ impl App {
                     drop(extra);
                     return;
                 }
+                self.downloads_ui.document_view_generation = generation;
                 self.downloads_ui.document_ticket = Some(ticket);
                 self.fit_comparator_to_panel();
                 self.after_panel_change();
@@ -395,6 +397,30 @@ mod gates {
             assert_eq!(size.width, 360.0);
         }
     }
+
+    #[test]
+    fn document_title_click_closes_only_the_close_band() {
+        assert!(!document_chrome_closes(10, 360));
+        assert!(!document_chrome_closes(180, 360));
+        assert!(document_chrome_closes(250, 360));
+        assert!(document_chrome_closes(359, 360));
+        assert!(!document_chrome_closes(360, 360));
+        assert!(!document_chrome_closes(-1, 360));
+    }
+
+    #[test]
+    fn a_newer_load_does_not_retire_the_visible_document() {
+        let ticket = side_panel::PanelTicket(7);
+        assert!(viewer_still_showing(4, 4, Some(ticket), Some(ticket)));
+        assert!(!viewer_still_showing(5, 4, Some(ticket), Some(ticket)));
+        assert!(!viewer_still_showing(
+            4,
+            4,
+            Some(ticket),
+            Some(side_panel::PanelTicket(8))
+        ));
+        assert!(!viewer_still_showing(0, 0, None, None));
+    }
 }
 
 fn decode_text(bytes: &[u8]) -> Result<String, String> {
@@ -426,6 +452,31 @@ fn decode_text(bytes: &[u8]) -> Result<String, String> {
 }
 
 pub(in crate::windows_app) const DOCUMENT_TITLE_HEIGHT: f64 = 38.0;
+
+/// O clique fecha só na faixa da direita, onde está o «Fechar ×».
+/// O resto da barra é título: um clique ali não desmonta o leitor.
+pub(in crate::windows_app) fn document_chrome_closes(x: i32, width: i32) -> bool {
+    if width <= 0 || x < 0 || x >= width {
+        return false;
+    }
+    let close = (width / 3).clamp(48, 160);
+    x >= width - close
+}
+
+/// Um aviso ou um pedido do leitor só vale para o documento que ainda está
+/// na tela. A geração do carregamento pode já ter subido (outro arquivo foi
+/// pedido e falhou) sem aposentar este.
+pub(in crate::windows_app) fn viewer_still_showing(
+    event_generation: u64,
+    view_generation: u64,
+    document: Option<side_panel::PanelTicket>,
+    active: Option<side_panel::PanelTicket>,
+) -> bool {
+    event_generation == view_generation
+        && view_generation != 0
+        && document.is_some()
+        && document == active
+}
 
 pub(in crate::windows_app) fn document_content_bounds(bounds: wry::Rect, scale: f64) -> wry::Rect {
     let position = bounds.position.to_logical::<f64>(scale);
@@ -466,11 +517,16 @@ unsafe extern "system" fn document_chrome_subclass(
     match message {
         WM_NCHITTEST => return HTCLIENT as LRESULT,
         WM_LBUTTONUP => {
-            let chrome = &*(reference as *const DocumentChrome);
-            let _ = chrome.proxy.send_event(UserEvent::DownloadDocumentUi {
-                generation: chrome.generation,
-                request: crate::epub_app::EpubUiRequest::Close,
-            });
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect);
+            let x = (lparam & 0xffff) as i16 as i32;
+            if document_chrome_closes(x, rect.right) {
+                let chrome = &*(reference as *const DocumentChrome);
+                let _ = chrome.proxy.send_event(UserEvent::DownloadDocumentUi {
+                    generation: chrome.generation,
+                    request: crate::epub_app::EpubUiRequest::Close,
+                });
+            }
             return 0;
         }
         WM_PAINT => {
@@ -523,7 +579,7 @@ impl App {
             .document_chrome
             .as_ref()
             .is_some_and(|chrome| {
-                chrome.generation != self.downloads_ui.document_generation
+                chrome.generation != self.downloads_ui.document_view_generation
                     || unsafe {
                         windows_sys::Win32::UI::WindowsAndMessaging::GetParent(chrome.hwnd)
                     } != owner
@@ -553,7 +609,7 @@ impl App {
                 let chrome = Box::new(DocumentChrome {
                     hwnd,
                     proxy: self.proxy.clone(),
-                    generation: self.downloads_ui.document_generation,
+                    generation: self.downloads_ui.document_view_generation,
                 });
                 if SetWindowSubclass(
                     hwnd,

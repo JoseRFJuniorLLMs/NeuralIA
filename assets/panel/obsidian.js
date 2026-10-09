@@ -139,6 +139,11 @@
     }
 
     function tick() {
+      const view = byId('view-obsidian');
+      if (view && view.hidden) {
+        animId = 0;
+        return;
+      }
       if (!physicsPaused) {
         stepPhysics();
       }
@@ -564,7 +569,9 @@
     }
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      const obsidianView = byId('view-obsidian');
       window.addEventListener('mousemove', (e) => {
+        if (obsidianView && obsidianView.hidden) return;
         if (isDragging && dragNode) {
           if (!container || typeof container.getBoundingClientRect !== 'function') return;
           const rect = container.getBoundingClientRect();
@@ -605,7 +612,10 @@
         if (activeNode && !isNodeVisible(activeNode)) showCard(null);
         hoveredNode = null;
         updateCounts();
-        center();
+        // Filtra no lugar. Recentrar a cada tecla fazia os nós saltarem
+        // e a busca parecer que não tinha acertado.
+        renderCanvas();
+        wake();
       };
       oq.addEventListener('input', search);
       oq.addEventListener('keydown', (e) => {

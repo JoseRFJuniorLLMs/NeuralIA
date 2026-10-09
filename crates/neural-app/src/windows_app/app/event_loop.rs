@@ -612,10 +612,12 @@ impl ApplicationHandler<UserEvent> for App {
                 generation,
                 request,
             } => {
-                if generation == self.downloads_ui.document_generation
-                    && self.downloads_ui.document_ticket.is_some()
-                    && self.side_panel.active_ticket() == self.downloads_ui.document_ticket
-                {
+                if downloads_ui::documents::viewer_still_showing(
+                    generation,
+                    self.downloads_ui.document_view_generation,
+                    self.downloads_ui.document_ticket,
+                    self.side_panel.active_ticket(),
+                ) {
                     match request {
                         crate::epub_app::EpubUiRequest::OpenExternal(url) => self.web(url),
                         crate::epub_app::EpubUiRequest::Close => {
@@ -626,10 +628,12 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::DownloadDocumentNotice { generation, notice } => {
-                if generation == self.downloads_ui.document_generation
-                    && self.downloads_ui.document_ticket.is_some()
-                    && self.side_panel.active_ticket() == self.downloads_ui.document_ticket
-                {
+                if downloads_ui::documents::viewer_still_showing(
+                    generation,
+                    self.downloads_ui.document_view_generation,
+                    self.downloads_ui.document_ticket,
+                    self.side_panel.active_ticket(),
+                ) {
                     self.panel_eval(&crate::epub_app::notice_script(&notice));
                     if let Some(error) = notice.status_line() {
                         self.show_splash(error, 5);

@@ -173,7 +173,8 @@ pub(super) enum NotesCommand {
     Save(NoteEdit),
     Delete(String),
     Create(NoteDraft),
-    Graph(Vec<neural_core::HistoryEntry>),
+    /// O histórico viaja no `NotesJob`, não aqui: a loja não compara.
+    Graph,
 }
 
 /// Porque e que uma nota vai para o editor.
@@ -378,7 +379,7 @@ pub(super) fn run_notes_command(
     command: NotesCommand,
     now_unix: u64,
 ) -> NotesReply {
-    run_notes_command_in(&mut NotesSession::default(), store, command, now_unix)
+    run_notes_command_in(&mut NotesSession::default(), store, command, now_unix, None)
 }
 
 /// O trabalho do worker das notas, sem thread nem janela: e isto que os
@@ -388,6 +389,7 @@ pub(super) fn run_notes_command_in(
     store: &ZettelStore,
     command: NotesCommand,
     now_unix: u64,
+    history: Option<&neural_core::HistoryStore>,
 ) -> NotesReply {
     match command {
         NotesCommand::List => notes_listed(store.list(), None),
@@ -465,8 +467,13 @@ pub(super) fn run_notes_command_in(
                 Err(error) => NotesReply::Failed(format!("Não foi possível criar a nota: {error}")),
             }
         }
-        NotesCommand::Graph(history) => match store.list() {
-            Ok(notes) => NotesReply::Graph(build_obsidian_graph(&notes, &history)),
+        NotesCommand::Graph => match store.list() {
+            Ok(notes) => {
+                let history = history
+                    .and_then(|store| store.recent(GRAPH_HISTORY_LIMIT).ok())
+                    .unwrap_or_default();
+                NotesReply::Graph(build_obsidian_graph(&notes, &history))
+            }
             Err(error) => NotesReply::Failed(format!(
                 "Não foi possível ler as notas para o grafo: {error}"
             )),
@@ -688,10 +695,32 @@ fn add_tag_node(
     tag_id
 }
 
+/// Notas mais recentes que entram no grafo. O resto continua nas notas;
+/// o canvas não aguenta a pasta inteira a cada frame.
+pub(super) const GRAPH_NOTE_LIMIT: usize = 120;
+/// Pesquisas recentes correlacionadas. O histórico no disco pode ter 250.
+pub(super) const GRAPH_HISTORY_LIMIT: usize = 80;
+const GRAPH_URLS_PER_NOTE: usize = 4;
+
 pub(super) fn build_obsidian_graph(
     notes: &[Note],
     history: &[neural_core::HistoryEntry],
 ) -> ObsidianGraphData {
+    let notes_limited;
+    let notes: &[Note] = if notes.len() > GRAPH_NOTE_LIMIT {
+        let mut ranked: Vec<&Note> = notes.iter().collect();
+        ranked.sort_by_key(|note| std::cmp::Reverse(note.updated_unix));
+        ranked.truncate(GRAPH_NOTE_LIMIT);
+        notes_limited = ranked.into_iter().cloned().collect::<Vec<_>>();
+        notes_limited.as_slice()
+    } else {
+        notes
+    };
+    let history = if history.len() > GRAPH_HISTORY_LIMIT {
+        &history[..GRAPH_HISTORY_LIMIT]
+    } else {
+        history
+    };
     let mut nodes_map = std::collections::HashMap::new();
     let mut edges = Vec::new();
     let mut edge_set = std::collections::HashSet::new();
@@ -758,7 +787,10 @@ pub(super) fn build_obsidian_graph(
         }
 
         // Links de URLs presentes no corpo da nota
-        for url in extract_urls(&note.body) {
+        for url in extract_urls(&note.body)
+            .into_iter()
+            .take(GRAPH_URLS_PER_NOTE)
+        {
             let site_id = add_site_node(&mut nodes_map, &url);
             add_edge(note_node_id.clone(), site_id, "source");
         }
@@ -873,6 +905,8 @@ pub(super) struct NotesJob {
     /// `None`: so uma marca na fila (`settle`) -- nada corre e ninguem
     /// recebe resposta.
     pub(super) command: Option<NotesCommand>,
+    /// Só o pedido do grafo traz a loja. A leitura do ficheiro é deste worker.
+    pub(super) history: Option<neural_core::HistoryStore>,
     pub(super) origin: NotesOrigin,
     /// Avisado depois do trabalho feito: e por aqui que a saida da app
     /// espera pela fila (`settle`).
@@ -936,9 +970,13 @@ impl ZettelWorker {
                         // pedido aguenta a pasta ter sido apagada com o app
                         // aberto.
                         let answer = match ZettelStore::open(&dir) {
-                            Ok(store) => {
-                                run_notes_command_in(&mut session, &store, command, unix_now())
-                            }
+                            Ok(store) => run_notes_command_in(
+                                &mut session,
+                                &store,
+                                command,
+                                unix_now(),
+                                job.history.as_ref(),
+                            ),
                             Err(error) => NotesReply::Failed(format!(
                                 "Não foi possível abrir a pasta das notas: {error}"
                             )),
@@ -960,9 +998,37 @@ impl ZettelWorker {
     /// -- o X do painel manda o salvar e logo a seguir o `close`, e a pagina
     /// ja nao esta la para tentar outra vez. O resto, com a fila cheia,
     /// volta ja com `NOTES_BUSY`, para quem pediu repetir.
+    /// O grafo leva a loja já aberta. Quem lê o ficheiro é esta thread.
+    pub(super) fn submit_graph(
+        &self,
+        history: neural_core::HistoryStore,
+        origin: NotesOrigin,
+    ) -> Result<(), String> {
+        let job = NotesJob {
+            command: Some(NotesCommand::Graph),
+            history: Some(history),
+            origin,
+            done: None,
+        };
+        if self
+            .queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                (queued < NOTES_QUEUE_LIMIT).then_some(queued + 1)
+            })
+            .is_err()
+        {
+            return Err(NOTES_BUSY.to_string());
+        }
+        self.tx.send(job).map_err(|_| {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+            NOTES_WORKER_GONE.to_string()
+        })
+    }
+
     pub(super) fn submit(&self, command: NotesCommand, origin: NotesOrigin) -> Result<(), String> {
         let job = NotesJob {
             command: Some(command),
+            history: None,
             origin,
             done: None,
         };
@@ -1002,6 +1068,7 @@ impl super::side_panel::DraftRescue for ZettelWorker {
     fn rescue(&self, command: NotesCommand) -> Result<(), String> {
         self.keep(NotesJob {
             command: Some(command),
+            history: None,
             origin: NotesOrigin::Closed,
             done: None,
         })
@@ -1013,6 +1080,7 @@ impl super::side_panel::DraftRescue for ZettelWorker {
         let (done, finished) = sync_channel(1);
         let barrier = NotesJob {
             command: None,
+            history: None,
             origin: NotesOrigin::Closed,
             done: Some(done),
         };

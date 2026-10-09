@@ -1005,8 +1005,12 @@ impl App {
             )),
             PanelMessage::Bookmarks(request) => self.bookmark_panel_request(request),
             PanelMessage::ObsidianGraph => {
-                let history = self.privacy.recent_history_sync(150).unwrap_or_default();
-                self.submit_notes(NotesCommand::Graph(history), NotesOrigin::Panel);
+                // A leitura do histórico fica no worker das notas. Aqui só
+                // se entrega a loja: o event loop não espera o trinco do ficheiro.
+                let history = self.privacy.history_store();
+                if let Err(error) = self.notes.submit_graph(history, NotesOrigin::Panel) {
+                    self.panel_run(notes_reply_script(&NotesReply::Failed(error)));
+                }
             }
             PanelMessage::CheckUpdate => {
                 self.check_and_apply_update(true);

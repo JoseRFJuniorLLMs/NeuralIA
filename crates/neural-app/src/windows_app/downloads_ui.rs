@@ -1503,7 +1503,12 @@ pub(in crate::windows_app) struct DownloadsUiState {
     /// A pagina do painel pediu a lista (a seccao Downloads ja se abriu
     /// nela): as mudancas seguem para la enquanto o painel estiver aberto.
     pub(in crate::windows_app) panel_live: bool,
+    /// Geração do carregamento em curso. Sobe ao pedir um documento, para uma
+    /// resposta atrasada não abrir por cima de um pedido mais novo.
     pub(in crate::windows_app) document_generation: u64,
+    /// Geração do leitor que está na tela. Só muda quando esse leitor
+    /// abre de verdade: um pedido que falha não aposenta o documento visível.
+    pub(in crate::windows_app) document_view_generation: u64,
     pub(in crate::windows_app) document_chrome: Option<Box<documents::DocumentChrome>>,
     pub(in crate::windows_app) document_ticket: Option<side_panel::PanelTicket>,
     /// Os downloads acabados que ja deram o toast.
@@ -1524,6 +1529,7 @@ impl DownloadsUiState {
             })),
             panel_live: false,
             document_generation: 0,
+            document_view_generation: 0,
             document_ticket: None,
             document_chrome: None,
             announced: BTreeSet::new(),
@@ -1541,6 +1547,7 @@ impl DownloadsUiState {
             card_sink: Box::new(Box::new(|_| {})),
             panel_live: false,
             document_generation: 0,
+            document_view_generation: 0,
             document_ticket: None,
             document_chrome: None,
             announced: BTreeSet::new(),

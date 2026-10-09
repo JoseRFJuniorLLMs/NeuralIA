@@ -2874,10 +2874,9 @@ impl HistoryWriter {
         }
     }
 
-    /// Le as entradas mais recentes sincronamente. Usado pelo grafo Obsidian
-    /// no worker de notas em background sem bloquear o event loop.
-    pub(crate) fn recent_sync(&self, limit: usize) -> Result<Vec<HistoryEntry>, String> {
-        self.store.recent(limit).map_err(|error| error.to_string())
+    /// Cópia da loja para um worker ler o ficheiro fora do event loop.
+    pub(crate) fn store_clone(&self) -> HistoryStore {
+        self.store.clone()
     }
 
     /// Nunca faz I/O no event loop. Sob saturacao, perder uma entrada e menos

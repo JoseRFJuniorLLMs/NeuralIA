@@ -2,6 +2,13 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.1] - 2026-10-09
+
+### Fixed
+- **O grafo deixa de travar a interface:** a leitura do histórico sai do event loop e corre no worker das notas. O grafo fica limitado às 120 notas mais recentes, 80 pesquisas e 4 endereços por nota.
+- **A busca do grafo filtra no lugar:** cada tecla já não recentraliza nem relança a física. Com a aba escondida, o rato e a animação não continuam a correr.
+- **Fechar um documento aberto continua a funcionar** se um segundo arquivo falhar a abrir. O clique na barra só fecha na faixa do «Fechar ×».
+
 ## [2.9.0] - 2026-10-08
 
 ### Fixed
