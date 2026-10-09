@@ -10,6 +10,8 @@ pub(in crate::windows_app) enum Service {
     Meet,
     /// Videochamada / reuniões: o Microsoft Teams.
     Teams,
+    /// Correio da Microsoft. A sessão fica no perfil do WebView.
+    Outlook,
     WhatsApp,
     YouTube,
     Gmail,
@@ -27,6 +29,7 @@ impl Service {
         match self {
             Self::Meet => "https://meet.google.com/",
             Self::Teams => "https://teams.microsoft.com/",
+            Self::Outlook => "https://outlook.office.com/mail/",
             Self::WhatsApp => "https://web.whatsapp.com/",
             Self::YouTube => "https://www.youtube.com/",
             Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
@@ -38,6 +41,7 @@ impl Service {
         match self {
             Self::Meet => "Videochamada (Google Meet)",
             Self::Teams => "Microsoft Teams",
+            Self::Outlook => "Outlook",
             Self::WhatsApp => "WhatsApp",
             Self::YouTube => "YouTube",
             Self::Gmail => "Gmail",
@@ -52,14 +56,23 @@ impl Service {
     pub(in crate::windows_app) fn private(self) -> bool {
         match self {
             Self::Breath => true,
-            Self::Meet | Self::Teams | Self::WhatsApp | Self::YouTube | Self::Gmail => false,
+            Self::Meet
+            | Self::Teams
+            | Self::Outlook
+            | Self::WhatsApp
+            | Self::YouTube
+            | Self::Gmail => false,
         }
     }
 
     /// Uma instancia destes servicos continua viva quando o painel e ocultado
-    /// ou outro servico toma o seu lugar. O Gmail usa um monitor proprio.
+    /// ou outro servico toma o seu lugar. A conta (Teams, Outlook, WhatsApp,
+    /// YouTube, Gmail) fica ligada. O Gmail tambem tem um monitor de avisos.
     pub(in crate::windows_app) fn keeps_running_in_background(self) -> bool {
-        matches!(self, Self::WhatsApp | Self::YouTube)
+        matches!(
+            self,
+            Self::Teams | Self::Outlook | Self::WhatsApp | Self::YouTube | Self::Gmail
+        )
     }
 }
 
@@ -341,9 +354,12 @@ pub(in crate::windows_app) fn breath_panel_allows_navigation(target: &str) -> bo
 pub(in crate::windows_app) fn service_panel_navigation(service: Service, target: &str) -> bool {
     match service {
         Service::Breath => breath_panel_allows_navigation(target),
-        Service::Meet | Service::Teams | Service::WhatsApp | Service::YouTube | Service::Gmail => {
-            service_panel_allows_navigation(target)
-        }
+        Service::Meet
+        | Service::Teams
+        | Service::Outlook
+        | Service::WhatsApp
+        | Service::YouTube
+        | Service::Gmail => service_panel_allows_navigation(target),
     }
 }
 

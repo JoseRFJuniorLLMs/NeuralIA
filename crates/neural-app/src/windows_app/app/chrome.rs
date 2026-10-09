@@ -223,22 +223,33 @@ impl App {
         let address_visible = self.surface == Surface::Comparator
             && self.bar_visible()
             && title_address_rect(size.width as f64, scale, self.pomodoro_bar_label()).width > 0.0;
+        let edit_focused = unsafe { GetFocus() == edit };
 
         // O mesmo EDIT nativo permanece vivo na Home e na barra de titulo.
         // Nas outras superficies fica estacionado e sem autoridade de teclado.
+        // Na Home o campo fica no tamanho de sempre. Na barra de titulo, com
+        // foco, acompanha a pilula que saltou.
+        let mut title_pill_height = None;
         let inner = if self.surface == Surface::Home {
             let layout =
                 HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
             let pad_x = 22.0 * scale;
-            let pad_y = 5.0 * scale;
+            let pad_y = 8.0 * scale;
+            let text_left = layout.input.x + pad_x;
+            let text_right = layout.search.x - 8.0 * scale;
             UiRect {
-                x: layout.input.x + pad_x,
+                x: text_left,
                 y: layout.input.y + pad_y,
-                width: (layout.input.width - pad_x * 2.0).max(1.0),
+                width: (text_right - text_left).max(1.0),
                 height: (layout.input.height - pad_y * 2.0).max(1.0),
             }
         } else if address_visible {
-            let address = title_address_rect(size.width as f64, scale, self.pomodoro_bar_label());
+            let mut address =
+                title_address_rect(size.width as f64, scale, self.pomodoro_bar_label());
+            if edit_focused {
+                address = sprung_title_address(address, scale);
+            }
+            title_pill_height = Some(address.height);
             let padding = 8.0 * scale;
             UiRect {
                 x: address.x + padding,
@@ -271,17 +282,26 @@ impl App {
             }
             ShowWindow(edit, SW_SHOW);
         }
-        self.apply_omnibox_font(inner.height);
+        if let Some(pill) = title_pill_height {
+            self.apply_omnibox_font_px(title_address_font_height(pill, scale));
+        } else {
+            self.apply_omnibox_font(inner.height);
+        }
         self.needs_clear = true;
         self.request_redraw();
     }
 
     /// Fonte proporcional a altura da barra: acompanha o tamanho da caixa e o DPI.
+    /// A Home usa esta conta. A barra de título passa por `title_address_font_height`.
     fn apply_omnibox_font(&mut self, box_height: f64) {
+        let height = -((box_height * 0.58).round() as i32).clamp(18, 80);
+        self.apply_omnibox_font_px(height);
+    }
+
+    fn apply_omnibox_font_px(&mut self, height: i32) {
         let Some(edit) = self.omnibox else {
             return;
         };
-        let height = -((box_height * 0.58).round() as i32).clamp(18, 80);
         if self.omnibox_font_height == height && self.omnibox_font.is_some() {
             return;
         }

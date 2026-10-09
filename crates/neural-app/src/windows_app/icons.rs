@@ -8,6 +8,8 @@ pub(in crate::windows_app) const ICON_SLOT_TEAMS: usize = COMPARATOR_COLUMNS + 2
 pub(in crate::windows_app) const ICON_SLOT_WHATSAPP: usize = COMPARATOR_COLUMNS + 3;
 pub(in crate::windows_app) const ICON_SLOT_YOUTUBE: usize = COMPARATOR_COLUMNS + 4;
 pub(in crate::windows_app) const ICON_SLOT_MAIL: usize = COMPARATOR_COLUMNS + 5;
+/// O circulo azul do Outlook, ao lado do Gmail na barra de titulo.
+pub(in crate::windows_app) const ICON_SLOT_OUTLOOK: usize = COMPARATOR_COLUMNS + 14;
 pub(in crate::windows_app) const ICON_SLOT_INCOGNITO: usize = COMPARATOR_COLUMNS + 6;
 /// Ferramentas: Pomodoro, Notas, Obsidian e Respiracao.
 pub(in crate::windows_app) const ICON_SLOT_POMODORO: usize = COMPARATOR_COLUMNS + 7;
@@ -21,8 +23,8 @@ pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 11
 pub(in crate::windows_app) const ICON_SLOT_DOWNLOADS: usize = COMPARATOR_COLUMNS + 12;
 /// Informacoes sobre o navegador e atualizacoes.
 pub(in crate::windows_app) const ICON_SLOT_ABOUT: usize = COMPARATOR_COLUMNS + 13;
-pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 13] =
-    [const { OnceLock::new() }; 13];
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 14] =
+    [const { OnceLock::new() }; 14];
 
 pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -115,7 +117,8 @@ pub(in crate::windows_app) fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_TEAMS => include_bytes!("../../../../assets/ai/teams.png"),
             ICON_SLOT_WHATSAPP => include_bytes!("../../../../assets/ai/whatsapp.png"),
             ICON_SLOT_YOUTUBE => include_bytes!("../../../../assets/ai/youtube.png"),
-            ICON_SLOT_MAIL => include_bytes!("../../../../assets/ai/mail.png"),
+            ICON_SLOT_MAIL => include_bytes!("../../../../assets/ai/gmail.png"),
+            ICON_SLOT_OUTLOOK => include_bytes!("../../../../assets/ai/outlook.png"),
             ICON_SLOT_POMODORO => include_bytes!("../../../../assets/ai/pomodoro.png"),
             ICON_SLOT_NOTES => include_bytes!("../../../../assets/ai/notes.png"),
             ICON_SLOT_OBSIDIAN => include_bytes!("../../../../assets/ai/obsidian.png"),

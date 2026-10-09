@@ -209,6 +209,9 @@ pub(in crate::windows_app) enum UserEvent {
     PrintPage,
     PrintTarget(PageTarget),
     FocusOmnibox,
+    /// O foco entrou ou saiu da omnibox: a barra salta de tamanho e o EDIT
+    /// nativo acompanha a pílula.
+    OmniboxFocus,
     ToggleColumnFullscreen,
     OpenDevTools,
     OpenDevToolsTarget(PageTarget),
@@ -1056,10 +1059,11 @@ pub(in crate::windows_app) const AUX_POPUP_STYLE: u32 = WS_POPUP;
 
 // Dicas. A barra e os botoes nativos sao desenhados a mao, por isso o Windows
 // nao tem texto nenhum para mostrar sozinho. A dica e uma MENSAGEM no centro da
-// janela, com o visual dos avisos (fundo e texto do tema, letra grande), como o
-// dono pediu: o balao do Windows junto ao cursor era pequeno -- e, em modo
-// TTF_SUBCLASS, nem aparecia sobre a janela do winit. Aparece depois de o rato
-// parar TOOLTIP_DELAY_MS sobre um alvo; some quando ele sai ou clica.
+// janela, no formato de um alerta: fundo do tema, contorno redondo, icone e
+// texto na cor do tom (erro, aviso, informacao, sucesso). O balao do Windows
+// junto ao cursor era pequeno -- e, em modo TTF_SUBCLASS, nem aparecia sobre a
+// janela do winit. Aparece depois de o rato parar TOOLTIP_DELAY_MS sobre um
+// alvo; some quando ele sai ou clica.
 static HINT_HWND: AtomicUsize = AtomicUsize::new(0);
 static HINT_TEXT: Mutex<String> = Mutex::new(String::new());
 /// A dica que o temporizador vai mostrar: (janela raiz, texto).
@@ -1124,14 +1128,20 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::Private => {
             "Painel privado: abre ao lado sem gravar histórico nem memória".to_string()
         }
-        BarHit::Service(service) => format!("{} no painel ao lado", service.label()),
-        BarHit::ServiceStrip(button) => button.hint("o serviço"),
-        BarHit::GmailToggle => if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
-            "Avisos do Gmail: ligados · clique para desligar"
-        } else {
-            "Avisos do Gmail: desligados · clique para ligar"
+        BarHit::Service(service) => {
+            if service.keeps_running_in_background() {
+                format!(
+                    "{} no painel ao lado · a sessão continua em segundo plano",
+                    service.label()
+                )
+            } else {
+                format!("{} no painel ao lado", service.label())
+            }
         }
-        .to_string(),
+        BarHit::ServiceStrip(button) => button.hint("o serviço"),
+        BarHit::GmailToggle => {
+            "Gmail no painel ao lado · a sessão continua em segundo plano".to_string()
+        }
         BarHit::Tool(tool) => tool.tooltip().to_string(),
         BarHit::GeminiLive => LIVE_TOOLTIP.to_string(),
         BarHit::Downloads => downloads_tooltip(state.downloads),
@@ -1228,7 +1238,7 @@ fn home_tool_buttons(
     client_width: f64,
     scale: f64,
     pomodoro_label: Option<BarLabel>,
-) -> [UiRect; 5] {
+) -> [UiRect; 3] {
     let scale = scale.max(1.0);
     let caption_left = client_width - 3.0 * 46.0 * scale;
     let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
@@ -1258,8 +1268,10 @@ fn home_tool_hit(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HomeClick {
     Tool(Tool),
-    /// O botao "Ir" da omnibox.
+    /// "Pesquisar com IA": abre as tres colunas.
     Go,
+    /// "Pesquisar": Google, e a janela maximiza.
+    Search,
     /// A faixa de cima fora dos botoes: arrasta a janela.
     Drag,
     Nothing,
@@ -1278,8 +1290,12 @@ fn home_click_target(
     if let Some(tool) = home_tool_hit(size.0, scale, pomodoro_label, x, y) {
         return HomeClick::Tool(tool);
     }
-    if HomeLayout::new(size.0, size.1, scale).go.contains(x, y) {
+    let layout = HomeLayout::new(size.0, size.1, scale);
+    if layout.go.contains(x, y) {
         return HomeClick::Go;
+    }
+    if layout.search.contains(x, y) {
+        return HomeClick::Search;
     }
     if home_drag_strip(y, scale) {
         return HomeClick::Drag;
@@ -3163,19 +3179,35 @@ impl UiRect {
     }
 }
 
+/// Azul do botao "Pesquisar com IA", o da barra da imagem.
+const SEARCH_AI_BLUE: Rgb = (26, 115, 232);
+
 #[derive(Debug, Clone, Copy)]
 struct HomeLayout {
+    /// A barra inteira, redonda, com o texto e os dois botoes dentro.
     input: UiRect,
+    /// "Pesquisar": Google, e a janela maximiza.
+    search: UiRect,
+    /// "Pesquisar com IA": as tres colunas. Era o "Ir".
     go: UiRect,
 }
 
 impl HomeLayout {
     fn new(width: f64, height: f64, scale: f64) -> Self {
         let scale = scale.max(1.0);
-        let row_width = (720.0 * scale).min((width - 48.0 * scale).max(320.0 * scale));
-        let row_height = 54.0 * scale;
-        let go_width = 84.0 * scale;
-        let gap = 10.0 * scale;
+        let available = (width - 48.0 * scale).max(280.0 * scale);
+        let row_width = (880.0 * scale).min(available);
+        let row_height = 56.0 * scale;
+        let inset = 8.0 * scale;
+        let gap = 8.0 * scale;
+        let ideal_ai = 196.0 * scale;
+        let ideal_search = 118.0 * scale;
+        let chrome = inset * 2.0 + gap;
+        let room = (row_width - 96.0 * scale).max(chrome + 48.0 * scale);
+        let fit = ((room - chrome) / (ideal_ai + ideal_search)).clamp(0.62, 1.0);
+        let ai_w = ideal_ai * fit;
+        let search_w = ideal_search * fit;
+        let button_h = (row_height - inset * 2.0).max(1.0);
         let row_x = (width - row_width) / 2.0;
         // `f64::clamp` entra em panico se o minimo for maior que o maximo, e
         // isso acontece sempre que a altura e inferior a 490*scale -- em
@@ -3191,17 +3223,23 @@ impl HomeLayout {
         let input = UiRect {
             x: row_x,
             y: row_y,
-            width: row_width - go_width - gap,
+            width: row_width,
             height: row_height,
         };
         let go = UiRect {
-            x: input.x + input.width + gap,
-            y: row_y,
-            width: go_width,
-            height: row_height,
+            x: input.x + input.width - inset - ai_w,
+            y: input.y + inset,
+            width: ai_w,
+            height: button_h,
+        };
+        let search = UiRect {
+            x: go.x - gap - search_w,
+            y: go.y,
+            width: search_w,
+            height: button_h,
         };
 
-        Self { input, go }
+        Self { input, search, go }
     }
 }
 
@@ -6535,18 +6573,33 @@ fn draw_home(
             Some((border_color, border_width * scale)),
             theme.page_bg,
         );
-        if go_hover {
-            // Parado com NEURALIA_REDUCE_MOTION; senao o degradê desliza ao
-            // ritmo dos frames da Home.
-            let phase = if home_animation_enabled() {
-                (now_ms() % GO_GRADIENT_PERIOD_MS) as f32 / GO_GRADIENT_PERIOD_MS as f32
-            } else {
-                0.0
-            };
-            draw_go_gradient(target, layout.go, phase, body_font, &theme);
+        draw_pill(
+            target,
+            layout.search,
+            "Pesquisar",
+            PillStyle::new(
+                mix(theme.surface, theme.fg, 0.10),
+                theme.surface_line,
+                theme.fg,
+            ),
+            scale,
+            body_font,
+            theme.surface,
+        );
+        let ai_blue = if go_hover {
+            mix(SEARCH_AI_BLUE, (255, 255, 255), 0.14)
         } else {
-            draw_button(target, layout.go, "Ir", true, scale, body_font, &theme);
-        }
+            SEARCH_AI_BLUE
+        };
+        draw_pill(
+            target,
+            layout.go,
+            "Pesquisar com IA",
+            PillStyle::new(ai_blue, ai_blue, (255, 255, 255)),
+            scale,
+            body_font,
+            theme.surface,
+        );
 
         if let Some(message) = status {
             SelectObject(target, small_font as _);
@@ -6792,19 +6845,6 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     };
     FillRect(target, &bottom_line, separator);
     DeleteObject(separator as _);
-
-    let address = title_address_rect(width as f64, scale, columns.pomodoro_label);
-    if address.width > 0.0 {
-        let (border_color, border_width) = theme.omnibox_border(state.omnibox_focused);
-        fill_pill(
-            target,
-            address,
-            address.height / 2.0,
-            theme.surface,
-            Some((border_color, border_width * scale)),
-            theme.bar_bg,
-        );
-    }
 
     SetBkMode(target, TRANSPARENT as i32);
     let font = create_font((-13.0 * scale) as i32, FW_NORMAL as i32);
@@ -7121,7 +7161,7 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     );
     // Ferramentas, num grupo a esquerda do Gemini Live. O Pomodoro leva o tempo
     // ao lado do icone quando `right_controls` lhe deu largura para isso.
-    let labels = [columns.pomodoro_label, None, None, None, None];
+    let labels = [columns.pomodoro_label, None, None];
     for ((rect, tool), label) in controls.tools.iter().zip(Tool::ALL).zip(labels) {
         draw_tool_button(
             target,
@@ -7137,17 +7177,9 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         );
     }
     // O canto direito pela ordem do registo (`RIGHT_CLUSTER`): o olho do
-    // Gemini Live pinta-se do estado do painel; os outros sao icones, com
-    // a cor de cada um -- o envelope do Gmail apaga-se com os avisos
-    // desligados; a seta dos downloads fica na cor de destaque enquanto ha
-    // downloads a correr; o Privado e o chapeu e os oculos, sem nome
-    // (pedido do dono). Os lugares nao se tocam, por isso a ordem de
-    // pintura e a do registo.
-    let gmail_tint = if GMAIL_NOTIFICATIONS.load(Ordering::Acquire) {
-        theme.fg
-    } else {
-        theme.fg_muted
-    };
+    // Gemini Live pinta-se do estado do painel. Meet e Privado sao glifos
+    // brancos e seguem o tema. Teams, Outlook, WhatsApp, YouTube e Gmail
+    // trazem a cor no PNG (circulo, nao quadrado) e nao levam tinta.
     for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
         let hovered = hover == Some(slot.hit);
         match slot.hit {
@@ -7156,12 +7188,7 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             }
             hit => {
                 let tint = match hit {
-                    BarHit::Service(Service::Meet)
-                    | BarHit::Service(Service::Teams)
-                    | BarHit::Private => Some(theme.fg),
-                    BarHit::GmailToggle => Some(gmail_tint),
-                    BarHit::Downloads if state.downloads.active > 0 => Some(theme.accent),
-                    BarHit::Downloads => Some(theme.fg),
+                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
                     _ => None,
                 };
                 draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
@@ -7224,6 +7251,24 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     }
 
     let _ = auto_scroll;
+
+    // Por cima das abas: com foco a pílula salta (mais alta e mais larga) e
+    // tapa o que ficou por baixo. A borda azul é a mesma de sempre.
+    let mut address = title_address_rect(width as f64, scale, columns.pomodoro_label);
+    if state.omnibox_focused {
+        address = sprung_title_address(address, scale);
+    }
+    if address.width > 0.0 {
+        let (border_color, border_width) = theme.omnibox_border(state.omnibox_focused);
+        fill_pill(
+            target,
+            address,
+            address.height / 2.0,
+            theme.surface,
+            Some((border_color, border_width * scale)),
+            theme.bar_bg,
+        );
+    }
 
     SelectObject(target, old_font);
     DeleteObject(font as _);

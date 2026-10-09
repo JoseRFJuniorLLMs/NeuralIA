@@ -1766,7 +1766,7 @@ pub(in crate::windows_app) const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 
   function sendButton() {
     const selectors = host === 'chatgpt.com'
-      ? ['button[data-testid="send-button"]', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'form button[type="submit"]']
+      ? ['[data-testid="send-button"]', '[data-testid="composer-submit-button"]', '#composer-submit-button', 'button[aria-label*="Send prompt"]', 'button[aria-label*="Send message"]', 'button[aria-label*="Enviar"]', 'button[aria-label*="Submit"]', 'form button[type="submit"]']
       : ['button[data-testid="send-button"]', 'button[aria-label*="Send"]', 'button[aria-label*="Enviar"]', 'button[data-testid*="send"]', 'form button[type="submit"]'];
     for (const selector of selectors) {
       const button = document.querySelector(selector);
@@ -1779,26 +1779,32 @@ pub(in crate::windows_app) const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
 
   // O sitio ja tratou da pergunta sozinho?
   //
-  // O ChatGPT, com `?q=...&hints=search`, NAO se limita a preencher a caixa:
-  // envia a pergunta e troca a URL para `/uc/<id>` sem recarregar a pagina.
-  // A caixa fica entao vazia -- e o script, que guardou a pergunta no
-  // arranque, via-a vazia e escrevia-a de volta. Era isso que ficava escrito
-  // no ChatGPT depois de a resposta ja estar na tela.
-  //
-  // O sinal e a propria URL e nao o DOM: o `?q=` desaparece quando o site o
-  // consome, em qualquer provedor e em qualquer versao do HTML deles. Ler o
-  // DOM obrigava a conhecer os seletores de cada um -- e o ChatGPT tem pelo
-  // menos duas variantes (ligado e desligado) com marcadores diferentes.
+  // Noutros provedores o `?q=` desaparece quando a pergunta foi consumida.
+  // No ChatGPT isso deixou de ser verdade: o redirect da SPA tira o `?q=` e
+  // deixa o texto na caixa, à espera de Enter. Enquanto o texto estiver lá,
+  // ainda falta carregar em enviar. A conversa (`/c/` ou `/uc/`) ou a caixa
+  // vazia depois de a pergunta ter aparecido é que fecham o ciclo — senão o
+  // script via a caixa vazia e escrevia a pergunta outra vez.
+  let sawQuery = false;
+
   function consumed() {
-    // No ChatGPT o desaparecimento de q e um sinal real de submissao. No
-    // Claude e apenas parte do redirect de /new para a SPA, portanto nao pode
-    // encerrar o auto-submit antes de o compositor sequer existir.
+    // No Claude o desaparecimento de q e apenas o redirect de /new para a
+    // SPA, portanto nao pode encerrar o auto-submit antes de o compositor
+    // existir. No ChatGPT passou a ser o mesmo: a caixa fica com o texto e
+    // o botao de enviar espera um Enter. So conta como enviado se a conversa
+    // abriu, ou se a caixa esvaziou depois de a pergunta ter aparecido.
     if (host === 'claude.ai') return false;
-    try {
-      return new URL(location.href).searchParams.get('q') !== query;
-    } catch (_) {
-      return true;
+    let url;
+    try { url = new URL(location.href); } catch (_) { return true; }
+    if (host === 'chatgpt.com') {
+      if (/^\/(c|uc)\//.test(url.pathname)) return true;
+      const el = editor();
+      if (el && textOf(el).indexOf(query) !== -1) sawQuery = true;
+      if (url.searchParams.get('q') === query) return false;
+      if (el && textOf(el)) return false;
+      return sawQuery && !!el;
     }
+    return url.searchParams.get('q') !== query;
   }
 
   // Reaviva o estado do framework quando o proprio ?q= desenhou texto no
@@ -1888,7 +1894,8 @@ pub(in crate::windows_app) const AI_AUTO_SUBMIT_SCRIPT: &str = r#"
         // Nao martelar o endpoint enquanto uma submissao anterior ainda pode
         // estar em voo. Se um Enter sintetico for ignorado, continuamos a
         // observar e tentamos o botao/formulario assim que aparecer.
-        if (attempts > 10 && now - lastSubmitAt >= 2500) {
+        const ready = host === 'chatgpt.com' ? attempts > 3 : attempts > 10;
+        if (ready && now - lastSubmitAt >= 2500) {
           lastSubmitAt = now;
           submitEditor(el);
         }

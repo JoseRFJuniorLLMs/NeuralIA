@@ -1043,7 +1043,7 @@ impl App {
             Some(BarHit::Private) => self.open_private_panel(),
             Some(BarHit::Service(service)) => self.open_service_panel(service),
             Some(BarHit::ServiceStrip(button)) => self.service_input(button.input()),
-            Some(BarHit::GmailToggle) => self.toggle_gmail_notifications(),
+            Some(BarHit::GmailToggle) => self.open_service_panel(Service::Gmail),
             Some(BarHit::Tool(_)) => {
                 if let Some(action) = bar_tool_action(hit, ToolClick::Left) {
                     self.run_tool_action(action);
@@ -1143,8 +1143,12 @@ impl App {
                 let _ = window.drag_window();
             }
             HomeClick::Go => {
-                debug_log(format_args!("click_home: botao Ir"));
-                self.submit_current();
+                debug_log(format_args!("click_home: pesquisar com IA"));
+                self.search_with_ais();
+            }
+            HomeClick::Search => {
+                debug_log(format_args!("click_home: pesquisar no Google"));
+                self.search_on_google();
             }
             HomeClick::Nothing => {}
         }

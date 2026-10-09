@@ -211,36 +211,30 @@ def video() -> None:
     finish(mask, solid((255, 255, 255)), "video.png")
 
 
+def circle_mask() -> Image.Image:
+    """Contorno redondo: o icone e um circulo, nunca um quadrado."""
+    mask = Image.new("L", (N, N), 0)
+    radius = N * 0.46
+    ImageDraw.Draw(mask).ellipse(
+        [CENTER - radius, CENTER - radius, CENTER + radius, CENTER + radius],
+        fill=255,
+    )
+    return mask
+
+
 # ------------------------------------------------------------- Teams
 def teams() -> None:
-    """Icone do Microsoft Teams: contorno branco (a barra pinta-o com o tema)."""
-    stroke = N * 0.065
-    mask = Image.new("L", (N, N), 0)
-    draw = ImageDraw.Draw(mask)
-
-    # Figura do fundo (participante de reuniao)
-    head_r = N * 0.10
-    head_cx, head_cy = N * 0.70, N * 0.28
-    draw.ellipse([head_cx - head_r, head_cy - head_r, head_cx + head_r, head_cy + head_r], outline=255, width=int(stroke))
-    draw.arc([N * 0.52, N * 0.42, N * 0.88, N * 0.78], start=190, end=350, fill=255, width=int(stroke))
-    draw.line([(N * 0.88, N * 0.60), (N * 0.88, N * 0.75)], fill=255, width=int(stroke))
-
-    # Badge/bloco da frente com o 'T'
-    tile_l, tile_t = N * 0.12, N * 0.25
-    tile_r, tile_b = N * 0.58, N * 0.75
-    draw.rounded_rectangle([tile_l, tile_t, tile_r, tile_b], radius=N * 0.08, outline=255, width=int(stroke))
-
-    # Letra 'T'
-    t_top = tile_t + (tile_b - tile_t) * 0.28
-    t_l = tile_l + (tile_r - tile_l) * 0.24
-    t_r = tile_r - (tile_r - tile_l) * 0.24
-    draw.line([(t_l, t_top), (t_r, t_top)], fill=255, width=int(stroke * 1.1))
-
-    t_cx = (t_l + t_r) / 2.0
-    t_bot = tile_b - (tile_b - tile_t) * 0.26
-    draw.line([(t_cx, t_top), (t_cx, t_bot)], fill=255, width=int(stroke * 1.1))
-
-    finish(mask, solid((255, 255, 255)), "teams.png")
+    """Circulo roxo com o T e um participante, nas cores do Teams."""
+    purple = (91, 95, 199)
+    person = (196, 198, 240)
+    paint = solid(purple)
+    draw = ImageDraw.Draw(paint)
+    draw.ellipse([N * 0.56, N * 0.22, N * 0.76, N * 0.42], fill=person)
+    draw.pieslice([N * 0.48, N * 0.36, N * 0.84, N * 0.68], start=200, end=340, fill=person)
+    stroke = int(N * 0.075)
+    draw.line([(N * 0.24, N * 0.46), (N * 0.56, N * 0.46)], fill=(255, 255, 255), width=stroke)
+    draw.line([(N * 0.40, N * 0.46), (N * 0.40, N * 0.76)], fill=(255, 255, 255), width=stroke)
+    finish(circle_mask(), paint, "teams.png")
 
 
 # ------------------------------------------------------------------ WhatsApp
@@ -278,17 +272,49 @@ def youtube() -> None:
     finish(mask, paint, "youtube.png")
 
 
-# -------------------------------------------------------------------- E-mail
-def mail() -> None:
-    """Envelope em contorno, branco (a barra pinta-o com o tema)."""
-    stroke = N * 0.068
-    left, right, top, bottom = N * 0.12, N * 0.88, N * 0.24, N * 0.76
-    mask = Image.new("L", (N, N), 0)
-    draw = ImageDraw.Draw(mask)
-    draw.rounded_rectangle([left, top, right, bottom], radius=N * 0.06, outline=255, width=int(stroke))
-    stroked(draw, (left + stroke, top + stroke), (CENTER, N * 0.53), stroke)
-    stroked(draw, (right - stroke, top + stroke), (CENTER, N * 0.53), stroke)
-    finish(mask, solid((255, 255, 255)), "mail.png")
+# -------------------------------------------------------------------- Gmail
+def gmail() -> None:
+    """Circulo claro com o M nas quatro cores do Gmail."""
+    red = (234, 67, 53)
+    blue = (66, 133, 244)
+    green = (52, 168, 83)
+    yellow = (251, 188, 5)
+    paint = solid((255, 255, 255))
+    draw = ImageDraw.Draw(paint)
+    stroke = int(N * 0.078)
+    left = (N * 0.30, N * 0.66)
+    peak_l = (N * 0.30, N * 0.36)
+    valley = (N * 0.50, N * 0.54)
+    peak_r = (N * 0.70, N * 0.36)
+    right = (N * 0.70, N * 0.66)
+    draw.line([left, peak_l, valley], fill=red, width=stroke, joint="curve")
+    draw.line([valley, peak_r, right], fill=blue, width=stroke, joint="curve")
+    draw.line([left, (left[0], left[1] - N * 0.14)], fill=yellow, width=stroke)
+    draw.line([(right[0], right[1] - N * 0.14), right], fill=green, width=stroke)
+    finish(circle_mask(), paint, "gmail.png")
+
+
+# ------------------------------------------------------------------ Outlook
+def outlook() -> None:
+    """Circulo azul com um envelope branco."""
+    blue = (15, 108, 189)
+    paint = solid(blue)
+    draw = ImageDraw.Draw(paint)
+    left, right, top, bottom = N * 0.28, N * 0.72, N * 0.36, N * 0.66
+    stroke = int(N * 0.045)
+    draw.rounded_rectangle(
+        [left, top, right, bottom],
+        radius=N * 0.06,
+        outline=(255, 255, 255),
+        width=stroke,
+    )
+    draw.line(
+        [(left + stroke, top + stroke), (CENTER, N * 0.56), (right - stroke, top + stroke)],
+        fill=(255, 255, 255),
+        width=stroke,
+        joint="curve",
+    )
+    finish(circle_mask(), paint, "outlook.png")
 
 
 # ----------------------------------------------------------------- Anonimo
@@ -546,7 +572,8 @@ ICONS = {
     "teams": teams,
     "whatsapp": whatsapp,
     "youtube": youtube,
-    "mail": mail,
+    "gmail": gmail,
+    "outlook": outlook,
     "incognito": incognito,
     "live": live,
     "pomodoro": pomodoro,

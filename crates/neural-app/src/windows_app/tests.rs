@@ -2014,20 +2014,25 @@ fn column_buttons_fit_or_vanish() {
 /// dos downloads (downloads-ui) logo antes do Privado.
 #[test]
 fn right_cluster_slots_never_overlap_and_hit_back() {
-    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..6].iter().map(|slot| slot.hit).collect();
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..7].iter().map(|slot| slot.hit).collect();
     assert_eq!(
         service_hits,
         [
             BarHit::Service(Service::Meet),
             BarHit::Service(Service::Teams),
+            BarHit::Service(Service::Outlook),
             BarHit::Service(Service::WhatsApp),
             BarHit::Service(Service::YouTube),
             BarHit::GmailToggle,
         ]
     );
     assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
-    assert_eq!(RIGHT_CLUSTER[6].hit, BarHit::Downloads);
-    assert_eq!(RIGHT_CLUSTER[6].icon, ICON_SLOT_DOWNLOADS);
+    assert!(
+        !RIGHT_CLUSTER
+            .iter()
+            .any(|slot| slot.hit == BarHit::Downloads),
+        "a seta de downloads saiu da barra de titulo; o Ctrl+J continua"
+    );
     assert_eq!(RIGHT_CLUSTER[7].hit, BarHit::Private);
     let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
     icons.sort_unstable();
@@ -2041,11 +2046,6 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
                 let at = format!("{width}px x{scale} gaveta={split_active}");
                 let mut previous_right = 0.0f64;
                 for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
-                    // A seta dos downloads cabe ou nao existe.
-                    if slot.hit == BarHit::Downloads && !downloads_slot_fits(client_width, scale) {
-                        assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
-                        continue;
-                    }
                     assert!(
                         rect.width > 0.0 && rect.height > 0.0,
                         "{at}: {:?} sem tamanho",
@@ -2070,56 +2070,34 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
     }
 }
 
-/// Gate (a seta dos downloads cabe ou nao existe, downloads-ui): de 720 a
-/// 2560 px, a 1x, 1,5x e 2x, com e sem gaveta, a seta existe se e so se a
-/// janela tem `DOWNLOADS_SLOT_MIN_WIDTH` px logicos; sem ela, nenhum ponto
-/// da linha a acerta e o resto do canto fica onde estava sem ela (o Gemini
-/// Live nao anda). Com ela, as tres IAs mantem a pilula, o "+" e os ‹ ›
-/// (`the_tools_never_take_room_from_the_ai_columns`, que corre sobre a
-/// mesma `right_controls`).
+/// A seta de downloads saiu da barra de titulo. O Ctrl+J e a aba do painel
+/// continuam a abrir a seccao. O Gmail encosta ao Privado.
 #[test]
-fn downloads_slot_fits_or_vanishes() {
-    let mut present = 0usize;
-    let mut absent = 0usize;
+fn the_title_bar_has_no_downloads_button() {
+    assert_eq!(
+        bar_hit_command(BarHit::Downloads),
+        Some(CommandId::Downloads)
+    );
     for scale in [1.0, 1.5, 2.0] {
-        for width in (720..=2560).step_by(10) {
+        for width in (720..=2560).step_by(40) {
             let width = width as f64;
             for split_active in [false, true] {
                 let controls = right_controls(width, scale, split_active, None);
                 let at = format!("{width}px x{scale} gaveta={split_active}");
-                let fits = width / scale >= DOWNLOADS_SLOT_MIN_WIDTH;
-                assert_eq!(downloads_slot_fits(width, scale), fits, "{at}");
-                let rect = controls.downloads;
-                let row_y = rect.y + rect.height / 2.0;
+                let row_y = controls.private.y + controls.private.height / 2.0;
                 let hits_it = (0..(width as i32)).any(|x| {
                     right_controls_hit(controls, x as f64 + 0.5, row_y) == Some(BarHit::Downloads)
                 });
-                if fits {
-                    present += 1;
-                    assert!(rect.width > 0.0, "{at}: a seta cabia e sumiu");
-                    assert_eq!(rect.width, controls.private.width, "{at}");
-                    assert!(hits_it, "{at}: a seta nao se clica");
-                    assert!(rect.x + rect.width <= controls.private.x, "{at}");
-                    assert!(
-                        controls.services[4].x + controls.services[4].width <= rect.x,
-                        "{at}"
-                    );
-                } else {
-                    absent += 1;
-                    assert_eq!(rect.width, 0.0, "{at}: a seta existe sem caber");
-                    assert!(!hits_it, "{at}: um clique acerta a seta que nao existe");
-                    // O Gmail encosta ao Privado, como antes da seta.
-                    let gap =
-                        controls.private.x - (controls.services[4].x + controls.services[4].width);
-                    assert!((gap - 4.0 * scale).abs() < 1e-6, "{at}: {gap}");
-                }
+                assert!(!hits_it, "{at}: a seta de downloads voltou a barra");
+                let gmail = controls.services[5];
+                let gap = controls.private.x - (gmail.x + gmail.width);
+                assert!(
+                    (gap - 4.0 * scale).abs() < 1e-4,
+                    "{at}: o Gmail nao encosta ao Privado ({gap})"
+                );
             }
         }
     }
-    assert!(
-        present > 0 && absent > 0,
-        "{present} com seta, {absent} sem"
-    );
 }
 
 #[test]
@@ -2600,6 +2578,7 @@ fn service_icons_sit_left_of_private_without_overlap_and_hit_their_service() {
     let order = [
         BarHit::Service(Service::Meet),
         BarHit::Service(Service::Teams),
+        BarHit::Service(Service::Outlook),
         BarHit::Service(Service::WhatsApp),
         BarHit::Service(Service::YouTube),
         BarHit::GmailToggle,
@@ -4290,8 +4269,25 @@ fn the_go_button_lights_up_only_under_the_mouse_on_home() {
     assert!(!home_go_hovered(Surface::Home, size, scale, (-1.0, -1.0)));
     assert!(
         !home_go_hovered(Surface::Comparator, size, scale, center),
-        "o Ir nao existe fora da Home"
+        "o botao azul nao existe fora da Home"
     );
+    let layout = HomeLayout::new(size.0, size.1, scale);
+    assert!(layout.search.x + layout.search.width <= layout.go.x + 0.5);
+    assert!(layout.go.x + layout.go.width <= layout.input.x + layout.input.width + 0.5);
+    assert!(layout.search.y >= layout.input.y);
+    let (sx, sy) = (
+        layout.search.x + layout.search.width / 2.0,
+        layout.search.y + layout.search.height / 2.0,
+    );
+    assert_eq!(
+        home_click_target((size.0, size.1), scale, None, sx, sy),
+        HomeClick::Search
+    );
+    assert_eq!(
+        google_search_url("  raft consensus  ").as_deref(),
+        Some("https://www.google.com/search?q=raft+consensus")
+    );
+    assert_eq!(google_search_url("  "), None);
 }
 
 #[test]
@@ -7156,6 +7152,9 @@ fn comparator_has_split_palette_and_real_three_way_submit() {
     assert!(AI_AUTO_SUBMIT_SCRIPT.contains("lastSubmitAt"));
     assert!(AI_AUTO_SUBMIT_SCRIPT.contains("neuralia:pending-query:"));
     assert!(AI_AUTO_SUBMIT_SCRIPT.contains("if (host === 'claude.ai') return false"));
+    assert!(AI_AUTO_SUBMIT_SCRIPT.contains("if (host === 'chatgpt.com')"));
+    assert!(AI_AUTO_SUBMIT_SCRIPT.contains("if (el && textOf(el)) return false"));
+    assert!(AI_AUTO_SUBMIT_SCRIPT.contains("/^\\/(c|uc)\\//"));
     assert!(AI_AUTO_SUBMIT_SCRIPT.contains("storageRemove(pendingKey)"));
     assert!(AI_AUTO_SUBMIT_SCRIPT.contains("setTimeout(submitWhenReady, 150)"));
 }
@@ -16555,6 +16554,33 @@ fn comparator_enables_the_address_omnibox() {
 }
 
 #[test]
+fn the_address_bar_jumps_larger_while_keeping_its_place() {
+    let rest = title_address_rect(1600.0, 1.0, None);
+    assert!(rest.width > 0.0);
+    let jumped = sprung_title_address(rest, 1.0);
+    assert!(
+        jumped.height >= rest.height + 32.0 - 0.01,
+        "altura {jumped:?} devia saltar a partir de {rest:?}"
+    );
+    assert!(jumped.width > rest.width + 40.0);
+    assert!(jumped.x < rest.x);
+    assert!((jumped.x + jumped.width - (rest.x + rest.width)).abs() < 0.01);
+
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        let rest = title_address_rect(1600.0 * scale, scale, None);
+        let jumped = sprung_title_address(rest, scale);
+        let rest_font = title_address_font_height(rest.height, scale).unsigned_abs();
+        let jumped_font = title_address_font_height(jumped.height, scale).unsigned_abs();
+        let expected = ((rest_font as f64) * (jumped.height / rest.height)).round() as u32;
+        assert_eq!(
+            jumped_font, expected,
+            "a letra tem de crescer na proporção da barra @{scale}"
+        );
+        assert!(jumped_font > rest_font);
+    }
+}
+
+#[test]
 fn comparator_titlebar_reserves_address_without_overlapping_tabs() {
     let layout = BarLayout::with_contexts(
         1600.0,
@@ -20240,9 +20266,7 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                         }
                     }
 
-                    let [pomodoro, notes, obsidian, breath, about] = controls.tools;
-                    assert_eq!(notes.width, notes.height, "{at}");
-                    assert_eq!(obsidian.width, obsidian.height, "{at}");
+                    let [pomodoro, breath, about] = controls.tools;
                     assert_eq!(breath.width, breath.height, "{at}");
                     assert_eq!(about.width, about.height, "{at}");
                     if pomodoro_label.is_none() {

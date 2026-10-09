@@ -125,16 +125,17 @@ impl std::fmt::Debug for BarLabel {
     }
 }
 
-/// Os cinco botoes das ferramentas, encostados a `right`: Sobre na ponta,
-/// Respiracao antes, Obsidian antes, Notas antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
+/// Os botoes das ferramentas, encostados a `right`: Sobre na ponta,
+/// Respiracao antes e o Pomodoro por ultimo -- e so ele alarga para a esquerda
 /// com a etiqueta, para os outros nao saltarem quando ela aparece.
+/// Zettelkasten e Obsidian nao entram: estao na aba do Sobre.
 pub(in crate::windows_app) fn tool_button_row(
     right: f64,
     y: f64,
     size: f64,
     gap: f64,
     label_width: f64,
-) -> [UiRect; 5] {
+) -> [UiRect; 3] {
     let about = UiRect {
         x: right - size,
         y,
@@ -145,20 +146,12 @@ pub(in crate::windows_app) fn tool_button_row(
         x: about.x - gap - size,
         ..about
     };
-    let obsidian = UiRect {
-        x: breath.x - gap - size,
-        ..about
-    };
-    let notes = UiRect {
-        x: obsidian.x - gap - size,
-        ..about
-    };
     let pomodoro = UiRect {
-        x: notes.x - gap - size - label_width,
+        x: breath.x - gap - size - label_width,
         width: size + label_width,
         ..about
     };
-    [pomodoro, notes, obsidian, breath, about]
+    [pomodoro, breath, about]
 }
 
 /// O estado do comparador de que a barra precisa. Anda sempre junto -- quem
@@ -1146,16 +1139,13 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
 #[derive(Debug, Clone, Copy)]
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
-    /// Videochamada, Teams, WhatsApp, YouTube e Gmail, a esquerda dos downloads (na barra de titulo).
-    pub(in crate::windows_app) services: [UiRect; 5],
-    /// A seta dos downloads (downloads-ui), logo a esquerda do Privado.
-    pub(in crate::windows_app) downloads: UiRect,
+    /// Meet, Teams, Outlook, WhatsApp, YouTube e Gmail, a esquerda do Privado.
+    pub(in crate::windows_app) services: [UiRect; 6],
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
     pub(in crate::windows_app) live: UiRect,
-    /// Pomodoro, Notas, Obsidian, Respiracao e Sobre (ordem de `Tool::ALL`) na linha de CIMA,
-    /// antes dos botoes da janela -- o mesmo sitio da Home
-    /// (`home_tool_buttons`).
-    pub(in crate::windows_app) tools: [UiRect; 5],
+    /// Pomodoro, Respiracao e Sobre (ordem de `Tool::ALL`) na linha de CIMA,
+    /// antes dos botoes da janela.
+    pub(in crate::windows_app) tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
@@ -1238,23 +1228,44 @@ pub(in crate::windows_app) fn title_address_rect(
     }
 }
 
-/// A seta dos downloads (downloads-ui) cabe ou nao existe: so a partir
-/// desta largura logica da janela. Abaixo, o Ctrl+J continua a abrir a
-/// seccao Downloads.
-pub(in crate::windows_app) const DOWNLOADS_SLOT_MIN_WIDTH: f64 = 1100.0;
+/// A barra de endereço com foco: a mesma âncora à direita, mais larga para a
+/// esquerda e bem mais alta, a sair da faixa de 32 px. O rect de repouso
+/// (`title_address_rect`) não muda — as abas continuam a reservar o lugar
+/// pequeno. A borda azul do foco fica; isto só aumenta a pílula.
+pub(in crate::windows_app) fn sprung_title_address(rest: UiRect, scale: f64) -> UiRect {
+    if rest.width <= 0.0 {
+        return rest;
+    }
+    let scale = scale.max(1.0);
+    let right = rest.x + rest.width;
+    let x = (rest.x - 96.0 * scale).max(8.0 * scale);
+    UiRect {
+        x,
+        y: (rest.y - 8.0 * scale).max(1.0 * scale),
+        width: (right - x).max(rest.width),
+        height: rest.height + 32.0 * scale,
+    }
+}
 
-/// A seta dos downloads cabe no canto a esta largura (`client_width` em
-/// pixeis fisicos).
-pub(in crate::windows_app) fn downloads_slot_fits(client_width: f64, scale: f64) -> bool {
-    client_width / scale.max(1.0) >= DOWNLOADS_SLOT_MIN_WIDTH
+/// Altura da fonte (negativa, como o `CreateFontW` pede) do endereço na barra
+/// de título. Em repouso é a mesma conta de sempre. Com a pílula saltada, a
+/// letra cresce na mesma proporção da pílula: o que a pessoa escreveu ocupa
+/// a mesma fração do campo novo.
+pub(in crate::windows_app) fn title_address_font_height(pill_height: f64, scale: f64) -> i32 {
+    let scale = scale.max(1.0);
+    let rest_pill = (TITLE_TAB_HEIGHT - 6.0) * scale;
+    let rest_edit = (rest_pill - 4.0 * scale).max(1.0);
+    let rest_font = ((rest_edit * 0.58).round() as i32).clamp(18, 80);
+    let px = ((rest_font as f64) * (pill_height / rest_pill)).round() as i32;
+    -px.clamp(rest_font, 160)
 }
 
 /// Geometria dos controlos encostados a direita. Na barra de titulo (Row 1)
-/// ficam os 7 atalhos (Gemini Live, Meet, WhatsApp, YouTube, Gmail, Downloads,
-/// Privado) encostados ao Pomodoro, e as 3 ferramentas (Pomodoro, Notas,
-/// Respiracao). Na segunda linha (Row 2) fica apenas a gaveta do Split View
-/// (quando aberta), libertando 100% da largura da linha 2 para as colunas das
-/// IAs quando o Split View esta fechado.
+/// ficam o Gemini Live, os servicos (Meet, Teams, Outlook, WhatsApp, YouTube,
+/// Gmail) e o Privado, encostados ao Pomodoro, e as ferramentas (Pomodoro,
+/// Respiracao, Sobre). A seta de Downloads nao fica na barra: o Ctrl+J e a
+/// aba do painel abrem a seccao. Na segunda linha (Row 2) fica apenas a
+/// gaveta do Split View (quando aberta).
 pub(in crate::windows_app) fn right_controls(
     client_width: f64,
     scale: f64,
@@ -1269,40 +1280,22 @@ pub(in crate::windows_app) fn right_controls(
     // Ferramentas na barra de titulo (Row 1): Pomodoro, Notas, Respiracao.
     let tools = home_tool_buttons(client_width, scale, pomodoro_label);
 
-    // Os 7 atalhos na barra de titulo (Row 1), posicionados imediatamente
-    // a esquerda do Pomodoro (`tools[0]`), com folga uniforme de 4 px (icon_gap),
-    // mantendo todos os icones juntos sem espaco vazio entre Privado e Pomodoro:
-    // [Live] [Meet] [WhatsApp] [YouTube] [Gmail] [Downloads] [Privado] -> [Pomodoro]
+    // Os atalhos na barra de titulo (Row 1), imediatamente a esquerda do
+    // Pomodoro (`tools[0]`), com folga uniforme de 4 px:
+    // [Live] [Meet] [Teams] [Outlook] [WhatsApp] [YouTube] [Gmail] [Privado]
     let title_y = 3.0 * scale;
     let title_size = (TITLE_TAB_HEIGHT - 6.0) * scale;
     let icon_gap = 4.0 * scale;
     let cluster_right = tools[0].x - icon_gap;
 
-    let downloads_fits = downloads_slot_fits(client_width, scale);
     let private = UiRect {
         x: cluster_right - title_size,
         y: title_y,
         width: title_size,
         height: title_size,
     };
-    let downloads = if downloads_fits {
-        UiRect {
-            x: private.x - (title_size + icon_gap),
-            ..private
-        }
-    } else {
-        UiRect {
-            width: 0.0,
-            ..private
-        }
-    };
-    let services_right = if downloads_fits {
-        downloads.x
-    } else {
-        private.x
-    };
-    let services: [UiRect; 5] = std::array::from_fn(|index| UiRect {
-        x: services_right - (5 - index) as f64 * (title_size + icon_gap),
+    let services: [UiRect; 6] = std::array::from_fn(|index| UiRect {
+        x: private.x - (6 - index) as f64 * (title_size + icon_gap),
         y: title_y,
         width: title_size,
         height: title_size,
@@ -1377,7 +1370,6 @@ pub(in crate::windows_app) fn right_controls(
     RightControls {
         private,
         services,
-        downloads,
         live,
         tools,
         split,
@@ -1393,8 +1385,9 @@ pub(in crate::windows_app) struct ClusterSlot {
     pub(in crate::windows_app) icon: usize,
 }
 
-/// O grupo dos 8 atalhos da barra de titulo, da esquerda para a direita:
-/// o Gemini Live, os cinco servicos, os downloads (downloads-ui) e o Privado.
+/// O grupo dos atalhos da barra de titulo, da esquerda para a direita:
+/// o Gemini Live, os servicos (Meet, Teams, Outlook, WhatsApp, YouTube,
+/// Gmail) e o Privado. Downloads nao tem botao aqui: Ctrl+J e a aba do painel.
 pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 8] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
@@ -1409,6 +1402,10 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 8] = [
         icon: ICON_SLOT_TEAMS,
     },
     ClusterSlot {
+        hit: BarHit::Service(Service::Outlook),
+        icon: ICON_SLOT_OUTLOOK,
+    },
+    ClusterSlot {
         hit: BarHit::Service(Service::WhatsApp),
         icon: ICON_SLOT_WHATSAPP,
     },
@@ -1419,10 +1416,6 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 8] = [
     ClusterSlot {
         hit: BarHit::GmailToggle,
         icon: ICON_SLOT_MAIL,
-    },
-    ClusterSlot {
-        hit: BarHit::Downloads,
-        icon: ICON_SLOT_DOWNLOADS,
     },
     ClusterSlot {
         hit: BarHit::Private,
@@ -1457,7 +1450,7 @@ impl RightControls {
             self.services[2],
             self.services[3],
             self.services[4],
-            self.downloads,
+            self.services[5],
             self.private,
         ]
     }
@@ -1477,10 +1470,15 @@ pub(in crate::windows_app) fn service_icon_rect(
             .find(|(tool, _)| **tool == Tool::Breath)
             .map(|(_, rect)| rect);
     }
+    let hit = if service == Service::Gmail {
+        BarHit::GmailToggle
+    } else {
+        BarHit::Service(service)
+    };
     RIGHT_CLUSTER
         .iter()
         .zip(controls.cluster())
-        .find(|(slot, _)| slot.hit == BarHit::Service(service))
+        .find(|(slot, _)| slot.hit == hit)
         .map(|(_, rect)| rect)
 }
 
@@ -1494,8 +1492,7 @@ pub(in crate::windows_app) fn right_controls_hit(
             return Some(BarHit::Tool(tool));
         }
     }
-    // O canto, pela ordem do registo: Gemini Live, os servicos, os
-    // downloads, o Privado.
+    // O canto, pela ordem do registo: Gemini Live, os servicos e o Privado.
     for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
         if rect.contains(x, y) {
             return Some(slot.hit);

@@ -277,6 +277,11 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::PrintPage => self.print_page(),
             UserEvent::PrintTarget(target) => self.print_target(target),
             UserEvent::FocusOmnibox => self.focus_omnibox(),
+            UserEvent::OmniboxFocus => {
+                if self.surface == Surface::Comparator {
+                    self.position_omnibox();
+                }
+            }
             UserEvent::ToggleColumnFullscreen => self.toggle_column_fullscreen(),
             UserEvent::OpenDevTools => self.open_devtools(),
             UserEvent::OpenDevToolsTarget(target) => self.open_devtools_target(target),

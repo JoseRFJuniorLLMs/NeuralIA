@@ -26,29 +26,25 @@ use crate::windows_app::{
 pub(in crate::windows_app) const POMODORO_NOTICE_SECONDS: u64 = 3;
 pub(in crate::windows_app) const POMODORO_PHASE_END_SECONDS: u64 = 8;
 
-/// As ferramentas da barra e da Home, na ordem em que aparecem (da esquerda
-/// para a direita): pedidas pelo dono como botoes, ao lado dos servicos.
+/// As ferramentas da barra, na ordem em que aparecem (da esquerda para a
+/// direita). Zettelkasten e Obsidian nao tem botao: abrem-se na mesma aba
+/// do painel, pelo Sobre. O atalho Ctrl+Shift+Z continua a criar notas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum Tool {
     Pomodoro,
-    /// Zettelkasten: as notas vivem no painel do Ctrl+H.
+    /// Zettelkasten: as notas vivem no painel do Ctrl+H, na aba do Sobre.
     Notes,
-    /// Obsidian: grafo do segundo cérebro no painel do Ctrl+H.
+    /// Obsidian: grafo do segundo cérebro no painel do Ctrl+H, na aba do Sobre.
     Obsidian,
     /// Respiracao guiada (metodo Wim Hof): o video no painel anonimo.
     Breath,
-    /// Sobre o NeuralIA: dados do criador, versão e atualização.
+    /// Sobre o NeuralIA: versao, atualizacao, Zettelkasten e Obsidian.
     About,
 }
 
 impl Tool {
-    pub(in crate::windows_app) const ALL: [Tool; 5] = [
-        Tool::Pomodoro,
-        Tool::Notes,
-        Tool::Obsidian,
-        Tool::Breath,
-        Tool::About,
-    ];
+    /// So os botoes visiveis. Notas e Obsidian ficam de fora de proposito.
+    pub(in crate::windows_app) const ALL: [Tool; 3] = [Tool::Pomodoro, Tool::Breath, Tool::About];
 
     pub(in crate::windows_app) fn icon_slot(self) -> usize {
         match self {
@@ -78,7 +74,7 @@ impl Tool {
             Self::Notes => "Zettelkasten — Ctrl+Shift+Z cria nota da seleção",
             Self::Obsidian => "Obsidian (Segundo Cérebro) — grafo de notas, sites e histórico",
             Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
-            Self::About => "Sobre o NeuralIA — versão e atualizações",
+            Self::About => "Sobre o NeuralIA — versão, atualizações, Zettelkasten e Obsidian",
         }
     }
 }

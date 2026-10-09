@@ -74,6 +74,17 @@ pub(in crate::windows_app) fn service_icon_hint(
     }
 }
 
+fn service_button_hint(service: Service, badge: Option<ServiceBadge>) -> Option<String> {
+    if badge.is_none() && service.keeps_running_in_background() {
+        Some(format!(
+            "{} aberto ao lado · clique para ocultar, continua em segundo plano",
+            service.label()
+        ))
+    } else {
+        Some(service_icon_hint(service.label(), badge))
+    }
+}
+
 /// A dica que o painel de servicos aberto (`service`, no modo `badge`) da
 /// ao alvo `hit` da barra: a faixa dele e o botao que o abriu -- o icone do
 /// servico ou, na Respiracao, o botao dela nas ferramentas, onde o ponto de
@@ -90,15 +101,9 @@ pub(in crate::windows_app) fn service_panel_hint(
             format!("Ocultar {}: continua em segundo plano", service.label()),
         ),
         BarHit::ServiceStrip(button) => Some(button.hint(service.label())),
+        BarHit::GmailToggle if service == Service::Gmail => service_button_hint(service, badge),
         BarHit::Service(hit_service) if hit_service == service => {
-            if badge.is_none() && service.keeps_running_in_background() {
-                Some(format!(
-                    "{} aberto ao lado · clique para ocultar, continua em segundo plano",
-                    service.label()
-                ))
-            } else {
-                Some(service_icon_hint(service.label(), badge))
-            }
+            service_button_hint(service, badge)
         }
         BarHit::Tool(Tool::Breath) if service == Service::Breath => {
             Some(service_icon_hint(service.label(), badge))
@@ -1257,7 +1262,13 @@ mod youtube_transition_tests {
 
     #[test]
     fn account_services_keep_their_webviews_when_hidden() {
-        for service in [Service::WhatsApp, Service::YouTube] {
+        for service in [
+            Service::Teams,
+            Service::Outlook,
+            Service::WhatsApp,
+            Service::YouTube,
+            Service::Gmail,
+        ] {
             assert!(service.keeps_running_in_background());
             assert_eq!(
                 service_panel_hint(BarHit::ServiceStrip(StripButton::Close), service, None),
@@ -1267,7 +1278,7 @@ mod youtube_transition_tests {
                 ))
             );
         }
-        for service in [Service::Meet, Service::Gmail, Service::Breath] {
+        for service in [Service::Meet, Service::Breath] {
             assert!(!service.keeps_running_in_background());
         }
     }
@@ -1286,7 +1297,13 @@ mod youtube_transition_tests {
     fn an_already_minimized_background_service_needs_no_second_transition() {
         let mut state = ServicePanelState::default();
         assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
-        for service in [Service::YouTube, Service::WhatsApp] {
+        for service in [
+            Service::YouTube,
+            Service::WhatsApp,
+            Service::Teams,
+            Service::Outlook,
+            Service::Gmail,
+        ] {
             assert_eq!(service_transition_input(service, state), None);
         }
     }
@@ -1312,7 +1329,7 @@ mod youtube_transition_tests {
 
     #[test]
     fn other_services_keep_the_old_close_policy() {
-        for service in [Service::Meet, Service::Gmail, Service::Breath] {
+        for service in [Service::Meet, Service::Breath] {
             assert_eq!(
                 service_transition_input(service, ServicePanelState::default()),
                 Some(ServiceInput::Close)

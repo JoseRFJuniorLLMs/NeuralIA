@@ -30,6 +30,17 @@ use neural_core::parse_intent;
 /// Quantas entradas do historico a caixa "history:" mostra.
 pub(in crate::windows_app) const HISTORY_RECENT_LIMIT: usize = 20;
 
+/// A pesquisa no Google do botao "Pesquisar". Vazio nao vira URL.
+pub(in crate::windows_app) fn google_search_url(query: &str) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let mut url = Url::parse("https://www.google.com/search").ok()?;
+    url.query_pairs_mut().append_pair("q", query);
+    Some(url.into())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum HistoryStep {
     Back,
@@ -343,6 +354,12 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
         if !parent.is_null() {
             InvalidateRect(parent, std::ptr::null(), 0);
         }
+        // A pílula e o EDIT crescem (ou voltam) juntos. O tamanho lê-se no
+        // event loop, quando o foco já assentou.
+        if reference_data != 0 {
+            let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
+            let _ = proxy.send_event(UserEvent::OmniboxFocus);
+        }
     }
 
     if message == WM_KEYDOWN {
@@ -561,6 +578,26 @@ impl App {
         if !input.is_empty() {
             self.handle_input(input);
         }
+    }
+
+    /// O botao azul: a pergunta vai para as tres IAs, lado a lado.
+    pub(in crate::windows_app) fn search_with_ais(&mut self) {
+        let query = self.omnibox_text().trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.compare(CompareRequest::ask(query));
+    }
+
+    /// O outro botao: a mesma frase no Google, com a janela maximizada.
+    pub(in crate::windows_app) fn search_on_google(&mut self) {
+        let Some(url) = google_search_url(&self.omnibox_text()) else {
+            return;
+        };
+        if let Some(window) = &self.window {
+            window.set_maximized(true);
+        }
+        self.web(url);
     }
 
     /// Endereco digitado no controlo nativo: usa as mesmas rotas da palette,
