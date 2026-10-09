@@ -1870,15 +1870,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # 1.98.1
-      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      # audit-check v2.0.0 reports informational advisories through the Checks
+      # API and dies with 404 on update-a-check-run, even when cargo-audit
+      # found zero vulnerabilities. The binary's own exit code is the gate:
+      # warnings stay visible, a vulnerability still fails the job.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies for vulnerabilities
+        run: cargo audit
 
   dependency-policy:
     runs-on: ubuntu-latest
