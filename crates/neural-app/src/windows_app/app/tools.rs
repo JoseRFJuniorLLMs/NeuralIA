@@ -33,8 +33,12 @@ pub(in crate::windows_app) const POMODORO_PHASE_END_SECONDS: u64 = 8;
 pub(in crate::windows_app) enum Tool {
     Pomodoro,
     /// Zettelkasten: as notas vivem no painel do Ctrl+H, na aba do Sobre.
+    /// Sem botao na barra; o atalho e o painel continuam a construir a variante.
+    #[allow(dead_code)]
     Notes,
     /// Obsidian: grafo do segundo cérebro no painel do Ctrl+H, na aba do Sobre.
+    /// Sem botao na barra; o painel do Sobre continua a construir a variante.
+    #[allow(dead_code)]
     Obsidian,
     /// Respiracao guiada (metodo Wim Hof): o video no painel anonimo.
     Breath,

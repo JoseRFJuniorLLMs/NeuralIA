@@ -689,6 +689,7 @@ pub(in crate::windows_app) fn load_gmail_setting(path: &std::path::Path) -> bool
         .unwrap_or(true)
 }
 
+#[allow(dead_code)]
 pub(in crate::windows_app) fn save_gmail_setting(
     path: &std::path::Path,
     on: bool,

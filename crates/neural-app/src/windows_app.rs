@@ -557,7 +557,9 @@ pub(in crate::windows_app) enum BarHit {
     Tool(Tool),
     /// O olho: liga e desliga o Gemini Live (tela, camera e microfone).
     GeminiLive,
-    /// A seta dos downloads (downloads-ui): a seccao Downloads do painel.
+    /// A seta dos downloads saiu da barra. O Ctrl+J e a aba do painel
+    /// continuam a abrir a seccao; a variante fica para esse comando.
+    #[allow(dead_code)]
     Downloads,
     WindowMinimize,
     WindowMaximize,
@@ -7930,6 +7932,8 @@ fn pill_pixels(
 }
 
 /// Fim do degradê do "Ir" sob o rato; o inicio e a cor de destaque do tema.
+/// O botao da Home deixou de o pintar. O teste da cor ainda o usa.
+#[cfg(test)]
 const GO_GRADIENT_END: Rgb = (124, 58, 237);
 /// O que o aviso do meio da janela diz quando a rolagem muda.
 fn auto_scroll_message(on: bool) -> String {
@@ -7976,11 +7980,9 @@ fn auto_scroll_menu_label(on: bool) -> &'static str {
     }
 }
 
-/// Uma volta completa do degradê a deslizar.
-const GO_GRADIENT_PERIOD_MS: u64 = 2400;
-
 /// Cor do degradê do "Ir" na fraccao `t` da largura. A `phase` (0..1) faz a
-/// onda deslizar com o tempo: o botao "respira" enquanto o rato esta nele.
+/// onda deslizar com o tempo. A Home ja nao pinta este degradê; o teste fica.
+#[cfg(test)]
 fn go_gradient_color(from: Rgb, to: Rgb, t: f32, phase: f32) -> Rgb {
     let wave = 0.5 - 0.5 * (std::f32::consts::TAU * (t * 0.5 + phase)).cos();
     mix(from, to, wave)
@@ -7993,53 +7995,6 @@ fn home_go_hovered(surface: Surface, size: (f64, f64), scale: f64, cursor: (f64,
         && HomeLayout::new(size.0, size.1, scale)
             .go
             .contains(cursor.0, cursor.1)
-}
-
-/// O "Ir" em degradê, texto legivel sobre o meio do degradê.
-unsafe fn draw_go_gradient(
-    hdc: *mut core::ffi::c_void,
-    rect: UiRect,
-    phase: f32,
-    font: *mut core::ffi::c_void,
-    theme: &Theme,
-) {
-    let width = rect.width.round() as i32;
-    let height = rect.height.round() as i32;
-    if width <= 0 || height <= 0 {
-        return;
-    }
-    let (from, to) = (theme.accent, GO_GRADIENT_END);
-    let pixels = pill_pixels(
-        width,
-        height,
-        rect.height / 2.0,
-        &|t| go_gradient_color(from, to, t, phase),
-        None,
-        theme.page_bg,
-    );
-    blit_bgrx(
-        hdc,
-        &pixels,
-        rect.x.round() as i32,
-        rect.y.round() as i32,
-        width,
-        height,
-    );
-    SelectObject(hdc, font as _);
-    SetTextColor(hdc, rgb3(on_color(mix(from, to, 0.5))));
-    SetBkMode(hdc, TRANSPARENT as i32);
-    let mut text_rect = RECT {
-        left: rect.x.round() as i32,
-        top: rect.y as i32,
-        right: (rect.x + rect.width) as i32,
-        bottom: (rect.y + rect.height) as i32,
-    };
-    draw_text(
-        hdc,
-        "Ir",
-        &mut text_rect,
-        DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
-    );
 }
 
 /// Rotulos do botao injetado no comparador. Em tela cheia a barra nativa some,

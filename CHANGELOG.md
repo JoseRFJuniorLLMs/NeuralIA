@@ -2,6 +2,15 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.4] - 2026-10-09
+
+### Changed
+- **A barra de endereço da barra de título salta no foco.** A borda azul fica. A pílula fica mais alta e mais larga, e a letra do endereço cresce na mesma proporção. A Home não muda.
+- **O ChatGPT envia a pergunta.** Na pesquisa para as três IAs, o GPT deixa de ficar com o texto na caixa à espera de Enter.
+- **Teams, Outlook e Gmail ficam com a sessão.** Minimizar ou abrir outro painel não desliga a conta. Os ícones desses serviços são círculos coloridos.
+- **A Home pesquisa com dois botões.** «Pesquisar com IA» abre as três colunas. «Pesquisar» vai ao Google e maximiza a janela.
+- **Zettelkasten, Obsidian e Downloads saem da barra de título.** Notas e Obsidian abrem pelo Sobre. Downloads continua no Ctrl+J e na aba do painel.
+
 ## [2.9.3] - 2026-10-09
 
 ### Fixed

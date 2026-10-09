@@ -220,7 +220,9 @@ impl App {
         }
     }
 
-    /// O envelope da barra: liga e desliga os avisos do Gmail, e guarda.
+    /// Liga e desliga os avisos do Gmail, e guarda. O clique do botao passou
+    /// a abrir o painel; a funcao fica para esse interruptor.
+    #[allow(dead_code)]
     pub(in crate::windows_app) fn toggle_gmail_notifications(&mut self) {
         let on = !GMAIL_NOTIFICATIONS.load(Ordering::Acquire);
         GMAIL_NOTIFICATIONS.store(on, Ordering::Release);

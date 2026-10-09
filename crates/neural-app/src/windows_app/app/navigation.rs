@@ -573,6 +573,7 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub(in crate::windows_app) fn submit_current(&mut self) {
         let input = self.omnibox_text();
         if !input.is_empty() {
