@@ -4,8 +4,8 @@ use windows_sys::Win32::{
     Foundation::{HWND, POINT},
     Graphics::Gdi::{ClientToScreen, InvalidateRect, ScreenToClient},
     UI::WindowsAndMessaging::{
-        CreateWindowExW, DestroyWindow, HWND_TOP, SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-        SetWindowPos, ShowWindow,
+        CreateWindowExW, DestroyWindow, GetParent, HWND_TOP, SW_HIDE, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, SetWindowPos, ShowWindow, WS_CHILD,
     },
 };
 use winit::{
@@ -28,8 +28,8 @@ use crate::panel_chrome::{
 };
 use crate::windows_app::*;
 use crate::windows_app::{
-    AUX_POPUP_EX_STYLE, AUX_POPUP_STYLE, App, BarHit, COMPARATOR_CHROME_HEIGHT, Surface,
-    TITLE_TAB_HEIGHT, Tool, WebViewHost, debug_log, install_wheel_hook,
+    App, BarHit, COMPARATOR_CHROME_HEIGHT, Surface, TITLE_TAB_HEIGHT, Tool, WebViewHost, debug_log,
+    install_wheel_hook,
     native::{
         PANEL_HANDLE_SUBCLASS_ID, PANEL_RESIZE_PENDING, PANEL_RESIZE_X, SetWindowSubclass,
         WHEEL_APP_HWND, WHEEL_PANEL_ACTIVE, WHEEL_PANEL_BOTTOM, WHEEL_PANEL_HOST, WHEEL_PANEL_LEFT,
@@ -507,6 +507,7 @@ impl App {
 
     /// Depois de qualquer mudanca nos paineis da direita: a pega e a roda.
     pub(in crate::windows_app) fn after_panel_change(&mut self) {
+        self.sync_document_chrome();
         self.sync_panel_handle();
         self.sync_wheel_route();
     }
@@ -547,8 +548,8 @@ impl App {
         }
     }
 
-    /// A pega da borda esquerda do painel: popup owned como os divisores das
-    /// colunas, nunca ativa, so com o painel encostado.
+    /// A pega e filha da janela: segue visibilidade/posicao do dono e nao
+    /// desaparece quando o teclado passa para uma WebView filha.
     pub(in crate::windows_app) fn sync_panel_handle(&mut self) {
         let wanted = self.docked_right_panel();
         let (Some((_, panel)), Some(window)) = (wanted, &self.window) else {
@@ -566,7 +567,7 @@ impl App {
         let area = panel_handle_area(panel, PANEL_HANDLE_WIDTH);
 
         if let Some(handle) = self.panel_handle
-            && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindow(handle, 4) } != owner
+            && unsafe { GetParent(handle) } != owner
         {
             unsafe {
                 DestroyWindow(handle);
@@ -575,67 +576,19 @@ impl App {
         }
         let handle = match self.panel_handle {
             Some(handle) => handle,
-            None => unsafe {
-                let created = CreateWindowExW(
-                    AUX_POPUP_EX_STYLE,
-                    windows_sys::w!("STATIC"),
-                    windows_sys::w!("NeuralIA.PanelResize"),
-                    AUX_POPUP_STYLE,
-                    0,
-                    0,
-                    1,
-                    1,
-                    owner,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                );
-                if created.is_null() {
-                    return;
-                }
+            None => {
                 let proxy_ptr = (&*self.omnibox_proxy
                     as *const EventLoopProxy<crate::windows_app::UserEvent>)
                     as usize;
-                if SetWindowSubclass(
-                    created,
-                    Some(panel_handle_subclass),
-                    PANEL_HANDLE_SUBCLASS_ID,
-                    proxy_ptr,
-                ) == 0
-                {
-                    DestroyWindow(created);
+                let created = create_panel_handle(owner, proxy_ptr);
+                if created.is_null() {
                     return;
                 }
                 self.panel_handle = Some(created);
                 created
-            },
-        };
-        let mut origin = POINT { x: 0, y: 0 };
-        unsafe {
-            ClientToScreen(owner, &mut origin);
-            // A pega e uma janela auxiliar separada da WebView. Coloca-la
-            // explicitamente no topo e mostra-la no MESMO SetWindowPos evita
-            // o bug em que a WebView recem-criada ficava por cima ate o
-            // primeiro minimizar/restaurar do painel.
-            SetWindowPos(
-                handle,
-                HWND_TOP,
-                origin.x + (area.x * scale).round() as i32,
-                origin.y + (area.y * scale).round() as i32,
-                (area.width * scale).round().max(3.0) as i32,
-                (area.height * scale).round().max(1.0) as i32,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            );
-            InvalidateRect(handle, std::ptr::null(), 0);
-        }
-    }
-
-    pub(in crate::windows_app) fn hide_panel_handle(&self) {
-        if let Some(handle) = self.panel_handle {
-            unsafe {
-                ShowWindow(handle, SW_HIDE);
             }
-        }
+        };
+        position_panel_handle(handle, area, scale);
     }
 
     /// A pega foi arrastada: a borda do painel segue o rato, presa a
@@ -930,6 +883,18 @@ impl App {
 
     pub(in crate::windows_app) fn position_side_panel(&self) {
         if let (Some(panel), Some(bounds)) = (self.side_panel.view(), self.side_panel_rect()) {
+            let bounds = if self.downloads_ui.document_ticket.is_some()
+                && self.side_panel.active_ticket() == self.downloads_ui.document_ticket
+            {
+                downloads_ui::documents::document_content_bounds(
+                    bounds,
+                    self.window
+                        .as_ref()
+                        .map_or(1.0, |window| window.scale_factor()),
+                )
+            } else {
+                bounds
+            };
             let _ = panel.set_bounds(bounds);
         }
     }
@@ -1351,3 +1316,53 @@ mod youtube_transition_tests {
         }
     }
 }
+
+/// Same creation and placement used by the UI and the native regression gate.
+fn create_panel_handle(owner: HWND, proxy_ptr: usize) -> HWND {
+    unsafe {
+        let created = CreateWindowExW(
+            0,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!("NeuralIA.PanelResize"),
+            WS_CHILD,
+            0,
+            0,
+            1,
+            1,
+            owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if !created.is_null()
+            && SetWindowSubclass(
+                created,
+                Some(panel_handle_subclass),
+                PANEL_HANDLE_SUBCLASS_ID,
+                proxy_ptr,
+            ) == 0
+        {
+            DestroyWindow(created);
+            return std::ptr::null_mut();
+        }
+        created
+    }
+}
+
+fn position_panel_handle(handle: HWND, area: Area, scale: f64) {
+    unsafe {
+        SetWindowPos(
+            handle,
+            HWND_TOP,
+            (area.x * scale).round() as i32,
+            (area.y * scale).round() as i32,
+            (area.width * scale).round().max(3.0) as i32,
+            (area.height * scale).round().max(1.0) as i32,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        InvalidateRect(handle, std::ptr::null(), 0);
+    }
+}
+
+#[cfg(test)]
+mod panel_handle_gates;

@@ -1,5 +1,7 @@
 use super::*;
 
+pub(in crate::windows_app) mod documents;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
@@ -1355,6 +1357,7 @@ pub(in crate::windows_app) trait ShellHost {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::windows_app) enum OpenOutcome {
     Opened,
+    InternalDocument(PathBuf),
     /// O `DefaultAppTarget` recusou (o tipo, ou o conteudo no disco).
     Refused,
     /// A linha ja nao existe, ou o arquivo nao ficou no disco.
@@ -1374,6 +1377,9 @@ pub(in crate::windows_app) fn shell_open_checked(
     let Some(target) = default_app_target(path) else {
         return OpenOutcome::Refused;
     };
+    if documents::is_internal_document(target.path()) {
+        return OpenOutcome::InternalDocument(target.path().to_path_buf());
+    }
     match shell.shell_execute(SHELL_OPEN_VERB, target.path()) {
         Ok(()) => OpenOutcome::Opened,
         Err(error) => OpenOutcome::Failed(error),
@@ -1497,6 +1503,9 @@ pub(in crate::windows_app) struct DownloadsUiState {
     /// A pagina do painel pediu a lista (a seccao Downloads ja se abriu
     /// nela): as mudancas seguem para la enquanto o painel estiver aberto.
     pub(in crate::windows_app) panel_live: bool,
+    pub(in crate::windows_app) document_generation: u64,
+    pub(in crate::windows_app) document_chrome: Option<Box<documents::DocumentChrome>>,
+    pub(in crate::windows_app) document_ticket: Option<side_panel::PanelTicket>,
     /// Os downloads acabados que ja deram o toast.
     pub(in crate::windows_app) announced: BTreeSet<DownloadId>,
     /// A ultima seta pintada: so se repinta a barra quando ela muda.
@@ -1514,6 +1523,9 @@ impl DownloadsUiState {
                 let _ = proxy.send_event(event);
             })),
             panel_live: false,
+            document_generation: 0,
+            document_ticket: None,
+            document_chrome: None,
             announced: BTreeSet::new(),
             badge: DownloadsBadge::default(),
         }
@@ -1528,6 +1540,9 @@ impl DownloadsUiState {
             card_popup: None,
             card_sink: Box::new(Box::new(|_| {})),
             panel_live: false,
+            document_generation: 0,
+            document_ticket: None,
+            document_chrome: None,
             announced: BTreeSet::new(),
             badge: DownloadsBadge::default(),
         }
@@ -1827,6 +1842,7 @@ impl App {
     fn report_open(&mut self, outcome: OpenOutcome) {
         match outcome {
             OpenOutcome::Opened => {}
+            OpenOutcome::InternalDocument(path) => self.open_downloaded_document(path),
             OpenOutcome::Refused => self.show_splash(
                 "O NeuralIA não abre este tipo de arquivo. Use «Mostrar na pasta».".to_string(),
                 4,

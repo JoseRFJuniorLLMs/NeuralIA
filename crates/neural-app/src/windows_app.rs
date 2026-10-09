@@ -251,6 +251,19 @@ pub(in crate::windows_app) enum UserEvent {
     },
     /// Texto real extraido pelo viewer PDF interno. So o builder do PDF
     /// traduz a acao IPC para esta variante.
+    DownloadDocumentUi {
+        generation: u64,
+        request: EpubUiRequest,
+    },
+    DownloadDocumentNotice {
+        generation: u64,
+        notice: EpubNotice,
+    },
+    DownloadDocumentReady {
+        generation: u64,
+        ticket: side_panel::PanelTicket,
+        result: Result<downloads_ui::documents::PreparedDocument, String>,
+    },
     PdfPageText {
         page: u32,
         text: String,
@@ -507,6 +520,7 @@ pub(in crate::windows_app) enum BarHit {
     ColumnTranslate(usize),
     /// A estrela ☆/★ dos favoritos de cada IA, depois do › e do 文A.
     ColumnBookmark(usize),
+    ColumnMinimize(usize),
     /// A estrela ☆/★ da fonte aberta ao lado, depois do › dela.
     SplitBookmark,
     Column(usize),
@@ -1081,6 +1095,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::ColumnTranslate(_) => format!(
             "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
         ),
+        BarHit::ColumnMinimize(_) => format!("Minimizar {provider}"),
         BarHit::ColumnBookmark(index) => {
             bookmark_star_tooltip(state.bookmarked.get(index).copied().unwrap_or(false)).to_string()
         }
@@ -7082,7 +7097,8 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
                 ColumnButton::Back
                 | ColumnButton::Forward
                 | ColumnButton::Reload
-                | ColumnButton::Translate => button.glyph(),
+                | ColumnButton::Translate
+                | ColumnButton::Minimize => button.glyph(),
             };
             pairs.push((
                 layout.column_button(index, button),
@@ -7468,6 +7484,14 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
         include_str!("windows_app/app/navigation.rs"),
     ),
     ("app/panels.rs", include_str!("windows_app/app/panels.rs")),
+    (
+        "app/panels/panel_handle_gates.rs",
+        include_str!("windows_app/app/panels/panel_handle_gates.rs"),
+    ),
+    (
+        "downloads_ui/documents.rs",
+        include_str!("windows_app/downloads_ui/documents.rs"),
+    ),
     ("app/gmail.rs", include_str!("windows_app/app/gmail.rs")),
     ("app/tools.rs", include_str!("windows_app/app/tools.rs")),
     ("app/split.rs", include_str!("windows_app/app/split.rs")),

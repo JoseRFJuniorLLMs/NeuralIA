@@ -459,6 +459,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::ColumnTranslate(_)
         // A estrela e da pagina debaixo dela (o Ctrl+D e o mesmo pedido
         // com a origem do teclado).
+        | BarHit::ColumnMinimize(_)
         | BarHit::ColumnBookmark(_)
         | BarHit::SplitBookmark
         | BarHit::Column(_)

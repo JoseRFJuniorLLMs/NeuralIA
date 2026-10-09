@@ -69,7 +69,7 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .dot-hist{background:#10b981}
 .dot-tag{background:#f59e0b}
 #obsidian-container{flex:1;position:relative;overflow:hidden;min-height:300px;background:var(--surface);margin:0 12px 12px;border-radius:12px;border:1px solid var(--line)}
-#obsidian-canvas{display:block;width:100%;height:100%;cursor:grab}
+#obsidian-canvas{position:absolute;inset:0;display:block;width:100%;height:100%;cursor:grab}
 #obsidian-card{position:absolute;bottom:12px;left:12px;right:12px;background:var(--bg);border-color:var(--line);z-index:10;box-shadow:0 4px 14px rgba(0,0,0,.3)}
 .obsidian-filters{display:flex;gap:6px;flex-wrap:wrap;padding:0 16px 8px}
 .obsidian-chip{font-size:11px;font-weight:600;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:var(--surface);color:var(--muted);cursor:pointer;user-select:none;transition:all .15s ease}
@@ -98,3 +98,19 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .about-action-wrap{display:flex;justify-content:center;margin-top:4px}
 .about-update-btn{width:100%;font-size:14px;font-weight:700;padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:8px}
 .about-update-icon{font-size:16px}
+
+#view-obsidian .row{flex-wrap:wrap}
+#oq{flex:1;min-width:100px;width:auto}
+#obsidian-stats{flex-wrap:wrap;gap:6px}
+.obsidian-legend{flex-wrap:wrap}
+
+.zk-intro{padding:8px 18px;display:flex;flex-direction:column;gap:4px}
+.zk-intro span{font-size:12px;color:var(--muted)}
+.zk-options{flex-wrap:wrap}
+.zk-options .field{flex:1;min-width:130px;width:auto;font-size:13px}
+.zk-timeline{border-left:2px solid var(--accent);margin:8px 8px 0 18px;padding-left:18px}
+.zk-timeline>.item{position:relative;background:var(--surface);border:1px solid var(--line);margin-bottom:14px;padding:14px;border-radius:12px}
+.zk-timeline>.item::before{content:"";position:absolute;left:-27px;top:18px;width:12px;height:12px;border:2px solid var(--accent);border-radius:50%;background:var(--bg)}
+.zk-timeline .detail{white-space:normal;line-height:1.6;margin-top:8px}
+.zk-link-row{padding:0;flex-wrap:wrap}
+.zk-link-row .field{flex:1;min-width:150px;width:auto}

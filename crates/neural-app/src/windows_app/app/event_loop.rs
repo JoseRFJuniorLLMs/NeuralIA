@@ -608,6 +608,41 @@ impl ApplicationHandler<UserEvent> for App {
                     Err(error) => self.show_native_error(format!("Reader: {error}")),
                 }
             }
+            UserEvent::DownloadDocumentUi {
+                generation,
+                request,
+            } => {
+                if generation == self.downloads_ui.document_generation
+                    && self.downloads_ui.document_ticket.is_some()
+                    && self.side_panel.active_ticket() == self.downloads_ui.document_ticket
+                {
+                    match request {
+                        crate::epub_app::EpubUiRequest::OpenExternal(url) => self.web(url),
+                        crate::epub_app::EpubUiRequest::Close => {
+                            self.close_side_panel(PanelExit::CloseButton)
+                        }
+                        crate::epub_app::EpubUiRequest::AddBooks => {}
+                    }
+                }
+            }
+            UserEvent::DownloadDocumentNotice { generation, notice } => {
+                if generation == self.downloads_ui.document_generation
+                    && self.downloads_ui.document_ticket.is_some()
+                    && self.side_panel.active_ticket() == self.downloads_ui.document_ticket
+                {
+                    self.panel_eval(&crate::epub_app::notice_script(&notice));
+                    if let Some(error) = notice.status_line() {
+                        self.show_splash(error, 5);
+                    }
+                }
+            }
+            UserEvent::DownloadDocumentReady {
+                generation,
+                ticket,
+                result,
+            } => {
+                self.downloaded_document_ready(generation, ticket, result);
+            }
             UserEvent::EpubNotice(notice) => self.handle_epub_notice(notice),
             UserEvent::EpubUi(request) => self.handle_epub_ui(request),
             UserEvent::EpubDropped(paths) => {

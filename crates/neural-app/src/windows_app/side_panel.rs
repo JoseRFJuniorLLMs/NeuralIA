@@ -384,6 +384,10 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
         self.view.is_some()
     }
 
+    pub(in crate::windows_app) fn active_ticket(&self) -> Option<PanelTicket> {
+        self.view.as_ref().map(|_| PanelTicket(self.page))
+    }
+
     pub(in crate::windows_app) fn view(&self) -> Option<&W> {
         self.view.as_ref()
     }
@@ -566,6 +570,7 @@ pub(in crate::windows_app) fn comparator_logical_width(
 /// Um item do painel: o que se le e o que o clique volta a abrir.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::windows_app) struct PanelItem {
+    pub(in crate::windows_app) timestamp: Option<u64>,
     pub(in crate::windows_app) title: String,
     pub(in crate::windows_app) detail: String,
     pub(in crate::windows_app) input: String,
@@ -587,6 +592,7 @@ pub(in crate::windows_app) fn history_panel_items(entries: &[HistoryEntry]) -> V
                 format!("{kind} · {}", entry.target)
             };
             PanelItem {
+                timestamp: Some(entry.timestamp_unix),
                 title: entry.input.clone(),
                 detail,
                 input: entry.input.clone(),
@@ -604,6 +610,7 @@ pub(in crate::windows_app) fn memory_panel_items(hits: &[MemoryHit]) -> Vec<Pane
                 .or(hit.url.as_deref())
                 .unwrap_or("memória local");
             PanelItem {
+                timestamp: None,
                 title: hit.title.clone(),
                 detail: if hit.excerpt.trim().is_empty() {
                     source.to_string()
@@ -643,6 +650,7 @@ pub(in crate::windows_app) fn suggestion_panel_items(
             continue;
         }
         items.push(PanelItem {
+            timestamp: None,
             title: if hit.title.trim().is_empty() {
                 domain.clone()
             } else {
@@ -670,6 +678,7 @@ pub(in crate::windows_app) fn panel_render_script(
         .iter()
         .map(|item| {
             serde_json::json!({
+                "timestamp": item.timestamp,
                 "title": item.title,
                 "detail": item.detail,
                 "input": item.input,
@@ -724,7 +733,7 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
 "#,
     include_str!("../../../../assets/panel/panel.css"),
     r#"</style></head><body>
-<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Notas</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Zettelkasten</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
 "#,
     include_str!("../../../../assets/panel/history.html"),
     include_str!("../../../../assets/panel/notes.html"),

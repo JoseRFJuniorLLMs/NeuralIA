@@ -11,6 +11,7 @@
     const cardClose = byId('obsidian-card-close');
     const countsEl = byId('obsidian-counts');
     const resetBtn = byId('obsidian-reset');
+    const newNoteBtn = byId('obsidian-new-note');
     const refreshBtn = byId('obsidian-refresh');
     const orphanBtn = byId('filter-orphans');
     const zoomInBtn = byId('hud-zoom-in');
@@ -41,6 +42,9 @@
     let physicsPaused = false;
     let showLabels = true;
     let hideOrphans = false;
+    let needsCenter = false;
+    let viewportWidth = 0;
+    let viewportHeight = 0;
     const activeKinds = new Set(['note', 'site', 'history', 'tag']);
 
     const COLORS = {
@@ -58,26 +62,49 @@
     };
 
     function resize() {
-      if (!container || !canvas || typeof container.getBoundingClientRect !== 'function') return;
+      if (!container || !canvas || typeof container.getBoundingClientRect !== 'function') return false;
       const rect = container.getBoundingClientRect();
-      if (!rect || rect.width <= 0 || rect.height <= 0) return;
-      const dpr = typeof window !== 'undefined' && window.devicePixelRatio ? window.devicePixelRatio : 1;
-      canvas.width = Math.floor(rect.width * dpr);
-      canvas.height = Math.floor(rect.height * dpr);
-      if (canvas.style) {
-        canvas.style.width = rect.width + 'px';
-        canvas.style.height = rect.height + 'px';
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.max(1, Math.floor(rect.width * dpr));
+      const height = Math.max(1, Math.floor(rect.height * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
       }
-      wake();
+      // Keep the current view centered when the panel width changes.
+      panX += (rect.width - viewportWidth) / 2;
+      panY += (rect.height - viewportHeight) / 2;
+      viewportWidth = rect.width;
+      viewportHeight = rect.height;
+      renderCanvas();
+      if (needsCenter) { needsCenter = false; center(); }
+      return true;
     }
 
     function center() {
-      if (!container || typeof container.getBoundingClientRect !== 'function') return;
-      const rect = container.getBoundingClientRect();
-      panX = (rect && rect.width > 0 ? rect.width : 400) / 2;
-      panY = (rect && rect.height > 0 ? rect.height : 400) / 2;
-      zoom = 1;
+      needsCenter = false;
+      if (!resize()) { needsCenter = true; return; }
+      const visible = nodes.filter(isNodeVisible);
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+      for (const node of visible) {
+        minX = Math.min(minX, node.x - 15);
+        maxX = Math.max(maxX, node.x + 15);
+        minY = Math.min(minY, node.y - 15);
+        maxY = Math.max(maxY, node.y + 15);
+      }
+      // Leave room for labels and the HUD, including on narrow panels.
+      zoom = visible.length ? Math.max(0.2, Math.min(1,
+        Math.max(40, viewportWidth - 140) / Math.max(1, maxX - minX),
+        Math.max(40, viewportHeight - 70) / Math.max(1, maxY - minY))) : 1;
+      panX = (viewportWidth - 80) / 2 - (visible.length ? (minX + maxX) * zoom / 2 : 0);
+      panY = viewportHeight / 2 - (visible.length ? (minY + maxY) * zoom / 2 : 0);
+      renderCanvas();
       wake();
+    }
+
+    function normalized(text) {
+      return String(text || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
     }
 
     function zoomStep(factor) {
@@ -96,7 +123,8 @@
       if (!node) return false;
       if (!activeKinds.has(node.kind)) return false;
       if (hideOrphans && (node.degree || 0) === 0) return false;
-      return true;
+      const query = normalized(oq && oq.value).trim();
+      return !query || normalized([node.label, node.subtitle, node.target].join(' ')).includes(query);
     }
 
     function wake() {
@@ -226,11 +254,16 @@
 
       ctx.save();
       ctx.scale(dpr, dpr);
+
+      if (!nodes.some(isNodeVisible)) {
+        ctx.fillStyle = '#999999';
+        ctx.font = '13px "Segoe UI", system-ui, sans-serif';
+        ctx.fillText(nodes.length ? 'Nenhum nó corresponde aos filtros.' : 'Nenhum nó ainda. Crie uma nota na aba Notas.',
+          16, 30);
+      }
+
       ctx.translate(panX, panY);
       ctx.scale(zoom, zoom);
-
-      const query = (oq && oq.value ? oq.value : '').trim().toLowerCase();
-      const hasFilter = query.length > 0;
 
       // Mapa de conexões do nó sob hover
       const connectedIds = new Set();
@@ -277,12 +310,9 @@
         const isHovered = node === hoveredNode;
         const isSelected = node === activeNode;
         const isConnected = !hoveredNode || connectedIds.has(node.id);
-        const matchesQuery = !hasFilter || node.label.toLowerCase().includes(query);
 
         let alpha = 1;
-        if (hasFilter && !matchesQuery) {
-          alpha = 0.2;
-        } else if (hoveredNode && !isConnected) {
+        if (hoveredNode && !isConnected) {
           alpha = 0.25;
         }
 
@@ -417,11 +447,16 @@
         }
       }
 
+      activeNode = null;
+      hoveredNode = null;
+      if (card) card.hidden = true;
       updateCounts();
       center();
     }
 
     function refresh() {
+      resize();
+      center();
       if (countsEl) countsEl.textContent = 'Atualizando grafo…';
       post('obsidian-graph');
     }
@@ -455,7 +490,7 @@
           toggleActive(chip, true);
         }
         updateCounts();
-        wake();
+        center();
       });
     }
 
@@ -465,7 +500,7 @@
         hideOrphans = !hideOrphans;
         toggleActive(orphanBtn, hideOrphans);
         updateCounts();
-        wake();
+        center();
       });
     }
 
@@ -566,10 +601,21 @@
     }
 
     if (oq && typeof oq.addEventListener === 'function') {
-      oq.addEventListener('input', () => {
-        wake();
+      const search = () => {
+        if (activeNode && !isNodeVisible(activeNode)) showCard(null);
+        hoveredNode = null;
+        updateCounts();
+        center();
+      };
+      oq.addEventListener('input', search);
+      oq.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); search(); }
       });
     }
+
+    if (newNoteBtn) newNoteBtn.addEventListener('click', () => {
+      if (window.__neuraliaNotes) window.__neuraliaNotes.newNote();
+    });
 
     if (resetBtn && typeof resetBtn.addEventListener === 'function') {
       resetBtn.addEventListener('click', center);
@@ -590,7 +636,10 @@
       });
     }
 
-    setTimeout(resize, 100);
+    if (typeof ResizeObserver === 'function' && container) {
+      new ResizeObserver(resize).observe(container);
+    }
+    resize();
 
     return {
       refresh,

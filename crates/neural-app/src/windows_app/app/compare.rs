@@ -621,8 +621,12 @@ impl App {
                 for (i, v) in comp.views.iter().enumerate() {
                     if i == idx {
                         let _ = v.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, 0.0).into(),
-                            size: LogicalSize::new(logical_w, logical_h).into(),
+                            position: LogicalPosition::new(0.0, TITLE_TAB_HEIGHT).into(),
+                            size: LogicalSize::new(
+                                logical_w,
+                                (logical_h - TITLE_TAB_HEIGHT).max(1.0),
+                            )
+                            .into(),
                         });
                         let _ = v.webview.set_visible(true);
                     } else {

@@ -199,7 +199,7 @@ fn sample_zip() -> Zip {
         .add("OEBPS/Fonts/f.woff2", b"wOF2fake-font", false)
 }
 
-fn sample_epub() -> Vec<u8> {
+pub(crate) fn sample_epub() -> Vec<u8> {
     sample_zip().finish()
 }
 

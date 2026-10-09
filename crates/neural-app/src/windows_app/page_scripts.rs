@@ -2054,15 +2054,15 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   const rail = document.createElement('div');
   rail.id = 'neuralia-split-scroll-rail';
   Object.assign(rail.style, {
-    position:'fixed', top:'50%', right:'7px', transform:'translateY(-50%)',
-    zIndex:'2147483646', pointerEvents:'auto', width:'44px',
-    minHeight:'240px', maxHeight:'58vh',
+    position:'fixed', top:'50%', right:'10px', transform:'translateY(-50%)',
+    zIndex:'2147483646', pointerEvents:'auto', width:'64px',
+    height:'min(65vh,600px)', minHeight:'min(300px,65vh)', maxHeight:'calc(100vh - 100px)',
     display:'flex', flexDirection:'column', alignItems:'center',
-    justifyContent:'space-between', opacity:'.68',
+    justifyContent:'space-between', opacity:'1',
     transition:'opacity .18s ease', fontFamily:'Segoe UI, system-ui, sans-serif'
   });
   rail.onmouseenter = () => { rail.style.opacity = '1'; };
-  rail.onmouseleave = () => { rail.style.opacity = '.68'; };
+  rail.onmouseleave = () => { rail.style.opacity = '1'; };
 
   function arrow(symbol, title, direction) {
     const button = document.createElement('button');
@@ -2071,8 +2071,8 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
     button.title = title;
     button.setAttribute('aria-label', title);
     Object.assign(button.style, {
-      width: direction > 0 ? '42px' : '32px',
-      height: direction > 0 ? '42px' : '28px',
+      width:'44px', flex:'none',
+      height:'40px',
       border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
       borderRadius:'50%', padding:'0',
       background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
@@ -2093,7 +2093,7 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 
   const ticks = document.createElement('div');
   Object.assign(ticks.style, {
-    width:'34px', flex:'1', margin:'8px 0 10px',
+    width:'48px', flex:'1', minHeight:'0', overflowY:'auto', margin:'8px 0 10px',
     display:'flex', flexDirection:'column',
     justifyContent:'space-evenly', alignItems:'flex-end'
   });
@@ -2121,8 +2121,8 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
       tick.dataset.top = item ? String(item.top) : '';
       tick.dataset.fraction = item ? '' : String(count <= 1 ? 0 : i / (count - 1));
       Object.assign(tick.style, {
-        display:'block', height:'3px', width:i === 0 ? '30px' : '14px',
-        minHeight:'3px', border:'0', borderRadius:'2px', padding:'0',
+        display:'block', height:'8px', width:i === 0 ? '44px' : '24px',
+        minHeight:'8px', border:'0', borderRadius:'2px', padding:'0',
         background:'rgba(255,255,255,.30)', cursor:'pointer',
         transition:'width .16s ease, background .16s ease, opacity .16s ease'
       });
@@ -2137,9 +2137,36 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
     }
   }
 
+  let readingWords = 0;
+  let readingRoot = null;
+  let readingDirty = true;
+  const progressStatus = document.createElement('div');
+  progressStatus.className = 'neuralia-reading-progress';
+  Object.assign(progressStatus.style, {
+    flex:'none', width:'112px', boxSizing:'border-box', alignSelf:'flex-end', padding:'6px 8px', borderRadius:'8px',
+    background:'rgba(17,19,20,.94)', color:'#fff', fontSize:'12px',
+    lineHeight:'18px', textAlign:'center', whiteSpace:'pre-line', pointerEvents:'none'
+  });
+
   function syncTicks() {
     rebuildTicks();
     const state = metrics();
+    const pageHeight = Math.max(1, state.view);
+    const pages = Math.max(1, Math.ceil((state.max + pageHeight) / pageHeight));
+    const page = state.max > 0 && state.top >= state.max - 1
+      ? pages : Math.min(pages, Math.floor(Math.max(0, state.top) / pageHeight) + 1);
+    const textRoot = state.docLike ? document.body : state.root;
+    if (readingDirty || readingRoot !== textRoot) {
+      const text = textRoot ? (textRoot.innerText || textRoot.textContent || '') : '';
+      readingWords = text.trim() ? text.trim().split(/\s+/).length : 0;
+      readingRoot = textRoot;
+      readingDirty = false;
+    }
+    const remaining = state.max <= 0 ? 1 : Math.max(0, 1 - state.top / state.max);
+    const minutes = Math.ceil(readingWords * remaining / 200);
+    const label = 'Pág. ' + page + '/' + pages + '\n≈' + minutes + ' min restantes';
+    // Writing an unchanged label would feed our own MutationObserver.
+    if (progressStatus.textContent !== label) progressStatus.textContent = label;
     const children = Array.from(ticks.children);
     let active = 0;
     if (semantic.length) {
@@ -2156,7 +2183,7 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 
     children.forEach((tick, i) => {
       const selected = i === active;
-      tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
+      tick.style.width = selected ? '46px' : (Math.abs(i - active) === 1 ? '34px' : '24px');
       tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
       tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
     });
@@ -2164,6 +2191,7 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
 
   rail.appendChild(arrow('⌃', 'Seção semântica anterior', -1));
   rail.appendChild(ticks);
+  rail.appendChild(progressStatus);
   rail.appendChild(arrow('⌄', 'Próxima seção semântica', 1));
   document.documentElement.appendChild(rail);
 
@@ -2175,8 +2203,12 @@ pub(in crate::windows_app) const SPLIT_SCROLL_RAIL_SCRIPT: &str = r#"
   window.addEventListener('scroll', scheduleSync, { passive:true });
   document.addEventListener('scroll', scheduleSync, { passive:true, capture:true });
   window.addEventListener('resize', scheduleSync, { passive:true });
-  new MutationObserver(scheduleSync).observe(document.documentElement, {
-    childList:true, subtree:true
+  new MutationObserver((records) => {
+    if (records.every((record) => rail.contains(record.target))) return;
+    readingDirty = true;
+    scheduleSync();
+  }).observe(document.documentElement, {
+    childList:true, subtree:true, characterData:true
   });
   syncTicks();
   }
@@ -2669,14 +2701,14 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       const rail = createElement('div');
       rail.id = 'neuralia-response-rail';
       assign(rail.style, {
-        position:'absolute', top:'50%', right:'7px', transform:'translateY(-50%)',
-        pointerEvents:'auto', width:'44px', minHeight:'240px', maxHeight:'58vh',
+        position:'absolute', top:'50%', right:'10px', transform:'translateY(-50%)',
+        pointerEvents:'auto', width:'64px', height:'min(65vh,600px)', minHeight:'min(300px,65vh)', maxHeight:'calc(100vh - 100px)',
         display:'flex', flexDirection:'column', alignItems:'center',
-        justifyContent:'space-between', opacity:'.68',
+        justifyContent:'space-between', opacity:'1',
         transition:'opacity .18s ease'
       });
       rail.onmouseenter = () => { rail.style.opacity = '1'; };
-      rail.onmouseleave = () => { rail.style.opacity = '.68'; };
+      rail.onmouseleave = () => { rail.style.opacity = '1'; };
 
       function arrow(symbol, title, direction) {
         const button = createElement('button');
@@ -2684,8 +2716,8 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
         button.textContent = symbol;
         button.title = title;
         assign(button.style, {
-          width: direction > 0 ? '42px' : '32px',
-          height: direction > 0 ? '42px' : '28px',
+          width:'44px', flex:'none',
+          height:'40px',
           border: direction > 0 ? '1px solid rgba(255,255,255,.08)' : '0',
           borderRadius:'50%', padding:'0',
           background: direction > 0 ? 'rgba(38,38,38,.94)' : 'transparent',
@@ -2707,7 +2739,7 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       const ticks = createElement('div');
       ticks.id = 'neuralia-response-ticks';
       assign(ticks.style, {
-        width:'34px', flex:'1', margin:'8px 0 10px', display:'flex',
+        width:'48px', flex:'1', minHeight:'0', overflowY:'auto', margin:'8px 0 10px', display:'flex',
         flexDirection:'column', justifyContent:'space-evenly',
         alignItems:'flex-end', cursor:'pointer'
       });
@@ -2808,8 +2840,8 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
           tick.dataset.top = item ? String(item.top) : '';
           tick.dataset.fraction = item ? '' : String(count <= 1 ? 0 : i / (count - 1));
           assign(tick.style, {
-            display:'block', height:'3px', minHeight:'3px',
-            width:i === 0 ? '30px' : '14px', border:'0', borderRadius:'2px',
+            display:'block', height:'8px', minHeight:'8px',
+            width:i === 0 ? '44px' : '24px', border:'0', borderRadius:'2px',
             padding:'0', background:'rgba(255,255,255,.30)', cursor:'pointer',
             transition:'width .16s ease, background .16s ease, opacity .16s ease'
           });
@@ -2822,10 +2854,37 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
         }
       }
 
+      let readingWords = 0;
+      let readingRoot = null;
+      let readingDirty = true;
+      const progressStatus = createElement('div');
+      progressStatus.className = 'neuralia-reading-progress';
+      assign(progressStatus.style, {
+        flex:'none', width:'112px', boxSizing:'border-box', alignSelf:'flex-end', padding:'6px 8px', borderRadius:'8px',
+        background:'rgba(17,19,20,.94)', color:'#fff', fontSize:'12px',
+        lineHeight:'18px', textAlign:'center', whiteSpace:'pre-line', pointerEvents:'none'
+      });
+
       function syncTicks() {
         rebuildTicks();
         const state = metrics();
         const view = state.root ? state.root.clientHeight : window.innerHeight;
+        const pageHeight = Math.max(1, view);
+        const pages = Math.max(1, Math.ceil((state.max + pageHeight) / pageHeight));
+        const page = state.max > 0 && state.top >= state.max - 1
+          ? pages : Math.min(pages, Math.floor(Math.max(0, state.top) / pageHeight) + 1);
+        const textRoot = state.docLike ? document.body : state.root;
+        if (readingDirty || readingRoot !== textRoot) {
+          const text = textRoot ? (textRoot.innerText || textRoot.textContent || '') : '';
+          readingWords = text.trim() ? text.trim().split(/\s+/).length : 0;
+          readingRoot = textRoot;
+          readingDirty = false;
+        }
+        const remaining = state.max <= 0 ? 1 : Math.max(0, 1 - state.top / state.max);
+        const minutes = Math.ceil(readingWords * remaining / 200);
+        const label = 'Pág. ' + page + '/' + pages + '\n≈' + minutes + ' min restantes';
+        // Writing an unchanged label would feed our own MutationObserver.
+        if (progressStatus.textContent !== label) progressStatus.textContent = label;
         const children = Array.from(ticks.children);
         let active = 0;
 
@@ -2843,7 +2902,7 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
         children.forEach((tick, i) => {
           const selected = i === active;
-          tick.style.width = selected ? '32px' : (Math.abs(i - active) === 1 ? '22px' : '13px');
+          tick.style.width = selected ? '46px' : (Math.abs(i - active) === 1 ? '34px' : '24px');
           tick.style.background = selected ? '#fff' : 'rgba(255,255,255,.32)';
           tick.style.opacity = selected ? '1' : (Math.abs(i - active) === 1 ? '.78' : '.55');
         });
@@ -2851,9 +2910,14 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
 
       append(rail, arrow('⌃', 'Resposta anterior', -1));
       append(rail, ticks);
+      append(rail, progressStatus);
       append(rail, arrow('⌄', 'Próxima resposta', 1));
-      append(controls, minimize);
-      append(controls, expand);
+      const pdfDocument = /\.pdf$/i.test(location.pathname)
+        || location.host === 'neuralia-pdf.localhost';
+      if (!pdfDocument) {
+        append(controls, minimize);
+        append(controls, expand);
+      }
       append(controls, rail);
       append(document.documentElement, controls);
 
@@ -2865,11 +2929,13 @@ pub(in crate::windows_app) const COMPARATOR_INJECT_SCRIPT: &str = r#"
       listen(window, 'scroll', scheduleSync, { passive:true });
       listen(document, 'scroll', scheduleSync, { passive:true, capture:true });
       listen(window, 'resize', scheduleSync, { passive:true });
-      new MutationObserver(() => {
+      new MutationObserver((records) => {
+        if (records.every((record) => controls.contains(record.target))) return;
+        readingDirty = true;
         scheduleSync();
         scheduleResearchAnswer();
       }).observe(document.documentElement, {
-        childList:true, subtree:true
+        childList:true, subtree:true, characterData:true
       });
       syncTicks();
       scheduleResearchAnswer();

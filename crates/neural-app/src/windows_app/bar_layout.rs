@@ -217,6 +217,7 @@ pub(in crate::windows_app) enum ColumnButton {
     Forward,
     /// ↻: «Recarregar» a página da coluna.
     Reload,
+    Minimize,
     /// 文A: «Traduzir página» (`translation.rs`); outro clique devolve o
     /// original.
     Translate,
@@ -242,10 +243,11 @@ pub(in crate::windows_app) fn column_reload_event(hit: BarHit) -> Option<UserEve
 pub(in crate::windows_app) const COLUMN_PILL_MIN: f64 = 60.0;
 
 impl ColumnButton {
-    pub(in crate::windows_app) const ALL: [Self; 5] = [
+    pub(in crate::windows_app) const ALL: [Self; 6] = [
         Self::Back,
         Self::Forward,
         Self::Reload,
+        Self::Minimize,
         Self::Translate,
         Self::Bookmark,
     ];
@@ -261,11 +263,12 @@ impl ColumnButton {
     /// opcionais vem depois dos outros em `ALL` e cedem do ultimo para o
     /// primeiro: a estrela antes do 文A.
     pub(in crate::windows_app) fn optional(self) -> bool {
-        matches!(self, Self::Translate | Self::Bookmark)
+        matches!(self, Self::Minimize | Self::Translate | Self::Bookmark)
     }
 
     pub(in crate::windows_app) fn glyph(self) -> &'static str {
         match self {
+            Self::Minimize => "−",
             Self::Back => "‹",
             Self::Forward => "›",
             Self::Reload => "↻",
@@ -277,6 +280,7 @@ impl ColumnButton {
     /// O alvo da barra que este botao e, na coluna `column`.
     pub(in crate::windows_app) fn hit(self, column: usize) -> BarHit {
         match self {
+            Self::Minimize => BarHit::ColumnMinimize(column),
             Self::Back => BarHit::ColumnBack(column),
             Self::Forward => BarHit::ColumnForward(column),
             Self::Reload => BarHit::ColumnReload(column),

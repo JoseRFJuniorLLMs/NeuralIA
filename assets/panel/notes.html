@@ -1,14 +1,22 @@
 <div class="view" id="view-notes" hidden>
+<div class="zk-intro"><strong>Zettelkasten</strong><span>Uma ideia por nota. Conecte ideias com [[id|nome]], tags e fontes.</span></div>
 <div id="notes-msg" role="status"></div>
 <div class="view" id="notes-browse">
 <div class="row"><input id="nq" class="field" placeholder="Buscar nas notas" autocomplete="off" spellcheck="false"><button id="note-new" class="btn primary">Nova nota</button></div>
-<main><div id="notes-list"></div></main>
+<div class="row zk-options">
+<select id="zk-template" class="field" aria-label="Modelo de nova nota"><option value="">Nota livre</option><option value="rapida">Nota rápida</option><option value="leitura">Nota de leitura</option><option value="permanente">Nota permanente</option><option value="indice">Nota de índice</option></select>
+<select id="zk-filter" class="field" aria-label="Filtrar tipo"><option value="">Todos os tipos</option><option value="rapida">Rápidas</option><option value="leitura">Leitura</option><option value="permanente">Permanentes</option><option value="indice">Índices</option></select>
+</div>
+<div class="row zk-options"><button id="zk-timeline" class="btn primary" aria-pressed="true">Linha do tempo</button><button id="zk-list" class="btn" aria-pressed="false">Lista</button><button id="zk-graph" class="btn">Grafo</button></div>
+<main><div id="notes-list" class="zk-timeline"></div></main>
 </div>
 <div class="view" id="notes-edit" hidden>
-<div class="row"><button id="note-back" class="btn" title="Voltar à lista">← Notas</button><button id="note-save" class="btn primary" title="Salvar (Ctrl+S)">Salvar</button><button id="note-delete" class="btn danger">Excluir</button></div>
+<div class="row"><button id="note-back" class="btn" title="Voltar à lista">← Zettelkasten</button><button id="note-save" class="btn primary" title="Salvar (Ctrl+S)">Salvar</button><button id="note-delete" class="btn danger">Excluir</button></div>
 <div id="note-editor">
 <div id="note-confirm" class="confirm" hidden><span>Excluir esta nota? Ela vai para a lixeira (.trash) da pasta das notas.</span><button id="note-confirm-yes" class="btn danger">Excluir</button><button id="note-confirm-no" class="btn">Cancelar</button></div>
 <input id="note-title" class="field" placeholder="Título" autocomplete="off">
+<select id="note-kind" class="field" aria-label="Tipo de nota"><option value="">Nota livre</option><option value="rapida">Nota rápida</option><option value="leitura">Nota de leitura</option><option value="permanente">Nota permanente</option><option value="indice">Nota de índice</option></select>
+<div class="row zk-link-row"><select id="zk-link-target" class="field" aria-label="Conectar com outra nota"><option value="">Conectar com outra nota…</option></select><button id="zk-link-insert" class="btn">Inserir link</button></div>
 <textarea id="note-body" class="field" placeholder="Escreva em Markdown. Ligue outra nota com [[id]] ou [[id|nome]]."></textarea>
 <input id="note-tags" class="field" placeholder="Tags, separadas por vírgula" autocomplete="off" spellcheck="false">
 <div id="note-source-row" class="meta" hidden><span>Fonte: </span><button id="note-source" class="link"></button></div>

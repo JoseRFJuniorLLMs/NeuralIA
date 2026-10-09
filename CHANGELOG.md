@@ -2,6 +2,18 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.0] - 2026-10-08
+
+### Fixed
+- **A barra lateral direita fica sempre redimensionável:** a pega é uma janela filha da janela principal. Continua visível e clicável quando o foco entra numa WebView, e segue a posição do painel entre 300 px e 60% da janela.
+- **O grafo do Obsidian pinta os nós mesmo com a aba ainda escondida:** o canvas ocupa o contentor, a pesquisa filtra notas, sites, histórico e tags, e «Nova nota» abre o Zettelkasten para cadastrar.
+
+### Added
+- **Zettelkasten no painel:** modelos (rápida, leitura, permanente, índice), filtro por tipo, linha do tempo e lista, e inserção de `[[id]]` para ligar notas.
+- **Histórico com data local:** os itens recentes ordenam do mais novo para o mais antigo e mostram o carimbo no fuso do computador.
+- **Leitor interno para downloads:** PDF, EPUB e TXT baixados abrem no painel lateral, com o mesmo hospedeiro e os mesmos ganchos das WebViews de PDF e EPUB.
+- **Minimizar coluna:** o botão `−` na pílula da coluna junta-se a voltar, avançar, recarregar, traduzir e favorito.
+
 ## [2.8.4] - 2026-10-08
 
 ### Added

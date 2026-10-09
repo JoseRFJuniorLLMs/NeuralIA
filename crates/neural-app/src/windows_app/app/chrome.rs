@@ -81,7 +81,8 @@ impl App {
         // so servem o rato saem da frente ate a janela voltar.
         self.hide_comparator_splitters();
         self.hide_exit_button();
-        self.hide_panel_handle();
+        // A pega filha acompanha a janela, mesmo com foco numa WebView.
+        self.sync_panel_handle();
     }
 
     /// A janela ficou inteiramente tapada (ou deixou de estar). Enquanto esta
@@ -1121,7 +1122,8 @@ impl App {
             }
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(owner, &mut origin);
-            let top = ((COMPARATOR_CHROME_HEIGHT + 10.0) * scale).round() as i32;
+            let top =
+                ((TITLE_TAB_HEIGHT - EXIT_BUTTON_HEIGHT).max(0.0) * 0.5 * scale).round() as i32;
             SetWindowPos(
                 button,
                 windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOP,
@@ -1369,6 +1371,7 @@ impl App {
             | BarHit::ColumnForward(index)
             | BarHit::ColumnReload(index)
             | BarHit::ColumnTranslate(index)
+            | BarHit::ColumnMinimize(index)
             | BarHit::ColumnBookmark(index)
             | BarHit::TabOverflow(index) => Some(index),
             BarHit::ContextTab { source_index, .. }

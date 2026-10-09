@@ -1085,6 +1085,7 @@ impl App {
                     });
                 }
             }
+            Some(BarHit::ColumnMinimize(index)) => self.minimize_comparator(index),
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::ContextTab {

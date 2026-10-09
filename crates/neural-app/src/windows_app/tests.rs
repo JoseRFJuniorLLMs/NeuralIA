@@ -1414,6 +1414,48 @@ fn side_panel_only_ever_shows_its_local_page() {
 }
 
 #[test]
+fn history_timeline_orders_timestamps_and_reopens_the_selected_item() {
+    let entries = [
+        HistoryEntry {
+            timestamp_unix: 100,
+            kind: HistoryKind::Read,
+            input: "Antes".into(),
+            target: "".into(),
+        },
+        HistoryEntry {
+            timestamp_unix: 200,
+            kind: HistoryKind::Ask,
+            input: "Depois".into(),
+            target: "".into(),
+        },
+    ];
+    let script = panel_render_script(
+        "recentes",
+        "Linha do tempo",
+        "",
+        &history_panel_items(&entries),
+    );
+    let result = notes_gates::run_panel(&[
+        script,
+        "const box = $('recentes').querySelector('div'); __out.timeline = box.className; __out.first = box.children[0].children[0].textContent; __out.date = box.children[0].children[1].textContent; __posted.length = 0; __click(box.children[0]);".into(),
+    ]);
+    assert_eq!(result["out"]["timeline"], "zk-timeline");
+    assert_eq!(result["out"]["first"], "Depois");
+    let date = result["out"]["date"].as_str().unwrap();
+    // 200 s depois da época: 01/01/1970 em UTC e 31/12/1969 em Brasília.
+    assert!(
+        date.contains("1970") || date.contains("1969"),
+        "carimbo unix no fuso local: {date}"
+    );
+    assert!(date.ends_with("IA"), "{date}");
+    let posted = result["posted"][0].as_str().unwrap();
+    assert_eq!(
+        parse_panel_message(posted),
+        Some(PanelMessage::Open("Depois".into()))
+    );
+}
+
+#[test]
 fn obsidian_graph_builds_correlated_nodes_and_edges() {
     let note1 = neural_core::Note {
         id: "20261008120000".to_string(),
@@ -1577,6 +1619,7 @@ fn side_panel_data_reaches_the_page_as_text_never_as_html() {
     assert!(!PANEL_HTML.contains("insertAdjacentHTML"));
     assert!(!PANEL_HTML.contains("document.write"));
     let hostile = PanelItem {
+        timestamp: None,
         title: "<img src=x onerror=alert(1)>".to_string(),
         detail: "</script><script>alert(2)</script>".to_string(),
         input: "javascript:alert(3)".to_string(),
@@ -9267,7 +9310,7 @@ fn every_webview_gets_the_hooks() {
     // desequilibra a conta.
     let births = source.matches(".build_hooked(window)").count()
         + source.matches(".build_hooked_as_child(window)").count();
-    assert_eq!(births, 11, "sitios onde uma WebView nasce: {births}");
+    assert_eq!(births, 12, "sitios onde uma WebView nasce: {births}");
     assert_eq!(
         source.matches(".hooked_builder(").count(),
         births,
@@ -9277,10 +9320,10 @@ fn every_webview_gets_the_hooks() {
     // `hooked_builder` -- o argumento que escolhe a cadeia de navegacao e a
     // politica de downloads dessa WebView: o monitor do Gmail nascido como
     // `External` aceitava qualquer https e descarregava em silencio, e a
-    // conta acima nao o via. Cada um dos 11 sitios e uma linha com o
-    // hospedeiro literal, colada a ultima linha do builder que ela
-    // embrulha, e aparece uma so vez; a conta garante que nao ha um 12.o.
-    let sites: [(&str, &str); 11] = [
+    // conta acima nao o via. Cada sitio aparece uma so vez. Os onze
+    // primeiros declaram o hospedeiro literal; o leitor de um download
+    // escolhe Pdf ou Epub antes da chamada e passa essa variavel.
+    let sites: [(&str, &str); 12] = [
         (
             "Column",
             ".with_url(url.as_str());\n            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);",
@@ -9326,6 +9369,10 @@ fn every_webview_gets_the_hooks() {
         (
             "Service",
             ".with_permission_handler(move |kind| service_panel_permission(service, kind));\n        let hooked = self.hooked_builder(builder, WebViewHost::Service(service), None);",
+        ),
+        (
+            "Pdf",
+            "match self\n            .hooked_builder(builder, host, None)\n            .build_hooked_as_child(window)",
         ),
     ];
     for (kind, site) in sites {
@@ -16311,8 +16358,8 @@ fn expanded_column_takes_fullscreen_and_hides_chrome() {
         .nth(1)
         .and_then(|part| part.split("fn column_ipc_event_impl").next())
         .expect("layout body");
-    assert!(layout.contains("LogicalPosition::new(0.0, 0.0)"));
-    assert!(layout.contains("LogicalSize::new(logical_w, logical_h)"));
+    assert!(layout.contains("LogicalPosition::new(0.0, TITLE_TAB_HEIGHT)"));
+    assert!(layout.contains("logical_h - TITLE_TAB_HEIGHT"));
 
     let bar = BarLayout::new(1600.0, 1.0, true, 3);
     assert!(bar.window_minimize.width > 0.0);
@@ -16515,6 +16562,7 @@ fn each_reload_arrow_routes_only_its_own_ai_column() {
             ColumnButton::Back,
             ColumnButton::Forward,
             ColumnButton::Reload,
+            ColumnButton::Minimize,
             ColumnButton::Translate,
             ColumnButton::Bookmark
         ]
@@ -20140,16 +20188,17 @@ fn provider_row(layout: &BarLayout) -> Vec<[f64; 4]> {
 fn the_tools_never_take_room_from_the_ai_columns() {
     // A largura (logica) a partir da qual as tres colunas a vista tem o
     // 文A: a 1349 px a do canto ainda nao tem lugar para ele.
-    const TRANSLATE_FROM: f64 = 1350.0;
+    const TRANSLATE_FROM: f64 = 1428.0;
     // E a da estrela, que precisa do lugar do 文A e do seu: a 1427 px a do
     // canto so tem o 文A.
-    const BOOKMARK_FROM: f64 = 1428.0;
+    const BOOKMARK_FROM: f64 = 1506.0;
     // Nas colunas que nao encostam ao canto os opcionais cabem de 1280 px
     // (a pilula legivel) para cima.
     const OTHERS_FROM: f64 = 1280.0;
     let optional_from = |button: ColumnButton| match button {
         ColumnButton::Translate => TRANSLATE_FROM,
         ColumnButton::Bookmark => BOOKMARK_FROM,
+        ColumnButton::Minimize => 1350.0,
         ColumnButton::Back | ColumnButton::Forward | ColumnButton::Reload => 0.0,
     };
     let (running, paused) = shipped_pomodoro_labels();
@@ -20313,6 +20362,9 @@ fn the_tools_never_take_room_from_the_ai_columns() {
             );
             for column in 0..COMPARATOR_COLUMNS {
                 for button in ColumnButton::ALL {
+                    if button == ColumnButton::Minimize && width < 1350.0 {
+                        continue;
+                    }
                     assert!(layout.column_button(column, button).width > 0.0);
                 }
             }
@@ -20445,7 +20497,7 @@ fn tool_hints_say_what_the_click_does() {
         ),
         (
             Tool::Notes,
-            "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
+            "Zettelkasten — Ctrl+Shift+Z cria nota da seleção",
         ),
         (
             Tool::Obsidian,
@@ -21923,6 +21975,54 @@ process.stdout.write(JSON.stringify({
     /// (Nova nota, escrever, Ctrl+S, buscar, abrir, Excluir, confirmar),
     /// e cada pedido que ele manda levado pelo parser e pelo trabalho do
     /// worker a uma pasta temporaria.
+    #[test]
+    fn zettelkasten_template_connects_saves_and_filters_in_the_shipped_panel() {
+        let dir = NotesDir::new("zk-template");
+        let store = dir.store();
+        let linked = store
+            .create("Uma ideia conectada", "texto", vec![], None, T0)
+            .unwrap();
+        let listed = notes_reply_script(&notes_listed(store.list(), None));
+        let first = run_panel(&[
+            "window.neuraliaShowSection('notes');".into(),
+            listed,
+            "__out.timeline = $('notes-list').className; $('zk-template').value = 'permanente'; __click($('note-new'));".into(),
+            "__type($('note-title'), 'Ideia permanente');".into(),
+            format!("$('zk-link-target').value = '{}'; __click($('zk-link-insert'));", linked.id),
+            "__out.body = $('note-body').value; __posted.length = 0; __click($('note-save'));".into(),
+        ]);
+        assert_eq!(first["out"]["timeline"], "zk-timeline");
+        let messages = posted(&first);
+        let save = messages
+            .iter()
+            .find(|body| action_of(body) == "note-save")
+            .unwrap();
+        let reply = panel_request(&store, save, T0 + 1);
+        let NotesReply::Opened { note, .. } = &reply else {
+            panic!("save failed: {reply:?}");
+        };
+        assert!(note.tags.contains(&"zk:permanente".to_string()));
+        assert!(note.body.contains("## Ideia central"));
+        assert!(
+            note.body
+                .contains(&format!("[[{}|Uma ideia conectada]]", linked.id))
+        );
+        assert_eq!(
+            neural_core::zettel::backlinks(&store, &linked.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        let listed = notes_reply_script(&notes_listed(store.list(), None));
+        let filtered = run_panel(&[
+            "window.neuraliaShowSection('notes');".into(), listed,
+            "$('zk-filter').value = 'permanente'; __fire($('zk-filter'), 'change'); __out.count = $('notes-list').children.length; __out.title = $('notes-list').children[0].children[0].textContent; __click($('zk-list')); __out.list = $('notes-list').className;".into(),
+        ]);
+        assert_eq!(filtered["out"]["count"], 1);
+        assert_eq!(filtered["out"]["title"], "Ideia permanente");
+        assert_eq!(filtered["out"]["list"], "");
+    }
+
     #[test]
     fn notes_panel_saves_lists_searches_and_deletes_through_the_shipped_handler() {
         let dir = NotesDir::new("roundtrip");
@@ -23416,7 +23516,7 @@ process.stdout.write(JSON.stringify({
         );
         for tag in result["created"].as_array().expect("created") {
             assert!(
-                matches!(tag.as_str(), Some("button" | "span" | "div")),
+                matches!(tag.as_str(), Some("button" | "span" | "div" | "option")),
                 "a nota criou um <{tag}>"
             );
         }
@@ -29225,12 +29325,20 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
         }
         assert!(shell.executed.is_empty(), "{:?}", shell.executed);
         for path in &allowed {
-            assert_eq!(shell_open_checked(path, &mut shell), OpenOutcome::Opened);
+            assert_eq!(
+                shell_open_checked(path, &mut shell),
+                if downloads_ui::documents::is_internal_document(path) {
+                    OpenOutcome::InternalDocument(path.clone())
+                } else {
+                    OpenOutcome::Opened
+                }
+            );
         }
         assert_eq!(
             shell.executed,
             allowed
                 .iter()
+                .filter(|path| !downloads_ui::documents::is_internal_document(path))
                 .map(|path| (SHELL_OPEN_VERB, path.clone()))
                 .collect::<Vec<_>>()
         );
@@ -29303,16 +29411,16 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
         assert!(shell.executed.is_empty(), "{:?}", shell.executed);
         assert_eq!(
             open_download_row(&manager, &rows, pdf_row.id, &mut shell),
-            OpenOutcome::Opened
+            OpenOutcome::InternalDocument(pdf.clone())
         );
-        assert_eq!(shell.executed, vec![(SHELL_OPEN_VERB, pdf.clone())]);
+        assert!(shell.executed.is_empty());
         // «Mostrar na pasta» nao corre nada: so o Explorador na pasta.
         assert_eq!(
             show_download_row(&manager, &rows, docm_row.id, &mut shell),
             OpenOutcome::Opened
         );
         assert_eq!(shell.revealed, vec![docm.clone()]);
-        assert_eq!(shell.executed.len(), 1);
+        assert!(shell.executed.is_empty());
         // Um numero que nao esta na lista nao abre nada.
         assert_eq!(
             open_download_row(&manager, &rows, 999, &mut shell),
@@ -29330,11 +29438,14 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             let outcome = open_download_row(&old, &rows, row.id, &mut shell);
             assert_eq!(
                 row.open,
-                outcome == OpenOutcome::Opened,
+                matches!(
+                    outcome,
+                    OpenOutcome::Opened | OpenOutcome::InternalDocument(_)
+                ),
                 "{row:?} {outcome:?}"
             );
         }
-        assert_eq!(shell.executed, vec![(SHELL_OPEN_VERB, pdf)]);
+        assert!(shell.executed.is_empty());
 
         // O conteudo e relido no clique: o PDF trocado por um programa
         // depois de a lista ser pintada nao abre.

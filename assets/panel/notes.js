@@ -17,6 +17,34 @@
     const previewBox = byId('note-preview-box'), preview = byId('note-preview');
     const backBox = byId('note-backlinks-box'), backlinks = byId('note-backlinks');
     const confirmBox = byId('note-confirm');
+    const template = byId('zk-template'), kindField = byId('note-kind'), typeFilter = byId('zk-filter');
+    const linkTarget = byId('zk-link-target');
+    let lastList = null;
+    let timeline = true;
+    const templates = {
+      rapida: '## Ideia\n\n\n## Próximo passo\n\n',
+      leitura: '## Referência\n\n\n## Ideias em minhas palavras\n\n\n## Conexões\n\n',
+      permanente: '## Ideia central\n\n\n## Argumento\n\n\n## Fontes\n\n\n## Conexões\n\n',
+      indice: '## Tema\n\n\n## Notas relacionadas\n\n\n## Questões abertas\n\n'
+    };
+    const noteType = (note) => (note.tags || []).find((tag) => /^zk:(rapida|leitura|permanente|indice)$/.test(tag))?.slice(3) || '';
+    function linkOptions() {
+      if (!linkTarget) return;
+      linkTarget.textContent = '';
+      const empty = make('option', '', 'Conectar com outra nota…'); empty.value = '';
+      linkTarget.appendChild(empty);
+      for (const note of lastList?.notes || []) {
+        if (note.id === openId) continue;
+        const option = make('option', '', note.title + ' · ' + note.id);
+        option.value = note.id;
+        linkTarget.appendChild(option);
+      }
+    }
+    function changed() {
+      dirty = true;
+      say('Alterações por salvar.');
+      postDraft();
+    }
     // Nota no editor: o id dela, ou null para uma nota nova ainda por salvar.
     let openId = null;
     // A revisao da nota que o editor mostra (do disco, ou do nosso ultimo
@@ -79,8 +107,12 @@
     function renderList(data) {
       // Resposta a uma busca que ja nao e a da caixa: a seguinte vem a caminho.
       if ((data.query || '') !== query()) return;
+      lastList = data;
+      linkOptions();
       list.textContent = '';
-      if (!data.notes.length) {
+      list.className = timeline ? 'zk-timeline' : '';
+      const visible = data.notes.filter((note) => !typeFilter?.value || noteType(note) === typeFilter.value);
+      if (!visible.length) {
         list.appendChild(make('div', 'empty', data.query
           ? 'Nenhuma nota encontrada.'
           : 'Nenhuma nota ainda. Crie uma em Nova nota, ou selecione um texto numa página e tecle Ctrl+Shift+Z.'));
@@ -89,9 +121,9 @@
       if (data.total > data.notes.length) {
         list.appendChild(make('div', 'empty', 'Mostrando ' + data.notes.length + ' de ' + data.total + ' notas. Refine a busca.'));
       }
-      for (const note of data.notes) {
+      for (const note of [...visible].sort((a, b) => b.updated - a.updated)) {
         const button = make('button', 'item');
-        const detail = [when(note.updated), note.tags.map((tag) => '#' + tag).join(' ')].filter(Boolean).join(' · ');
+        const detail = ['Atualizada ' + when(note.updated), 'ID ' + note.id, note.tags.map((tag) => '#' + tag).join(' ')].filter(Boolean).join(' · ');
         button.append(make('span', 'title', note.title), make('span', 'detail', detail));
         button.addEventListener('click', () => open(note.id));
         list.appendChild(button);
@@ -146,6 +178,8 @@
       title.value = note ? note.title : '';
       body.value = note ? note.body : '';
       tags.value = note ? note.tags.join(', ') : '';
+      if (kindField) kindField.value = note ? noteType(note) : '';
+      linkOptions();
       describe(note, links);
       confirmBox.hidden = true;
       dirty = false;
@@ -193,7 +227,16 @@
     function newNote() {
       if (!leave()) return;
       fill(null, []);
+      const kind = template?.value || '';
+      if (templates[kind]) {
+        body.value = templates[kind];
+        tags.value = 'zk:' + kind;
+        if (kindField) kindField.value = kind;
+        dirty = true;
+        renderPreview();
+      }
       showEditor();
+      if (dirty) postDraft();
       say('');
       title.focus();
     }
@@ -278,6 +321,38 @@
           break;
       }
     }
+
+    if (kindField) kindField.addEventListener('change', () => {
+      const current = tags.value.split(',').map(line).filter((tag) => tag && !/^zk:(rapida|leitura|permanente|indice)$/.test(tag));
+      if (templates[kindField.value]) current.push('zk:' + kindField.value);
+      tags.value = current.join(', ');
+      changed();
+    });
+    if (typeFilter) typeFilter.addEventListener('change', () => { if (lastList) renderList(lastList); });
+    const display = (on) => {
+      timeline = on;
+      byId('zk-timeline').setAttribute('aria-pressed', on ? 'true' : 'false');
+      byId('zk-list').setAttribute('aria-pressed', on ? 'false' : 'true');
+      byId('zk-timeline').className = on ? 'btn primary' : 'btn';
+      byId('zk-list').className = on ? 'btn' : 'btn primary';
+      if (lastList) renderList(lastList);
+    };
+    byId('zk-timeline').addEventListener('click', () => display(true));
+    byId('zk-list').addEventListener('click', () => display(false));
+    byId('zk-graph').addEventListener('click', () => window.neuraliaShowSection('obsidian'));
+    byId('zk-link-insert').addEventListener('click', () => {
+      const note = lastList?.notes.find((note) => note.id === linkTarget.value);
+      if (!note || !ID.test(note.id) || note.id === openId) return;
+      const label = note.title.replace(/[\[\]|\r\n]/g, ' ').trim();
+      const link = '[[' + note.id + (label ? '|' + label : '') + ']]';
+      const start = Number.isInteger(body.selectionStart) ? body.selectionStart : body.value.length;
+      const end = Number.isInteger(body.selectionEnd) ? body.selectionEnd : start;
+      body.value = body.value.slice(0, start) + link + body.value.slice(end);
+      body.focus();
+      if (typeof body.setSelectionRange === 'function') body.setSelectionRange(start + link.length, start + link.length);
+      changed();
+      renderPreview();
+    });
 
     nq.addEventListener('input', () => {
       clearTimeout(searchTimer);

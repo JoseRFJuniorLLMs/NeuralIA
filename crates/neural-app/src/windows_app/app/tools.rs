@@ -75,7 +75,7 @@ impl Tool {
             Self::Pomodoro => {
                 "Pomodoro: foco e pausas (clique inicia/pausa; botão direito: opções)"
             }
-            Self::Notes => "Notas (Zettelkasten) — Ctrl+Shift+Z cria nota da seleção",
+            Self::Notes => "Zettelkasten — Ctrl+Shift+Z cria nota da seleção",
             Self::Obsidian => "Obsidian (Segundo Cérebro) — grafo de notas, sites e histórico",
             Self::Breath => "Respiração guiada — método Wim Hof (vídeo em modo anônimo)",
             Self::About => "Sobre o NeuralIA — versão e atualizações",
