@@ -7,7 +7,13 @@ use std::sync::{Arc, Mutex};
 pub(in crate::windows_app) enum PreparedDocument {
     Pdf(Vec<u8>),
     Text(String),
-    Epub { runtime: EpubRuntime, id: String },
+    Epub {
+        runtime: EpubRuntime,
+        id: String,
+        /// True only when this open created the library entry. Cancelling must
+        /// not delete a book the user already owned (same bytes, same id).
+        imported: bool,
+    },
 }
 
 impl std::fmt::Debug for PreparedDocument {
@@ -90,6 +96,16 @@ fn prepare_document(
     }
     // Import uses the existing library worker/parser and file locks. This
     // temporary worker's channels stay alive in the viewer's protocol closures.
+    // Snapshot ids first and drop that handle: the worker locks the same dir.
+    // If the snapshot fails, `imported` stays false so a cancel cannot delete
+    // a book we failed to see.
+    let known = neural_core::Library::open(&library).ok().map(|library| {
+        library
+            .list()
+            .iter()
+            .map(|book| book.id.clone())
+            .collect::<std::collections::HashSet<_>>()
+    });
     let (send, receive) = std::sync::mpsc::channel();
     let runtime = EpubRuntime::start(
         library,
@@ -118,10 +134,28 @@ fn prepare_document(
                     .map(|failure| failure.message.clone())
                     .unwrap_or_else(|| "Não foi possível ler o EPUB.".into())
             })?;
-            Ok(PreparedDocument::Epub { runtime, id })
+            let imported = known.as_ref().is_some_and(|ids| !ids.contains(&id));
+            Ok(PreparedDocument::Epub {
+                runtime,
+                id,
+                imported,
+            })
         }
         EpubNotice::Failed { message } => Err(message),
         _ => Err("Resposta inesperada da biblioteca.".into()),
+    }
+}
+
+/// Drop a document that never became the visible viewer. A book this open
+/// just created is removed; a book that was already in the library stays.
+pub(in crate::windows_app) fn release_unshown_document(document: PreparedDocument) {
+    if let PreparedDocument::Epub {
+        runtime,
+        id,
+        imported: true,
+    } = document
+    {
+        let _ = runtime.worker.submit(EpubJob::Remove { id });
     }
 }
 
@@ -168,6 +202,9 @@ impl App {
         if generation != self.downloads_ui.document_generation
             || self.side_panel.active_ticket() != Some(ticket)
         {
+            if let Ok(document) = result {
+                release_unshown_document(document);
+            }
             return;
         }
         let document = match result {
@@ -215,7 +252,7 @@ impl App {
                     .with_initialization_script(SPLIT_SCROLL_RAIL_SCRIPT),
                 WebViewHost::Pdf,
             ),
-            PreparedDocument::Epub { runtime, id } => {
+            PreparedDocument::Epub { runtime, id, .. } => {
                 let server = runtime.server.clone();
                 let worker = runtime.worker.clone();
                 let epub_proxy = proxy.clone();
@@ -288,154 +325,20 @@ impl App {
     }
 }
 
-#[cfg(test)]
-mod gates {
-    use super::*;
-    struct Files(PathBuf);
-    impl Files {
-        fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "neuralia-doc-panel-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(&root).unwrap();
-            Self(root)
-        }
-        fn file(&self, name: &str, content: &[u8]) -> PathBuf {
-            let path = self.0.join(name);
-            std::fs::write(&path, content).unwrap();
-            path
-        }
-        fn prepare(&self, path: &Path) -> Result<PreparedDocument, String> {
-            prepare_document(path, self.0.join("library"), Box::new(|_| {}))
-        }
-    }
-    impl Drop for Files {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn internal_documents_validate_real_files_and_preserve_text_as_text() {
-        let files = Files::new();
-        let pdf = files.file("document.PDF", b"%PDF-1.7\noriginal");
-        let PreparedDocument::Pdf(bytes) = files.prepare(&pdf).unwrap() else {
-            panic!("PDF not internal");
-        };
-        std::fs::write(&pdf, b"MZ switched executable").unwrap();
-        assert_eq!(bytes, b"%PDF-1.7\noriginal");
-        assert!(files.prepare(&pdf).is_err());
-        let invalid = files.file("invalid.pdf", b"plain text");
-        assert!(files.prepare(&invalid).is_err());
-        let script = files.file("script.txt", b"MZ executable");
-        assert!(files.prepare(&script).is_err());
-        let txt = files.file("note.txt", b"<script>window.pwned=1</script>\n[[id]]");
-        let PreparedDocument::Text(html) = files.prepare(&txt).unwrap() else {
-            panic!("TXT not internal");
-        };
-        assert!(!html.contains("<script>window.pwned"));
-        assert!(html.contains("&lt;script&gt;window.pwned"));
-        assert!(read_bounded(&txt, 4).is_err());
-        assert_eq!(decode_text(&[0xff, 0xfe, 0x61, 0, 0xe7, 0]).unwrap(), "aç");
-        assert!(decode_text(&[0xff, 0xfe, 0x61]).is_err());
-    }
-
-    #[test]
-    fn epub_import_and_bookmark_notifications_keep_the_internal_viewer_live() {
-        let files = Files::new();
-        let path = files.file("book.epub", &crate::epub_app::tests::sample_epub());
-        let (send, receive) = std::sync::mpsc::channel();
-        let document = prepare_document(
-            &path,
-            files.0.join("library"),
-            Box::new(move |notice| {
-                let _ = send.send(notice);
-            }),
-        )
-        .unwrap();
-        let PreparedDocument::Epub { runtime, id } = document else {
-            panic!("EPUB not internal");
-        };
-        assert!(reader_url(&id).is_some());
-        assert!(matches!(
-            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
-            EpubNotice::Added { .. }
-        ));
-        assert!(runtime.worker.submit(EpubJob::AddBookmark {
-            id: id.clone(),
-            spine: 0,
-            fraction: 0.3,
-            label: "Ideia".into()
-        }));
-        assert_eq!(
-            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
-            EpubNotice::Bookmarks { id }
-        );
-    }
-
-    #[test]
-    fn document_toolbar_keeps_the_viewer_below_native_title_at_every_dpi() {
-        for scale in [1.0, 1.5, 2.0] {
-            let bounds = wry::Rect {
-                position: winit::dpi::PhysicalPosition::new(
-                    (400.0 * scale) as i32,
-                    (80.0 * scale) as i32,
-                )
-                .into(),
-                size: winit::dpi::PhysicalSize::new((360.0 * scale) as u32, (700.0 * scale) as u32)
-                    .into(),
-            };
-            let content = document_content_bounds(bounds, scale);
-            let position = content.position.to_logical::<f64>(scale);
-            let size = content.size.to_logical::<f64>(scale);
-            assert_eq!(position.x, 400.0);
-            assert_eq!(position.y, 80.0 + DOCUMENT_TITLE_HEIGHT);
-            assert_eq!(size.height, 700.0 - DOCUMENT_TITLE_HEIGHT);
-            assert_eq!(size.width, 360.0);
-        }
-    }
-
-    #[test]
-    fn document_title_click_closes_only_the_close_band() {
-        assert!(!document_chrome_closes(10, 360));
-        assert!(!document_chrome_closes(180, 360));
-        assert!(document_chrome_closes(250, 360));
-        assert!(document_chrome_closes(359, 360));
-        assert!(!document_chrome_closes(360, 360));
-        assert!(!document_chrome_closes(-1, 360));
-    }
-
-    #[test]
-    fn a_newer_load_does_not_retire_the_visible_document() {
-        let ticket = side_panel::PanelTicket(7);
-        assert!(viewer_still_showing(4, 4, Some(ticket), Some(ticket)));
-        assert!(!viewer_still_showing(5, 4, Some(ticket), Some(ticket)));
-        assert!(!viewer_still_showing(
-            4,
-            4,
-            Some(ticket),
-            Some(side_panel::PanelTicket(8))
-        ));
-        assert!(!viewer_still_showing(0, 0, None, None));
-    }
-}
-
 fn decode_text(bytes: &[u8]) -> Result<String, String> {
     if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
         if !(bytes.len() - 2).is_multiple_of(2) {
             return Err("TXT UTF-16 incompleto.".into());
         }
         let little = bytes[0] == 0xff;
-        let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+        let (pairs, _) = bytes[2..].as_chunks::<2>();
+        let units: Vec<u16> = pairs
+            .iter()
             .map(|pair| {
                 if little {
-                    u16::from_le_bytes([pair[0], pair[1]])
+                    u16::from_le_bytes(*pair)
                 } else {
-                    u16::from_be_bytes([pair[0], pair[1]])
+                    u16::from_be_bytes(*pair)
                 }
             })
             .collect();
@@ -639,5 +542,210 @@ impl App {
                 InvalidateRect(chrome.hwnd, std::ptr::null(), 0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod gates {
+    use super::*;
+    struct Files(PathBuf);
+    impl Files {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "neuralia-doc-panel-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+        fn file(&self, name: &str, content: &[u8]) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+        fn prepare(&self, path: &Path) -> Result<PreparedDocument, String> {
+            prepare_document(path, self.0.join("library"), Box::new(|_| {}))
+        }
+    }
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn internal_documents_validate_real_files_and_preserve_text_as_text() {
+        let files = Files::new();
+        let pdf = files.file("document.PDF", b"%PDF-1.7\noriginal");
+        let PreparedDocument::Pdf(bytes) = files.prepare(&pdf).unwrap() else {
+            panic!("PDF not internal");
+        };
+        std::fs::write(&pdf, b"MZ switched executable").unwrap();
+        assert_eq!(bytes, b"%PDF-1.7\noriginal");
+        assert!(files.prepare(&pdf).is_err());
+        let invalid = files.file("invalid.pdf", b"plain text");
+        assert!(files.prepare(&invalid).is_err());
+        let script = files.file("script.txt", b"MZ executable");
+        assert!(files.prepare(&script).is_err());
+        let txt = files.file("note.txt", b"<script>window.pwned=1</script>\n[[id]]");
+        let PreparedDocument::Text(html) = files.prepare(&txt).unwrap() else {
+            panic!("TXT not internal");
+        };
+        assert!(!html.contains("<script>window.pwned"));
+        assert!(html.contains("&lt;script&gt;window.pwned"));
+        assert!(read_bounded(&txt, 4).is_err());
+        assert_eq!(decode_text(&[0xff, 0xfe, 0x61, 0, 0xe7, 0]).unwrap(), "aç");
+        assert!(decode_text(&[0xff, 0xfe, 0x61]).is_err());
+    }
+
+    #[test]
+    fn epub_import_and_bookmark_notifications_keep_the_internal_viewer_live() {
+        let files = Files::new();
+        let path = files.file("book.epub", &crate::epub_app::tests::sample_epub());
+        let (send, receive) = std::sync::mpsc::channel();
+        let document = prepare_document(
+            &path,
+            files.0.join("library"),
+            Box::new(move |notice| {
+                let _ = send.send(notice);
+            }),
+        )
+        .unwrap();
+        let PreparedDocument::Epub { runtime, id, .. } = document else {
+            panic!("EPUB not internal");
+        };
+        assert!(reader_url(&id).is_some());
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
+            EpubNotice::Added { .. }
+        ));
+        assert!(runtime.worker.submit(EpubJob::AddBookmark {
+            id: id.clone(),
+            spine: 0,
+            fraction: 0.3,
+            label: "Ideia".into()
+        }));
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
+            EpubNotice::Bookmarks { id }
+        );
+    }
+
+    #[test]
+    fn a_cancelled_open_removes_only_the_book_it_just_imported() {
+        let files = Files::new();
+        let path = files.file("book.epub", &crate::epub_app::tests::sample_epub());
+        let library = files.0.join("library");
+        let (send, receive) = std::sync::mpsc::channel();
+        let first = prepare_document(
+            &path,
+            library.clone(),
+            Box::new(move |notice| {
+                let _ = send.send(notice);
+            }),
+        )
+        .unwrap();
+        let PreparedDocument::Epub {
+            id, imported: true, ..
+        } = &first
+        else {
+            panic!("a new EPUB must be marked imported");
+        };
+        let removed_id = id.clone();
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
+            EpubNotice::Added { .. }
+        ));
+        release_unshown_document(first);
+        assert!(matches!(
+            receive.recv_timeout(Duration::from_secs(20)).unwrap(),
+            EpubNotice::Removed { id, .. } if id == removed_id
+        ));
+        assert!(
+            neural_core::Library::open(&library)
+                .unwrap()
+                .list()
+                .iter()
+                .all(|book| book.id != removed_id)
+        );
+
+        let kept = prepare_document(&path, library.clone(), Box::new(|_| {})).unwrap();
+        let PreparedDocument::Epub {
+            id: kept_id,
+            imported: true,
+            ..
+        } = &kept
+        else {
+            panic!("re-import after removal is a new book");
+        };
+        let kept_id = kept_id.clone();
+        drop(kept);
+
+        let again = prepare_document(&path, library.clone(), Box::new(|_| {})).unwrap();
+        let PreparedDocument::Epub {
+            id,
+            imported: false,
+            ..
+        } = &again
+        else {
+            panic!("the same bytes must reuse the library entry");
+        };
+        assert_eq!(id, &kept_id);
+        release_unshown_document(again);
+        assert!(
+            neural_core::Library::open(&library)
+                .unwrap()
+                .list()
+                .iter()
+                .any(|book| book.id == kept_id)
+        );
+    }
+
+    #[test]
+    fn document_toolbar_keeps_the_viewer_below_native_title_at_every_dpi() {
+        for scale in [1.0, 1.5, 2.0] {
+            let bounds = wry::Rect {
+                position: winit::dpi::PhysicalPosition::new(
+                    (400.0 * scale) as i32,
+                    (80.0 * scale) as i32,
+                )
+                .into(),
+                size: winit::dpi::PhysicalSize::new((360.0 * scale) as u32, (700.0 * scale) as u32)
+                    .into(),
+            };
+            let content = document_content_bounds(bounds, scale);
+            let position = content.position.to_logical::<f64>(scale);
+            let size = content.size.to_logical::<f64>(scale);
+            assert_eq!(position.x, 400.0);
+            assert_eq!(position.y, 80.0 + DOCUMENT_TITLE_HEIGHT);
+            assert_eq!(size.height, 700.0 - DOCUMENT_TITLE_HEIGHT);
+            assert_eq!(size.width, 360.0);
+        }
+    }
+
+    #[test]
+    fn document_title_click_closes_only_the_close_band() {
+        assert!(!document_chrome_closes(10, 360));
+        assert!(!document_chrome_closes(180, 360));
+        assert!(document_chrome_closes(250, 360));
+        assert!(document_chrome_closes(359, 360));
+        assert!(!document_chrome_closes(360, 360));
+        assert!(!document_chrome_closes(-1, 360));
+    }
+
+    #[test]
+    fn a_newer_load_does_not_retire_the_visible_document() {
+        let ticket = side_panel::PanelTicket(7);
+        assert!(viewer_still_showing(4, 4, Some(ticket), Some(ticket)));
+        assert!(!viewer_still_showing(5, 4, Some(ticket), Some(ticket)));
+        assert!(!viewer_still_showing(
+            4,
+            4,
+            Some(ticket),
+            Some(side_panel::PanelTicket(8))
+        ));
+        assert!(!viewer_still_showing(0, 0, None, None));
     }
 }
