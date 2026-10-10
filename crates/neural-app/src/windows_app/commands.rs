@@ -477,6 +477,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::Tool(_)
         | BarHit::GeminiLive
         | BarHit::WindowMinimize
-        | BarHit::WindowMaximize => None,
+        | BarHit::WindowMaximize
+        | BarHit::AddressBar => None,
     }
 }

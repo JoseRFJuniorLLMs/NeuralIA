@@ -1103,6 +1103,13 @@ impl App {
                 group_index,
             }) => self.toggle_context_group(source_index, group_index),
             Some(BarHit::TabOverflow(index)) => self.show_tab_list_menu(index),
+            Some(BarHit::AddressBar) => {
+                if let Some(edit) = self.omnibox {
+                    unsafe {
+                        SetFocus(edit);
+                    }
+                }
+            }
             None => {
                 let scale = self
                     .window

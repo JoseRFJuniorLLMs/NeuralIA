@@ -928,9 +928,7 @@ impl App {
                 let query = str_arg("query");
                 let started = !query.is_empty();
                 if started {
-                    self.compare(crate::windows_app::search_card::CompareRequest::ask(
-                        query.clone(),
-                    ));
+                    self.handle_input(format!("compare:{query}"));
                 }
                 serde_json::json!({
                     "ok": started,
@@ -1195,8 +1193,9 @@ impl App {
                 let target_lang = str_arg("target_lang");
                 let started = !text.is_empty();
                 if started {
-                    self.compare(crate::windows_app::search_card::CompareRequest::translate(
-                        &text,
+                    self.handle_input(format!(
+                        "{}{text}",
+                        crate::windows_app::search_card::TRANSLATE_COMMAND
                     ));
                 }
                 serde_json::json!({

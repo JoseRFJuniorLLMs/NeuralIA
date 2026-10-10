@@ -875,6 +875,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         BarHit::WindowMinimize,
         BarHit::WindowMaximize,
         BarHit::WindowClose,
+        BarHit::AddressBar,
     ] {
         let label = bar_tooltip_label(
             hit,
@@ -932,15 +933,30 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         context_index: 0,
     };
     assert_eq!(label(close, false).as_deref(), Some("Fechar aba"));
+    assert_eq!(
+        label(BarHit::AddressBar, false).as_deref(),
+        Some(TITLE_ADDRESS_HINT)
+    );
 }
 
 #[test]
 fn hovering_a_target_shows_its_hint_in_the_center_and_leaving_hides_it() {
     // O que o dono ve: a dica como mensagem no MEIO da janela, visivel,
-    // com o texto do alvo, sem roubar a ativacao, e escondida ao sair.
+    // com o texto do alvo, sem roubar a ativacao, acima dos divisores e
+    // escondida ao sair.
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetActiveWindow, SetActiveWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, IsWindowVisible, WS_OVERLAPPEDWINDOW,
+        GW_HWNDPREV, GetWindow, GetWindowRect, IsWindowVisible, WS_OVERLAPPEDWINDOW,
+    };
+    let is_above = |top: HWND, bottom: HWND| unsafe {
+        let mut cursor = GetWindow(bottom, GW_HWNDPREV);
+        while !cursor.is_null() {
+            if cursor == top {
+                return true;
+            }
+            cursor = GetWindow(cursor, GW_HWNDPREV);
+        }
+        false
     };
     unsafe {
         let owner = CreateWindowExW(
@@ -960,13 +976,58 @@ fn hovering_a_target_shows_its_hint_in_the_center_and_leaving_hides_it() {
         assert!(!owner.is_null(), "a janela tem de nascer");
         SetActiveWindow(owner);
 
-        // O rato para no minimizar, passa para o fechar e o temporizador
-        // dispara (aqui sem esperar os 450 ms).
+        // Cria primeiro a dica, depois um divisor owned (como no comparador),
+        // e verifica que mostrar a dica ou chamar raise_hint_if_visible() a
+        // mantem sempre na frente do divisor na ordem Z.
         hover_tooltip(owner, "Minimizar");
+        show_pending_tooltip();
+        let splitter = CreateWindowExW(
+            AUX_POPUP_EX_STYLE,
+            windows_sys::w!("STATIC"),
+            windows_sys::w!(""),
+            AUX_POPUP_STYLE,
+            100,
+            100,
+            7,
+            400,
+            owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        assert!(!splitter.is_null());
+        SetWindowPos(
+            splitter,
+            std::ptr::null_mut(),
+            100,
+            100,
+            7,
+            400,
+            SWP_NOACTIVATE,
+        );
+        show_popup_without_activation(splitter);
+
+        // O rato passa para o fechar e o temporizador dispara.
         hover_tooltip(owner, "Fechar");
         show_pending_tooltip();
         let hint = HINT_HWND.load(Ordering::Acquire) as HWND;
         let shown = !hint.is_null() && IsWindowVisible(hint) != 0;
+        let above_on_show = is_above(hint, splitter);
+
+        // Mesmo se o divisor se reposicionar enquanto a dica esta visivel,
+        // raise_hint_if_visible() devolve a dica para a frente.
+        SetWindowPos(
+            splitter,
+            std::ptr::null_mut(),
+            120,
+            100,
+            7,
+            400,
+            SWP_NOACTIVATE,
+        );
+        raise_hint_if_visible();
+        let above_after_relayout = is_above(hint, splitter);
+
         let text = HINT_TEXT
             .lock()
             .map(|value| value.clone())
@@ -987,9 +1048,18 @@ fn hovering_a_target_shows_its_hint_in_the_center_and_leaving_hides_it() {
         // O rato sai de todos os alvos.
         hover_tooltip(owner, "");
         let hidden = IsWindowVisible(hint) == 0;
+        DestroyWindow(splitter);
         DestroyWindow(owner);
 
         assert!(shown, "a dica nao apareceu depois do atraso");
+        assert!(
+            above_on_show,
+            "a dica tem de ficar a frente das barras de redimensionamento ao aparecer"
+        );
+        assert!(
+            above_after_relayout,
+            "a dica tem de continuar a frente das barras de redimensionamento apos relayout"
+        );
         assert_eq!(text, "Fechar", "a dica nao acompanhou o rato");
         assert_eq!(active, owner, "a dica roubou a ativacao a janela");
         assert!(
@@ -11556,6 +11626,7 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::WindowMinimize, None),
         (BarHit::WindowMaximize, None),
         (BarHit::WindowClose, Some(Exit)),
+        (BarHit::AddressBar, None),
     ];
     for (hit, expected) in hits {
         assert_eq!(bar_hit_command(hit), expected, "{hit:?}");
@@ -16688,11 +16759,15 @@ fn comparator_titlebar_reserves_address_without_overlapping_tabs() {
         [1, 0, 0],
     );
     assert_eq!(layout.context_tab_counts[0], 1);
+    let addr = title_address_rect(1600.0, 1.0, None);
     assert!(
-        layout.context_tabs[0][0].x + layout.context_tabs[0][0].width
-            <= title_address_rect(1600.0, 1.0, None).x,
+        layout.context_tabs[0][0].x + layout.context_tabs[0][0].width <= addr.x,
         "a primeira aba sobrepoe o endereco: {:?}",
         layout.context_tabs[0][0]
+    );
+    assert_eq!(
+        layout.hit(addr.x + addr.width / 2.0, addr.y + addr.height / 2.0),
+        Some(BarHit::AddressBar)
     );
 }
 

@@ -362,6 +362,7 @@ pub(in crate::windows_app) struct BarLayout {
     /// Quantas abas o "‹N" de cada coluna esconde (0: nao ha botao).
     pub(in crate::windows_app) tab_overflow_counts: [usize; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) columns_len: usize,
+    pub(in crate::windows_app) address: UiRect,
     pub(in crate::windows_app) window_minimize: UiRect,
     pub(in crate::windows_app) window_maximize: UiRect,
     pub(in crate::windows_app) window_close: UiRect,
@@ -440,6 +441,7 @@ impl BarLayout {
                 tab_overflow: [empty; COMPARATOR_COLUMNS],
                 tab_overflow_counts: [0; COMPARATOR_COLUMNS],
                 columns_len: 0,
+                address: empty,
                 window_minimize: empty,
                 window_maximize: empty,
                 window_close: empty,
@@ -767,6 +769,7 @@ impl BarLayout {
             tab_overflow: overflow,
             tab_overflow_counts: overflow_counts,
             columns_len,
+            address,
             window_minimize,
             window_maximize,
             window_close,
@@ -795,6 +798,9 @@ impl BarLayout {
         }
         if self.window_minimize.contains(x, y) {
             return Some(BarHit::WindowMinimize);
+        }
+        if self.address.contains(x, y) {
+            return Some(BarHit::AddressBar);
         }
         for index in 0..self.columns_len {
             if self.tab_overflow[index].contains(x, y) {

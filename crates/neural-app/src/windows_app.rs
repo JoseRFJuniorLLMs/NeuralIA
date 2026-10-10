@@ -565,6 +565,8 @@ pub(in crate::windows_app) enum BarHit {
     WindowMinimize,
     WindowMaximize,
     WindowClose,
+    /// A barra de endereço/URL na linha superior do comparador.
+    AddressBar,
 }
 
 /// O menu que o botao direito abre na barra.
@@ -1074,6 +1076,12 @@ static TOOLTIP_PENDING: Mutex<Option<(usize, String)>> = Mutex::new(None);
 static TOOLTIP_TIMER: AtomicUsize = AtomicUsize::new(0);
 /// O botao Home ja agendou a sua dica nesta passagem do rato.
 static HOME_TOOLTIP_ARMED: AtomicBool = AtomicBool::new(false);
+/// O EDIT da omnibox esta posicionado na barra de titulo do comparador (a 2.a barra).
+pub(in crate::windows_app) static OMNIBOX_IN_TITLE_BAR: AtomicBool = AtomicBool::new(false);
+/// O EDIT da barra de endereco ja agendou a sua dica nesta passagem do rato.
+pub(in crate::windows_app) static OMNIBOX_TOOLTIP_ARMED: AtomicBool = AtomicBool::new(false);
+pub(in crate::windows_app) const TITLE_ADDRESS_HINT: &str =
+    "Barra de endereço · digite uma URL, pesquisa ou comando (Ctrl+L)";
 const TOOLTIP_DELAY_MS: u32 = 450;
 /// Letra, margem, largura maxima e raio da dica, em pixels a 96 dpi.
 const HINT_FONT_PX: f64 = 20.0;
@@ -1151,6 +1159,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::WindowMinimize => caption_tooltip_label(0, maximized).to_string(),
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
+        BarHit::AddressBar => TITLE_ADDRESS_HINT.to_string(),
     })
 }
 
@@ -1850,11 +1859,44 @@ fn show_pending_tooltip() {
             &text,
             scale,
         );
+        SetWindowPos(
+            hint,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOSIZE
+                | SWP_NOACTIVATE,
+        );
         show_popup_without_activation(hint);
     }
     *HINT_TEXT
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = text;
+}
+
+/// Garante que a dica (quando visivel) continua na frente de todos os popups
+/// auxiliares (como as barras de redimensionamento das colunas).
+pub(in crate::windows_app) fn raise_hint_if_visible() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsWindowVisible, SWP_NOMOVE, SWP_NOSIZE};
+    let hint = HINT_HWND.load(Ordering::Acquire) as HWND;
+    if !hint.is_null() {
+        unsafe {
+            if IsWindowVisible(hint) != 0 {
+                SetWindowPos(
+                    hint,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
 }
 
 fn hide_tooltip() {

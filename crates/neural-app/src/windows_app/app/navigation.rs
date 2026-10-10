@@ -349,7 +349,28 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
         return 0;
     }
 
+    if message == WM_MOUSEMOVE {
+        if OMNIBOX_IN_TITLE_BAR.load(Ordering::Acquire)
+            && GetFocus() != hwnd
+            && !OMNIBOX_TOOLTIP_ARMED.swap(true, Ordering::AcqRel)
+        {
+            track_mouse_leave(hwnd);
+            hover_tooltip(hwnd, TITLE_ADDRESS_HINT);
+        }
+    } else if message == WM_MOUSELEAVE {
+        if OMNIBOX_TOOLTIP_ARMED.swap(false, Ordering::AcqRel) {
+            hover_tooltip(hwnd, "");
+        }
+    } else if message == WM_LBUTTONDOWN {
+        OMNIBOX_TOOLTIP_ARMED.store(false, Ordering::Release);
+        hover_tooltip(hwnd, "");
+    }
+
     if message == WM_SETFOCUS || message == WM_KILLFOCUS {
+        if message == WM_SETFOCUS {
+            OMNIBOX_TOOLTIP_ARMED.store(false, Ordering::Release);
+            hover_tooltip(hwnd, "");
+        }
         let parent = GetParent(hwnd);
         if !parent.is_null() {
             InvalidateRect(parent, std::ptr::null(), 0);
@@ -363,6 +384,8 @@ pub(in crate::windows_app) unsafe extern "system" fn omnibox_subclass(
     }
 
     if message == WM_KEYDOWN {
+        OMNIBOX_TOOLTIP_ARMED.store(false, Ordering::Release);
+        hover_tooltip(hwnd, "");
         let proxy = &*(reference_data as *const EventLoopProxy<UserEvent>);
         let ctrl = (GetAsyncKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
         let shift = (GetAsyncKeyState(VK_SHIFT as i32) as u16 & 0x8000) != 0;

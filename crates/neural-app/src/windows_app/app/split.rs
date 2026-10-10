@@ -662,6 +662,7 @@ impl App {
                 InvalidateRect(hwnd, std::ptr::null(), 0);
             }
         }
+        self.raise_overlay_popups();
     }
 
     pub(in crate::windows_app) fn resize_comparator(&mut self, divider: usize, screen_x: i32) {

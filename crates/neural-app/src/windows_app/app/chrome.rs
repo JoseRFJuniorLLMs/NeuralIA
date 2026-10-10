@@ -223,6 +223,10 @@ impl App {
         let address_visible = self.surface == Surface::Comparator
             && self.bar_visible()
             && title_address_rect(size.width as f64, scale, self.pomodoro_bar_label()).width > 0.0;
+        OMNIBOX_IN_TITLE_BAR.store(address_visible, Ordering::Release);
+        if !address_visible && OMNIBOX_TOOLTIP_ARMED.swap(false, Ordering::AcqRel) {
+            hover_tooltip(edit, "");
+        }
         let edit_focused = unsafe { GetFocus() == edit };
 
         // O mesmo EDIT nativo permanece vivo na Home e na barra de titulo.
@@ -821,6 +825,43 @@ impl App {
             show_popup_without_activation(card);
             InvalidateRect(card, std::ptr::null(), 0);
         }
+    }
+
+    /// Garante que dicas, avisos, toasts e cartoes continuam sempre na frente
+    /// das barras de redimensionamento (`self.splitters`) na ordem Z.
+    pub(in crate::windows_app) fn raise_overlay_popups(&self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SWP_NOMOVE, SWP_NOSIZE};
+        let raise = |hwnd: HWND| {
+            if !hwnd.is_null() {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        };
+        if let Some(card) = self.search_card_popup {
+            raise(card);
+        }
+        if let Some(palette) = &self.palette {
+            raise(palette.popup);
+        }
+        if let Some(rename) = &self.group_rename {
+            raise(rename.popup);
+        }
+        if let Some(toast) = self.toast {
+            raise(toast);
+        }
+        if let Some(splash) = self.splash {
+            raise(splash);
+        }
+        raise_hint_if_visible();
     }
 
     pub(in crate::windows_app) fn is_fullscreen_column(&self) -> bool {
