@@ -292,6 +292,13 @@ impl App {
                 SetWindowRgn(edit, rgn, 1);
             }
             apply_omnibox_interactivity(edit, self.surface);
+            let cue_text = if self.surface == Surface::Home {
+                "Pergunte algo ou cole uma URL"
+            } else {
+                "Digite aqui a URL"
+            };
+            let cue: Vec<u16> = cue_text.encode_utf16().chain(std::iter::once(0)).collect();
+            SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
             if self.surface == Surface::Comparator && !address_visible {
                 EnableWindow(edit, 0);
             }

@@ -2,6 +2,12 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.7] - 2026-10-10
+
+### Fixed
+- **Borda azul da Home sem interferência dos cantos do botão IA:** ajustado o afastamento lateral (`right_inset = 12.0 * scale`) e aplicado recorte interno com `SelectClipRgn` na pílula da barra de pesquisa da Home, eliminando completamente os dois pontos escuros que sobrepunham a linha de contorno azul próximo ao botão «Pesquisar com IA».
+- **Aviso e placeholder na segunda barra de pesquisa:** adicionado aviso textual de orientação (`EM_SETCUEBANNER`) com «Digite aqui a URL» exclusivamente na segunda barra de pesquisa (barra de endereço da barra de título / comparador), mantendo a barra de pesquisa da tela Home inalterada.
+
 ## [2.9.6] - 2026-10-09
 
 ### Fixed

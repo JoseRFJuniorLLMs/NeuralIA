@@ -56,8 +56,9 @@ use windows_sys::Win32::{
         DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
         DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
         GetStockObject, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient, SelectObject,
-        SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
+        PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient, SelectClipRgn,
+        SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
+        TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -3201,10 +3202,11 @@ impl HomeLayout {
         let row_width = (620.0 * scale).min(available);
         let row_height = 48.0 * scale;
         let inset = 6.0 * scale;
+        let right_inset = 12.0 * scale;
         let gap = 6.0 * scale;
         let ideal_ai = 150.0 * scale;
         let ideal_search = 92.0 * scale;
-        let chrome = inset * 2.0 + gap;
+        let chrome = inset + right_inset + gap;
         let room = (row_width - 80.0 * scale).max(chrome + 40.0 * scale);
         let fit = ((room - chrome) / (ideal_ai + ideal_search)).clamp(0.62, 1.0);
         let ai_w = ideal_ai * fit;
@@ -3229,7 +3231,7 @@ impl HomeLayout {
             height: row_height,
         };
         let go = UiRect {
-            x: input.x + input.width - inset - ai_w,
+            x: input.x + input.width - right_inset - ai_w,
             y: input.y + inset,
             width: ai_w,
             height: button_h,
@@ -6575,6 +6577,18 @@ fn draw_home(
             Some((border_color, border_width * scale)),
             theme.page_bg,
         );
+        let clip_inset = (border_width * scale).round() as i32;
+        let rgn = CreateRoundRectRgn(
+            layout.input.x.round() as i32 + clip_inset,
+            layout.input.y.round() as i32 + clip_inset,
+            (layout.input.x + layout.input.width).round() as i32 - clip_inset + 1,
+            (layout.input.y + layout.input.height).round() as i32 - clip_inset + 1,
+            (layout.input.height - 2.0 * clip_inset as f64).round() as i32,
+            (layout.input.height - 2.0 * clip_inset as f64).round() as i32,
+        );
+        if !rgn.is_null() {
+            SelectClipRgn(target, rgn);
+        }
         draw_pill(
             target,
             layout.search,
@@ -6602,6 +6616,10 @@ fn draw_home(
             body_font,
             theme.surface,
         );
+        if !rgn.is_null() {
+            SelectClipRgn(target, std::ptr::null_mut());
+            DeleteObject(rgn as _);
+        }
 
         if let Some(message) = status {
             SelectObject(target, small_font as _);
