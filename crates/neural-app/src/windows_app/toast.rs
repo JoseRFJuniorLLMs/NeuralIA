@@ -263,62 +263,7 @@ pub(in crate::windows_app) unsafe extern "system" fn toast_subclass(
 
 /// Os 4 tons das notificações (erro, aviso, informação, sucesso) com as
 /// respetivas cores e ícones correspondentes, desenhados com borda redonda.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::windows_app) enum ToastTone {
-    Error,
-    Warning,
-    Info,
-    Success,
-}
-
-impl ToastTone {
-    pub(in crate::windows_app) fn of(title: &str, body: &str) -> Self {
-        let t = title.to_lowercase();
-        let b = body.to_lowercase();
-        if t.contains("bloqueado")
-            || t.contains("recusado")
-            || t.contains("erro")
-            || t.contains("falhou")
-            || b.contains("erro")
-            || b.contains("recusado")
-        {
-            Self::Error
-        } else if t.contains("aviso")
-            || t.contains("atenção")
-            || b.contains("macros")
-            || b.contains("programas")
-            || b.contains("não conseguiu ver")
-        {
-            Self::Warning
-        } else if t.contains("concluído")
-            || t.contains("sucesso")
-            || t.contains("salvo")
-            || b.contains("concluído")
-        {
-            Self::Success
-        } else {
-            Self::Info
-        }
-    }
-
-    pub(in crate::windows_app) fn color(self) -> Rgb {
-        match self {
-            Self::Error => (244, 67, 54),   // Vermelho (Error alert)
-            Self::Warning => (255, 152, 0), // Âmbar / Laranja (Warning alert)
-            Self::Info => (33, 150, 243),   // Azul (Info alert)
-            Self::Success => (76, 175, 80), // Verde (Success alert)
-        }
-    }
-
-    pub(in crate::windows_app) fn glyph(self) -> &'static str {
-        match self {
-            Self::Error => "!",
-            Self::Warning => "⚠",
-            Self::Info => "ℹ",
-            Self::Success => "✓",
-        }
-    }
-}
+pub(in crate::windows_app) type ToastTone = HintTone;
 
 /// Titulo na cor de destaque do alerta, corpo legível, os botões
 /// como pílulas à direita e borda redonda na cor respectiva do tom.
@@ -331,7 +276,7 @@ unsafe fn paint_toast(hdc: *mut core::ffi::c_void, client: &RECT, view: Option<&
     };
     let theme = Theme::system();
     let scale = toast_scale(client);
-    let tone = ToastTone::of(&view.title, &view.body);
+    let tone = ToastTone::of_title_body(&view.title, &view.body);
     let tone_color = tone.color();
 
     // Fundo e borda redonda na cor respectiva do alerta.

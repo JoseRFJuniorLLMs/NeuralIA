@@ -53,12 +53,12 @@ use windows_sys::Win32::{
         BeginPaint, BitBlt, CLEARTYPE_QUALITY, ClientToScreen, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
         CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
-        DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-        DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
-        GetStockObject, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient, SelectClipRgn,
-        SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits,
-        TRANSPARENT,
+        DT_EDITCONTROL, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+        DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL,
+        FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH,
+        OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient,
+        SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
+        StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -1522,17 +1522,113 @@ fn hint_popup(root: HWND) -> Option<HWND> {
     }
 }
 
+/// Os 4 tipos de mensagens (erro, aviso, informação, sucesso) com as respetivas
+/// cores e ícones correspondentes, desenhados com contorno arredondado e linhas coloridas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum HintTone {
+    Error,
+    Warning,
+    Info,
+    Success,
+}
+
+impl HintTone {
+    pub(in crate::windows_app) fn of(text: &str) -> Self {
+        let t = text.to_lowercase();
+        if t.contains("erro")
+            || t.contains("falh")
+            || t.contains("bloquead")
+            || t.contains("recusad")
+            || t.contains("impossível")
+            || t.contains("impossivel")
+            || t.contains("não foi possível")
+            || t.contains("nao foi possivel")
+            || t.contains("não consegui")
+            || t.contains("nao consegui")
+            || t.contains("não respondeu")
+            || t.contains("nao respondeu")
+            || t.contains("inválid")
+            || t.contains("invalid")
+            || t.contains("corrompid")
+            || t.contains("perigo")
+            || t.contains("cancelad")
+        {
+            Self::Error
+        } else if t.contains("aviso")
+            || t.contains("atenção")
+            || t.contains("atencao")
+            || t.contains("cuidado")
+            || t.contains("alerta")
+            || t.contains("selecione")
+            || t.contains("já está")
+            || t.contains("ja esta")
+            || t.contains("já foi")
+            || t.contains("ja foi")
+            || t.contains("expirar")
+            || t.contains("espera")
+            || t.contains("limite")
+            || t.contains("macros")
+            || t.contains("programas")
+            || t.contains("não conseguiu ver")
+        {
+            Self::Warning
+        } else if t.contains("sucesso")
+            || t.contains("concluíd")
+            || t.contains("concluid")
+            || t.contains("salvo")
+            || t.contains("salva")
+            || t.contains("criad")
+            || t.contains("ativad")
+            || t.contains("restaurad")
+            || t.contains("copiad")
+            || t.contains("adicionad")
+            || t.contains("movido")
+            || t.contains("movida")
+            || t.contains("pronto")
+            || t.contains("online")
+        {
+            Self::Success
+        } else {
+            Self::Info
+        }
+    }
+
+    pub(in crate::windows_app) fn of_title_body(title: &str, body: &str) -> Self {
+        let combined = format!("{title} {body}");
+        Self::of(&combined)
+    }
+
+    pub(in crate::windows_app) fn color(self) -> Rgb {
+        match self {
+            Self::Error => (244, 67, 54),   // Vermelho (#f44336)
+            Self::Warning => (255, 152, 0), // Âmbar / Laranja (#ff9800)
+            Self::Info => (33, 150, 243),   // Azul (#2196f3)
+            Self::Success => (76, 175, 80), // Verde (#4caf50)
+        }
+    }
+
+    pub(in crate::windows_app) fn glyph(self) -> &'static str {
+        match self {
+            Self::Error => "!",
+            Self::Warning => "⚠",
+            Self::Info => "ℹ",
+            Self::Success => "✓",
+        }
+    }
+}
+
 /// Raio da dica: pilula, como os botoes (metade da altura), limitado para
 /// dicas de varias linhas nao ficarem ovais.
 fn hint_radius(height: f64, scale: f64) -> f64 {
     (height / 2.0).min(28.0 * scale.max(1.0))
 }
 
-/// Aplica a forma da dica a um bitmap BGRA ja pintado (fundo + texto):
-/// cobertura suave pela distancia ao rectangulo arredondado, um fio de borda
-/// na cor dos botoes e o resultado PRE-MULTIPLICADO, como o
-/// UpdateLayeredWindow exige. O recorte por regiao do GDI deixava escadinhas.
+/// Aplica a forma da dica a um bitmap BGRA ja pintado (fundo + texto + icone):
+/// cobertura suave pela distancia ao rectangulo arredondado, contorno nitido
+/// na cor do tom (erro, aviso, info, sucesso) e o resultado PRE-MULTIPLICADO,
+/// como o UpdateLayeredWindow exige.
 fn apply_hint_shape(pixels: &mut [u8], width: usize, height: usize, radius: f32, line: Rgb) {
+    let border_width = 1.6f32;
     for y in 0..height {
         for x in 0..width {
             let distance = round_rect_sdf(
@@ -1542,19 +1638,19 @@ fn apply_hint_shape(pixels: &mut [u8], width: usize, height: usize, radius: f32,
                 height as f32,
                 radius,
             );
-            let coverage = (0.5 - distance).clamp(0.0, 1.0);
-            // Fio de 1 px por dentro do contorno.
-            let border = (1.0 - (distance + 1.0).abs()).clamp(0.0, 1.0);
+            let outer_cov = (0.5 - distance).clamp(0.0, 1.0);
+            let inner_cov = (0.5 - (distance + border_width)).clamp(0.0, 1.0);
+            let border = (outer_cov - inner_cov).max(0.0);
             let index = (y * width + x) * 4;
             let Some(pixel) = pixels.get_mut(index..index + 4) else {
                 return;
             };
             for (channel, target) in [(0, line.2), (1, line.1), (2, line.0)] {
                 let base = pixel[channel] as f32;
-                let mixed = base + (target as f32 - base) * border;
-                pixel[channel] = (mixed * coverage).round() as u8;
+                let mixed = base * (1.0 - border) + (target as f32) * border;
+                pixel[channel] = (mixed * outer_cov).round() as u8;
             }
-            pixel[3] = (coverage * 255.0).round() as u8;
+            pixel[3] = (outer_cov * 255.0).round() as u8;
         }
     }
 }
@@ -1620,9 +1716,11 @@ fn render_hint(hint: HWND, x: i32, y: i32, width: i32, height: i32, text: &str, 
         }
         let old_bitmap = SelectObject(memory, bitmap as _);
 
-        // Fundo opaco e texto primeiro (o GDI nao escreve alfa); a forma vem
+        // Fundo opaco, icone e texto primeiro (o GDI nao escreve alfa); a forma vem
         // depois, pixel a pixel.
         let theme = Theme::system();
+        let tone = HintTone::of(text);
+        let tone_color = tone.color();
         let all = RECT {
             left: 0,
             top: 0,
@@ -1632,26 +1730,52 @@ fn render_hint(hint: HWND, x: i32, y: i32, width: i32, height: i32, text: &str, 
         let fill = CreateSolidBrush(rgb3(theme.surface));
         FillRect(memory, &all, fill);
         DeleteObject(fill as _);
-        let font = create_font(-(HINT_FONT_PX * scale).round() as i32, FW_NORMAL as i32);
-        let old_font = SelectObject(memory, font as _);
-        SetBkMode(memory, TRANSPARENT as i32);
-        SetTextColor(memory, rgb3(theme.fg));
+
         let pad_x = (HINT_PADDING_X_PX * scale).round() as i32;
         let pad_y = (HINT_PADDING_Y_PX * scale).round() as i32;
-        let mut area = RECT {
+        let icon_w = (18.0 * scale).round() as i32;
+        let icon_gap = (8.0 * scale).round() as i32;
+
+        // Ícone à esquerda na cor do tom (erro: vermelho, aviso: âmbar, info: azul, sucesso: verde)
+        let icon_font = create_font(-(16.0 * scale).round() as i32, FW_BOLD as i32);
+        let old_font = SelectObject(memory, icon_font as _);
+        SetBkMode(memory, TRANSPARENT as i32);
+        SetTextColor(memory, rgb3(tone_color));
+        let mut icon_rect = RECT {
             left: pad_x,
             top: pad_y,
-            right: width - pad_x,
+            right: pad_x + icon_w,
             bottom: height - pad_y,
+        };
+        draw_text(
+            memory,
+            tone.glyph(),
+            &mut icon_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+
+        // Texto da dica ao lado do ícone
+        let text_font = create_font(-(HINT_FONT_PX * scale).round() as i32, FW_NORMAL as i32);
+        SelectObject(memory, text_font as _);
+        DeleteObject(icon_font as _);
+        SetTextColor(memory, rgb3(theme.fg));
+
+        let (_, text_h) = hint_text_size(text, scale);
+        let text_top = pad_y + ((height - 2 * pad_y - text_h) / 2).max(0);
+        let mut area = RECT {
+            left: pad_x + icon_w + icon_gap,
+            top: text_top,
+            right: width - pad_x,
+            bottom: text_top + text_h.max(icon_w),
         };
         draw_text(
             memory,
             text,
             &mut area,
-            DT_CENTER | DT_WORDBREAK | DT_NOPREFIX,
+            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
         );
         SelectObject(memory, old_font);
-        DeleteObject(font as _);
+        DeleteObject(text_font as _);
 
         let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (width * height * 4) as usize);
         apply_hint_shape(
@@ -1659,7 +1783,7 @@ fn render_hint(hint: HWND, x: i32, y: i32, width: i32, height: i32, text: &str, 
             width as usize,
             height as usize,
             hint_radius(height as f64, scale) as f32,
-            theme.surface_line,
+            tone_color,
         );
 
         let position = POINT { x, y };
@@ -1702,8 +1826,13 @@ fn show_pending_tooltip() {
     let scale = screen_scale();
     let pad_x = (HINT_PADDING_X_PX * scale).round() as i32;
     let pad_y = (HINT_PADDING_Y_PX * scale).round() as i32;
+    let icon_w = (18.0 * scale).round() as i32;
+    let icon_gap = (8.0 * scale).round() as i32;
     let (text_w, text_h) = hint_text_size(&text, scale);
-    let (width, height) = (text_w + 2 * pad_x, text_h + 2 * pad_y);
+    let (width, height) = (
+        text_w + icon_w + icon_gap + 2 * pad_x,
+        text_h.max(icon_w) + 2 * pad_y,
+    );
     unsafe {
         let mut client = RECT::default();
         if GetClientRect(root, &mut client) == 0 {

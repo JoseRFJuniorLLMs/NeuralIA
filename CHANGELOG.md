@@ -2,6 +2,18 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.8] - 2026-10-10
+
+### Fixed
+- **Auditoria e padronização visual das mensagens de hint e avisos flutuantes:** resolvido o problema onde as mensagens de dica (tooltips de botões, abas, ferramentas e navegação) e avisos em tela cheia utilizavam borda cinza padrão sem ícones ou tons semânticos.
+- **4 tons de mensagens com contorno arredondado, linhas coloridas e ícones:**
+  - **Erro:** contorno vermelho nítido (`#f44336`), ícone `!` à esquerda e texto informativo.
+  - **Aviso:** contorno âmbar/laranja (`#ff9800`), ícone `⚠` à esquerda e texto informativo.
+  - **Informação:** contorno azul (`#2196f3`), ícone `ℹ` à esquerda e texto informativo.
+  - **Sucesso:** contorno verde (`#4caf50`), ícone `✓` à esquerda e texto informativo.
+- **Renderização de contorno suave com anti-aliasing via SDF:** `apply_hint_shape` atualizado com SDF suavizado de ~1.6px na cor viva do tom com pré-multiplicação de alfa exata para `UpdateLayeredWindow`.
+- **Avisos de splash e notificações unificados:** `splash.rs` e `toast.rs` compartilham o mesmo enum e comportamento `HintTone`, garantindo consistência visual em toda a aplicação.
+
 ## [2.9.7] - 2026-10-10
 
 ### Fixed

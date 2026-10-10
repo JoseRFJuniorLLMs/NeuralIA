@@ -4228,6 +4228,35 @@ fn hint_is_a_smooth_pill_like_the_buttons() {
 }
 
 #[test]
+fn hint_tones_have_four_colors_glyphs_and_semantic_mapping() {
+    assert_eq!(HintTone::of("Erro na conexão"), HintTone::Error);
+    assert_eq!(HintTone::of("Falhou ao salvar"), HintTone::Error);
+    assert_eq!(
+        HintTone::of("Não foi possível carregar a página"),
+        HintTone::Error
+    );
+    assert_eq!(HintTone::of("Aviso de expiração"), HintTone::Warning);
+    assert_eq!(
+        HintTone::of("Atenção: selecione um texto"),
+        HintTone::Warning
+    );
+    assert_eq!(HintTone::of("Nota criada"), HintTone::Success);
+    assert_eq!(HintTone::of("Salvo com sucesso"), HintTone::Success);
+    assert_eq!(HintTone::of("Voltar à Home"), HintTone::Info);
+    assert_eq!(HintTone::of("Minimizar"), HintTone::Info);
+
+    assert_eq!(HintTone::Error.color(), (244, 67, 54));
+    assert_eq!(HintTone::Warning.color(), (255, 152, 0));
+    assert_eq!(HintTone::Info.color(), (33, 150, 243));
+    assert_eq!(HintTone::Success.color(), (76, 175, 80));
+
+    assert_eq!(HintTone::Error.glyph(), "!");
+    assert_eq!(HintTone::Warning.glyph(), "⚠");
+    assert_eq!(HintTone::Info.glyph(), "ℹ");
+    assert_eq!(HintTone::Success.glyph(), "✓");
+}
+
+#[test]
 fn an_open_side_panel_shrinks_the_comparator_instead_of_covering_it() {
     let columns = BarColumns {
         panel_width: 440.0,

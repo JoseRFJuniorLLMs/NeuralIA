@@ -137,16 +137,7 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
             if GetClientRect(hwnd, &mut client) != 0 {
                 let theme = Theme::system();
                 let height = (client.bottom - client.top) as f64;
-
-                let background = CreateSolidBrush(rgb3(theme.surface));
-                FillRect(hdc, &client, background);
-                DeleteObject(background as _);
-
-                let scale = (height / SPLASH_HEIGHT).max(1.0);
-                let font = create_font((-14.0 * scale) as i32, FW_NORMAL as i32);
-                let old_font = SelectObject(hdc, font as _);
-                SetBkMode(hdc, TRANSPARENT as i32);
-                SetTextColor(hdc, rgb3(theme.fg));
+                let scale: f64 = (height / SPLASH_HEIGHT).max(1.0);
 
                 let text_guard = SPLASH_TEXT.lock();
                 let text: &str = match text_guard {
@@ -155,6 +146,15 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                 };
 
                 if let Some(question) = question {
+                    let background = CreateSolidBrush(rgb3(theme.surface));
+                    FillRect(hdc, &client, background);
+                    DeleteObject(background as _);
+
+                    let font = create_font((-14.0 * scale) as i32, FW_NORMAL as i32);
+                    let old_font = SelectObject(hdc, font as _);
+                    SetBkMode(hdc, TRANSPARENT as i32);
+                    SetTextColor(hdc, rgb3(theme.fg));
+
                     let buttons = splash_buttons(&client, question.buttons.len());
                     let first = buttons.first().map_or(client.right, |button| button.left);
                     let mut asked = RECT {
@@ -188,18 +188,77 @@ pub(in crate::windows_app) unsafe extern "system" fn splash_subclass(
                         };
                         draw_pill(hdc, pill, button.label, style, scale, font, theme.surface);
                     }
+                    SelectObject(hdc, old_font);
+                    DeleteObject(font as _);
                 } else {
-                    let mut rect = client;
+                    let tone = HintTone::of(text);
+                    let tone_color = tone.color();
+
+                    // Borda arredondada na cor do tom (erro: vermelho, aviso: âmbar, info: azul, sucesso: verde)
+                    let pen = CreatePen(
+                        PS_SOLID,
+                        (2.0 * scale).round().max(1.0) as i32,
+                        rgb3(tone_color),
+                    );
+                    let brush = CreateSolidBrush(rgb3(theme.surface));
+                    let old_pen = SelectObject(hdc, pen as _);
+                    let old_brush = SelectObject(hdc, brush as _);
+                    let r = height as i32;
+                    RoundRect(
+                        hdc,
+                        client.left,
+                        client.top,
+                        client.right,
+                        client.bottom,
+                        r,
+                        r,
+                    );
+                    SelectObject(hdc, old_brush);
+                    SelectObject(hdc, old_pen);
+                    DeleteObject(brush as _);
+                    DeleteObject(pen as _);
+
+                    SetBkMode(hdc, TRANSPARENT as i32);
+
+                    // Ícone à esquerda na cor do tom
+                    let icon_w = (20.0 * scale).round() as i32;
+                    let icon_font = create_font((-16.0 * scale) as i32, FW_BOLD as i32);
+                    let old_font = SelectObject(hdc, icon_font as _);
+                    SetTextColor(hdc, rgb3(tone_color));
+                    let mut icon_rect = RECT {
+                        left: client.left + (16.0 * scale) as i32,
+                        top: client.top,
+                        right: client.left + (16.0 * scale) as i32 + icon_w,
+                        bottom: client.bottom,
+                    };
+                    draw_text(
+                        hdc,
+                        tone.glyph(),
+                        &mut icon_rect,
+                        DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
+                    );
+
+                    // Texto do aviso na cor do primeiro plano
+                    let font = create_font((-14.0 * scale) as i32, FW_NORMAL as i32);
+                    SelectObject(hdc, font as _);
+                    DeleteObject(icon_font as _);
+                    SetTextColor(hdc, rgb3(theme.fg));
+
+                    let mut rect = RECT {
+                        left: client.left + (16.0 * scale) as i32 + icon_w + (10.0 * scale) as i32,
+                        top: client.top,
+                        right: client.right - (16.0 * scale) as i32,
+                        bottom: client.bottom,
+                    };
                     draw_text(
                         hdc,
                         text,
                         &mut rect,
-                        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                     );
+                    SelectObject(hdc, old_font);
+                    DeleteObject(font as _);
                 }
-
-                SelectObject(hdc, old_font);
-                DeleteObject(font as _);
             }
             EndPaint(hwnd, &paint);
         }
