@@ -2,6 +2,24 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.0.0] - 2026-10-10
+
+### Added
+- **SPEC-0117 — Gemini Live Omnipotent Agent & Native Browser Tooling Architecture (40 ferramentas / 12 subsistemas):** o Gemini Live passa a atuar como o sistema operacional cognitivo e agente executivo de voz/visão em tempo real do NeuralIA, com suporte completo a `functionDeclarations` assíncronos (`NON_BLOCKING`) no WebSocket `BidiGenerateContent` e ponte bidirecional segura `LiveMessage::ToolCall` ↔ `execute_live_tool_call` ↔ `sendToolResponse`:
+  1. **Navegação, Abas, Split View & Modo de Leitura (`nav_*`):** abrir URLs, pesquisar nas 3 IAs (`Gemini` + `ChatGPT` + `Claude`) ou Google AI Mode, listar/alternar/fechar abas, controlar Split View, alternar Reader Mode e navegar no histórico (`back`/`forward`/`reload`).
+  2. **Automação DOM & Interação Visual (`dom_*`):** leitura estruturada da página ativa (título, URL, headings, texto visível e controles interativos), clique semântico, preenchimento de campos, rolagem e destaque visual de elementos na tela.
+  3. **Gravação de Tela, Snapshot Visual & Captura (`media_*`):** iniciar/parar gravação de vídeo e áudio da sessão (`ScreenRecorder`), capturar snapshots e extrair texto estruturado da visão/DOM.
+  4. **Tradução Simultânea, Dublagem & Legendas ao Vivo (`babel_*`):** tradução em tempo real (voz e overlay), legendagem ao vivo (`Live Captions` CC) para vídeos/chamadas com histórico rolável e tradução do DOM da página.
+  5. **Co-Piloto de Reuniões — Teams, Meet & Zoom (`meeting_*`):** modo co-piloto com escuta ativa de reuniões, geração de ata executiva estruturada (tópicos, decisões e *action items* salvos no Zettelkasten) e sugestão silenciosa de respostas na HUD.
+  6. **Leitura Imersiva, Narração & Podcast (`reader_*`):** leitura em voz alta de artigos/seleções com destaque sincronizado e geração de resumo falado estilo *Audio Overview*.
+  7. **Memória Semântica, Zettelkasten & Obsidian (`knowledge_*`):** busca híbrida FTS5 + vetorial na memória local, criação de notas Zettelkasten com tags, sincronização com cofre Obsidian e síntese/exportação de sessões de pesquisa.
+  8. **Acesso Completo ao Histórico Temporal, Timeline & Sessões (`history_*`):** pesquisa textual e por filtro temporal no histórico (`HistoryStore`), listagem de visitas recentes, navegação por âncoras da Timeline Semântica, reabertura de entradas históricas e limpeza controlada de histórico por janela de tempo.
+  9. **Comunicação & Produtividade — Gmail, Outlook & WhatsApp (`comm_*`):** abertura e leitura de contexto nos painéis nativos de comunicação e preparação de rascunhos assistidos por voz com confirmação explícita do usuário.
+  10. **Downloads, Arquivos Locais & PDFs (`files_*`):** inspeção da fila de downloads (`Ctrl+J`) e leitura/resumo de PDFs abertos no visor nativo.
+  11. **Privacidade, Segurança & Controle de Sessão (`privacy_*`):** alternância de modo privado/incógnito e auditoria em tempo real do estado de privacidade e redação DPAPI.
+  12. **Controle de Janela & UI Nativa (`ui_*`):** alternância de tema (`dark`/`light`), tela cheia (`F11`) e minimização do painel Gemini Live mantendo a sessão de voz e visão ativa em segundo plano.
+- **HUD de Ferramentas e Legendas no Painel Gemini Live (`live.html` / `live.css` / `live.js`):** adicionada barra de status de ferramentas ativas (`CC Legendas`, `REC Gravação`, `Tradutor`, `Co-Piloto`), caixa de legendas ao vivo (`#captions-box`) e log dedicado de execução de ferramentas (`.line.tool`).
+
 ## [2.9.9] - 2026-10-10
 
 ### Fixed

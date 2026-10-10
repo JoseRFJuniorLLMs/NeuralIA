@@ -24,7 +24,15 @@
   const errorKey = $('error-key');
   const cam = $('cam');
   const log = $('log');
+  const captionsBox = $('captions-box');
+  const captionsText = $('captions-text');
   const toggles = { screen: $('t-screen'), camera: $('t-camera'), mic: $('t-mic') };
+  const toolPills = {
+    captions: $('t-captions'),
+    record: $('t-record'),
+    translate: $('t-translate'),
+    copilot: $('t-copilot')
+  };
 
   // A tela vai para um <video> fora do DOM; o frame e composto num canvas.
   const screenVideo = document.createElement('video');
@@ -37,6 +45,12 @@
   let session = null;
   let lastRole = null;
   let lastLine = null;
+  let captionsEnabled = false;
+  let interpreterEnabled = false;
+  let copilotEnabled = false;
+  let recordingActive = false;
+  let transcriptEntries = [];
+  const toolLines = new Map();
 
   // Um aviso por motivo, cada um apagado so quando o seu motivo acaba: o da
   // chave que nao foi salva, o de cada fonte que nao ligou e o do som que
@@ -101,6 +115,48 @@
     }
   }
 
+  function setToolPill(which, on) {
+    const pill = toolPills[which];
+    if (pill) pill.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+
+  function setCaptionsMode(on) {
+    captionsEnabled = !!on;
+    setToolPill('captions', captionsEnabled);
+    if (captionsBox) {
+      captionsBox.hidden = !captionsEnabled;
+      if (captionsEnabled && captionsText && !captionsText.textContent) {
+        captionsText.textContent = 'Legendas ao vivo ativas…';
+      }
+    }
+  }
+
+  function setRecordingMode(action) {
+    if (action === 'stop') recordingActive = false;
+    else if (action === 'start' || action === 'resume') recordingActive = true;
+    setToolPill('record', recordingActive);
+  }
+
+  function setInterpreterMode(on) {
+    interpreterEnabled = !!on;
+    setToolPill('translate', interpreterEnabled);
+  }
+
+  function setCopilotMode(on) {
+    copilotEnabled = !!on;
+    setToolPill('copilot', copilotEnabled);
+  }
+
+  function resetModes() {
+    setCaptionsMode(false);
+    setRecordingMode('stop');
+    setInterpreterMode(false);
+    setCopilotMode(false);
+    transcriptEntries = [];
+    toolLines.clear();
+    if (captionsText) captionsText.textContent = '';
+  }
+
   function transcript(role, text) {
     if (role !== lastRole || !lastLine) {
       lastLine = document.createElement('p');
@@ -111,15 +167,93 @@
       lastLine.appendChild(document.createTextNode(''));
       log.appendChild(lastLine);
       lastRole = role;
+      transcriptEntries.push({ role, text: '' });
+      if (transcriptEntries.length > 200) transcriptEntries.shift();
       while (log.childElementCount > 200) log.removeChild(log.firstElementChild);
     }
     lastLine.lastChild.textContent += text;
+    if (transcriptEntries.length) {
+      transcriptEntries[transcriptEntries.length - 1].text += text;
+    }
+    if (captionsEnabled && captionsText) {
+      const prefix = role === 'user' ? 'Você: ' : 'Gemini: ';
+      captionsText.textContent = prefix + lastLine.lastChild.textContent;
+    }
     log.scrollTop = log.scrollHeight;
+  }
+
+  function collectTranscriptMarkdown() {
+    return transcriptEntries
+      .map((item) => '**' + (item.role === 'user' ? 'Você' : 'Gemini') + ':** ' + item.text.trim())
+      .filter((line) => line.length > 0)
+      .join('\n\n')
+      .slice(0, 1800);
   }
 
   function turnComplete() {
     lastRole = null;
     lastLine = null;
+  }
+
+  function appendToolLine(id, name, summary) {
+    lastRole = null;
+    lastLine = null;
+    const line = document.createElement('p');
+    line.className = 'line tool';
+    const label = document.createElement('b');
+    label.textContent = '⚡ ' + name + ': ';
+    const detail = document.createTextNode(summary || 'executando…');
+    line.appendChild(label);
+    line.appendChild(detail);
+    log.appendChild(line);
+    while (log.childElementCount > 200) log.removeChild(log.firstElementChild);
+    log.scrollTop = log.scrollHeight;
+    if (id) toolLines.set(String(id), detail);
+  }
+
+  function handleToolCall(call) {
+    if (!call || typeof call.name !== 'string') return;
+    const id = String(call.id || call.name);
+    const name = call.name;
+    const params =
+      call.args && typeof call.args === 'object' && !Array.isArray(call.args)
+        ? Object.assign({}, call.args)
+        : {};
+
+    if (name === 'captions_live_overlay') {
+      setCaptionsMode(params.enabled !== false);
+    } else if (name === 'recorder_screen') {
+      setRecordingMode(String(params.action || 'start'));
+      if (params.action === 'stop' && !params.transcript) {
+        params.transcript = collectTranscriptMarkdown();
+      }
+    } else if (name === 'recorder_clip_last' || name === 'captions_export') {
+      if (!params.transcript) params.transcript = collectTranscriptMarkdown();
+    } else if (name === 'translate_live_audio') {
+      setInterpreterMode(params.enabled !== false);
+    } else if (name === 'meeting_copilot_mode') {
+      setCopilotMode(params.enabled !== false);
+    } else if (name === 'meeting_summarize_so_far') {
+      if (!params.summary) params.summary = collectTranscriptMarkdown();
+    }
+
+    appendToolLine(id, name, 'executando…');
+    post('tool_call', { id, name, params });
+  }
+
+  function toolResponse(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const id = String(payload.id || payload.name || '');
+    const name = String(payload.name || '');
+    const result = payload.result && typeof payload.result === 'object' ? payload.result : { ok: true };
+    const node = toolLines.get(id);
+    if (node) {
+      node.textContent = String(result.summary || (result.ok === false ? 'erro' : 'concluído'));
+      toolLines.delete(id);
+    }
+    if (session && typeof session.sendToolResponse === 'function') {
+      session.sendToolResponse(id, name, result, payload.scheduling);
+    }
   }
 
   function attach(video, stream) {
@@ -192,6 +326,7 @@
     sources: renderSources,
     transcript,
     turnComplete,
+    toolCall: handleToolCall,
     // A sessao acabou sem o utilizador a desligar: o nativo tira o vermelho
     // do olho, porque ja nada sai.
     ended() {
@@ -207,6 +342,7 @@
   };
 
   function stopSession() {
+    resetModes();
     if (session) {
       session.stop();
       session = null;
@@ -303,6 +439,46 @@
       session[setters[name]](on);
     });
   }
+  if (toolPills.captions) {
+    toolPills.captions.addEventListener('click', () => {
+      if (!session) return;
+      handleToolCall({
+        id: 'ui-captions',
+        name: 'captions_live_overlay',
+        args: { enabled: !captionsEnabled }
+      });
+    });
+  }
+  if (toolPills.record) {
+    toolPills.record.addEventListener('click', () => {
+      if (!session) return;
+      handleToolCall({
+        id: 'ui-record',
+        name: 'recorder_screen',
+        args: { action: recordingActive ? 'stop' : 'start' }
+      });
+    });
+  }
+  if (toolPills.translate) {
+    toolPills.translate.addEventListener('click', () => {
+      if (!session) return;
+      handleToolCall({
+        id: 'ui-translate',
+        name: 'translate_live_audio',
+        args: { enabled: !interpreterEnabled, target_lang: 'pt-BR' }
+      });
+    });
+  }
+  if (toolPills.copilot) {
+    toolPills.copilot.addEventListener('click', () => {
+      if (!session) return;
+      handleToolCall({
+        id: 'ui-copilot',
+        name: 'meeting_copilot_mode',
+        args: { enabled: !copilotEnabled }
+      });
+    });
+  }
   // O som (e o worklet do microfone) so arranca depois de um gesto na pagina
   // quando o painel abre sem nenhum: o primeiro clique retoma o contexto.
   document.addEventListener(
@@ -319,7 +495,7 @@
   window.addEventListener('pagehide', stopSession);
 
   Object.defineProperty(window, '__neuraliaLive', {
-    value: Object.freeze({ theme, start, askKey }),
+    value: Object.freeze({ theme, start, askKey, toolResponse }),
     writable: false,
     configurable: false
   });

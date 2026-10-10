@@ -193,6 +193,61 @@ pub(crate) fn validate_live_key(raw: &str) -> Option<LiveKey> {
     valid.then(|| LiveKey(key.to_string()))
 }
 
+/// Todas as 40 ferramentas nativas expostas ao Gemini Live (SPEC-0117).
+pub(crate) const LIVE_TOOL_NAMES: &[&str; 40] = &[
+    "history_list_recent",
+    "history_search",
+    "history_reopen",
+    "history_clear",
+    "memory_semantic_query",
+    "memory_timeline_browse",
+    "browser_search_ai",
+    "browser_navigate",
+    "browser_layout",
+    "browser_tabs",
+    "browser_dom_action",
+    "consensus_compare_columns",
+    "research_session_manage",
+    "recorder_screen",
+    "recorder_clip_last",
+    "recorder_snapshot_ocr",
+    "translate_surface",
+    "translate_live_audio",
+    "translate_selection",
+    "captions_live_overlay",
+    "captions_export",
+    "meeting_open_or_join",
+    "meeting_copilot_mode",
+    "meeting_summarize_so_far",
+    "meeting_send_chat",
+    "reader_read_aloud",
+    "reader_navigate_doc",
+    "reader_highlight_and_note",
+    "notes_manage",
+    "notes_obsidian_graph",
+    "downloads_manage",
+    "library_documents",
+    "bookmarks_manage",
+    "services_panel",
+    "services_gmail_status",
+    "services_media_control",
+    "agents_hub_manage",
+    "focus_pomodoro",
+    "focus_anti_distraction",
+    "system_control",
+];
+
+pub(crate) fn is_known_live_tool(name: &str) -> bool {
+    LIVE_TOOL_NAMES.contains(&name)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) params: serde_json::Value,
+}
+
 /// O que a pagina do painel pode pedir. Lista fechada.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LiveMessage {
@@ -209,10 +264,12 @@ pub(crate) enum LiveMessage {
     Stopped,
     Close,
     Minimize,
+    /// Invocacao de ferramenta da SPEC-0117 validada contra a lista fechada.
+    ToolCall(LiveToolCall),
 }
 
-/// Chega para uma chave de 256 caracteres dentro do envelope.
-pub(crate) const LIVE_MESSAGE_MAX_BYTES: usize = 1024;
+/// Chega para uma chave de 256 caracteres ou chamada de ferramenta no envelope.
+pub(crate) const LIVE_MESSAGE_MAX_BYTES: usize = 4096;
 
 pub(crate) fn parse_live_message(body: &str) -> Option<LiveMessage> {
     if body.len() > LIVE_MESSAGE_MAX_BYTES {
@@ -235,6 +292,32 @@ pub(crate) fn parse_live_message(body: &str) -> Option<LiveMessage> {
         "save_key" => {
             let raw = envelope.get("args")?.get("key")?.as_str()?;
             Some(validate_live_key(raw).map_or(LiveMessage::InvalidKey, LiveMessage::SaveKey))
+        }
+        "tool_call" => {
+            let args = envelope.get("args")?.as_object()?;
+            if args
+                .keys()
+                .any(|field| !matches!(field.as_str(), "id" | "name" | "params"))
+            {
+                return None;
+            }
+            let id = args.get("id")?.as_str()?.trim();
+            let name = args.get("name")?.as_str()?.trim();
+            if id.is_empty() || id.len() > 128 || !is_known_live_tool(name) {
+                return None;
+            }
+            let params = args
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !params.is_object() {
+                return None;
+            }
+            Some(LiveMessage::ToolCall(LiveToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                params,
+            }))
         }
         _ => None,
     }
@@ -321,6 +404,21 @@ pub(crate) fn live_theme_script(theme: &serde_json::Value) -> String {
     live_call("theme", theme)
 }
 
+pub(crate) fn live_tool_response_script(
+    id: &str,
+    name: &str,
+    result: &serde_json::Value,
+) -> String {
+    live_call(
+        "toolResponse",
+        &serde_json::json!({
+            "id": id,
+            "name": name,
+            "result": result,
+        }),
+    )
+}
+
 /// O que fazer com uma mensagem do painel. Separado da janela para se testar:
 /// o `App` so corre o script devolvido ou fecha o painel.
 pub(crate) enum LiveStep {
@@ -334,6 +432,7 @@ pub(crate) enum LiveStep {
     Stopped,
     Close,
     Minimize,
+    Tool(LiveToolCall),
 }
 
 pub(crate) fn live_step(
@@ -371,6 +470,7 @@ pub(crate) fn live_step(
         LiveMessage::Stopped => LiveStep::Stopped,
         LiveMessage::Close => LiveStep::Close,
         LiveMessage::Minimize => LiveStep::Minimize,
+        LiveMessage::ToolCall(call) => LiveStep::Tool(call),
     }
 }
 
@@ -385,6 +485,7 @@ pub(crate) enum LiveAction {
     Run(String),
     Close,
     Minimize,
+    Tool(LiveToolCall),
     Nothing,
 }
 
@@ -490,6 +591,7 @@ impl<W> LivePanel<W> {
             }
             LiveStep::Close => LiveAction::Close,
             LiveStep::Minimize => LiveAction::Minimize,
+            LiveStep::Tool(call) => LiveAction::Tool(call),
         }
     }
 
@@ -718,6 +820,24 @@ return calls;
             parse_live_message(r#"{"action":"stopped","args":{}}"#),
             Some(LiveMessage::Stopped)
         );
+        assert_eq!(
+            parse_live_message(
+                r#"{"action":"tool_call","args":{"id":"c-1","name":"history_list_recent","params":{"limit":10}}}"#
+            ),
+            Some(LiveMessage::ToolCall(LiveToolCall {
+                id: "c-1".to_string(),
+                name: "history_list_recent".to_string(),
+                params: json!({ "limit": 10 }),
+            }))
+        );
+        for bad_tool in [
+            r#"{"action":"tool_call","args":{"id":"c-1","name":"unknown_tool","params":{}}}"#,
+            r#"{"action":"tool_call","args":{"id":"","name":"history_list_recent","params":{}}}"#,
+            r#"{"action":"tool_call","args":{"id":"c-1","name":"history_list_recent","params":"bad"}}"#,
+            r#"{"action":"tool_call","args":{"id":"c-1","name":"history_list_recent","extra":1}}"#,
+        ] {
+            assert_eq!(parse_live_message(bad_tool), None, "{bad_tool}");
+        }
         let save = |key: &str| json!({ "action": "save_key", "args": { "key": key } }).to_string();
         assert_eq!(
             parse_live_message(&save(&format!("  {TEST_KEY}\n"))),
@@ -948,6 +1068,7 @@ return calls;
             LiveStep::Stopped => ("<parou>".to_string(), Value::Null),
             LiveStep::Close => ("<fechar>".to_string(), Value::Null),
             LiveStep::Minimize => ("<minimizar>".to_string(), Value::Null),
+            LiveStep::Tool(call) => (format!("<tool:{}>", call.name), call.params),
         };
 
         // Primeira vez: pede a chave.
@@ -2078,6 +2199,157 @@ return out;
             parsed_posts(&out["posts"]),
             [LiveMessage::Ready, LiveMessage::Stopped, LiveMessage::Ready],
             "nem a colagem grande nem Conectar de novo apagam a chave"
+        );
+    }
+
+    #[test]
+    fn live_js_declares_all_40_tools_and_handles_tool_calls_and_responses() {
+        let out = node_core(
+            r#"
+const setup = core.setupMessage();
+const tools = setup.setup.tools[0].functionDeclarations;
+const parsed = core.parseToolCalls(JSON.stringify({
+  toolCall: {
+    functionCalls: [
+      { id: 'call-1', name: 'history_list_recent', args: { limit: 15 } },
+      { name: 'focus_pomodoro', args: { action: 'start', minutes: 25 } }
+    ]
+  },
+  toolCallCancellation: { ids: ['call-0'] }
+}));
+const resp = core.toolResponseMessage('call-1', 'history_list_recent', { ok: true, count: 3 });
+return {
+  names: tools.map((t) => t.name),
+  behaviors: tools.every((t) => t.behavior === 'NON_BLOCKING'),
+  descriptions: tools.every((t) => typeof t.description === 'string' && t.description.length > 10),
+  parsed,
+  resp
+};
+"#,
+            Value::Null,
+        );
+        let names: Vec<String> = out["names"]
+            .as_array()
+            .expect("nomes")
+            .iter()
+            .map(|v| v.as_str().expect("str").to_string())
+            .collect();
+        assert_eq!(
+            names,
+            LIVE_TOOL_NAMES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "a lista de ferramentas do JS e a lista fechada do Rust batem 1:1"
+        );
+        assert_eq!(out["behaviors"], true);
+        assert_eq!(out["descriptions"], true);
+        assert_eq!(
+            out["parsed"]["calls"],
+            json!([
+                { "id": "call-1", "name": "history_list_recent", "args": { "limit": 15 } },
+                { "id": "focus_pomodoro", "name": "focus_pomodoro", "args": { "action": "start", "minutes": 25 } }
+            ])
+        );
+        assert_eq!(out["parsed"]["cancelledIds"], json!(["call-0"]));
+        assert_eq!(
+            out["resp"],
+            json!({
+                "toolResponse": {
+                    "functionResponses": [{
+                        "id": "call-1",
+                        "name": "history_list_recent",
+                        "response": {
+                            "result": { "ok": true, "count": 3 },
+                            "scheduling": "WHEN_IDLE"
+                        }
+                    }]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn the_shipped_page_dispatches_tool_calls_and_returns_responses_to_websocket() {
+        let theme = json!({ "--bg": "#202124" });
+        let response_script = live_tool_response_script(
+            "srv-1",
+            "history_list_recent",
+            &json!({ "ok": true, "summary": "3 itens recentes do histórico" }),
+        );
+        let out = run_page(
+            r#"
+const { vm, sandbox, input, flush, elements, posts, sockets } = t;
+vm.runInContext(input.startScript, sandbox);
+for (let i = 0; i < 5; i++) await flush();
+const socket = sockets[0];
+socket.open();
+socket.receive('{"setupComplete":{}}');
+await flush();
+// 1. O servidor pede uma ferramenta via WebSocket:
+socket.receive(JSON.stringify({
+  toolCall: {
+    functionCalls: [{ id: 'srv-1', name: 'history_list_recent', args: { limit: 5 } }]
+  }
+}));
+await flush();
+// 2. O nativo devolve a resposta da ferramenta:
+vm.runInContext(input.responseScript, sandbox);
+await flush();
+// 3. O utilizador clica na pilula de Legendas:
+elements['t-captions'].click();
+await flush();
+// 4. Chega uma fala do modelo com as legendas ligadas:
+socket.receive(JSON.stringify({
+  serverContent: { outputTranscription: { text: 'Traduzindo ao vivo!' }, turnComplete: true }
+}));
+await flush();
+return {
+  posts,
+  sent: socket.sent.map((s) => JSON.parse(s)),
+  captionsHidden: elements['captions-box'].hidden,
+  captionsText: elements['captions-text'].textContent,
+  logLines: elements.log.children.map((c) => c.children.map((k) => k.textContent).join(''))
+};
+"#,
+            json!({}),
+            json!({
+                "startScript": live_start_script(&key(TEST_KEY), &theme, None),
+                "responseScript": response_script,
+            }),
+        );
+        assert_eq!(out["captionsHidden"], false);
+        assert_eq!(out["captionsText"], "Gemini: Traduzindo ao vivo!");
+        assert_eq!(
+            out["logLines"],
+            json!([
+                "⚡ history_list_recent: 3 itens recentes do histórico",
+                "⚡ captions_live_overlay: executando…",
+                "Gemini: Traduzindo ao vivo!"
+            ])
+        );
+        let sent = out["sent"].as_array().expect("sent");
+        assert!(sent.iter().any(|msg| {
+            msg["toolResponse"]["functionResponses"][0]["id"] == "srv-1"
+                && msg["toolResponse"]["functionResponses"][0]["name"] == "history_list_recent"
+                && msg["toolResponse"]["functionResponses"][0]["response"]["result"]["summary"]
+                    == "3 itens recentes do histórico"
+        }));
+        assert_eq!(
+            parsed_posts(&out["posts"]),
+            [
+                LiveMessage::Ready,
+                LiveMessage::ToolCall(LiveToolCall {
+                    id: "srv-1".to_string(),
+                    name: "history_list_recent".to_string(),
+                    params: json!({ "limit": 5 }),
+                }),
+                LiveMessage::ToolCall(LiveToolCall {
+                    id: "ui-captions".to_string(),
+                    name: "captions_live_overlay".to_string(),
+                    params: json!({ "enabled": true }),
+                }),
+            ]
         );
     }
 }

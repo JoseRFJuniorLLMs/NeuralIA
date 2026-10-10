@@ -2902,6 +2902,7 @@ fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
         LiveAction::Run(script) => script,
         LiveAction::Close => "<fechar>".to_string(),
         LiveAction::Minimize => "<minimizar>".to_string(),
+        LiveAction::Tool(call) => format!("<tool:{}>", call.name),
         LiveAction::Nothing => "<nada>".to_string(),
     };
 
@@ -3006,6 +3007,26 @@ fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
     assert_eq!(run(panel.follow(start())), "arranca()");
     panel.open(9);
     assert_eq!(panel.indicator(), LiveIndicator::Standby);
+}
+
+#[test]
+fn execute_live_tool_call_dispatches_all_40_spec_0117_tools() {
+    use crate::gemini_live::LIVE_TOOL_NAMES;
+
+    let panels_src = include_str!("app/panels.rs");
+    let dispatcher = panels_src
+        .split("fn execute_live_tool_call")
+        .nth(1)
+        .expect("execute_live_tool_call in panels.rs");
+
+    assert_eq!(LIVE_TOOL_NAMES.len(), 40);
+    for tool in LIVE_TOOL_NAMES {
+        let pattern = format!("\"{tool}\" =>");
+        assert!(
+            dispatcher.contains(&pattern),
+            "tool {tool} missing from execute_live_tool_call in panels.rs"
+        );
+    }
 }
 
 /// Os tres porteiros do painel do Gemini Live, tal como o `open_live_panel`

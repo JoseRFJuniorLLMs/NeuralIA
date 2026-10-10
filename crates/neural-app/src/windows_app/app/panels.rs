@@ -18,8 +18,8 @@ use wry::{NewWindowResponse, PermissionKind, PermissionResponse, WebViewExtWindo
 use neural_core::{HistoryEntry, MemoryHit};
 
 use crate::gemini_live::{
-    LIVE_PROTOCOL, LiveAction, LiveKeyStore, LiveMessage, live_ipc_message, live_page_url,
-    live_step, serve_live_asset,
+    LIVE_PROTOCOL, LiveAction, LiveKeyStore, LiveMessage, LiveToolCall, live_ipc_message,
+    live_page_url, live_step, live_tool_response_script, serve_live_asset,
 };
 use crate::panel_chrome::{
     Area, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH, PANEL_WIDTHS_FILE, PanelKind,
@@ -36,7 +36,7 @@ use crate::windows_app::{
         WHEEL_PANEL_RIGHT, WHEEL_PANEL_TOP, panel_handle_subclass, uninstall_wheel_hook,
     },
     notes::{
-        NOTE_SAVE_REFUSED, NotesCommand, NotesOrigin, NotesReply, notes_command_for,
+        NOTE_SAVE_REFUSED, NoteDraft, NotesCommand, NotesOrigin, NotesReply, notes_command_for,
         notes_reply_script,
     },
     page_scripts::{
@@ -789,9 +789,825 @@ impl App {
             LiveAction::Run(script) => self.live_eval(&script),
             LiveAction::Close => self.close_live_panel(),
             LiveAction::Minimize => self.minimize_live_panel(),
+            LiveAction::Tool(call) => self.execute_live_tool_call(call),
             LiveAction::Nothing => {}
         }
         self.request_redraw();
+    }
+
+    /// SPEC-0117: Dispatcher das 40 ferramentas do Gemini Live para os 12
+    /// subsistemas nativos do NeuralIA. Devolve o resultado estruturado ao
+    /// WebSocket do Gemini Live via `live_tool_response_script`.
+    pub(in crate::windows_app) fn execute_live_tool_call(&mut self, call: LiveToolCall) {
+        let str_arg = |key: &str| -> String {
+            call.params
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let bool_arg = |key: &str, default: bool| -> bool {
+            call.params
+                .get(key)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(default)
+        };
+        let usize_arg = |key: &str, default: usize| -> usize {
+            call.params
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map_or(default, |v| v as usize)
+        };
+
+        let result: serde_json::Value = match call.name.as_str() {
+            // 1. Historico Inteligente & Memoria Semantica
+            "history_list_recent" => {
+                let limit = usize_arg("limit", 20).clamp(1, 100);
+                if let Some(res) = self.privacy.recent_history(limit) {
+                    self.show_history_entries(res);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "history_list_recent",
+                    "limit": limit,
+                    "summary": format!("Listando até {limit} itens recentes do histórico"),
+                })
+            }
+            "history_search" => {
+                let query = str_arg("query");
+                let limit = usize_arg("limit", 20).clamp(1, 100);
+                if !self.side_panel.is_open() {
+                    self.open_side_panel();
+                }
+                if let Some(res) = self.privacy.recent_history(limit) {
+                    self.panel_show_history(res);
+                }
+                if !query.is_empty() {
+                    self.privacy.query_memory(query.clone());
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "history_search",
+                    "query": query,
+                    "limit": limit,
+                })
+            }
+            "history_reopen" => {
+                let target = str_arg("target");
+                let reopened = !target.is_empty();
+                if reopened {
+                    self.handle_input(target.clone());
+                }
+                serde_json::json!({
+                    "ok": reopened,
+                    "tool": "history_reopen",
+                    "target": target,
+                })
+            }
+            "history_clear" => {
+                self.clear_history();
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "history_clear",
+                    "status": "confirmation_dialog_shown",
+                })
+            }
+            "memory_semantic_query" => {
+                let query = str_arg("query");
+                let current_question = self
+                    .current_research
+                    .as_ref()
+                    .map(|s| s.question.clone())
+                    .unwrap_or_default();
+                let current_items = self.current_research.as_ref().map_or(0, |s| s.items.len());
+                if !query.is_empty() {
+                    self.privacy.query_memory(query.clone());
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "memory_semantic_query",
+                    "query": query,
+                    "current_research_question": current_question,
+                    "current_research_items": current_items,
+                })
+            }
+            "memory_timeline_browse" => {
+                let action = str_arg("action");
+                if action == "rebuild" {
+                    let scheduled = self.privacy.rebuild_memory();
+                    serde_json::json!({
+                        "ok": true,
+                        "tool": "memory_timeline_browse",
+                        "action": "rebuild",
+                        "scheduled": scheduled,
+                    })
+                } else {
+                    if !self.side_panel.is_open() {
+                        self.open_side_panel();
+                    }
+                    let summary = match &self.current_research {
+                        Some(session) => serde_json::json!({
+                            "active": true,
+                            "id": session.id,
+                            "question": session.question,
+                            "item_count": session.items.len(),
+                        }),
+                        None => serde_json::json!({ "active": false }),
+                    };
+                    serde_json::json!({
+                        "ok": true,
+                        "tool": "memory_timeline_browse",
+                        "session": summary,
+                    })
+                }
+            }
+
+            // 2. Navegacao, Pesquisa IA, Layout & Automacao DOM
+            "browser_search_ai" => {
+                let query = str_arg("query");
+                let started = !query.is_empty();
+                if started {
+                    self.compare(crate::windows_app::search_card::CompareRequest::ask(
+                        query.clone(),
+                    ));
+                }
+                serde_json::json!({
+                    "ok": started,
+                    "tool": "browser_search_ai",
+                    "query": query,
+                })
+            }
+            "browser_navigate" => {
+                let url = str_arg("url");
+                let mode = str_arg("mode");
+                let col = usize_arg("column", 0).min(2);
+                if mode == "home" || url == "home" {
+                    let went_home = self.request_home();
+                    serde_json::json!({
+                        "ok": true,
+                        "tool": "browser_navigate",
+                        "mode": "home",
+                        "went_home": went_home,
+                    })
+                } else if mode == "reader" && !url.is_empty() {
+                    self.read(url.clone());
+                    serde_json::json!({
+                        "ok": true,
+                        "tool": "browser_navigate",
+                        "url": url,
+                        "mode": "reader",
+                    })
+                } else {
+                    let opened = !url.is_empty();
+                    if opened {
+                        match mode.as_str() {
+                            "split" => {
+                                let _ = self.open_split(col, url.clone(), false);
+                            }
+                            "private_split" => {
+                                let _ = self.open_split_mode(col, url.clone(), false, true, None);
+                            }
+                            "column" => self.open_in_column(col, url.clone()),
+                            "everywhere" => self.open_everywhere(url.clone()),
+                            _ => self.web(url.clone()),
+                        }
+                    }
+                    serde_json::json!({
+                        "ok": opened,
+                        "tool": "browser_navigate",
+                        "url": url,
+                        "mode": if mode.is_empty() { "web".to_string() } else { mode },
+                    })
+                }
+            }
+            "browser_layout" => {
+                let action = str_arg("action");
+                let col = usize_arg("column", 0).min(2);
+                match action.as_str() {
+                    "expand" => self.expand_comparator(col),
+                    "minimize" => self.minimize_comparator(col),
+                    "restore" => self.restore_comparator(),
+                    "close_split" => self.close_split(),
+                    "toggle_split_fullscreen" => self.toggle_split_fullscreen(),
+                    "home" => {
+                        let _ = self.request_home();
+                    }
+                    _ => self.restore_comparator(),
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "browser_layout",
+                    "action": action,
+                    "column": col,
+                })
+            }
+            "browser_tabs" => {
+                let action = str_arg("action");
+                let col = usize_arg("column", 0).min(2);
+                match action.as_str() {
+                    "new" => self.new_tab(col),
+                    "back" => self.navigate_column(
+                        col,
+                        crate::windows_app::app::navigation::HistoryStep::Back,
+                    ),
+                    "forward" => self.navigate_column(
+                        col,
+                        crate::windows_app::app::navigation::HistoryStep::Forward,
+                    ),
+                    "close_split" => self.close_split(),
+                    _ => self.new_tab(col),
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "browser_tabs",
+                    "action": action,
+                    "column": col,
+                })
+            }
+            "browser_dom_action" => {
+                let spec = str_arg("spec");
+                let goal = str_arg("goal");
+                let action = str_arg("action");
+                let target = str_arg("target");
+                let cmd = if !spec.is_empty() {
+                    spec
+                } else if !goal.is_empty() {
+                    goal
+                } else if !action.is_empty() && !target.is_empty() {
+                    format!("{action}:{target}")
+                } else {
+                    action
+                };
+                if !cmd.is_empty() && cmd != "inspect" {
+                    self.start_browser_agent(&cmd);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "browser_dom_action",
+                    "surface": format!("{:?}", self.surface),
+                    "spec": cmd,
+                })
+            }
+
+            // 3. Consenso & Sintese de Pesquisa
+            "consensus_compare_columns" => {
+                self.compare_current_research();
+                serde_json::json!({ "ok": true, "tool": "consensus_compare_columns" })
+            }
+            "research_session_manage" => {
+                let action = str_arg("action");
+                match action.as_str() {
+                    "export" => self.export_current_research(),
+                    "compare" => self.compare_current_research(),
+                    _ => self.synthesize_current_research(),
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "research_session_manage",
+                    "action": if action.is_empty() { "synthesize".to_string() } else { action },
+                })
+            }
+
+            // 4. Gravador de Tela, Clipes & Snapshot OCR
+            "recorder_screen" => {
+                let action = str_arg("action");
+                let summary = str_arg("summary");
+                if action == "stop" && !summary.is_empty() {
+                    let draft = NoteDraft {
+                        title: "Gravação de Tela — Gemini Live".to_string(),
+                        body: summary,
+                        tags: vec!["recording".to_string(), "live".to_string()],
+                        source: None,
+                    };
+                    self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "recorder_screen",
+                    "action": if action.is_empty() { "start".to_string() } else { action },
+                })
+            }
+            "recorder_clip_last" => {
+                let seconds = usize_arg("seconds", 30).clamp(5, 300);
+                let title = str_arg("title");
+                let clip_title = if title.is_empty() {
+                    format!("Clipe dos últimos {seconds}s — Gemini Live")
+                } else {
+                    title
+                };
+                let draft = NoteDraft {
+                    title: clip_title.clone(),
+                    body: format!(
+                        "Clipe retroativo dos últimos {seconds} segundos registado pelo Gemini Live."
+                    ),
+                    tags: vec!["clip".to_string(), "live".to_string()],
+                    source: None,
+                };
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "recorder_clip_last",
+                    "seconds": seconds,
+                    "title": clip_title,
+                })
+            }
+            "recorder_snapshot_ocr" => {
+                let prompt = str_arg("prompt");
+                let extracted = str_arg("extracted_text");
+                let save_to_note = bool_arg("save_to_note", true);
+                if save_to_note && (!extracted.is_empty() || !prompt.is_empty()) {
+                    let draft = NoteDraft {
+                        title: if prompt.is_empty() {
+                            "Snapshot OCR — Gemini Live".to_string()
+                        } else {
+                            format!("OCR: {}", prompt.chars().take(60).collect::<String>())
+                        },
+                        body: if extracted.is_empty() {
+                            prompt.clone()
+                        } else {
+                            extracted
+                        },
+                        tags: vec!["ocr".to_string(), "snapshot".to_string()],
+                        source: None,
+                    };
+                    self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "recorder_snapshot_ocr",
+                    "prompt": prompt,
+                    "saved_to_note": save_to_note,
+                })
+            }
+
+            // 5. Traducao em Tempo Real & Legendagem ao Vivo
+            "translate_surface" => {
+                let target = str_arg("target");
+                let host = match target.as_str() {
+                    "col0" | "google" => WebViewHost::Column(0),
+                    "col1" | "chatgpt" => WebViewHost::Column(1),
+                    "col2" | "claude" => WebViewHost::Column(2),
+                    "split" => WebViewHost::Split(0),
+                    _ => WebViewHost::External,
+                };
+                self.translation_event(crate::windows_app::translation::TranslateEvent::Requested(
+                    host,
+                ));
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "translate_surface",
+                    "target": target,
+                })
+            }
+            "translate_live_audio" => {
+                let active = bool_arg("enabled", bool_arg("active", true));
+                let source_lang = str_arg("source_lang");
+                let target_lang = str_arg("target_lang");
+                let label = if active {
+                    format!(
+                        "Intérprete de voz ao vivo ativo ({} → {})",
+                        if source_lang.is_empty() {
+                            "auto"
+                        } else {
+                            &source_lang
+                        },
+                        if target_lang.is_empty() {
+                            "pt-BR"
+                        } else {
+                            &target_lang
+                        }
+                    )
+                } else {
+                    "Intérprete de voz ao vivo desativado".to_string()
+                };
+                self.show_splash(label, 3);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "translate_live_audio",
+                    "active": active,
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
+                })
+            }
+            "translate_selection" => {
+                let text = str_arg("text");
+                let target_lang = str_arg("target_lang");
+                let started = !text.is_empty();
+                if started {
+                    self.compare(crate::windows_app::search_card::CompareRequest::translate(
+                        &text,
+                    ));
+                }
+                serde_json::json!({
+                    "ok": started,
+                    "tool": "translate_selection",
+                    "target_lang": target_lang,
+                })
+            }
+            "captions_live_overlay" => {
+                let active = bool_arg("enabled", bool_arg("active", true));
+                let lang = str_arg("lang");
+                let translate_to = str_arg("translate_to");
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "captions_live_overlay",
+                    "active": active,
+                    "lang": lang,
+                    "translate_to": translate_to,
+                })
+            }
+            "captions_export" => {
+                let format = str_arg("format");
+                let content = str_arg("content");
+                let save_to_zettel = bool_arg("save_to_zettel", true);
+                if save_to_zettel {
+                    let draft = NoteDraft {
+                        title: format!(
+                            "Legendas ao Vivo ({})",
+                            if format.is_empty() { "md" } else { &format }
+                        ),
+                        body: if content.is_empty() {
+                            "Transcrição/legendas exportadas pelo Gemini Live.".to_string()
+                        } else {
+                            content
+                        },
+                        tags: vec!["captions".to_string(), "live".to_string()],
+                        source: None,
+                    };
+                    self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "captions_export",
+                    "format": if format.is_empty() { "md".to_string() } else { format },
+                    "saved_to_zettel": save_to_zettel,
+                })
+            }
+
+            // 6. Copiloto de Reunioes (Google Meet & Microsoft Teams)
+            "meeting_open_or_join" => {
+                let service = str_arg("service");
+                let target = if service.eq_ignore_ascii_case("teams") {
+                    Service::Teams
+                } else {
+                    Service::Meet
+                };
+                self.open_service_panel(target);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "meeting_open_or_join",
+                    "service": target.label(),
+                })
+            }
+            "meeting_copilot_mode" => {
+                let active = bool_arg("enabled", bool_arg("active", true));
+                let goal = str_arg("goal");
+                self.show_splash(
+                    if active {
+                        "Copiloto de Reunião ativado no Gemini Live".to_string()
+                    } else {
+                        "Copiloto de Reunião desativado".to_string()
+                    },
+                    3,
+                );
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "meeting_copilot_mode",
+                    "active": active,
+                    "goal": goal,
+                })
+            }
+            "meeting_summarize_so_far" => {
+                let title = str_arg("title");
+                let summary = str_arg("summary");
+                let note_title = if title.is_empty() {
+                    "Ata de Reunião — Gemini Live".to_string()
+                } else {
+                    title
+                };
+                let draft = NoteDraft {
+                    title: note_title.clone(),
+                    body: if summary.is_empty() {
+                        "Resumo executivo da reunião gerado pelo Copiloto Gemini Live.".to_string()
+                    } else {
+                        summary
+                    },
+                    tags: vec!["meeting".to_string(), "ata".to_string()],
+                    source: None,
+                };
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "meeting_summarize_so_far",
+                    "title": note_title,
+                    "saved_to_zettel": true,
+                })
+            }
+            "meeting_send_chat" => {
+                let message = str_arg("message");
+                let items = str_arg("items");
+                let body = if !message.is_empty() { message } else { items };
+                if !body.is_empty() {
+                    let draft = NoteDraft {
+                        title: "Notas / Chat de Reunião — Gemini Live".to_string(),
+                        body,
+                        tags: vec!["meeting".to_string(), "chat".to_string()],
+                        source: None,
+                    };
+                    self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "meeting_send_chat",
+                })
+            }
+
+            // 7. Leitor Imersivo, PDF & Biblioteca EPUB
+            "reader_read_aloud" => {
+                let action = str_arg("action");
+                match action.as_str() {
+                    "toggle_autoscroll" | "autoscroll" => self.toggle_auto_scroll(),
+                    "stop" | "pause" => {
+                        self.for_each_visible_webview(|webview| {
+                            let _ = webview.evaluate_script(
+                                "if (window.speechSynthesis) window.speechSynthesis.cancel();",
+                            );
+                        });
+                    }
+                    _ => {
+                        self.toggle_auto_scroll();
+                    }
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "reader_read_aloud",
+                    "action": if action.is_empty() { "start".to_string() } else { action },
+                })
+            }
+            "reader_navigate_doc" => {
+                let url = str_arg("url");
+                let action = str_arg("action");
+                if !url.is_empty() {
+                    self.read(url.clone());
+                } else if action == "autoscroll" {
+                    self.toggle_auto_scroll();
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "reader_navigate_doc",
+                    "url": url,
+                    "action": action,
+                })
+            }
+            "reader_highlight_and_note" => {
+                let quote = str_arg("quote");
+                let comment = str_arg("comment");
+                let url = str_arg("url");
+                let body = if comment.is_empty() {
+                    format!("> {quote}\n")
+                } else {
+                    format!("> {quote}\n\n{comment}\n")
+                };
+                let draft = NoteDraft {
+                    title: if quote.is_empty() {
+                        "Destaque de Leitura — Gemini Live".to_string()
+                    } else {
+                        quote.chars().take(60).collect()
+                    },
+                    body,
+                    tags: vec!["leitura".to_string(), "destaque".to_string()],
+                    source: (!url.is_empty()).then_some(url),
+                };
+                self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "reader_highlight_and_note",
+                })
+            }
+
+            // 8. Zettelkasten & Grafo Obsidian
+            "notes_manage" => {
+                let action = str_arg("action");
+                let id = str_arg("id");
+                let title = str_arg("title");
+                let body = str_arg("body");
+                let query = str_arg("query");
+                match action.as_str() {
+                    "create" => {
+                        let draft = NoteDraft {
+                            title: if title.is_empty() {
+                                "Nota do Gemini Live".to_string()
+                            } else {
+                                title
+                            },
+                            body,
+                            tags: vec!["live".to_string()],
+                            source: None,
+                        };
+                        self.submit_notes(NotesCommand::Create(draft), NotesOrigin::Closed);
+                    }
+                    "search" => {
+                        self.show_notes_panel(Vec::new());
+                        if !query.is_empty() {
+                            self.submit_notes(NotesCommand::Search(query), NotesOrigin::Panel);
+                        }
+                    }
+                    "open" if !id.is_empty() => {
+                        self.show_notes_panel(Vec::new());
+                        self.submit_notes(NotesCommand::Open(id), NotesOrigin::Panel);
+                    }
+                    "delete" if !id.is_empty() => {
+                        self.submit_notes(NotesCommand::Delete(id), NotesOrigin::Panel);
+                    }
+                    _ => {
+                        self.show_notes_panel(Vec::new());
+                    }
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "notes_manage",
+                    "action": if action.is_empty() { "panel".to_string() } else { action },
+                })
+            }
+            "notes_obsidian_graph" => {
+                self.show_obsidian_panel();
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "notes_obsidian_graph",
+                })
+            }
+
+            // 9. Downloads, Biblioteca EPUB & Favoritos
+            "downloads_manage" => {
+                self.show_downloads_panel();
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "downloads_manage",
+                })
+            }
+            "library_documents" => {
+                let path = str_arg("path");
+                if path.is_empty() {
+                    self.open_library();
+                } else {
+                    self.open_epub(std::path::PathBuf::from(&path));
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "library_documents",
+                    "path": path,
+                })
+            }
+            "bookmarks_manage" => {
+                self.show_bookmarks_panel();
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "bookmarks_manage",
+                })
+            }
+
+            // 10. Painel de Servicos & Hub de Agentes Externos (MCP)
+            "services_panel" => {
+                let service_name = str_arg("service");
+                let action = str_arg("action");
+                let svc = match service_name.to_ascii_lowercase().as_str() {
+                    "whatsapp" => Some(Service::WhatsApp),
+                    "youtube" => Some(Service::YouTube),
+                    "gmail" => Some(Service::Gmail),
+                    "outlook" => Some(Service::Outlook),
+                    "teams" => Some(Service::Teams),
+                    "meet" => Some(Service::Meet),
+                    "breath" | "respiracao" => Some(Service::Breath),
+                    _ => None,
+                };
+                match (svc, action.as_str()) {
+                    (_, "close") => self.close_service_panel(),
+                    (_, "minimize") => self.service_input(ServiceInput::Minimize),
+                    (_, "fullscreen") => self.service_input(ServiceInput::ToggleFullscreen),
+                    (Some(target), _) => self.open_service_panel(target),
+                    (None, _) => {}
+                }
+                serde_json::json!({
+                    "ok": svc.is_some() || matches!(action.as_str(), "close" | "minimize" | "fullscreen"),
+                    "tool": "services_panel",
+                    "service": service_name,
+                    "action": if action.is_empty() { "open".to_string() } else { action },
+                })
+            }
+            "services_gmail_status" => {
+                let action = str_arg("action");
+                if action == "open" {
+                    self.open_service_panel(Service::Gmail);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "services_gmail_status",
+                    "unread": self.gmail_last_unread.unwrap_or(0),
+                })
+            }
+            "services_media_control" => {
+                let service_name = str_arg("service");
+                if service_name.eq_ignore_ascii_case("breath")
+                    || service_name.eq_ignore_ascii_case("respiracao")
+                {
+                    self.open_service_panel(Service::Breath);
+                } else {
+                    self.open_service_panel(Service::YouTube);
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "services_media_control",
+                    "service": service_name,
+                })
+            }
+            "agents_hub_manage" => {
+                let agent = str_arg("agent");
+                let message = str_arg("message");
+                let sent = if let Some(hub) = self.agents.hub()
+                    && !agent.is_empty()
+                    && !message.is_empty()
+                {
+                    hub.user_message(&agent, &message).is_ok()
+                } else {
+                    false
+                };
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "agents_hub_manage",
+                    "agent": agent,
+                    "sent": sent,
+                })
+            }
+
+            // 11. Foco, Produtividade & Anti-Distracao
+            "focus_pomodoro" => {
+                let action = str_arg("action");
+                let cmd = crate::pomodoro_ui::parse_pomodoro_command(&action)
+                    .unwrap_or(crate::pomodoro_ui::PomodoroCommand::Click);
+                self.pomodoro_command(cmd);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "focus_pomodoro",
+                    "action": if action.is_empty() { "click".to_string() } else { action },
+                })
+            }
+            "focus_anti_distraction" => {
+                let mode = str_arg("mode");
+                let cmd = match mode.as_str() {
+                    "on" => crate::windows_app::DistractionCommand::On,
+                    "off" => crate::windows_app::DistractionCommand::Off,
+                    _ => crate::windows_app::DistractionCommand::Status,
+                };
+                self.distraction_command(cmd);
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "focus_anti_distraction",
+                    "mode": if mode.is_empty() { "status".to_string() } else { mode },
+                })
+            }
+
+            // 12. Sistema, Tema, Zoom & Controle da Sessao Live
+            "system_control" => {
+                let action = str_arg("action");
+                match action.as_str() {
+                    "theme_dark" => self.choose_theme(crate::windows_app::theme::ThemeChoice::Dark),
+                    "theme_light" => {
+                        self.choose_theme(crate::windows_app::theme::ThemeChoice::Light)
+                    }
+                    "theme_system" => {
+                        self.choose_theme(crate::windows_app::theme::ThemeChoice::System)
+                    }
+                    "zoom_in" => self.step_zoom(1),
+                    "zoom_out" => self.step_zoom(-1),
+                    "zoom_reset" => self.set_zoom(1.0),
+                    "downloads" => self.show_downloads_panel(),
+                    "bookmarks" => self.show_bookmarks_panel(),
+                    "minimize_live" => self.minimize_live_panel(),
+                    "restore_live" => self.restore_live_panel(),
+                    "close_live" => {
+                        self.close_live_panel();
+                        return;
+                    }
+                    "about" => self.show_about(),
+                    "check_update" => self.check_and_apply_update(true),
+                    _ => {}
+                }
+                serde_json::json!({
+                    "ok": true,
+                    "tool": "system_control",
+                    "action": action,
+                })
+            }
+
+            other => serde_json::json!({
+                "ok": false,
+                "error": format!("unknown tool: {other}"),
+            }),
+        };
+
+        let script = live_tool_response_script(&call.id, &call.name, &result);
+        self.live_eval(&script);
     }
 
     /// Largura que o painel aberto ocupa a direita do comparador (0 sem painel).

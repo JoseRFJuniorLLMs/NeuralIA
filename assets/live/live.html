@@ -30,6 +30,12 @@
     <button id="t-camera" class="toggle" aria-pressed="false">Câmera</button>
     <button id="t-mic" class="toggle" aria-pressed="false">Microfone</button>
   </div>
+  <div class="toggles tools-bar">
+    <button id="t-captions" class="toggle tool-pill" aria-pressed="false" title="Legendas ao vivo em tempo real">Legendas</button>
+    <button id="t-record" class="toggle tool-pill" aria-pressed="false" title="Gravar sessão e salvar resumo nas Notas">Gravar</button>
+    <button id="t-translate" class="toggle tool-pill" aria-pressed="false" title="Modo intérprete de tradução simultânea">Intérprete</button>
+    <button id="t-copilot" class="toggle tool-pill" aria-pressed="false" title="Modo copiloto de reunião com ata automática">Reunião</button>
+  </div>
   <p id="status" class="status">Conectando…</p>
   <div id="notices" class="notices" hidden></div>
   <div id="error-box" class="error-box" hidden>
@@ -39,6 +45,9 @@
       <button id="restart">Conectar de novo</button>
       <button id="error-key">Trocar chave</button>
     </div>
+  </div>
+  <div id="captions-box" class="captions-box" hidden>
+    <p id="captions-text" class="captions-text"></p>
   </div>
   <video id="cam" class="cam" muted playsinline hidden></video>
   <div id="log" class="log" aria-live="polite"></div>

@@ -42,7 +42,381 @@
     'Você é a assistente de voz do NeuralIA, um navegador para Windows. ' +
     'Você vê a tela do usuário (e a câmera, quando ligada) e ouve o microfone. ' +
     'Responda sempre em português do Brasil, de forma breve e natural. ' +
-    'Fale só do que for útil para a pergunta e diga quando algo na tela não estiver legível.';
+    'Fale só do que for útil para a pergunta e diga quando algo na tela não estiver legível. ' +
+    'Você possui ferramentas nativas para controlar todo o navegador NeuralIA ' +
+    '(histórico, memória semântica, pesquisa nas 3 IAs, abas, gravação de tela, tradução, ' +
+    'legendas ao vivo, reuniões, leitura em voz alta, notas Zettelkasten, grafo Obsidian, ' +
+    'downloads, favoritos, serviços e Pomodoro): chame a ferramenta adequada sempre que ' +
+    'o usuário pedir uma ação no navegador.';
+
+  function toolDecl(name, description, properties, required) {
+    const parameters = { type: 'OBJECT', properties: Object.freeze(properties || {}) };
+    if (Array.isArray(required) && required.length) {
+      parameters.required = Object.freeze(required.slice());
+    }
+    return Object.freeze({
+      name,
+      description,
+      behavior: 'NON_BLOCKING',
+      parameters: Object.freeze(parameters)
+    });
+  }
+
+  /// Ferramentas onipotentes do navegador NeuralIA (SPEC-0117, 12 subsistemas).
+  const LIVE_TOOLS = Object.freeze([
+    // 1. Historico e Memoria Semantica
+    toolDecl(
+      'history_list_recent',
+      'Lista as entradas mais recentes do histórico de navegação e pesquisas do NeuralIA.',
+      {
+        limit: { type: 'INTEGER', description: 'Quantidade máxima de itens (padrão 20, máx 100).' },
+        open_panel: { type: 'BOOLEAN', description: 'Se verdadeiro, também abre o painel lateral no Histórico.' }
+      }
+    ),
+    toolDecl(
+      'history_search',
+      'Pesquisa no histórico do navegador por palavra-chave, domínio ou tipo (ask, read, web).',
+      {
+        query: { type: 'STRING', description: 'Termo ou domínio a procurar no histórico.' },
+        kind: { type: 'STRING', description: 'Filtro opcional de tipo: all, ask, read ou web.' },
+        limit: { type: 'INTEGER', description: 'Quantidade máxima de resultados (padrão 20).' }
+      },
+      ['query']
+    ),
+    toolDecl(
+      'history_reopen',
+      'Reabre um item do histórico ou navega para trás/frente na página ativa.',
+      {
+        action: { type: 'STRING', description: 'Ação: reopen, back ou forward.' },
+        query: { type: 'STRING', description: 'Texto, URL ou consulta do histórico para reabrir.' },
+        index: { type: 'INTEGER', description: 'Índice 0-based na lista recente (opcional).' }
+      }
+    ),
+    toolDecl(
+      'history_clear',
+      'Abre a confirmação para apagar histórico e memória local ou limpa as abas salvas.',
+      {
+        scope: { type: 'STRING', description: 'Escopo: all, tabs ou agents.' }
+      }
+    ),
+    toolDecl(
+      'memory_semantic_query',
+      'Consulta a memória semântica local (SQLite FTS5 + vetores) do NeuralIA ou reconstrói o índice.',
+      {
+        query: { type: 'STRING', description: 'Pergunta ou termos para buscar na memória local.' },
+        rebuild: { type: 'BOOLEAN', description: 'Se verdadeiro, agenda a reconstrução do índice (memory:rebuild).' }
+      }
+    ),
+    toolDecl(
+      'memory_timeline_browse',
+      'Abre o painel lateral no Histórico Inteligente e Linha do Tempo e filtra por consulta opcional.',
+      {
+        query: { type: 'STRING', description: 'Filtro opcional para buscar na memória do painel.' }
+      }
+    ),
+    // 2. Navegacao, Comparador de 3 IAs, Abas e Consenso
+    toolDecl(
+      'browser_search_ai',
+      'Pesquisa uma pergunta simultaneamente nas 3 IAs (Gemini, ChatGPT e Claude), em uma única IA ou no Google.',
+      {
+        query: { type: 'STRING', description: 'A pergunta ou pesquisa a realizar.' },
+        mode: { type: 'STRING', description: 'Modo: compare_3ai (padrão), single_ai ou google_web.' },
+        column: { type: 'INTEGER', description: 'Coluna alvo (0=Gemini, 1=ChatGPT, 2=Claude) se direcionado a uma coluna.' }
+      },
+      ['query']
+    ),
+    toolDecl(
+      'browser_navigate',
+      'Navega para uma URL em Web completa, modo Leitor (Reader), Split view lateral, todas as colunas ou volta à Home.',
+      {
+        url: { type: 'STRING', description: 'URL de destino (quando aplicável).' },
+        mode: { type: 'STRING', description: 'Modo: web, reader, split, everywhere, column, home ou reload.' },
+        column: { type: 'INTEGER', description: 'Coluna de origem/alvo (0, 1 ou 2).' }
+      }
+    ),
+    toolDecl(
+      'browser_layout',
+      'Controla o layout das colunas do comparador, Split view e zoom da página.',
+      {
+        action: {
+          type: 'STRING',
+          description: 'Ação: expand_column, minimize_column, restore_columns, toggle_split_fullscreen, close_split, zoom_in, zoom_out ou zoom_reset.'
+        },
+        column: { type: 'INTEGER', description: 'Índice da coluna (0=Gemini, 1=ChatGPT, 2=Claude).' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'browser_tabs',
+      'Lista, abre, fecha ou agrupa abas de contexto nas colunas do comparador.',
+      {
+        action: { type: 'STRING', description: 'Ação: list, open, open_fullscreen, close, group, ungroup ou new_tab.' },
+        column: { type: 'INTEGER', description: 'Coluna (0, 1 ou 2).' },
+        tab_index: { type: 'INTEGER', description: 'Índice da aba na coluna (0-based).' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'browser_dom_action',
+      'Executa ações na página ativa (rolagem, auto-scroll F8, impressão ou foco na barra de endereço).',
+      {
+        action: { type: 'STRING', description: 'Ação: scroll_down, scroll_up, scroll_top, scroll_bottom, toggle_auto_scroll, print ou focus_omnibox.' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'consensus_compare_columns',
+      'Executa o leitor nativo de Consenso entre as respostas das 3 IAs (Gemini, ChatGPT e Claude).',
+      {
+        save_to_notes: { type: 'BOOLEAN', description: 'Se verdadeiro, também salva um resumo nas Notas Zettelkasten.' }
+      }
+    ),
+    toolDecl(
+      'research_session_manage',
+      'Compara, sintetiza com proveniência ou exporta em Markdown a sessão de pesquisa ativa.',
+      {
+        action: { type: 'STRING', description: 'Ação: compare, synthesize, export ou status.' }
+      },
+      ['action']
+    ),
+    // 3. Gravacao de Tela, Clipes e OCR
+    toolDecl(
+      'recorder_screen',
+      'Inicia, pausa, retoma ou finaliza a gravação de tela/áudio no Gemini Live e registra nas Notas.',
+      {
+        action: { type: 'STRING', description: 'Ação: start, pause, resume ou stop.' },
+        title: { type: 'STRING', description: 'Título opcional para a gravação.' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'recorder_clip_last',
+      'Salva um clipe instantâneo dos últimos segundos da sessão e registra nas Notas Zettelkasten.',
+      {
+        seconds: { type: 'INTEGER', description: 'Duração em segundos do clipe (padrão 30).' },
+        title: { type: 'STRING', description: 'Título descritivo do clipe.' }
+      }
+    ),
+    toolDecl(
+      'recorder_snapshot_ocr',
+      'Captura um snapshot da tela compartilhada e salva o texto/análise como nota Zettelkasten.',
+      {
+        title: { type: 'STRING', description: 'Título da captura/OCR.' },
+        notes: { type: 'STRING', description: 'Texto extraído por OCR, código ou explicação da tela.' },
+        tags: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Tags para a nota Zettelkasten.' }
+      }
+    ),
+    // 4. Traducao em Tempo Real
+    toolDecl(
+      'translate_surface',
+      'Traduz a página ativa ou uma coluna do comparador para português in-place (ou restaura o original).',
+      {
+        target: { type: 'STRING', description: 'Alvo: active, column ou split.' },
+        column: { type: 'INTEGER', description: 'Índice da coluna (0, 1 ou 2) quando target=column.' }
+      }
+    ),
+    toolDecl(
+      'translate_live_audio',
+      'Ativa ou desativa o modo intérprete de tradução simultânea de voz no Gemini Live.',
+      {
+        enabled: { type: 'BOOLEAN', description: 'Se verdadeiro, ativa o modo intérprete simultâneo.' },
+        source_lang: { type: 'STRING', description: 'Idioma de origem (ex.: en, es, auto).' },
+        target_lang: { type: 'STRING', description: 'Idioma de destino (padrão pt-BR).' }
+      }
+    ),
+    toolDecl(
+      'translate_selection',
+      'Envia um texto para tradução comparada nas 3 IAs (traduzir:<texto>).',
+      {
+        text: { type: 'STRING', description: 'Texto a traduzir nas 3 IAs.' }
+      },
+      ['text']
+    ),
+    // 5. Legendas ao Vivo (Live Captions)
+    toolDecl(
+      'captions_live_overlay',
+      'Liga ou desliga o painel de Legendas ao Vivo em tempo real.',
+      {
+        enabled: { type: 'BOOLEAN', description: 'Liga (true) ou desliga (false) as legendas ao vivo.' },
+        bilingual: { type: 'BOOLEAN', description: 'Exibir texto original e tradução.' },
+        target_lang: { type: 'STRING', description: 'Idioma alvo das legendas (padrão pt-BR).' }
+      }
+    ),
+    toolDecl(
+      'captions_export',
+      'Exporta as legendas e transcrições acumuladas da sessão para uma nota Zettelkasten em Markdown ou SRT.',
+      {
+        format: { type: 'STRING', description: 'Formato: markdown (padrão) ou srt.' },
+        title: { type: 'STRING', description: 'Título da transcrição exportada.' }
+      }
+    ),
+    // 6. Reunioes (Meet / Teams / WhatsApp)
+    toolDecl(
+      'meeting_open_or_join',
+      'Abre Google Meet, Microsoft Teams ou WhatsApp no painel de serviços ou entra num link de reunião.',
+      {
+        service: { type: 'STRING', description: 'Serviço: meet, teams ou whatsapp.' },
+        url: { type: 'STRING', description: 'URL específica da reunião (opcional).' }
+      }
+    ),
+    toolDecl(
+      'meeting_copilot_mode',
+      'Ativa ou desativa o modo Copiloto de Reunião para acompanhamento silencioso e registro de ata.',
+      {
+        enabled: { type: 'BOOLEAN', description: 'Ativa (true) ou desativa (false) o modo copiloto.' },
+        topic: { type: 'STRING', description: 'Tópico ou nome da reunião.' }
+      }
+    ),
+    toolDecl(
+      'meeting_summarize_so_far',
+      'Salva a ata estruturada da reunião até o momento (decisões, participantes e action items) nas Notas Zettelkasten.',
+      {
+        title: { type: 'STRING', description: 'Título da ata de reunião.' },
+        summary: { type: 'STRING', description: 'Resumo estruturado dos pontos discutidos e decisões.' },
+        action_items: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Lista de tarefas e próximos passos.' }
+      }
+    ),
+    toolDecl(
+      'meeting_send_chat',
+      'Registra ou prepara uma mensagem para o chat da reunião ativa.',
+      {
+        text: { type: 'STRING', description: 'Texto da mensagem para a reunião.' }
+      },
+      ['text']
+    ),
+    // 7. Leitura (Reader / PDF / EPUB / TTS)
+    toolDecl(
+      'reader_read_aloud',
+      'Controla a leitura em voz alta ou rolagem automática (auto-scroll) do artigo, PDF ou EPUB aberto.',
+      {
+        action: { type: 'STRING', description: 'Ação: start, pause, stop ou toggle_auto_scroll.' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'reader_navigate_doc',
+      'Abre uma URL no modo Leitor limpo, abre um PDF ou navega para página/capítulo do documento aberto.',
+      {
+        action: { type: 'STRING', description: 'Ação: open_reader, next_page, prev_page, goto_page ou open_library.' },
+        url: { type: 'STRING', description: 'URL do artigo/PDF quando action=open_reader.' },
+        page: { type: 'INTEGER', description: 'Número da página quando action=goto_page.' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'reader_highlight_and_note',
+      'Captura a seleção da página ativa ou salva um destaque/citação como nota Zettelkasten.',
+      {
+        text: { type: 'STRING', description: 'Texto destacado (se omitido, captura a seleção atual da página).' },
+        title: { type: 'STRING', description: 'Título opcional para a nota.' },
+        tags: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Tags opcionais.' }
+      }
+    ),
+    // 8. Notas Zettelkasten e Grafo Obsidian
+    toolDecl(
+      'notes_manage',
+      'Cria, lista, busca ou abre notas Zettelkasten locais em Markdown compatível com Obsidian.',
+      {
+        action: { type: 'STRING', description: 'Ação: create, list, search, open ou open_panel.' },
+        title: { type: 'STRING', description: 'Título da nota (para create).' },
+        body: { type: 'STRING', description: 'Conteúdo em Markdown da nota (para create).' },
+        tags: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Tags da nota (para create).' },
+        query: { type: 'STRING', description: 'Termo de busca (para search).' },
+        id: { type: 'STRING', description: 'ID da nota (para open).' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'notes_obsidian_graph',
+      'Abre o Grafo do Segundo Cérebro (Obsidian) no painel lateral conectando notas, sites e histórico.',
+      {
+        filter: { type: 'STRING', description: 'Filtro opcional para buscar ao abrir.' }
+      }
+    ),
+    // 9. Downloads, Biblioteca e Favoritos
+    toolDecl(
+      'downloads_manage',
+      'Abre, alterna ou consulta o painel de Downloads do navegador.',
+      {
+        action: { type: 'STRING', description: 'Ação: open, toggle ou close.' }
+      }
+    ),
+    toolDecl(
+      'library_documents',
+      'Abre a biblioteca de livros EPUB (estilo Calibre), o diálogo de abrir arquivo EPUB ou um caminho específico.',
+      {
+        action: { type: 'STRING', description: 'Ação: open_library, open_dialog ou open_path.' },
+        path: { type: 'STRING', description: 'Caminho local do arquivo .epub quando action=open_path.' }
+      }
+    ),
+    toolDecl(
+      'bookmarks_manage',
+      'Adiciona/remove a página atual dos favoritos ou abre os favoritos no painel lateral.',
+      {
+        action: { type: 'STRING', description: 'Ação: toggle_current ou open_panel.' }
+      }
+    ),
+    // 10. Servicos em Segundo Plano e Midia
+    toolDecl(
+      'services_panel',
+      'Abre, minimiza para segundo plano ou fecha um serviço integrado (WhatsApp, YouTube, Gmail, Outlook, Teams, Meet, Breath).',
+      {
+        service: { type: 'STRING', description: 'Serviço: whatsapp, youtube, gmail, outlook, teams, meet ou breath.' },
+        action: { type: 'STRING', description: 'Ação: open (padrão), minimize ou close.' }
+      },
+      ['service']
+    ),
+    toolDecl(
+      'services_gmail_status',
+      'Consulta o estado do monitor do Gmail ou abre o painel do Gmail.',
+      {
+        action: { type: 'STRING', description: 'Ação: status ou open.' }
+      }
+    ),
+    toolDecl(
+      'services_media_control',
+      'Controla reprodução de mídia em segundo plano (YouTube ou serviço ativo).',
+      {
+        action: { type: 'STRING', description: 'Ação: toggle_play, pause, play, mute ou unmute.' }
+      },
+      ['action']
+    ),
+    // 11. Agents Hub, Pomodoro, Anti-Distracao e Sistema
+    toolDecl(
+      'agents_hub_manage',
+      'Consulta os agentes externos conectados ao Agents Hub via MCP ou limpa o histórico de conversas de agentes.',
+      {
+        action: { type: 'STRING', description: 'Ação: status, run_browser_agent ou clear.' },
+        goal: { type: 'STRING', description: 'Objetivo para o agente de navegação quando action=run_browser_agent.' }
+      }
+    ),
+    toolDecl(
+      'focus_pomodoro',
+      'Controla o temporizador Pomodoro nativo do NeuralIA (iniciar, pausar, retomar, pular fase, parar ou trocar preset 25/50).',
+      {
+        action: { type: 'STRING', description: 'Ação: toggle, start, pause, resume, skip, stop, preset_25 ou preset_50.' }
+      },
+      ['action']
+    ),
+    toolDecl(
+      'focus_anti_distraction',
+      'Ativa, desativa ou consulta o modo anti-distração do navegador.',
+      {
+        action: { type: 'STRING', description: 'Ação: on, off, toggle ou status.' }
+      }
+    ),
+    toolDecl(
+      'system_control',
+      'Controla o tema (claro, escuro, sistema), abre a tela Sobre, verifica atualizações ou minimiza/restaura o painel Gemini Live.',
+      {
+        action: {
+          type: 'STRING',
+          description: 'Ação: theme_light, theme_dark, theme_system, about, check_update, minimize_live ou restore_live.'
+        }
+      },
+      ['action']
+    )
+  ]);
 
   const WORKLET_NAME = 'neuralia-mic';
   // O processador do microfone: junta blocos de 128 amostras em 2048 e manda
@@ -78,6 +452,7 @@
         model: MODEL,
         generationConfig: { responseModalities: ['AUDIO'] },
         systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+        tools: [{ functionDeclarations: LIVE_TOOLS }],
         inputAudioTranscription: {},
         outputAudioTranscription: {},
         // Sem compressao do contexto, o Google corta uma sessao com video aos
@@ -275,6 +650,62 @@
     return out;
   }
 
+  /// Chamadas de ferramentas (`toolCall`) e cancelamentos (`toolCallCancellation`)
+  /// vindos do servidor numa mensagem BidiGenerateContent.
+  function parseToolCalls(text) {
+    let message;
+    try {
+      message = JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+    if (!message || typeof message !== 'object') return null;
+    const calls = [];
+    const toolCall = message.toolCall;
+    if (toolCall && Array.isArray(toolCall.functionCalls)) {
+      for (const fc of toolCall.functionCalls) {
+        if (fc && typeof fc.name === 'string' && fc.name) {
+          calls.push({
+            id: typeof fc.id === 'string' && fc.id ? fc.id : fc.name,
+            name: fc.name,
+            args: fc.args && typeof fc.args === 'object' && !Array.isArray(fc.args) ? fc.args : {}
+          });
+        }
+      }
+    }
+    const cancelledIds = [];
+    const cancel = message.toolCallCancellation;
+    if (cancel && Array.isArray(cancel.ids)) {
+      for (const id of cancel.ids) {
+        if (typeof id === 'string' && id) cancelledIds.push(id);
+      }
+    }
+    if (!calls.length && !cancelledIds.length) return null;
+    return { calls, cancelledIds };
+  }
+
+  /// Resposta de uma ferramenta executada pelo navegador para o Gemini Live.
+  function toolResponseMessage(id, name, result, scheduling) {
+    const response = {
+      result: result === undefined ? { ok: true } : result
+    };
+    if (scheduling !== null) {
+      response.scheduling =
+        typeof scheduling === 'string' && scheduling ? scheduling : 'WHEN_IDLE';
+    }
+    return {
+      toolResponse: {
+        functionResponses: [
+          {
+            id: String(id || name || ''),
+            name: String(name || ''),
+            response
+          }
+        ]
+      }
+    };
+  }
+
   /// Porque a sessao fechou, em portugues do Brasil, se a culpa e da chave, e
   /// o motivo cru do servidor (em ingles) como detalhe a parte.
   function describeClose(code, reason) {
@@ -386,6 +817,10 @@
       return true;
     }
 
+    function sendToolResponse(id, name, result, scheduling) {
+      return send(toolResponseMessage(id, name, result, scheduling));
+    }
+
     function takeMicQueue() {
       const joined = new Int16Array(state.micQueued);
       let at = 0;
@@ -467,6 +902,11 @@
       if (message.outputText) notify('transcript', 'model', message.outputText);
       if (message.turnComplete) notify('turnComplete');
       if (message.error) notify('error', 'Erro do servidor: ' + message.error, false, '');
+      const tools = parseToolCalls(text);
+      if (tools) {
+        if (tools.cancelledIds.length) notify('toolCancel', tools.cancelledIds);
+        for (const call of tools.calls) notify('toolCall', call);
+      }
       // Por ultimo: retomar troca o socket, e o resto desta mensagem ainda
       // era da ligacao velha.
       if (message.goAway && !resume('goaway')) {
@@ -696,6 +1136,7 @@
       start,
       stop,
       resumeAudio,
+      sendToolResponse,
       setMic: (on) => toggle('mic', on),
       setCamera: (on) => toggle('camera', on),
       setScreen: (on) => toggle('screen', on),
@@ -723,6 +1164,7 @@
     MAX_DROP_RESUMES,
     MAX_GOAWAY_RESUMES,
     SYSTEM_INSTRUCTION,
+    LIVE_TOOLS,
     WORKLET_NAME,
     WORKLET_SOURCE,
     socketUrl,
@@ -739,6 +1181,8 @@
     pictureInPicture,
     frameText,
     parseServerMessage,
+    parseToolCalls,
+    toolResponseMessage,
     describeClose,
     createSession
   });

@@ -72,6 +72,9 @@ p { margin: 0; }
   padding: 7px 14px;
 }
 .toggle[aria-pressed="true"] { background: var(--live); border-color: var(--live); color: #fff; }
+.tool-pill { padding: 5px 11px; font-size: 12px; }
+.tool-pill[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+#t-record.tool-pill[aria-pressed="true"] { background: var(--live); border-color: var(--live); color: #fff; }
 .status { font-size: 13px; color: var(--muted); }
 .notices { display: flex; flex-direction: column; gap: 6px; }
 .notice { font-size: 13px; color: var(--fg); background: var(--surface); padding: 8px 10px; border-radius: 6px; }
@@ -83,6 +86,11 @@ p { margin: 0; }
   align-self: flex-start; border: 1px solid var(--line); background: var(--surface);
   border-radius: 999px; padding: 5px 12px; font-size: 13px;
 }
+.captions-box {
+  background: #101214; color: #f8f9fa; border: 1px solid var(--accent);
+  border-radius: 10px; padding: 10px 12px; min-height: 44px;
+}
+.captions-text { font-size: 14px; line-height: 1.45; font-weight: 500; }
 .cam { width: 160px; max-width: 45%; border-radius: 8px; border: 1px solid var(--line); background: #000; }
 .log { flex: 1; min-height: 80px; overflow: auto; border-top: 1px solid var(--line); padding-top: 8px; }
 /* A barra de rolagem fina do NeuralIA, nas cores do tema, em vez da classica
@@ -95,4 +103,10 @@ p { margin: 0; }
 .line { margin: 0 0 8px; font-size: 14px; line-height: 1.4; }
 .line.user b { color: var(--muted); }
 .line.model b { color: var(--accent); }
+.line.tool {
+  font-size: 12px; color: var(--muted); background: var(--surface);
+  border-left: 3px solid var(--accent); padding: 5px 8px; border-radius: 6px;
+}
+.line.tool b { color: var(--accent); }
 footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
