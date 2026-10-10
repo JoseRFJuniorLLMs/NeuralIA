@@ -2901,17 +2901,20 @@ fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
     let run = |action: LiveAction| match action {
         LiveAction::Run(script) => script,
         LiveAction::Close => "<fechar>".to_string(),
+        LiveAction::Minimize => "<minimizar>".to_string(),
         LiveAction::Nothing => "<nada>".to_string(),
     };
 
     let mut panel: LivePanel<u8> = LivePanel::off();
     assert_eq!(panel.indicator(), LiveIndicator::Off);
+    assert!(!panel.is_open() && !panel.is_minimized() && !panel.is_docked());
     let off = painted_bar_with_live(width, &panel, &theme);
     assert_eq!(red_in_eye(&off), 0, "fechado nao tem vermelho");
     assert!(near(fill(&off), theme.surface), "{:?}", fill(&off));
 
     // Abrir: a pedir a chave, nada sai ainda.
     panel.open(7);
+    assert!(panel.is_open() && !panel.is_minimized() && panel.is_docked());
     assert_eq!(panel.indicator(), LiveIndicator::Standby);
     let waiting = painted_bar_with_live(width, &panel, &theme);
     assert!(near(fill(&waiting), theme.surface), "{:?}", fill(&waiting));
@@ -2922,6 +2925,44 @@ fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
     assert_eq!(panel.indicator(), LiveIndicator::Live);
     let live = painted_bar_with_live(width, &panel, &theme);
     assert!(near(fill(&live), LIVE_ON_RED), "{:?}", fill(&live));
+
+    // Minimizar a meio de uma sessao: o painel oculta (is_docked = false),
+    // mas a sessao continua viva (is_open = true, LiveIndicator::Live, olho vermelho).
+    assert_eq!(run(panel.follow(LiveStep::Minimize)), "<minimizar>");
+    panel.minimize();
+    assert!(panel.is_open() && panel.is_minimized() && !panel.is_docked());
+    assert_eq!(panel.indicator(), LiveIndicator::Live);
+    let minimized_bar = painted_bar_with_live(width, &panel, &theme);
+    assert!(
+        near(fill(&minimized_bar), LIVE_ON_RED),
+        "{:?}",
+        fill(&minimized_bar)
+    );
+    assert_eq!(
+        open_panel_width_for(
+            Surface::Comparator,
+            None,
+            panel.is_docked(),
+            false,
+            1440.0,
+            PanelWidths::default()
+        ),
+        0.0,
+        "minimizado nao rouba largura ao comparador"
+    );
+    panel.restore();
+    assert!(panel.is_open() && !panel.is_minimized() && panel.is_docked());
+    assert!(
+        open_panel_width_for(
+            Surface::Comparator,
+            None,
+            panel.is_docked(),
+            false,
+            1440.0,
+            PanelWidths::default()
+        ) > 0.0,
+        "restaurado volta a ocupar a lateral"
+    );
 
     // A sessao caiu (a pagina disse "stopped"): ja nada sai.
     assert_eq!(run(panel.follow(LiveStep::Stopped)), "<nada>");

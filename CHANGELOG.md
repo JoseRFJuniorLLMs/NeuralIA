@@ -2,6 +2,11 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.9] - 2026-10-10
+
+### Fixed
+- **Gemini Live continua ativo em segundo plano ao ser minimizado:** corrigido o bug em que clicar para minimizar ou alternar o painel do Gemini Live encerrava a sessão. Agora o painel possui botão de minimizar (`—`) no cabeçalho e alterna entre visível e minimizado ao clicar no ícone do olho na barra de título: a WebView oculta-se liberando toda a largura do comparador, enquanto a captura de tela (`getDisplayMedia`), o microfone e a conversa por voz (`AudioContext`/WebSocket) permanecem ativos em segundo plano com o indicador vermelho aceso. O encerramento completo ocorre apenas ao clicar em «Desligar» ou ao sair do comparador.
+
 ## [2.9.8] - 2026-10-10
 
 ### Fixed

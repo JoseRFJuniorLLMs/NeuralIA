@@ -208,6 +208,7 @@ pub(crate) enum LiveMessage {
     /// recusou): ja nada e capturado nem enviado, e o olho deixa o vermelho.
     Stopped,
     Close,
+    Minimize,
 }
 
 /// Chega para uma chave de 256 caracteres dentro do envelope.
@@ -228,6 +229,7 @@ pub(crate) fn parse_live_message(body: &str) -> Option<LiveMessage> {
     match envelope.get("action")?.as_str()? {
         "ready" => Some(LiveMessage::Ready),
         "close" => Some(LiveMessage::Close),
+        "minimize" => Some(LiveMessage::Minimize),
         "forget_key" => Some(LiveMessage::ForgetKey),
         "stopped" => Some(LiveMessage::Stopped),
         "save_key" => {
@@ -331,6 +333,7 @@ pub(crate) enum LiveStep {
     /// A pagina diz que a sessao acabou: nada a correr, so o olho muda.
     Stopped,
     Close,
+    Minimize,
 }
 
 pub(crate) fn live_step(
@@ -367,6 +370,7 @@ pub(crate) fn live_step(
         }),
         LiveMessage::Stopped => LiveStep::Stopped,
         LiveMessage::Close => LiveStep::Close,
+        LiveMessage::Minimize => LiveStep::Minimize,
     }
 }
 
@@ -380,6 +384,7 @@ pub(crate) const LIVE_INVALID_KEY_NOTICE: &str =
 pub(crate) enum LiveAction {
     Run(String),
     Close,
+    Minimize,
     Nothing,
 }
 
@@ -406,6 +411,7 @@ pub(crate) enum LiveIndicator {
 pub(crate) struct LivePanel<W> {
     view: Option<W>,
     started: bool,
+    minimized: bool,
 }
 
 impl<W> LivePanel<W> {
@@ -413,19 +419,32 @@ impl<W> LivePanel<W> {
         Self {
             view: None,
             started: false,
+            minimized: false,
         }
     }
 
     /// Abre com a vista nova (uma que ja estivesse aberta e largada).
     pub(crate) fn open(&mut self, view: W) {
         self.started = false;
+        self.minimized = false;
         self.view = Some(view);
     }
 
     /// Fecha: devolve a vista para o chamador a esconder e largar.
     pub(crate) fn close(&mut self) -> Option<W> {
         self.started = false;
+        self.minimized = false;
         self.view.take()
+    }
+
+    pub(crate) fn minimize(&mut self) {
+        if self.view.is_some() {
+            self.minimized = true;
+        }
+    }
+
+    pub(crate) fn restore(&mut self) {
+        self.minimized = false;
     }
 
     pub(crate) fn view(&self) -> Option<&W> {
@@ -436,6 +455,14 @@ impl<W> LivePanel<W> {
         self.view.is_some()
     }
 
+    pub(crate) fn is_minimized(&self) -> bool {
+        self.minimized && self.view.is_some()
+    }
+
+    pub(crate) fn is_docked(&self) -> bool {
+        self.view.is_some() && !self.minimized
+    }
+
     /// Acompanha o passo e devolve o que o `App` faz a seguir. O script so
     /// sai daqui DEPOIS de o estado do olho mudar: nao ha forma de arrancar a
     /// sessao sem o olho ficar vermelho, nem de o esquecer. Sem painel aberto
@@ -444,6 +471,7 @@ impl<W> LivePanel<W> {
         if self.view.is_none() {
             return match step {
                 LiveStep::Close => LiveAction::Close,
+                LiveStep::Minimize => LiveAction::Minimize,
                 _ => LiveAction::Nothing,
             };
         }
@@ -461,6 +489,7 @@ impl<W> LivePanel<W> {
                 LiveAction::Nothing
             }
             LiveStep::Close => LiveAction::Close,
+            LiveStep::Minimize => LiveAction::Minimize,
         }
     }
 
@@ -676,6 +705,10 @@ return calls;
         assert_eq!(
             parse_live_message(r#"{"action":"close"}"#),
             Some(LiveMessage::Close)
+        );
+        assert_eq!(
+            parse_live_message(r#"{"action":"minimize"}"#),
+            Some(LiveMessage::Minimize)
         );
         assert_eq!(
             parse_live_message(r#"{"action":"forget_key","args":{}}"#),
@@ -914,6 +947,7 @@ return calls;
             }
             LiveStep::Stopped => ("<parou>".to_string(), Value::Null),
             LiveStep::Close => ("<fechar>".to_string(), Value::Null),
+            LiveStep::Minimize => ("<minimizar>".to_string(), Value::Null),
         };
 
         // Primeira vez: pede a chave.
@@ -950,6 +984,10 @@ return calls;
         assert!(matches!(
             live_step(LiveMessage::Close, &store, &theme),
             LiveStep::Close
+        ));
+        assert!(matches!(
+            live_step(LiveMessage::Minimize, &store, &theme),
+            LiveStep::Minimize
         ));
         // A pagina diz que a sessao caiu: nada a correr, e a chave fica.
         assert!(matches!(
@@ -1834,6 +1872,9 @@ out.started = {
 elements['t-camera'].click();
 for (let i = 0; i < 3; i++) await flush();
 out.cameraOff = { pressed: elements['t-camera'].getAttribute('aria-pressed'), stopped: tracks.filter((t) => t.kind === 'video').map((t) => t.stopped), camHidden: elements.cam.hidden };
+elements.min.click();
+await flush();
+out.minimized = { stopped: tracks.map((t) => [t.kind, t.stopped]), socketClosed: sockets[0].closedWith === undefined, contextsClosed: contexts.map((c) => c.closed) };
 elements.off.click();
 await flush();
 out.off = { stopped: tracks.map((t) => [t.kind, t.stopped]), socketClosed: sockets[0].closedWith, contextsClosed: contexts.map((c) => c.closed) };
@@ -1874,6 +1915,15 @@ return out;
             json!({ "pressed": "false", "stopped": [1], "camHidden": true })
         );
         assert_eq!(
+            out["minimized"],
+            json!({
+                "stopped": [["audio", 0], ["video", 1], ["screen", 0]],
+                "socketClosed": true,
+                "contextsClosed": [0]
+            }),
+            "Minimizar mantém tela, microfone, áudio e WebSocket ativos"
+        );
+        assert_eq!(
             out["off"],
             json!({
                 "stopped": [["audio", 1], ["video", 1], ["screen", 1]],
@@ -1888,6 +1938,7 @@ return out;
             [
                 LiveMessage::Ready,
                 LiveMessage::SaveKey(key(TEST_KEY)),
+                LiveMessage::Minimize,
                 LiveMessage::Close,
                 LiveMessage::ForgetKey,
             ]

@@ -172,7 +172,7 @@ impl App {
             // Voltar do minimizado ocupa o lugar do painel que estiver aberto.
             if panel.state.minimized() {
                 self.close_side_panel(PanelExit::OtherPanel);
-                self.close_live_panel();
+                self.minimize_live_panel();
             }
             self.service_input(ServiceInput::IconClick);
             return;
@@ -180,7 +180,7 @@ impl App {
         self.close_service_panel();
         // Um painel de cada vez.
         self.close_side_panel(PanelExit::OtherPanel);
-        self.close_live_panel();
+        self.minimize_live_panel();
         if let Some(index) = self
             .background_services
             .iter()
@@ -479,7 +479,7 @@ impl App {
                 .flatten()
                 .map(|area| (PanelKind::Service, area));
         }
-        let kind = if self.live_panel.is_open() {
+        let kind = if self.live_panel.is_docked() {
             PanelKind::Service
         } else if self.side_panel.is_open() {
             PanelKind::History
@@ -506,7 +506,11 @@ impl App {
             return Some((area, panel.webview.hwnd().0 as HWND));
         }
         let (_, area) = self.docked_right_panel()?;
-        let host = self.live_panel.view().or(self.side_panel.view())?.hwnd().0 as HWND;
+        let host = if self.live_panel.is_docked() {
+            self.live_panel.view()?.hwnd().0 as HWND
+        } else {
+            self.side_panel.view()?.hwnd().0 as HWND
+        };
         Some((area, host))
     }
 
@@ -644,14 +648,49 @@ impl App {
 
     /// O olho da barra: liga o Gemini Live (abre o painel, que pede a chave
     /// na primeira vez e depois liga tela, camera e microfone); de novo,
-    /// desliga -- fechar o painel destroi a pagina e com ela tudo o que
-    /// estava a ser capturado.
+    /// minimiza para segundo plano continuando a ver a tela e a falar; de novo,
+    /// restaura para o lado. O botao Desligar dentro do painel desliga de vez.
     pub(in crate::windows_app) fn toggle_live_panel(&mut self) {
-        if self.live_panel.is_open() {
-            self.close_live_panel();
-        } else {
+        if !self.live_panel.is_open() {
             self.open_live_panel();
+        } else if self.live_panel.is_minimized() {
+            self.restore_live_panel();
+        } else {
+            self.minimize_live_panel();
         }
+    }
+
+    pub(in crate::windows_app) fn minimize_live_panel(&mut self) {
+        if !self.live_panel.is_open() || self.live_panel.is_minimized() {
+            return;
+        }
+        self.live_panel.minimize();
+        if let Some(panel) = self.live_panel.view() {
+            let _ = panel.set_visible(false);
+            let _ = panel.focus_parent();
+        }
+        debug_log(format_args!("live panel: minimizado para segundo plano"));
+        self.fit_comparator_to_panel();
+        self.after_panel_change();
+        self.request_redraw();
+    }
+
+    pub(in crate::windows_app) fn restore_live_panel(&mut self) {
+        if !self.live_panel.is_open() || !self.live_panel.is_minimized() {
+            return;
+        }
+        self.close_docked_service_panel();
+        self.close_side_panel(PanelExit::OtherPanel);
+        self.live_panel.restore();
+        self.position_live_panel();
+        if let Some(panel) = self.live_panel.view() {
+            let _ = panel.set_visible(true);
+            let _ = panel.focus();
+        }
+        debug_log(format_args!("live panel: restaurado"));
+        self.fit_comparator_to_panel();
+        self.after_panel_change();
+        self.request_redraw();
     }
 
     pub(in crate::windows_app) fn live_panel_rect(&self) -> Option<wry::Rect> {
@@ -727,6 +766,9 @@ impl App {
     }
 
     pub(in crate::windows_app) fn position_live_panel(&self) {
+        if self.live_panel.is_minimized() {
+            return;
+        }
         if let (Some(panel), Some(bounds)) = (self.live_panel.view(), self.live_panel_rect()) {
             let _ = panel.set_bounds(bounds);
         }
@@ -746,6 +788,7 @@ impl App {
         match self.live_panel.follow(step) {
             LiveAction::Run(script) => self.live_eval(&script),
             LiveAction::Close => self.close_live_panel(),
+            LiveAction::Minimize => self.minimize_live_panel(),
             LiveAction::Nothing => {}
         }
         self.request_redraw();
@@ -760,7 +803,7 @@ impl App {
         open_panel_width_for(
             self.surface,
             self.service_panel.as_ref().map(|panel| panel.state),
-            self.live_panel.is_open(),
+            self.live_panel.is_docked(),
             self.side_panel.is_open(),
             window.inner_size().width as f64 / scale,
             self.panel_widths,
@@ -813,7 +856,7 @@ impl App {
         // Um painel de cada vez -- o de servicos minimizado nao esta a vista e
         // continua a tocar.
         self.close_docked_service_panel();
-        self.close_live_panel();
+        self.minimize_live_panel();
         let Some(bounds) = self.side_panel_rect() else {
             return;
         };

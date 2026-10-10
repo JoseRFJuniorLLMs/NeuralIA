@@ -271,6 +271,12 @@
       saveKey();
     }
   });
+  const minButton = $('min');
+  if (minButton) {
+    minButton.addEventListener('click', () => {
+      post('minimize');
+    });
+  }
   $('off').addEventListener('click', () => {
     stopSession();
     post('close');

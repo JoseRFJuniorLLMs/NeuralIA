@@ -1425,6 +1425,16 @@ impl App {
                 return Some(hint);
             }
         }
+        if hit == BarHit::GeminiLive {
+            if self.live_panel.is_minimized() {
+                return Some("Gemini Live minimizado · clique para voltar ao painel".to_string());
+            } else if self.live_panel.is_open() {
+                return Some(
+                    "Gemini Live aberto ao lado · clique para minimizar (continua em segundo plano)"
+                        .to_string(),
+                );
+            }
+        }
         let comp = self.comparator.as_ref();
         let column = match hit {
             BarHit::Column(index)

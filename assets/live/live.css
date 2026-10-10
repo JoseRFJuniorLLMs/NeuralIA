@@ -42,10 +42,11 @@ body[data-state="connecting"] .dot { background: var(--accent); }
 body[data-state="live"] .dot { background: var(--live); box-shadow: 0 0 0 4px color-mix(in srgb, var(--live) 25%, transparent); }
 body[data-state="warn"] .dot { background: #f9ab00; }
 body[data-state="error"] .dot { background: var(--live); }
-.off {
+.min, .off {
   border: 1px solid var(--line); background: var(--surface); border-radius: 999px;
   padding: 6px 14px;
 }
+.min:hover { background: var(--line); color: var(--fg); }
 .off:hover { background: #e81123; border-color: #e81123; color: #fff; }
 
 section { display: flex; flex-direction: column; gap: 10px; padding: 6px 18px 16px; min-height: 0; flex: 1; }
