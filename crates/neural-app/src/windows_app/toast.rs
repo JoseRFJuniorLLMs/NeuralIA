@@ -261,18 +261,103 @@ pub(in crate::windows_app) unsafe extern "system" fn toast_subclass(
     }
 }
 
-/// Titulo na cor de destaque, corpo numa linha com reticencias, os botoes
-/// como pilulas a direita (o principal cheio).
+/// Os 4 tons das notificações (erro, aviso, informação, sucesso) com as
+/// respetivas cores e ícones correspondentes, desenhados com borda redonda.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ToastTone {
+    Error,
+    Warning,
+    Info,
+    Success,
+}
+
+impl ToastTone {
+    pub(in crate::windows_app) fn of(title: &str, body: &str) -> Self {
+        let t = title.to_lowercase();
+        let b = body.to_lowercase();
+        if t.contains("bloqueado")
+            || t.contains("recusado")
+            || t.contains("erro")
+            || t.contains("falhou")
+            || b.contains("erro")
+            || b.contains("recusado")
+        {
+            Self::Error
+        } else if t.contains("aviso")
+            || t.contains("atenção")
+            || b.contains("macros")
+            || b.contains("programas")
+            || b.contains("não conseguiu ver")
+        {
+            Self::Warning
+        } else if t.contains("concluído")
+            || t.contains("sucesso")
+            || t.contains("salvo")
+            || b.contains("concluído")
+        {
+            Self::Success
+        } else {
+            Self::Info
+        }
+    }
+
+    pub(in crate::windows_app) fn color(self) -> Rgb {
+        match self {
+            Self::Error => (244, 67, 54),   // Vermelho (Error alert)
+            Self::Warning => (255, 152, 0), // Âmbar / Laranja (Warning alert)
+            Self::Info => (33, 150, 243),   // Azul (Info alert)
+            Self::Success => (76, 175, 80), // Verde (Success alert)
+        }
+    }
+
+    pub(in crate::windows_app) fn glyph(self) -> &'static str {
+        match self {
+            Self::Error => "!",
+            Self::Warning => "⚠",
+            Self::Info => "ℹ",
+            Self::Success => "✓",
+        }
+    }
+}
+
+/// Titulo na cor de destaque do alerta, corpo legível, os botões
+/// como pílulas à direita e borda redonda na cor respectiva do tom.
 unsafe fn paint_toast(hdc: *mut core::ffi::c_void, client: &RECT, view: Option<&ToastView>) {
-    let theme = Theme::system();
-    let background = CreateSolidBrush(rgb3(theme.surface));
-    FillRect(hdc, client, background);
-    DeleteObject(background as _);
+    if client.right <= 0 || client.bottom <= 0 {
+        return;
+    }
     let Some(view) = view else {
         return;
     };
-
+    let theme = Theme::system();
     let scale = toast_scale(client);
+    let tone = ToastTone::of(&view.title, &view.body);
+    let tone_color = tone.color();
+
+    // Fundo e borda redonda na cor respectiva do alerta.
+    let pen = CreatePen(
+        PS_SOLID,
+        (2.0 * scale).round().max(1.0) as i32,
+        rgb3(tone_color),
+    );
+    let brush = CreateSolidBrush(rgb3(theme.surface));
+    let old_pen = SelectObject(hdc, pen as _);
+    let old_brush = SelectObject(hdc, brush as _);
+    let r = (28.0 * scale).round() as i32;
+    RoundRect(
+        hdc,
+        client.left,
+        client.top,
+        client.right,
+        client.bottom,
+        r,
+        r,
+    );
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(brush as _);
+    DeleteObject(pen as _);
+
     let title_font = create_font((-13.0 * scale) as i32, FW_BOLD as i32);
     let body_font = create_font((-12.0 * scale) as i32, FW_NORMAL as i32);
     let widths: Vec<f64> = view.buttons.iter().map(|button| button.width).collect();
@@ -285,9 +370,25 @@ unsafe fn paint_toast(hdc: *mut core::ffi::c_void, client: &RECT, view: Option<&
     let old_font = SelectObject(hdc, title_font as _);
     SetBkMode(hdc, TRANSPARENT as i32);
 
-    SetTextColor(hdc, rgb3(theme.accent));
-    let mut title = RECT {
+    // Ícone do alerta à esquerda
+    SetTextColor(hdc, rgb3(tone_color));
+    let icon_w = (18.0 * scale).round() as i32;
+    let mut icon_rect = RECT {
         left: (16.0 * scale) as i32,
+        top: (7.0 * scale) as i32,
+        right: (16.0 * scale) as i32 + icon_w,
+        bottom: (28.0 * scale) as i32,
+    };
+    draw_text(
+        hdc,
+        tone.glyph(),
+        &mut icon_rect,
+        DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX,
+    );
+
+    // Título do alerta na cor respectiva
+    let mut title = RECT {
+        left: (16.0 * scale) as i32 + icon_w + (6.0 * scale) as i32,
         top: (7.0 * scale) as i32,
         right: buttons_left,
         bottom: (28.0 * scale) as i32,
@@ -322,7 +423,7 @@ unsafe fn paint_toast(hdc: *mut core::ffi::c_void, client: &RECT, view: Option<&
             height: (rect.bottom - rect.top) as f64,
         };
         let style = if button.primary {
-            PillStyle::new(theme.accent, theme.accent, on_color(theme.accent))
+            PillStyle::new(tone_color, tone_color, on_color(tone_color))
         } else {
             PillStyle::new(theme.surface_line, theme.surface_line, theme.fg)
         };
@@ -373,7 +474,7 @@ pub(in crate::windows_app) unsafe fn create_toast_window(
         DestroyWindow(created);
         return None;
     }
-    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 18, 18);
+    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 28, 28);
     if !region.is_null() {
         SetWindowRgn(created, region, 1);
     }

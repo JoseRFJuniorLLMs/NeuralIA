@@ -2,6 +2,14 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [2.9.6] - 2026-10-09
+
+### Fixed
+- **Barra de endereço sem cantos pretos sobre a borda azul:** o controle Win32 EDIT nativo agora utiliza padding horizontal que respeita o arco da pílula (`pad_x = (height / 2.0).max(...)`) e possui região de recorte arredondada (`CreateRoundRectRgn` + `SetWindowRgn`), eliminando cantos retos sobre a borda azul de destaque.
+- **Barra de endereço centralizada ao receber foco:** ao clicar na barra de endereço na barra de título, ela salta para o centro exato da tela com dimensões ampliadas e foco imediato.
+- **Barra de pesquisa da tela Home redimensionada:** a barra de pesquisa na Home foi ajustada para uma largura balanceada de 620 px e altura de 48 px, com botões «Pesquisar com IA» e «Pesquisar» devidamente proporcionais.
+- **Notificações toast com bordas redondas e cores respectivas:** sistema de toast estilizado com borda arredondada (estilo pílula) e tonalidades semânticas com ícones dedicados para Erro (vermelho `#f44336`), Aviso (laranja `#ff9800`), Informação (azul `#2196f3`) e Sucesso (verde `#4caf50`).
+
 ## [2.9.5] - 2026-10-09
 
 ### Fixed

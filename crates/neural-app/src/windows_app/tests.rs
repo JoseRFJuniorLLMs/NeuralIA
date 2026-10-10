@@ -16556,20 +16556,26 @@ fn comparator_enables_the_address_omnibox() {
 
 #[test]
 fn the_address_bar_jumps_larger_while_keeping_its_place() {
-    let rest = title_address_rect(1600.0, 1.0, None);
+    let client_width = 1600.0;
+    let rest = title_address_rect(client_width, 1.0, None);
     assert!(rest.width > 0.0);
-    let jumped = sprung_title_address(rest, 1.0);
+    let jumped = sprung_title_address(client_width, rest, 1.0);
     assert!(
-        jumped.height >= rest.height + 32.0 - 0.01,
+        jumped.height >= rest.height + 10.0,
         "altura {jumped:?} devia saltar a partir de {rest:?}"
     );
     assert!(jumped.width > rest.width + 40.0);
-    assert!(jumped.x < rest.x);
-    assert!((jumped.x + jumped.width - (rest.x + rest.width)).abs() < 0.01);
+    // Aparece no meio da tela: o centro horizontal da barra coincide com o meio da janela
+    let center = jumped.x + jumped.width / 2.0;
+    assert!(
+        (center - client_width / 2.0).abs() < 1.0,
+        "barra no foco tem de aparecer no meio da tela: center={center}, width={client_width}"
+    );
 
     for scale in [1.0, 1.25, 1.5, 2.0] {
-        let rest = title_address_rect(1600.0 * scale, scale, None);
-        let jumped = sprung_title_address(rest, scale);
+        let cw = 1600.0 * scale;
+        let rest = title_address_rect(cw, scale, None);
+        let jumped = sprung_title_address(cw, rest, scale);
         let rest_font = title_address_font_height(rest.height, scale).unsigned_abs();
         let jumped_font = title_address_font_height(jumped.height, scale).unsigned_abs();
         let expected = ((rest_font as f64) * (jumped.height / rest.height)).round() as u32;

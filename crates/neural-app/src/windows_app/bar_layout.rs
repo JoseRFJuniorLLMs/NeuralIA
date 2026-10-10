@@ -1228,22 +1228,28 @@ pub(in crate::windows_app) fn title_address_rect(
     }
 }
 
-/// A barra de endereço com foco: a mesma âncora à direita, mais larga para a
-/// esquerda e bem mais alta, a sair da faixa de 32 px. O rect de repouso
-/// (`title_address_rect`) não muda — as abas continuam a reservar o lugar
-/// pequeno. A borda azul do foco fica; isto só aumenta a pílula.
-pub(in crate::windows_app) fn sprung_title_address(rest: UiRect, scale: f64) -> UiRect {
+/// A barra de endereço com foco: quando clicada, aparece no meio da tela
+/// (centralizada horizontalmente na janela) e bem mais confortável (altura 44 px).
+/// As abas em repouso continuam a reservar o lugar pequeno à direita. A borda
+/// azul do foco fica e o defeito dos cantos pretos é corrigido garantindo que o
+/// EDIT interno respeite a curvatura da pílula.
+pub(in crate::windows_app) fn sprung_title_address(
+    client_width: f64,
+    rest: UiRect,
+    scale: f64,
+) -> UiRect {
     if rest.width <= 0.0 {
         return rest;
     }
     let scale = scale.max(1.0);
-    let right = rest.x + rest.width;
-    let x = (rest.x - 96.0 * scale).max(8.0 * scale);
+    let max_avail = (client_width - 16.0 * scale).max(1.0);
+    let sprung_w = (620.0 * scale).min(max_avail);
+    let x = ((client_width - sprung_w) / 2.0).max(4.0 * scale);
     UiRect {
         x,
-        y: (rest.y - 8.0 * scale).max(1.0 * scale),
-        width: (right - x).max(rest.width),
-        height: rest.height + 32.0 * scale,
+        y: 4.0 * scale,
+        width: sprung_w,
+        height: 44.0 * scale,
     }
 }
 

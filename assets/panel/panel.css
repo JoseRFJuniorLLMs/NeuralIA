@@ -114,3 +114,9 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .zk-timeline .detail{white-space:normal;line-height:1.6;margin-top:8px}
 .zk-link-row{padding:0;flex-wrap:wrap}
 .zk-link-row .field{flex:1;min-width:150px;width:auto}
+
+.alert{display:flex;align-items:center;gap:10px;padding:9px 18px;border-radius:999px;border:1.5px solid var(--line);background:var(--surface);font-size:13.5px;color:var(--fg)}
+.alert-error{border-color:#f44336;color:#f44336}
+.alert-warning{border-color:#ff9800;color:#ff9800}
+.alert-info{border-color:#2196f3;color:#2196f3}
+.alert-success{border-color:#4caf50;color:#4caf50}

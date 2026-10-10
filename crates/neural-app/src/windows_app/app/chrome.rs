@@ -233,8 +233,8 @@ impl App {
         let inner = if self.surface == Surface::Home {
             let layout =
                 HomeLayout::new(size.width as f64, size.height as f64, window.scale_factor());
-            let pad_x = 22.0 * scale;
-            let pad_y = 8.0 * scale;
+            let pad_x = (layout.input.height / 2.0).max(18.0 * scale);
+            let pad_y = 6.0 * scale;
             let text_left = layout.input.x + pad_x;
             let text_right = layout.search.x - 8.0 * scale;
             UiRect {
@@ -247,15 +247,16 @@ impl App {
             let mut address =
                 title_address_rect(size.width as f64, scale, self.pomodoro_bar_label());
             if edit_focused {
-                address = sprung_title_address(address, scale);
+                address = sprung_title_address(size.width as f64, address, scale);
             }
             title_pill_height = Some(address.height);
-            let padding = 8.0 * scale;
+            let pad_x = (address.height / 2.0).max(18.0 * scale);
+            let pad_y = 4.0 * scale;
             UiRect {
-                x: address.x + padding,
-                y: address.y + 2.0 * scale,
-                width: (address.width - 2.0 * padding).max(1.0),
-                height: (address.height - 4.0 * scale).max(1.0),
+                x: address.x + pad_x,
+                y: address.y + pad_y,
+                width: (address.width - 2.0 * pad_x).max(1.0),
+                height: (address.height - 2.0 * pad_y).max(1.0),
             }
         } else {
             UiRect {
@@ -276,6 +277,20 @@ impl App {
                 inner.height.round() as i32,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            // Cantos arredondados no controle EDIT: impede que as pontas
+            // retangulares pretas se sobreponham à curvatura azul da pílula.
+            let rgn_radius = ((inner.height * 0.35) as i32).max(4);
+            let rgn = CreateRoundRectRgn(
+                0,
+                0,
+                inner.width.round() as i32 + 1,
+                inner.height.round() as i32 + 1,
+                rgn_radius,
+                rgn_radius,
+            );
+            if !rgn.is_null() {
+                SetWindowRgn(edit, rgn, 1);
+            }
             apply_omnibox_interactivity(edit, self.surface);
             if self.surface == Surface::Comparator && !address_visible {
                 EnableWindow(edit, 0);

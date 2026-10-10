@@ -56,8 +56,8 @@ use windows_sys::Win32::{
         DT_EDITCONTROL, DT_END_ELLIPSIS, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
         DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL, FillRect, GetDC,
         GetStockObject, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS,
-        PAINTSTRUCT, PS_SOLID, ReleaseDC, SRCCOPY, ScreenToClient, SelectObject, SetBkColor,
-        SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
+        PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient, SelectObject,
+        SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -3198,14 +3198,14 @@ impl HomeLayout {
     fn new(width: f64, height: f64, scale: f64) -> Self {
         let scale = scale.max(1.0);
         let available = (width - 48.0 * scale).max(280.0 * scale);
-        let row_width = (880.0 * scale).min(available);
-        let row_height = 56.0 * scale;
-        let inset = 8.0 * scale;
-        let gap = 8.0 * scale;
-        let ideal_ai = 196.0 * scale;
-        let ideal_search = 118.0 * scale;
+        let row_width = (620.0 * scale).min(available);
+        let row_height = 48.0 * scale;
+        let inset = 6.0 * scale;
+        let gap = 6.0 * scale;
+        let ideal_ai = 150.0 * scale;
+        let ideal_search = 92.0 * scale;
         let chrome = inset * 2.0 + gap;
-        let room = (row_width - 96.0 * scale).max(chrome + 48.0 * scale);
+        let room = (row_width - 80.0 * scale).max(chrome + 40.0 * scale);
         let fit = ((room - chrome) / (ideal_ai + ideal_search)).clamp(0.62, 1.0);
         let ai_w = ideal_ai * fit;
         let search_w = ideal_search * fit;
@@ -7258,7 +7258,7 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
     // tapa o que ficou por baixo. A borda azul é a mesma de sempre.
     let mut address = title_address_rect(width as f64, scale, columns.pomodoro_label);
     if state.omnibox_focused {
-        address = sprung_title_address(address, scale);
+        address = sprung_title_address(width as f64, address, scale);
     }
     if address.width > 0.0 {
         let (border_color, border_width) = theme.omnibox_border(state.omnibox_focused);

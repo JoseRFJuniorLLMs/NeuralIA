@@ -195,9 +195,13 @@ select, input[type='search'] {
 .progress-percent { font-weight: 600; }
 .toast {
   position: fixed; left: 50%; bottom: 56px; transform: translateX(-50%); z-index: 30; max-width: 80vw;
-  padding: 9px 16px; border-radius: 10px; background: var(--fg); color: var(--bg); box-shadow: var(--shadow);
+  padding: 9px 18px; border-radius: 999px; background: var(--surface); color: var(--fg);
+  border: 1.5px solid var(--accent); box-shadow: var(--shadow);
 }
-.toast.error { background: var(--danger); color: #ffffff; }
+.toast.error { border-color: #f44336; color: #f44336; background: var(--surface); }
+.toast.warning { border-color: #ff9800; color: #ff9800; background: var(--surface); }
+.toast.info { border-color: #2196f3; color: #2196f3; background: var(--surface); }
+.toast.success { border-color: #4caf50; color: #4caf50; background: var(--surface); }
 .help-box { width: min(560px, 94vw); }
 .shortcuts { display: grid; grid-template-columns: auto 1fr; gap: 6px 18px; margin: 12px 0 0; }
 .shortcuts dt { font-weight: 600; white-space: nowrap; }
