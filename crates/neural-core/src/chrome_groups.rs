@@ -561,7 +561,7 @@ pub fn read_profile_tab_groups(profile_dir: &Path) -> Vec<ChromeTabGroup> {
             .map(|entry| entry.path())
             .filter(|path| is_leveldb_payload(path))
             .collect();
-        files.sort_by(|left, right| file_rank(left).cmp(&file_rank(right)));
+        files.sort_by_key(|path| file_rank(path));
         for path in files {
             if total >= MAX_PROFILE_BYTES {
                 break;

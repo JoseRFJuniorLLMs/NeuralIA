@@ -391,7 +391,7 @@ pub enum ServiceBadge {
 
 /// Largura da faixa que fica quando o painel esta minimizado.
 pub fn restore_bar_width(panel_width: f64) -> f64 {
-    panel_width.max(0.0).min(320.0)
+    panel_width.clamp(0.0, 320.0)
 }
 
 impl ServicePanelState {
