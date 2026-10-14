@@ -389,6 +389,11 @@ pub enum ServiceBadge {
     Minimized,
 }
 
+/// Largura da faixa que fica quando o painel esta minimizado.
+pub fn restore_bar_width(panel_width: f64) -> f64 {
+    panel_width.max(0.0).min(320.0)
+}
+
 impl ServicePanelState {
     pub fn minimized(&self) -> bool {
         self.minimized
@@ -412,6 +417,12 @@ impl ServicePanelState {
         match input {
             ServiceInput::Close => ServiceEffect::Close,
             ServiceInput::Minimize => {
+                // A faixa de restaurar usa o mesmo botao: minimizado, ele volta
+                // ao painel. Em tela cheia nao ha faixa, e o botao nao faz nada.
+                if self.minimized {
+                    self.minimized = false;
+                    return ServiceEffect::Relayout;
+                }
                 if !self.docked() {
                     return ServiceEffect::Nothing;
                 }
@@ -469,10 +480,14 @@ impl ServicePanelState {
         }
     }
 
-    /// A largura que o comparador cede ao painel: nada com ele minimizado
-    /// (as colunas voltam a ocupar a janela toda).
+    /// A largura que o comparador cede ao painel. Minimizado, so a faixa de
+    /// restaurar (o video continua); ocultar e que devolve a janela toda.
     pub fn reserved_width(&self, width: f64) -> f64 {
-        if self.minimized { 0.0 } else { width }
+        if self.minimized {
+            restore_bar_width(width)
+        } else {
+            width
+        }
     }
 
     /// Onde fica a WebView do painel; `None` = escondida (minimizado).
@@ -503,9 +518,26 @@ impl ServicePanelState {
         ))
     }
 
-    /// A faixa nativa de controlos, por cima do painel encostado.
+    /// A faixa nativa de controlos, por cima do painel encostado. Minimizado,
+    /// encolhe para uma barra de restaurar encostada a direita: o video
+    /// continua, e o botao Minimizar passa a restaurar.
     pub fn strip_area(&self, width: f64, logical_w: f64, top: f64, strip: f64) -> Option<Area> {
-        if !self.docked() || strip <= 0.0 {
+        if strip <= 0.0 {
+            return None;
+        }
+        if self.minimized {
+            let bar = restore_bar_width(width).min(logical_w.max(0.0));
+            if bar <= 0.0 {
+                return None;
+            }
+            return Some(Area {
+                x: (logical_w - bar).max(0.0),
+                y: top,
+                width: bar,
+                height: strip,
+            });
+        }
+        if !self.docked() {
             return None;
         }
         let panel = panel_area(width, logical_w, top + strip, top);
@@ -979,9 +1011,21 @@ mod tests {
         // ganha o ponto -- vermelho a tocar, neutro em silencio.
         assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
         assert!(state.minimized());
-        assert_eq!(state.reserved_width(560.0), 0.0);
+        assert_eq!(state.reserved_width(560.0), 320.0);
         assert_eq!(state.panel_area(560.0, 1600.0, 900.0, 88.0, 34.0), None);
-        assert_eq!(state.strip_area(560.0, 1600.0, 88.0, 34.0), None);
+        let restore = state
+            .strip_area(560.0, 1600.0, 88.0, 34.0)
+            .expect("faixa de restaurar");
+        assert_eq!(
+            (restore.x, restore.y, restore.width, restore.height),
+            (1280.0, 88.0, 320.0, 34.0)
+        );
+        assert_eq!(state.strip_area(560.0, 1600.0, 88.0, 0.0), None);
+        // O mesmo botao, na faixa, volta ao painel encostado.
+        assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
+        assert!(state.docked());
+        assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
+        assert!(state.minimized());
         assert_eq!(state.badge(true), Some(ServiceBadge::Playing));
         assert_eq!(state.badge(false), Some(ServiceBadge::Minimized));
         // Minimizado, a pagina nao toma o ecra nem a faixa faz nada.
@@ -1112,12 +1156,18 @@ mod tests {
         assert!(docked.strip.is_some() && docked.resize_handle);
         assert!(!docked.window_fullscreen && !docked.exit_button);
 
-        // Minimizado: nada a vista, as colunas recuperam tudo.
+        // Minimizado: o video sai, fica a faixa de restaurar, sem pega.
         state.step(ServiceInput::Minimize);
         let minimized = frame(&state);
         assert_eq!(minimized.panel, None);
-        assert_eq!(minimized.reserved_width, 0.0);
-        assert!(minimized.strip.is_none() && !minimized.resize_handle);
+        assert_eq!(minimized.reserved_width, 320.0);
+        assert_eq!(
+            minimized
+                .strip
+                .map(|area| (area.x, area.width, area.height)),
+            Some((1280.0, 320.0, 34.0))
+        );
+        assert!(!minimized.resize_handle);
         assert!(!minimized.window_fullscreen);
         state.step(ServiceInput::IconClick);
 

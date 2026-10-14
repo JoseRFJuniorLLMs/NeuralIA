@@ -76,6 +76,11 @@ impl Service {
     }
 }
 
+/// Pausa o video ao ocultar o YouTube. Minimizar nao corre isto: a faixa de
+/// restaurar deixa o video a tocar.
+pub(in crate::windows_app) const YOUTUBE_PAUSE_SCRIPT: &str =
+    "(function(){try{var v=document.querySelector('video');if(v)v.pause();}catch(e){}})();";
+
 /// Para onde vai o teclado quando um painel ao lado fecha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum PanelCloseFocus {
@@ -186,8 +191,9 @@ pub(in crate::windows_app) fn service_key_event(
     is_escape_down(virtual_key, key_down).then_some(UserEvent::ServiceEscape(generation))
 }
 
-/// A largura que as colunas cedem ao painel da direita aberto. O de servicos
-/// minimizado nao cede nada: as colunas voltam a ocupar a janela toda.
+/// A largura que as colunas cedem ao painel da direita aberto. Minimizado, o
+/// servico deixa so a faixa de restaurar; se o historico ou o Gemini Live
+/// estiverem abertos, e esse painel que ocupa o lugar.
 pub(in crate::windows_app) fn reserved_panel_width(
     service: Option<ServicePanelState>,
     live_open: bool,
@@ -195,13 +201,23 @@ pub(in crate::windows_app) fn reserved_panel_width(
     service_width: f64,
     history_width: f64,
 ) -> f64 {
-    // O de servicos minimizado nao cede nada; se ao lado houver outro painel
-    // aberto, e esse que conta.
-    match service.map(|state| state.reserved_width(service_width)) {
-        Some(width) if width > 0.0 => width,
-        _ if live_open => service_width,
-        _ if side_open => history_width,
-        _ => 0.0,
+    if let Some(state) = service {
+        if state.minimized() {
+            if live_open {
+                return service_width;
+            }
+            if side_open {
+                return history_width;
+            }
+        }
+        return state.reserved_width(service_width);
+    }
+    if live_open {
+        service_width
+    } else if side_open {
+        history_width
+    } else {
+        0.0
     }
 }
 
@@ -475,7 +491,7 @@ pub(in crate::windows_app) fn start_whatsapp_with_notifications(
 /// o painel dele fica ao lado das colunas como os outros (o estado vem do
 /// `ServicePanel`, igual para todos); o do Gemini Live (`live_panel`) tem a
 /// largura dos servicos. As larguras sao as escolhidas pela borda
-/// (`panel-width.json`), e o de servicos minimizado nao cede nada
+/// (`panel-width.json`). Minimizado, cede so a faixa de restaurar
 /// (`reserved_panel_width`).
 pub(in crate::windows_app) fn open_panel_width_for(
     surface: Surface,
@@ -809,10 +825,12 @@ pub(in crate::windows_app) fn draw_service_chrome(
                         width: rect.width,
                         height: rect.height,
                     },
-                    if button == StripButton::Close && service.keeps_running_in_background() {
-                        "× Ocultar"
-                    } else {
-                        button.label()
+                    match button {
+                        StripButton::Minimize if badge.is_some() => "\u{21A9} Restaurar",
+                        StripButton::Close if service.keeps_running_in_background() => {
+                            "\u{00D7} Ocultar"
+                        }
+                        _ => button.label(),
                     },
                     style,
                     scale,

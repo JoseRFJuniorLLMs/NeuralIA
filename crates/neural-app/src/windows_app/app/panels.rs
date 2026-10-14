@@ -44,9 +44,9 @@ use crate::windows_app::{
         PANEL_SHOW_OBSIDIAN_SCRIPT,
     },
     services::{
-        Service, ServicePanel, close_service_panel_in, logical_rect, open_panel_width_for,
-        raise_webview_host, register_service_panel_events, service_event_is_current,
-        service_panel_permission, start_whatsapp_with_notifications,
+        Service, ServicePanel, YOUTUBE_PAUSE_SCRIPT, close_service_panel_in, logical_rect,
+        open_panel_width_for, raise_webview_host, register_service_panel_events,
+        service_event_is_current, service_panel_permission, start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
@@ -97,6 +97,14 @@ pub(in crate::windows_app) fn service_panel_hint(
     badge: Option<ServiceBadge>,
 ) -> Option<String> {
     match hit {
+        BarHit::ServiceStrip(StripButton::Minimize) if badge.is_some() => Some(format!(
+            "Restaurar {}: volta ao painel e continua a tocar",
+            service.label()
+        )),
+        BarHit::ServiceStrip(StripButton::Close) if service == Service::YouTube => Some(format!(
+            "Ocultar {}: pausa o vídeo e deixa a sessão em segundo plano",
+            service.label()
+        )),
         BarHit::ServiceStrip(StripButton::Close) if service.keeps_running_in_background() => Some(
             format!("Ocultar {}: continua em segundo plano", service.label()),
         ),
@@ -286,6 +294,17 @@ impl App {
         }
     }
 
+    /// Ocultar: no YouTube pausa o video e so depois esconde. Minimizar nao
+    /// passa por aqui, e trocar de servico tambem nao (o video continua).
+    pub(in crate::windows_app) fn conceal_service_panel(&mut self) {
+        if let Some(panel) = &self.service_panel
+            && panel.service == Service::YouTube
+        {
+            let _ = panel.webview.evaluate_script(YOUTUBE_PAUSE_SCRIPT);
+        }
+        self.close_service_panel();
+    }
+
     pub(in crate::windows_app) fn close_service_panel(&mut self) {
         let Some(service) = self.service_panel.as_ref().map(|panel| panel.service) else {
             return;
@@ -363,7 +382,8 @@ impl App {
     ) -> Option<ServiceFrame> {
         let (logical_w, logical_h, top, _) = self.panel_space()?;
         // A faixa de controlos so existe no comparador, que e onde ha barra.
-        let strip = if self.surface == Surface::Comparator {
+        let other_panel = self.live_panel.is_docked() || self.side_panel.is_open();
+        let strip = if self.surface == Surface::Comparator && !(state.minimized() && other_panel) {
             SERVICE_STRIP_HEIGHT
         } else {
             0.0
@@ -426,7 +446,7 @@ impl App {
             ServiceEffect::ExitPageFullscreen => {
                 let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
             }
-            ServiceEffect::Close => self.close_service_panel(),
+            ServiceEffect::Close => self.conceal_service_panel(),
             ServiceEffect::Nothing => {}
         }
     }
@@ -1481,7 +1501,7 @@ impl App {
                     _ => None,
                 };
                 match (svc, action.as_str()) {
-                    (_, "close") => self.close_service_panel(),
+                    (_, "close") => self.conceal_service_panel(),
                     (_, "minimize") => self.service_input(ServiceInput::Minimize),
                     (_, "fullscreen") => self.service_input(ServiceInput::ToggleFullscreen),
                     (Some(target), _) => self.open_service_panel(target),
@@ -2124,7 +2144,6 @@ mod youtube_transition_tests {
             Service::Teams,
             Service::Outlook,
             Service::WhatsApp,
-            Service::YouTube,
             Service::Gmail,
         ] {
             assert!(service.keeps_running_in_background());
@@ -2136,6 +2155,23 @@ mod youtube_transition_tests {
                 ))
             );
         }
+        assert!(Service::YouTube.keeps_running_in_background());
+        assert_eq!(
+            service_panel_hint(
+                BarHit::ServiceStrip(StripButton::Close),
+                Service::YouTube,
+                None
+            ),
+            Some("Ocultar YouTube: pausa o vídeo e deixa a sessão em segundo plano".to_string())
+        );
+        assert_eq!(
+            service_panel_hint(
+                BarHit::ServiceStrip(StripButton::Minimize),
+                Service::YouTube,
+                Some(crate::panel_chrome::ServiceBadge::Playing)
+            ),
+            Some("Restaurar YouTube: volta ao painel e continua a tocar".to_string())
+        );
         for service in [Service::Meet, Service::Breath] {
             assert!(!service.keeps_running_in_background());
         }

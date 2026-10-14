@@ -472,22 +472,10 @@ impl App {
         let Some(comp) = &self.comparator else {
             return;
         };
-        if idx >= comp.views.len() || comp.minimized[idx] {
-            return;
-        }
-
-        let has_split = comp.split.is_some();
-        let can_minimize_without_split =
-            can_minimize_column(&comp.minimized, comp.views.len(), idx);
-
-        if !has_split && !can_minimize_without_split {
-            // Se nao tem barra lateral e este e o ultimo painel de IA visivel:
-            // "3 - se eu minimizar os 3 paineis de ia, e a barra lateral, ele volta para home sozinho."
-            if let Some(comp) = &mut self.comparator {
-                comp.expanded = None;
-                comp.minimized[idx] = true;
-            }
-            self.request_home();
+        // A ultima coluna visivel tambem minimiza: vira chip e fica no
+        // comparador. Fechar a barra lateral com todas as IAs ja minimizadas
+        // e que volta a Home.
+        if !can_minimize_column(&comp.minimized, comp.views.len(), idx) {
             return;
         }
 

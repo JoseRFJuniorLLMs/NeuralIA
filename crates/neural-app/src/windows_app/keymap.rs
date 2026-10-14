@@ -89,6 +89,16 @@ impl Chord {
         }
     }
 
+    /// Alt+tecla. Sem Ctrl: Ctrl+Alt e o AltGr do ABNT2.
+    pub(in crate::windows_app) const fn alt(vk: u8) -> Chord {
+        Chord {
+            vk: vk as u32,
+            ctrl: false,
+            shift: false,
+            alt: true,
+        }
+    }
+
     /// A tecla sozinha (so F1-F24 servem de atalho assim).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::windows_app) const fn key(vk: u8) -> Chord {

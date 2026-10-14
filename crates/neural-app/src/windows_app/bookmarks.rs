@@ -192,6 +192,17 @@ pub(in crate::windows_app) enum BookmarkJob {
     Export {
         path: PathBuf,
     },
+    /// Grupos de abas guardados do Chrome e do Edge.
+    ScanTabGroups {
+        local_app_data: PathBuf,
+    },
+}
+
+/// Os grupos de um perfil, ja prontos para a barra.
+#[derive(Debug)]
+pub(in crate::windows_app) struct ProfileTabGroups {
+    pub(in crate::windows_app) label: String,
+    pub(in crate::windows_app) groups: Vec<neural_core::chrome_groups::ChromeTabGroup>,
 }
 
 /// O que a thread responde.
@@ -214,6 +225,7 @@ pub(in crate::windows_app) enum BookmarkReply {
     Exported {
         links: usize,
     },
+    TabGroups(Vec<ProfileTabGroups>),
     Failed(String),
 }
 
@@ -266,6 +278,32 @@ pub(in crate::windows_app) fn importable_profiles(local_app_data: &Path) -> Vec<
     choices
 }
 
+/// Grupos de abas guardados, perfil a perfil. Um perfil sem grupos nao entra.
+pub(in crate::windows_app) fn scan_chromium_tab_groups(
+    local_app_data: &Path,
+) -> Vec<ProfileTabGroups> {
+    let mut found = Vec::new();
+    for browser in ChromiumBrowser::ALL {
+        let user_data = browser.user_data_dir(local_app_data);
+        for profile in chromium_profiles_in(&user_data) {
+            let groups =
+                neural_core::chrome_groups::read_profile_tab_groups(&user_data.join(&profile.dir));
+            if groups.is_empty() {
+                continue;
+            }
+            found.push(ProfileTabGroups {
+                label: format!("{} · {}", browser.label(), profile.name),
+                groups,
+            });
+        }
+    }
+    found
+}
+
+fn menu_text(text: &str) -> String {
+    text.replace('&', "&&")
+}
+
 /// Uma tarefa da thread, contra a loja dela. Sem janela: os gates correm-na
 /// sobre uma pasta temporaria.
 pub(in crate::windows_app) fn run_bookmark_job(
@@ -312,6 +350,9 @@ pub(in crate::windows_app) fn run_bookmark_job(
             Ok(items) => import_items(store, folder_title, items, now_ms),
             Err(error) => BookmarkReply::Failed(import_failure(&error)),
         },
+        BookmarkJob::ScanTabGroups { local_app_data } => {
+            BookmarkReply::TabGroups(scan_chromium_tab_groups(&local_app_data))
+        }
         BookmarkJob::Export { path } => {
             // O que esta no disco agora (outra janela pode ter mudado).
             store.load();
@@ -434,6 +475,7 @@ pub(in crate::windows_app) enum BookmarkPanelRequest {
     Open(u64),
     Remove(u64),
     ImportChrome,
+    ImportGroups,
     ImportFile,
     Export,
 }
@@ -457,6 +499,9 @@ pub(in crate::windows_app) fn parse_bookmarks_action(
         "bookmark-remove" => panel_bookmark_id(args).map(BookmarkPanelRequest::Remove),
         "bookmarks-import-chrome" => {
             exact_keys(args, &[]).map(|_| BookmarkPanelRequest::ImportChrome)
+        }
+        "bookmarks-import-groups" => {
+            exact_keys(args, &[]).map(|_| BookmarkPanelRequest::ImportGroups)
         }
         "bookmarks-import-file" => exact_keys(args, &[]).map(|_| BookmarkPanelRequest::ImportFile),
         "bookmarks-export" => exact_keys(args, &[]).map(|_| BookmarkPanelRequest::Export),
@@ -939,6 +984,17 @@ impl App {
                     });
                 }
             }
+            BookmarkPanelRequest::ImportGroups => {
+                let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+                else {
+                    self.bookmarks_panel_render(Some(
+                        "O Chrome e o Edge não têm grupos de abas guardados.",
+                    ));
+                    return;
+                };
+                self.bookmarks_panel_render(Some("A procurar grupos de abas do Chrome e do Edge…"));
+                self.submit_bookmark_job(BookmarkJob::ScanTabGroups { local_app_data });
+            }
             BookmarkPanelRequest::ImportChrome => {
                 let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
                 else {
@@ -1010,6 +1066,136 @@ impl App {
         });
     }
 
+    /// Os grupos que a thread leu: escolhe o perfil e, se houver varios, o
+    /// grupo. Caem na primeira coluna de IA visivel.
+    fn offer_tab_groups(&mut self, profiles: Vec<ProfileTabGroups>) {
+        if profiles.is_empty() {
+            self.bookmarks_panel_render(Some(
+                "O Chrome e o Edge não têm grupos de abas guardados. No Chrome: botão direito no grupo e Guardar grupo.",
+            ));
+            return;
+        }
+        if self.surface != Surface::Comparator || self.comparator.is_none() {
+            let notice = "Abra uma pesquisa de IA para receber os grupos de abas.";
+            self.bookmarks_panel_render(Some(notice));
+            self.show_splash(notice.to_string(), 4);
+            return;
+        }
+        let profile = match profiles.len() {
+            1 => profiles.into_iter().next(),
+            _ => {
+                let mut menu = PopupMenu::default();
+                menu.push(MenuCommand::new(0, "Importar grupos de").disabled(""));
+                for (index, profile) in profiles.iter().enumerate() {
+                    menu.push(MenuCommand::new(
+                        index + 1,
+                        menu_text(&format!("{} ({})", profile.label, profile.groups.len())),
+                    ));
+                }
+                let picked = self.track_menu(&menu, cursor_point(), MenuButton::Left);
+                picked
+                    .checked_sub(1)
+                    .and_then(|index| profiles.into_iter().nth(index))
+            }
+        };
+        let Some(profile) = profile else {
+            self.bookmarks_panel_render(Some(""));
+            return;
+        };
+        let chosen = match profile.groups.len() {
+            0 => {
+                self.bookmarks_panel_render(Some(""));
+                return;
+            }
+            1 => profile.groups,
+            _ => {
+                let mut menu = PopupMenu::default();
+                let total: usize = profile.groups.iter().map(|group| group.tabs.len()).sum();
+                menu.push(MenuCommand::new(0, "Grupos de abas").disabled(""));
+                menu.push(MenuCommand::new(
+                    1,
+                    format!("Importar todos ({total} abas)"),
+                ));
+                for (index, group) in profile.groups.iter().enumerate() {
+                    let name = if group.title.trim().is_empty() {
+                        "Grupo sem nome".to_string()
+                    } else {
+                        group.title.chars().take(48).collect()
+                    };
+                    menu.push(MenuCommand::new(
+                        index + 2,
+                        menu_text(&format!("{name} ({} abas)", group.tabs.len())),
+                    ));
+                }
+                let picked = self.track_menu(&menu, cursor_point(), MenuButton::Left);
+                if picked == 1 {
+                    profile.groups
+                } else if picked >= 2 {
+                    profile
+                        .groups
+                        .into_iter()
+                        .nth(picked - 2)
+                        .into_iter()
+                        .collect()
+                } else {
+                    self.bookmarks_panel_render(Some(""));
+                    return;
+                }
+            }
+        };
+        self.apply_imported_tab_groups(chosen);
+    }
+
+    fn apply_imported_tab_groups(
+        &mut self,
+        incoming: Vec<neural_core::chrome_groups::ChromeTabGroup>,
+    ) {
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        if self.surface != Surface::Comparator || comp.views.is_empty() {
+            let notice = "Abra uma pesquisa de IA para receber os grupos de abas.";
+            self.bookmarks_panel_render(Some(notice));
+            self.show_splash(notice.to_string(), 4);
+            return;
+        }
+        let index = (0..comp.views.len())
+            .find(|&slot| !comp.minimized[slot])
+            .unwrap_or(0);
+        let provider = comp.views[index].name;
+        let (groups_kept, tabs_kept, lost) = {
+            let comp = self.comparator.as_mut().expect("comparador conferido");
+            comp.minimized[index] = false;
+            let before = grouped_tab_ids(&comp.contexts[index]);
+            let (groups_kept, tabs_kept) = import_chrome_groups(
+                &mut comp.contexts[index],
+                &mut comp.groups[index],
+                &mut comp.next_group_id,
+                &mut comp.next_context_id,
+                &incoming,
+            );
+            let lost = lost_grouped_tabs(&before, &comp.contexts[index]);
+            if let Some(last) = comp.contexts[index].last() {
+                comp.bar_focus[index] = Some(last.id);
+            }
+            (groups_kept, tabs_kept, lost)
+        };
+        self.update_comparator_layout();
+        self.observe_tab_session();
+        self.request_redraw();
+        let mut notice = if tabs_kept == 0 {
+            "Não couberam mais abas nesta coluna.".to_string()
+        } else {
+            format!("{groups_kept} grupos ({tabs_kept} abas) no {provider}")
+        };
+        if let Some(extra) = lost_grouped_notice(lost) {
+            notice.push('\n');
+            notice.push_str(&extra);
+        }
+        self.bookmarks_panel_render(Some(&notice));
+        self.show_splash(notice, 4);
+    }
+
     /// A resposta da thread.
     fn bookmark_reply(&mut self, reply: BookmarkReply) {
         match reply {
@@ -1047,6 +1233,7 @@ impl App {
                 self.request_redraw();
             }
             BookmarkReply::Profiles(choices) => self.bookmark_profiles(choices),
+            BookmarkReply::TabGroups(profiles) => self.offer_tab_groups(profiles),
             BookmarkReply::Exported { links } => {
                 let text = format!("{links} favoritos exportados");
                 self.bookmarks_panel_render(Some(&text));

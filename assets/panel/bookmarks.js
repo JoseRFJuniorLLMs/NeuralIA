@@ -44,6 +44,7 @@
     };
     bq.addEventListener('input', render);
     byId('bookmarks-import-chrome').addEventListener('click', () => post('bookmarks-import-chrome'));
+    byId('bookmarks-import-groups').addEventListener('click', () => post('bookmarks-import-groups'));
     byId('bookmarks-import-file').addEventListener('click', () => post('bookmarks-import-file'));
     byId('bookmarks-export').addEventListener('click', () => post('bookmarks-export'));
     const receive = (data) => {

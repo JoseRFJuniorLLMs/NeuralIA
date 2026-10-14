@@ -2,6 +2,16 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.0.1] - 2026-10-14
+
+### Fixed
+- **YouTube: Minimizar e Ocultar deixam de fazer a mesma coisa.** Minimizar esconde o vídeo, deixa a faixa **↩ Restaurar** e o som continua. Ocultar pausa o vídeo e tira a faixa; a sessão fica no ícone.
+- **Minimizar a última coluna de IA** vira um chip e permanece no comparador. A Home só volta quando a barra lateral fecha com todas as IAs já minimizadas.
+
+### Added
+- **Atalhos nas dicas da barra.** Home **Alt+Home**, voltar/avançar **Alt+←** / **Alt+→**, recarregar **F5**, nova pergunta **Ctrl+N**, expandir coluna ou a fonte ao lado **F11**, fechar a janela **Alt+F4** (e **Ctrl+Shift+W** com o foco na janela), minimizar/maximizar **Win+↓** / **Win+↑**.
+- **Importar grupos de abas do Chrome/Edge** no painel de favoritos (**Importar grupos de abas**). Os grupos guardados entram na primeira coluna de IA visível. Sem uma pesquisa de IA aberta, a app pede para abrir uma.
+
 ## [3.0.0] - 2026-10-10
 
 ### Added

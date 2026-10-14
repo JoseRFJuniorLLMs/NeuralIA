@@ -1100,7 +1100,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
     group: Option<(&str, bool)>,
 ) -> Option<String> {
     let maximized = state.maximized;
-    Some(match hit {
+    let text = match hit {
         BarHit::Home => "Voltar à Home".to_string(),
         BarHit::Back => "Voltar na fonte aberta ao lado".to_string(),
         BarHit::Forward => "Avançar na fonte aberta ao lado".to_string(),
@@ -1160,7 +1160,38 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
         BarHit::AddressBar => TITLE_ADDRESS_HINT.to_string(),
-    })
+    };
+    Some(with_shortcut(text, bar_hit_shortcut(hit, maximized)))
+}
+
+/// Acrescenta o atalho quando a dica ainda nao o diz.
+fn with_shortcut(text: String, keys: Option<&str>) -> String {
+    match keys {
+        Some(keys) if !keys.is_empty() && !text.contains(keys) => format!("{text} ({keys})"),
+        _ => text,
+    }
+}
+
+/// O atalho que o clique faz, o da NeuralIA ou o do Chrome quando e o mesmo
+/// gesto. Sem atalho aqui: o Chrome nao tem um equivalente que esta app
+/// consiga cumprir (Ctrl+W, por exemplo, volta atras).
+fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
+    match hit {
+        BarHit::Home => Some("Alt+Home"),
+        BarHit::Back | BarHit::ColumnBack(_) => Some("Alt+←"),
+        BarHit::Forward | BarHit::ColumnForward(_) => Some("Alt+→"),
+        BarHit::ColumnReload(_) => Some("F5"),
+        BarHit::Column(_) | BarHit::SplitExpand => Some("F11"),
+        BarHit::AddTab(_) => Some("Ctrl+N"),
+        BarHit::ColumnBookmark(_) | BarHit::SplitBookmark => Some("Ctrl+D"),
+        BarHit::WindowMinimize => Some("Win+↓"),
+        BarHit::WindowMaximize if maximized => Some("Win+↓"),
+        BarHit::WindowMaximize => Some("Win+↑"),
+        BarHit::WindowClose => Some("Alt+F4"),
+        BarHit::AddressBar => Some("Ctrl+L"),
+        BarHit::Downloads => Some("Ctrl+J"),
+        _ => None,
+    }
 }
 
 /// Os botoes da janela do proprio app aparecem sempre que a moldura do Windows
@@ -1333,7 +1364,7 @@ fn caption_button_style(index: usize, hovered: bool, theme: &Theme) -> PillStyle
 fn column_hint_text(hint: ColumnHint, provider: &str) -> String {
     match hint {
         ColumnHint::Minimize => format!("Minimizar {provider}"),
-        ColumnHint::Expand => format!("Expandir {provider}"),
+        ColumnHint::Expand => format!("Expandir {provider} (F11)"),
         ColumnHint::None => String::new(),
     }
 }
@@ -1390,10 +1421,10 @@ fn column_hint_step(
 /// Os tres botoes da janela, na ordem em que `native_button_index` os conta.
 fn caption_tooltip_label(index: usize, maximized: bool) -> &'static str {
     match index {
-        0 => "Minimizar",
-        1 if maximized => "Restaurar",
-        1 => "Maximizar",
-        _ => "Fechar",
+        0 => "Minimizar (Win+↓)",
+        1 if maximized => "Restaurar (Win+↓)",
+        1 => "Maximizar (Win+↑)",
+        _ => "Fechar (Alt+F4)",
     }
 }
 
@@ -2355,7 +2386,10 @@ unsafe extern "system" fn home_button_subclass(
         WM_MOUSEMOVE => {
             if !HOME_TOOLTIP_ARMED.swap(true, Ordering::AcqRel) {
                 track_mouse_leave(hwnd);
-                hover_tooltip(hwnd, "Voltar à Home · Botão direito: tema claro ou escuro");
+                hover_tooltip(
+                    hwnd,
+                    "Voltar à Home (Alt+Home) · Botão direito: tema claro ou escuro",
+                );
             }
             DefSubclassProc(hwnd, message, wparam, lparam)
         }

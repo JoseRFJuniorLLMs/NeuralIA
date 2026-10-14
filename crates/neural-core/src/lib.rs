@@ -8,6 +8,7 @@ pub mod agent_security;
 pub mod ai_policy;
 pub mod bookmarks;
 pub mod chat;
+pub mod chrome_groups;
 pub mod config;
 pub mod context_budget;
 pub mod distraction;

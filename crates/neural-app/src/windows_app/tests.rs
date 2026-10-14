@@ -903,7 +903,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     };
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
-        Some("Nova pergunta ao ChatGPT")
+        Some("Nova pergunta ao ChatGPT (Ctrl+N)")
     );
     // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
     assert_eq!(
@@ -912,11 +912,11 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     );
     assert_eq!(
         label(BarHit::WindowMaximize, false).as_deref(),
-        Some("Maximizar")
+        Some("Maximizar (Win+↑)")
     );
     assert_eq!(
         label(BarHit::WindowMaximize, true).as_deref(),
-        Some("Restaurar")
+        Some("Restaurar (Win+↓)")
     );
     let tab = BarHit::ContextTab {
         source_index: 1,
@@ -7774,9 +7774,51 @@ fn context_limit_prunes_group_orphaned_by_eviction() {
 
 #[test]
 fn rejected_minimize_keeps_last_visible_panel_state_intact() {
-    assert!(!can_minimize_column(&[true, false, true], 3, 1));
+    assert!(can_minimize_column(&[true, false, true], 3, 1));
     assert!(can_minimize_column(&[false, false, true], 3, 1));
+    assert!(can_minimize_column(&[false, true, true], 3, 0));
+    assert!(!can_minimize_column(&[true, false, true], 3, 0));
     assert!(!can_minimize_column(&[false, false, true], 3, 9));
+}
+
+#[test]
+fn imported_chrome_groups_keep_the_first_tabs_and_the_chrome_color() {
+    use neural_core::chrome_groups::{ChromeSavedTab, ChromeTabGroup};
+    let mut tabs = Vec::new();
+    let mut groups = Vec::new();
+    let mut next_group = 1u64;
+    let mut next_tab = 10u64;
+    let incoming = vec![ChromeTabGroup {
+        title: "Trabalho".into(),
+        color: 5,
+        position: 0,
+        tabs: vec![
+            ChromeSavedTab {
+                position: 0,
+                url: "https://example.com/a".into(),
+                title: "A".into(),
+            },
+            ChromeSavedTab {
+                position: 1,
+                url: "javascript:alert(1)".into(),
+                title: "nao".into(),
+            },
+        ],
+    }];
+    let (kept_groups, kept_tabs) = import_chrome_groups(
+        &mut tabs,
+        &mut groups,
+        &mut next_group,
+        &mut next_tab,
+        &incoming,
+    );
+    assert_eq!((kept_groups, kept_tabs), (1, 1));
+    assert_eq!(groups[0].name, "Trabalho");
+    assert_eq!(groups[0].color, GroupColor::Green);
+    assert_eq!(tabs[0].url, "https://example.com/a");
+    assert_eq!(tabs[0].group, Some(groups[0].id));
+    assert_eq!(group_color_from_chrome(1), GroupColor::Slate);
+    assert_eq!(group_color_from_chrome(0), GroupColor::Blue);
 }
 
 #[test]
@@ -8532,7 +8574,7 @@ __on('neuralia-comp-expand', 'mouseleave');
         .collect();
     assert_eq!(
         texts,
-        ["Minimizar ChatGPT", "", "Expandir ChatGPT", ""],
+        ["Minimizar ChatGPT", "", "Expandir ChatGPT (F11)", ""],
         "o mouseenter sintetico nao pode pedir dica"
     );
 
@@ -8717,9 +8759,9 @@ fn the_history_panel_scrollbar_is_thin_and_follows_the_theme() {
 }
 
 /// Arrastar a borda do painel muda a largura dele e as colunas das IAs
-/// refluem ate a borda nova, sem buraco nem sobreposicao; minimizado, o
-/// painel de servicos devolve a largura inteira as colunas. E a mesma conta
-/// que o layout, os divisores e o arrasto dos divisores usam.
+/// refluem ate a borda nova, sem buraco nem sobreposicao; minimizado, fica
+/// so a faixa de restaurar. E a mesma conta que o layout, os divisores e o
+/// arrasto dos divisores usam.
 #[test]
 fn the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized() {
     let window_w = 1600.0;
@@ -8760,12 +8802,15 @@ fn the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized() {
         assert!((300.0..=960.0).contains(&panel_w), "{panel_w}");
     }
 
-    // Minimizado: as colunas voltam a ocupar a janela toda.
+    // Minimizado: fica a faixa de restaurar. O resto da janela volta as colunas.
     let mut minimized = ServicePanelState::default();
     minimized.step(ServiceInput::Minimize);
     let reserved = reserved_panel_width(Some(minimized), false, false, 600.0, 440.0);
-    assert_eq!(reserved, 0.0);
-    assert_eq!(comparator_logical_width(window_w, reserved), window_w);
+    assert_eq!(reserved, 320.0);
+    assert_eq!(
+        comparator_logical_width(window_w, reserved),
+        window_w - 320.0
+    );
     // Minimizado e com o historico aberto ao lado: conta o historico.
     assert_eq!(
         reserved_panel_width(Some(minimized), false, true, 600.0, 440.0),
@@ -10521,9 +10566,11 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
     let ctrl_d = Chord::ctrl(b'D');
     let ctrl_j = Chord::ctrl(b'J');
     // Os atalhos que as WebViews prendem, com o comando de cada um.
+    let alt_home = Chord::alt(0x24);
     let global = [
         (ctrl_d, CommandId::Bookmark),
         (ctrl_j, CommandId::Downloads),
+        (alt_home, CommandId::Home),
     ];
     let mut chords = vec![
         ctrl_d,
@@ -10626,6 +10673,7 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
     assert_eq!(
         outside_window,
         [
+            (CommandId::Home, KeyScope::Global, alt_home),
             (CommandId::Bookmark, KeyScope::Global, ctrl_d),
             (CommandId::Downloads, KeyScope::Global, ctrl_j),
         ]
@@ -10793,7 +10841,7 @@ fn accelerator_decision_table() {
     }
     // Os sete da 2.2.0, o Ctrl+D dos favoritos e o Ctrl+J dos Downloads
     // (os dois `Global`, valem tambem la).
-    assert_eq!(window_chords, 2 * 9);
+    assert_eq!(window_chords, 2 * 12);
 }
 
 /// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
@@ -10870,6 +10918,13 @@ fn keymap_chords_are_unique_per_scope() {
                 KeyScope::Window,
                 Chord::ctrl_shift(0x2E)
             ),
+            (CommandId::Home, KeyScope::Global, Chord::alt(0x24)),
+            (
+                CommandId::SplitFullscreen,
+                KeyScope::Window,
+                Chord::key(0x7A)
+            ),
+            (CommandId::Exit, KeyScope::Window, Chord::ctrl_shift(b'W')),
             (CommandId::Bookmark, KeyScope::Global, Chord::ctrl(b'D')),
             (CommandId::Downloads, KeyScope::Global, Chord::ctrl(b'J')),
         ]
@@ -11746,7 +11801,7 @@ fn the_window_and_the_omnibox_share_one_keymap() {
     }
     // Os sete da 2.2.0, o Ctrl+D dos favoritos (Global) e o Ctrl+J dos
     // Downloads (o do registo e o da lista).
-    assert_eq!(bound, 10);
+    assert_eq!(bound, 13);
     // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
     let source = shipped_source();
     assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
@@ -32653,7 +32708,9 @@ mod bookmarks_gates {
     /// ids e `{}` -- os titulos chegam-lhe como texto.
     #[test]
     fn bookmark_panel_messages_carry_ids_only() {
-        use BookmarkPanelRequest::{Export, ImportChrome, ImportFile, List, Open, Remove};
+        use BookmarkPanelRequest::{
+            Export, ImportChrome, ImportFile, ImportGroups, List, Open, Remove,
+        };
         let parse = |body: serde_json::Value| parse_panel_message(&body.to_string());
         for (action, args, request) in [
             ("bookmarks-list", serde_json::json!({}), List),
@@ -32663,6 +32720,11 @@ mod bookmarks_gates {
                 "bookmarks-import-chrome",
                 serde_json::json!({}),
                 ImportChrome,
+            ),
+            (
+                "bookmarks-import-groups",
+                serde_json::json!({}),
+                ImportGroups,
             ),
             ("bookmarks-import-file", serde_json::json!({}), ImportFile),
             ("bookmarks-export", serde_json::json!({}), Export),
@@ -32698,6 +32760,7 @@ mod bookmarks_gates {
         for action in [
             "bookmarks-list",
             "bookmarks-import-chrome",
+            "bookmarks-import-groups",
             "bookmarks-import-file",
             "bookmarks-export",
         ] {
@@ -32742,7 +32805,8 @@ mod bookmarks_gates {
             "const rows = $('bookmarks-list').children; __out.rows = rows.length; \
              __out.texts = rows.map((row) => row.textContent); \
              __click(rows[1].children[0]); __click(rows[2].children[1]); \
-             __click($('bookmarks-import-chrome')); __click($('bookmarks-import-file')); \
+             __click($('bookmarks-import-chrome')); __click($('bookmarks-import-groups')); \
+             __click($('bookmarks-import-file')); \
              __click($('bookmarks-export')); __out.notice = $('bookmarks-msg').textContent;"
                 .into(),
             "__type($('bq'), 'outro'); __out.filtered = $('bookmarks-list').children.length;"
@@ -32770,6 +32834,7 @@ mod bookmarks_gates {
                 Some(PanelMessage::Bookmarks(Open(3))),
                 Some(PanelMessage::Bookmarks(Remove(4))),
                 Some(PanelMessage::Bookmarks(ImportChrome)),
+                Some(PanelMessage::Bookmarks(ImportGroups)),
                 Some(PanelMessage::Bookmarks(ImportFile)),
                 Some(PanelMessage::Bookmarks(Export)),
             ],
@@ -33195,7 +33260,7 @@ mod bookmarks_gates {
         for hit in [BarHit::ColumnBookmark(1), BarHit::SplitBookmark] {
             assert_eq!(
                 tip(hit).as_deref(),
-                Some("Nos favoritos · clique: remover, mover ou abrir Favoritos"),
+                Some("Nos favoritos · clique: remover, mover ou abrir Favoritos (Ctrl+D)"),
                 "{hit:?}"
             );
         }

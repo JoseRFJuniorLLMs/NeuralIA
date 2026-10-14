@@ -697,20 +697,124 @@ pub(in crate::windows_app) fn lost_grouped_tabs(before: &[u64], tabs: &[ContextT
         .count()
 }
 
-/// Decide se uma coluna ainda pode ser minimizada sem esconder todas as IAs.
-/// Esta decisao acontece ANTES de fechar um Split ativo: um clique rejeitado
-/// nao pode destruir estado que o utilizador tinha aberto.
+/// A coluna `index` pode ser minimizada. A ultima visivel tambem: vira chip
+/// e o comparador fica. Um indice fora ou uma coluna ja minimizada, nao.
 pub(in crate::windows_app) fn can_minimize_column(
     minimized: &[bool; COMPARATOR_COLUMNS],
     columns: usize,
     index: usize,
 ) -> bool {
-    index < columns
-        && !minimized[index]
-        && (0..columns.min(COMPARATOR_COLUMNS))
-            .filter(|slot| !minimized[*slot])
-            .count()
-            > 1
+    index < columns && index < COMPARATOR_COLUMNS && !minimized[index]
+}
+
+/// A cor do Chrome (`saved_tab_group`) na paleta da barra.
+pub(in crate::windows_app) fn group_color_from_chrome(color: i32) -> GroupColor {
+    match color {
+        1 => GroupColor::Slate,
+        2 => GroupColor::Blue,
+        3 => GroupColor::Red,
+        4 => GroupColor::Amber,
+        5 => GroupColor::Green,
+        6 => GroupColor::Pink,
+        7 => GroupColor::Purple,
+        8 => GroupColor::Cyan,
+        9 => GroupColor::Orange,
+        _ => GroupColor::Blue,
+    }
+}
+
+fn imported_group_name(title: &str) -> String {
+    let name: String = title
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let name: String = name.chars().take(80).collect();
+    if name.is_empty() {
+        "Grupo sem nome".to_string()
+    } else {
+        name
+    }
+}
+
+/// Acrescenta grupos do Chrome a uma coluna. As primeiras abas de cada grupo
+/// ficam com a identidade mais nova, para o tecto de abas largar o fim e nao
+/// o comeco. Devolve quantos grupos e abas ficaram.
+pub(in crate::windows_app) fn import_chrome_groups(
+    tabs: &mut Vec<ContextTab>,
+    groups: &mut Vec<ContextGroup>,
+    next_group_id: &mut u64,
+    next_context_id: &mut u64,
+    incoming: &[neural_core::chrome_groups::ChromeTabGroup],
+) -> (usize, usize) {
+    struct Planned {
+        name: String,
+        color: GroupColor,
+        urls: Vec<String>,
+    }
+    let mut planned = Vec::new();
+    for source in incoming {
+        let mut urls = Vec::new();
+        for tab in &source.tabs {
+            if !tab_session::storable_url(&tab.url) || urls.iter().any(|url| url == &tab.url) {
+                continue;
+            }
+            urls.push(tab.url.clone());
+        }
+        if urls.is_empty() {
+            continue;
+        }
+        planned.push(Planned {
+            name: imported_group_name(&source.title),
+            color: group_color_from_chrome(source.color),
+            urls,
+        });
+    }
+    let total: usize = planned.iter().map(|group| group.urls.len()).sum();
+    if total == 0 {
+        return (0, 0);
+    }
+    let mut made_groups = Vec::new();
+    let mut made_tabs = Vec::new();
+    let base = (*next_context_id).max(1);
+    let mut offset = 0usize;
+    for group in &planned {
+        let group_id = *next_group_id;
+        *next_group_id = next_group_id.wrapping_add(1).max(1);
+        groups.push(ContextGroup {
+            id: group_id,
+            name: group.name.clone(),
+            color: group.color,
+            collapsed: false,
+        });
+        made_groups.push(group_id);
+        for (index, url) in group.urls.iter().enumerate() {
+            // A primeira aba do grupo e a mais nova: o tecto larga o fim.
+            let age = total - 1 - (offset + index);
+            let id = base.wrapping_add(age as u64);
+            tabs.push(ContextTab {
+                id,
+                url: url.clone(),
+                group: Some(group_id),
+            });
+            made_tabs.push(id);
+        }
+        offset += group.urls.len();
+    }
+    *next_context_id = base.wrapping_add(total as u64).max(1);
+    let before = made_tabs.clone();
+    prune_context_tabs(tabs, groups, &[]);
+    let groups_kept = made_groups
+        .iter()
+        .filter(|id| groups.iter().any(|group| group.id == **id))
+        .count();
+    let tabs_kept = before
+        .iter()
+        .filter(|id| tabs.iter().any(|tab| tab.id == **id))
+        .count();
+    (groups_kept, tabs_kept)
 }
 
 /// Fecha as outras abas do MESMO escopo da aba selecionada. Um grupo real

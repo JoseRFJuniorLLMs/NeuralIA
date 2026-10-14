@@ -251,7 +251,9 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Voltar à Home",
         category: CommandCategory::Navegacao,
         keywords: &["home", "início", "inicio", "voltar"],
-        chords: &[],
+        chords: &[ChordSpec::global(Chord::alt(
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_HOME as u8,
+        ))],
         alias: None,
     },
     CommandRow {
@@ -269,7 +271,9 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Expandir ou reduzir a fonte aberta ao lado",
         category: CommandCategory::FonteAoLado,
         keywords: &["expandir", "reduzir", "fonte", "lado", "tela cheia"],
-        chords: &[],
+        chords: &[ChordSpec::window(Chord::key(
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F11 as u8,
+        ))],
         alias: None,
     },
     CommandRow {
@@ -278,7 +282,7 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Fechar a NeuralIA",
         category: CommandCategory::Janela,
         keywords: &["sair", "fechar", "janela"],
-        chords: &[],
+        chords: &[ChordSpec::window(Chord::ctrl_shift(b'W'))],
         alias: None,
     },
     CommandRow {
