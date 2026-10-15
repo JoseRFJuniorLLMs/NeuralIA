@@ -590,10 +590,11 @@ jobs:
               Test = "keymap_chords_are_unique_per_scope"
               SourcePath = "crates/neural-app/src/windows_app/commands.rs"
               Old = @'
-                  chords: &[ChordSpec::window(Chord::ctrl(b'N'))],
+            ChordSpec::global(Chord::ctrl(b'N')),
           '@
               New = @'
-                  chords: &[ChordSpec::window(Chord::ctrl(b'N')), ChordSpec::window(Chord::ctrl(b'H'))],
+            ChordSpec::global(Chord::ctrl(b'N')),
+            ChordSpec::global(Chord::ctrl(b'H')),
           '@
             },
             @{
