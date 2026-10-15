@@ -4,7 +4,115 @@
 use crate::windows_app::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WS_BORDER};
 
+pub(in crate::windows_app) fn close_tab_origin_matches(
+    origin: CommandOrigin,
+    source: usize,
+) -> bool {
+    match origin {
+        CommandOrigin::Window | CommandOrigin::Omnibox => true,
+        CommandOrigin::Host(
+            WebViewHost::Column(index)
+            | WebViewHost::Split(index)
+            | WebViewHost::PrivateSplit(index),
+        ) => index < COMPARATOR_COLUMNS && index == source,
+        _ => false,
+    }
+}
+
 impl App {
+    pub(in crate::windows_app) fn close_active_tab(&mut self, origin: CommandOrigin) {
+        match origin {
+            CommandOrigin::Host(WebViewHost::Live) => {
+                self.minimize_live_panel();
+                return;
+            }
+            CommandOrigin::Host(WebViewHost::SidePanel) => {
+                self.close_side_panel(PanelExit::CloseButton);
+                return;
+            }
+            CommandOrigin::Host(WebViewHost::Service(_)) => {
+                self.conceal_service_panel();
+                return;
+            }
+            _ => {}
+        }
+        let target = self.comparator.as_ref().and_then(|comp| {
+            let split = comp.split.as_ref()?;
+            if !close_tab_origin_matches(origin, split.source_index) {
+                return None;
+            }
+            let index = comp
+                .contexts
+                .get(split.source_index)?
+                .iter()
+                .position(|tab| Some(tab.id) == split.context_id);
+            Some((split.source_index, index))
+        });
+        if let Some((column, index)) = target {
+            if let Some(index) = index {
+                self.close_context_tab(column, index);
+            } else {
+                self.close_split();
+            }
+        } else if self.comparator.is_none() && self.surface != Surface::Home {
+            self.request_home();
+        }
+    }
+
+    pub(in crate::windows_app) fn cycle_context_shortcut(
+        &mut self,
+        column: usize,
+        backwards: bool,
+    ) {
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        let Some(tabs) = comp.contexts.get(column) else {
+            return;
+        };
+        if tabs.is_empty() {
+            return;
+        }
+        let active = comp
+            .split
+            .as_ref()
+            .filter(|split| split.source_index == column)
+            .and_then(|split| tabs.iter().position(|tab| Some(tab.id) == split.context_id));
+        let next = active.map_or(if backwards { tabs.len() - 1 } else { 0 }, |index| {
+            if backwards {
+                (index + tabs.len() - 1) % tabs.len()
+            } else {
+                (index + 1) % tabs.len()
+            }
+        });
+        self.open_context_tab(column, next);
+    }
+
+    pub(in crate::windows_app) fn toggle_active_group_shortcut(&mut self, column: usize) {
+        let Some(comp) = &self.comparator else {
+            return;
+        };
+        let group_index = comp
+            .split
+            .as_ref()
+            .filter(|split| split.source_index == column)
+            .and_then(|split| {
+                comp.contexts
+                    .get(column)?
+                    .iter()
+                    .find(|tab| Some(tab.id) == split.context_id)
+            })
+            .and_then(|tab| {
+                comp.groups
+                    .get(column)?
+                    .iter()
+                    .position(|group| Some(group.id) == tab.group)
+            });
+        if let Some(index) = group_index {
+            self.toggle_context_group(column, index);
+        }
+    }
+
     /// Corre depois de cada lote de eventos: se as abas ou os grupos mudaram,
     /// agenda a gravacao. Olhar aqui, e nao em cada sitio que mexe nas abas,
     /// apanha tambem os gestos da barra que ainda vao nascer.
@@ -121,15 +229,15 @@ impl App {
             .is_some_and(|split| {
                 split.source_index == source_index && split.context_id == Some(context_id)
             });
-        if closes_active {
-            self.close_split();
-        }
         if let Some(comp) = &mut self.comparator {
             let _ = remove_context_tab(
                 &mut comp.contexts[source_index],
                 &mut comp.groups[source_index],
                 context_index,
             );
+        }
+        if closes_active {
+            self.close_split();
         }
         self.request_redraw();
     }
@@ -349,7 +457,7 @@ impl App {
     /// e fa-la ancora da coluna -- a barra passa a mostra-la, pilula incluida.
     /// Sem isto, uma aba guardada que ficasse fora do corte das mais recentes
     /// continuava no `tabs.json` sem se poder abrir, recolorir nem fechar.
-    fn show_tab_list_menu(&mut self, source_index: usize) {
+    pub(in crate::windows_app) fn show_tab_list_menu(&mut self, source_index: usize) {
         let Some(hwnd) = self.window.as_ref().and_then(window_hwnd) else {
             return;
         };
@@ -1051,7 +1159,7 @@ impl App {
             }
             Some(BarHit::GeminiLive) => self.toggle_live_panel(),
             Some(BarHit::Downloads) => self.toggle_downloads_panel(),
-            Some(BarHit::SplitClose) => self.close_split(),
+            Some(BarHit::SplitClose) => self.close_active_tab(CommandOrigin::Window),
             Some(BarHit::SplitMinimize) => self.toggle_split_minimized(),
             Some(BarHit::SplitExpand) => self.toggle_split_fullscreen(),
             Some(BarHit::Home) => {
@@ -1128,6 +1236,18 @@ impl App {
     }
 
     pub(in crate::windows_app) fn click_home(&mut self) {
+        if self.live_panel.is_open()
+            && let Some(window) = &self.window
+        {
+            let size = window.inner_size();
+            let scale = window.scale_factor();
+            if self.cursor.1 >= f64::from(size.height) - 64.0 * scale
+                && self.cursor.1 < f64::from(size.height) - 24.0 * scale
+            {
+                self.toggle_live_panel();
+                return;
+            }
+        }
         let Some(window) = &self.window else {
             return;
         };

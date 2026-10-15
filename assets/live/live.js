@@ -315,6 +315,8 @@
     getDisplayMedia: (constraints) => navigator.mediaDevices.getDisplayMedia(constraints),
     createMic,
     grabFrame,
+    setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimeout: (id) => window.clearTimeout(id),
     setInterval: (fn, ms) => window.setInterval(fn, ms),
     clearInterval: (id) => window.clearInterval(id)
   };
@@ -349,7 +351,38 @@
     }
   }
 
+  let panelShortcuts = [];
+  function configureShortcuts(config) {
+    if (!config || !Array.isArray(config.shortcuts)) return;
+    panelShortcuts = config.shortcuts;
+    for (const row of panelShortcuts) {
+      for (const id of [row.id, row.fallback].filter(Boolean)) {
+        const button = $(id);
+        if (button) button.title = row.label + ' (' + row.keys + ')';
+      }
+    }
+  }
+  document.addEventListener('keydown', (event) => {
+    if (event.defaultPrevented || event.repeat || event.isComposing) return;
+    const row = panelShortcuts.find(row => !row.native &&
+      !!event.ctrlKey === !!row.ctrl && !!event.altKey === !!row.alt && !!event.shiftKey === !!row.shift &&
+      String(event.key).toLowerCase() === row.key);
+    if (!row) return;
+    const button = [row.id, row.fallback].filter(Boolean).map($)
+      .find(button => button && !button.disabled && !button.hidden && !button.closest('[hidden]'));
+    if (button) {
+      event.preventDefault(); event.stopPropagation();
+      if (session && session.audioSuspended) {
+        session.resumeAudio().then(() => {
+          if (session && !session.audioSuspended) setNotice('audio', '');
+        });
+      }
+      button.click();
+    }
+  });
+
   function start(config) {
+    configureShortcuts(config);
     theme(config && config.theme);
     stopSession();
     show('live');
@@ -368,6 +401,7 @@
   }
 
   function askKey(config) {
+    configureShortcuts(config);
     theme(config && config.theme);
     stopSession();
     show('key');

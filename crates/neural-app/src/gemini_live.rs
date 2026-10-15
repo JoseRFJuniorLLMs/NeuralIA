@@ -29,6 +29,74 @@ use wry::http::{Method, Request, Response as HttpResponse, StatusCode};
 
 use crate::secrets::{SecretFile, wipe};
 
+pub(crate) fn live_mouse_point(
+    params: &serde_json::Value,
+    primary: (i32, i32),
+) -> Option<(i32, i32)> {
+    let x = params.get("x")?.as_f64()?;
+    let y = params.get("y")?.as_f64()?;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let normalized = match params.get("normalized") {
+        None => false,
+        Some(value) => value.as_bool()?,
+    };
+    let (x, y) = if normalized {
+        if !(0.0..=1.0).contains(&x)
+            || !(0.0..=1.0).contains(&y)
+            || primary.0 <= 0
+            || primary.1 <= 0
+        {
+            return None;
+        }
+        (x * f64::from(primary.0 - 1), y * f64::from(primary.1 - 1))
+    } else {
+        (x, y)
+    };
+    if x < f64::from(i32::MIN)
+        || x > f64::from(i32::MAX)
+        || y < f64::from(i32::MIN)
+        || y > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    Some((x.round() as i32, y.round() as i32))
+}
+
+pub(crate) fn live_destination_url(kind: &str, destination: &str, origin: &str) -> Option<Url> {
+    let destination = destination.trim();
+    if destination.is_empty() || destination.len() > 2048 || origin.len() > 2048 {
+        return None;
+    }
+    let mut url = Url::parse(match kind {
+        "browser_maps" if origin.trim().is_empty() => "https://www.google.com/maps/search/",
+        "browser_maps" => "https://www.google.com/maps/dir/",
+        "browser_uber" => "https://m.uber.com/looking",
+        _ => return None,
+    })
+    .ok()?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        if kind == "browser_maps" {
+            pairs.append_pair("api", "1");
+            if origin.trim().is_empty() {
+                pairs.append_pair("query", destination);
+            } else {
+                pairs
+                    .append_pair("origin", origin.trim())
+                    .append_pair("destination", destination);
+            }
+        } else {
+            pairs.append_pair("dropoff[formatted_address]", destination);
+            if !origin.trim().is_empty() {
+                pairs.append_pair("pickup[formatted_address]", origin.trim());
+            }
+        }
+    }
+    Some(url)
+}
+
 /// Nome do esquema registado no wry.
 pub(crate) const LIVE_PROTOCOL: &str = "neuralia-live";
 /// Como o WebView2 ve o esquema (`http://<esquema>.localhost`).
@@ -42,6 +110,10 @@ pub(crate) const LIVE_CSS: &str = include_str!("../../../assets/live/live.css");
 pub(crate) const LIVE_CORE_JS: &str = include_str!("../../../assets/live/live-core.js");
 /// A interface do painel.
 pub(crate) const LIVE_APP_JS: &str = include_str!("../../../assets/live/live.js");
+pub(crate) fn live_panel_shortcuts() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../../assets/live/shortcuts.json"))
+        .expect("bundled Live shortcut catalog must be valid JSON")
+}
 
 /// Nada de scripts de fora nem de inline: so os dois ficheiros desta origem e
 /// o worklet do microfone (Blob URL criado pela propria pagina). A unica
@@ -194,7 +266,11 @@ pub(crate) fn validate_live_key(raw: &str) -> Option<LiveKey> {
 }
 
 /// Todas as 40 ferramentas nativas expostas ao Gemini Live (SPEC-0117).
-pub(crate) const LIVE_TOOL_NAMES: &[&str; 40] = &[
+pub(crate) const LIVE_TOOL_NAMES: &[&str; 44] = &[
+    "desktop_move_mouse",
+    "browser_maps",
+    "browser_uber",
+    "browser_agent_plan",
     "history_list_recent",
     "history_search",
     "history_reopen",
@@ -389,14 +465,14 @@ pub(crate) fn live_start_script(
 ) -> String {
     live_call(
         "start",
-        &serde_json::json!({ "theme": theme, "key": key.expose(), "notice": notice }),
+        &serde_json::json!({ "theme": theme, "key": key.expose(), "notice": notice, "shortcuts": live_panel_shortcuts() }),
     )
 }
 
 pub(crate) fn live_ask_key_script(theme: &serde_json::Value, error: Option<&str>) -> String {
     live_call(
         "askKey",
-        &serde_json::json!({ "theme": theme, "error": error }),
+        &serde_json::json!({ "theme": theme, "error": error, "shortcuts": live_panel_shortcuts() }),
     )
 }
 
@@ -500,6 +576,24 @@ pub(crate) enum LiveIndicator {
     /// O nativo mandou a pagina arrancar: a tela, a camera e o microfone podem
     /// estar a sair para o Google.
     Live,
+}
+
+pub(crate) fn live_home_status(indicator: LiveIndicator) -> Option<&'static str> {
+    match indicator {
+        LiveIndicator::Off => None,
+        LiveIndicator::Standby => Some("Gemini Live sem sessao ativa - Alt+G para abrir"),
+        LiveIndicator::Live => {
+            Some("Gemini Live ativo - Alt+G para abrir; Alt+Shift+G para desligar")
+        }
+    }
+}
+
+pub(crate) fn live_window_title(indicator: LiveIndicator) -> &'static str {
+    match indicator {
+        LiveIndicator::Off => "NeuralIA",
+        LiveIndicator::Standby => "NeuralIA - Gemini Live sem sessao ativa",
+        LiveIndicator::Live => "NeuralIA - Gemini Live ativo (Alt+Shift+G desliga)",
+    }
 }
 
 /// O painel do Gemini Live e o estado do olho numa peca so: o olho e lido
@@ -1343,7 +1437,7 @@ return {
         );
         assert_eq!(
             out["handles"],
-            json!(["h1", "", "", ""]),
+            json!(["h1", null, "", ""]),
             "so um handle retomavel conta"
         );
         assert_eq!(
@@ -1448,6 +1542,8 @@ function world(options) {
     getDisplayMedia: () => media('screen'),
     createMic: async (ctx, s, onChunk) => { w.micChunk = onChunk; return { rate: ctx.sampleRate, disconnect() { w.micDisconnects++; } }; },
     grabFrame: async () => 'SlBFRw==',
+    setTimeout: (fn, ms) => { w.reconnect = fn; w.reconnectMs = ms; return 9; },
+    clearTimeout: () => { w.reconnect = null; },
     setInterval: (fn, ms) => { w.tick = fn; w.intervalMs = ms; return 7; },
     clearInterval: (id) => w.cleared.push(id)
   };
@@ -1649,163 +1745,88 @@ return out;
     }
 
     #[test]
-    fn a_server_that_keeps_dropping_after_setup_cannot_reconnect_forever() {
-        // O setupComplete zera o tecto de religacoes SEGUIDAS; sem um tecto
-        // por sessao, um servidor que aceita e volta a fechar religava sem
-        // fim, a gastar a cota do dono.
+    fn requested_live_persists_across_rotations_and_drops_until_stop() {
         let body = format!(
             "{SESSION_FAKES}{}",
             r#"
 const w = world();
 const session = core.createSession({ env: w.env, ui: w.uiHandlers, key: 'K' });
 await session.start();
-for (let round = 0; round < 12; round++) {
+for (let i = 0; i < 50; i++) {
   const socket = w.sockets[w.sockets.length - 1];
-  if (!socket || socket.closedWith) break;
-  socket.open();
-  socket.receive('{"setupComplete":{}}');
-  socket.receive(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h' + round, resumable: true } }));
+  socket.open(); socket.receive('{"setupComplete":{}}');
+  socket.receive(JSON.stringify({sessionResumptionUpdate:{newHandle:'h'+i,resumable:true}}));
   await flush();
-  socket.drop(1011, 'Internal error');
-  await flush();
+  if (i % 2) socket.drop(1006, '');
+  else { socket.receive('{"goAway":{}}'); await flush(); }
+  if (typeof w.reconnect !== 'function') throw Error('reconnect missing');
+  const next = w.reconnect; w.reconnect = null; next();
 }
-return {
-  sockets: w.sockets.length,
-  live: session.live,
-  errors: w.ui.errors.map((e) => e.message),
-  ended: w.ui.ended,
-  stopped: w.tracks.map((t) => t.stopped),
-  caps: [core.MAX_DROP_RESUMES, core.MAX_GOAWAY_RESUMES]
-};
+const before = {sockets:w.sockets.length, ended:w.ui.ended, stopped:w.tracks.map(t=>t.stopped)};
+w.sockets[w.sockets.length-1].drop(1006, '');
+session.stop();
+return {before, canceled:w.reconnect === null, stopped:w.tracks.map(t=>t.stopped)};
 "#
         );
         let out = node_core(&body, Value::Null);
-        assert_eq!(out["caps"], json!([6, 36]));
-        assert_eq!(
-            out["sockets"], 7,
-            "a primeira ligacao + 6 religacoes, e para: {out}"
-        );
-        assert_eq!(out["live"], false);
-        assert_eq!(out["ended"], 1);
-        assert_eq!(out["stopped"], json!([1, 1, 1]), "tela, camera e mic param");
-        assert_eq!(
-            out["errors"],
-            json!([
-                "A conexão caiu várias vezes e a sessão foi encerrada para não gastar a sua cota. Ligue de novo quando quiser."
-            ])
-        );
+        assert_eq!(out["before"]["sockets"], 51);
+        assert_eq!(out["before"]["ended"], 0);
+        assert_eq!(out["before"]["stopped"], json!([0, 0, 0]));
+        assert_eq!(out["canceled"], true);
+        assert_eq!(out["stopped"], json!([1, 1, 1]));
     }
 
     #[test]
-    fn live_js_keeps_the_session_across_go_away_and_drops() {
+    fn requested_live_invalidates_resumption_and_recovers_expired_handle() {
         let body = format!(
             "{SESSION_FAKES}{}",
             r#"
-const ready = async (socket) => { socket.open(); socket.receive('{"setupComplete":{}}'); await flush(); };
-const w = world();
-const session = core.createSession({ env: w.env, ui: w.uiHandlers, key: 'K' });
+const w=world(); const session=core.createSession({env:w.env,ui:w.uiHandlers,key:'K'});
 await session.start();
-const first = w.sockets[0];
-await ready(first);
-first.receive(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h1', resumable: true } }));
-await flush();
-// O servidor avisa que vai fechar: a sessao passa ja para uma ligacao nova,
-// com o handle, e a tela, a camera e o microfone continuam ligados.
-first.receive(JSON.stringify({ goAway: { timeLeft: '10s' } }));
-await flush();
-const out = { afterGoAway: { sockets: w.sockets.length, oldClosed: first.closedWith, live: session.live } };
-const second = w.sockets[1];
-second.open();
-out.secondSetup = second.sent[0].setup.sessionResumption;
-out.secondModel = second.sent[0].setup.model;
-second.receive('{"setupComplete":{}}');
-await flush();
-out.resumed = { live: session.live, stopped: w.tracks.map((t) => t.stopped), sources: session.sources(), errors: w.ui.errors.length };
-// A voz vai para a ligacao nova; o fecho tardio da velha nao faz nada.
-w.micChunk(new Float32Array(4800).fill(0.25));
-out.audioOnSecond = realtime(second, 'audio').length;
-first.drop(1000, '');
-await flush();
-out.afterOldClose = { live: session.live, sockets: w.sockets.length, errors: w.ui.errors.length };
-// Uma queda (1011) com handle: retoma de novo.
-second.receive(JSON.stringify({ sessionResumptionUpdate: { newHandle: 'h2', resumable: true } }));
-await flush();
-second.drop(1011, 'Internal error');
-await flush();
-const third = w.sockets[2];
-third.open();
-out.thirdSetup = third.sent[0].setup.sessionResumption;
-// Religacoes que nunca chegam ao setupComplete acabam por desistir.
-third.drop(1006, '');
-await flush();
-w.sockets[3].drop(1006, '');
-await flush();
-out.stillTrying = { sockets: w.sockets.length, errors: w.ui.errors.length };
-w.sockets[4].drop(1006, '');
-await flush();
-out.giveUp = { sockets: w.sockets.length, live: session.live, errors: w.ui.errors.map((e) => e.message), ended: w.ui.ended, stopped: w.tracks.map((t) => t.stopped) };
-
-// Sem handle nao ha como retomar: para tudo e diz porque.
-const n = world();
-const plain = core.createSession({ env: n.env, ui: n.uiHandlers, key: 'K' });
-await plain.start();
-await ready(n.sockets[0]);
-n.sockets[0].drop(1006, '');
-await flush();
-out.noHandle = { sockets: n.sockets.length, errors: n.ui.errors.map((e) => e.message), ended: n.ui.ended, stopped: n.tracks.map((t) => t.stopped) };
-return out;
+const first=w.sockets[0];first.open();first.receive('{"setupComplete":{}}');
+first.receive('{"sessionResumptionUpdate":{"resumable":true,"newHandle":"old"}}');await flush();
+first.drop(1006,''); w.reconnect();
+const resumed=w.sockets[1];resumed.open();
+const oldHandle=resumed.sent[0].setup.sessionResumption.handle;
+resumed.receive('{"error":{"message":"Session resumption handle expired"}}');await flush();w.reconnect();
+const fresh=w.sockets[2];fresh.open();const freshSetup=fresh.sent[0].setup.sessionResumption;
+fresh.receive('{"setupComplete":{}}');fresh.receive('{"sessionResumptionUpdate":{"resumable":true,"newHandle":"new"}}');
+await flush();fresh.receive('{"sessionResumptionUpdate":{"resumable":false}}');await flush();
+fresh.drop(1006,'');w.reconnect();const last=w.sockets[3];last.open();
+const lastSetup=last.sent[0].setup.sessionResumption;session.stop();
+return {oldHandle,freshSetup,lastSetup,ended:w.ui.ended};
 "#
         );
         let out = node_core(&body, Value::Null);
-        assert_eq!(
-            out["afterGoAway"],
-            json!({ "sockets": 2, "oldClosed": 1000, "live": false })
+        assert_eq!(out["oldHandle"], "old");
+        assert_eq!(out["freshSetup"], json!({}));
+        assert_eq!(out["lastSetup"], json!({}));
+        assert_eq!(out["ended"], 0);
+    }
+
+    #[test]
+    fn requested_live_retries_without_handle_with_capped_backoff() {
+        let body = format!(
+            "{SESSION_FAKES}{}",
+            r#"
+const w=world(); const session=core.createSession({env:w.env,ui:w.uiHandlers,key:'K'});
+await session.start(); const delays=[];
+for(let i=0;i<10;i++){w.sockets[w.sockets.length-1].drop(1006,'');delays.push(w.reconnectMs);const next=w.reconnect;next();}
+const count=w.sockets.length;
+w.sockets[count-1].drop(1008,'API key not valid');
+return {count,delays,ended:w.ui.ended,stopped:w.tracks.map(t=>t.stopped)};
+"#
         );
-        assert_eq!(out["secondSetup"], json!({ "handle": "h1" }));
+        let out = node_core(&body, Value::Null);
+        assert_eq!(out["count"], 11);
         assert_eq!(
-            out["secondModel"],
-            "models/gemini-2.5-flash-native-audio-preview-12-2025"
+            out["delays"],
+            json!([
+                1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000
+            ])
         );
-        assert_eq!(
-            out["resumed"],
-            json!({
-                "live": true,
-                "stopped": [0, 0, 0],
-                "sources": { "screen": true, "camera": true, "mic": true },
-                "errors": 0
-            }),
-            "retomar nao larga nenhuma faixa"
-        );
-        assert_eq!(out["audioOnSecond"], 1);
-        assert_eq!(
-            out["afterOldClose"],
-            json!({ "live": true, "sockets": 2, "errors": 0 })
-        );
-        assert_eq!(out["thirdSetup"], json!({ "handle": "h2" }));
-        assert_eq!(
-            out["stillTrying"],
-            json!({ "sockets": 5, "errors": 0 }),
-            "tres religacoes seguidas antes de desistir"
-        );
-        assert_eq!(
-            out["giveUp"],
-            json!({
-                "sockets": 5,
-                "live": false,
-                "errors": ["A conexão caiu (rede ou servidor indisponível)."],
-                "ended": 1,
-                "stopped": [1, 1, 1]
-            })
-        );
-        assert_eq!(
-            out["noHandle"],
-            json!({
-                "sockets": 1,
-                "errors": ["A conexão caiu (rede ou servidor indisponível)."],
-                "ended": 1,
-                "stopped": [1, 1, 1]
-            })
-        );
+        assert_eq!(out["ended"], 1);
+        assert_eq!(out["stopped"], json!([1, 1, 1]));
     }
 
     #[test]
@@ -1857,6 +1878,7 @@ const input = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
 const options = input.options || {};
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 const posts = [], sockets = [], contexts = [], tracks = [], requests = [], themeVars = {}, docListeners = {};
+const timers = new Map(); let nextTimer = 0;
 let screenFails = options.screenFails || 0;
 function el(id, tag, hidden) {
   const e = {
@@ -1869,6 +1891,7 @@ function el(id, tag, hidden) {
     click() { e.dispatch('click'); },
     setAttribute(k, v) { e.attrs[k] = String(v); },
     getAttribute(k) { return k in e.attrs ? e.attrs[k] : null; },
+    closest() { return e.hiddenAncestor ? {} : null; },
     focus() {}, play() { return Promise.resolve(); },
     appendChild(c) { e.children.push(c); return c; },
     removeChild(c) { e.children.splice(e.children.indexOf(c), 1); },
@@ -1923,7 +1946,9 @@ const sandbox = {
     }
   } },
   WebSocket: Socket, AudioContext: Context, AudioWorkletNode: WorkletNode,
-  Blob, TextDecoder, TextEncoder, btoa, atob, setTimeout, clearTimeout,
+  Blob, TextDecoder, TextEncoder, btoa, atob,
+  setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
+  clearTimeout(id) { timers.delete(id); },
   URL: { createObjectURL: () => 'blob:worklet', revokeObjectURL() {} },
   setInterval: () => 1, clearInterval() {},
   ipc: { postMessage: (message) => posts.push(String(message)) },
@@ -1935,6 +1960,7 @@ vm.createContext(sandbox);
 vm.runInContext(input.core, sandbox, { filename: 'live-core.js' });
 vm.runInContext(input.app, sandbox, { filename: 'live.js' });
 const t = { vm, sandbox, input, flush, elements, posts, sockets, contexts, tracks, requests, themeVars, docListeners };
+t.runTimeout = () => { const [id, timer] = timers.entries().next().value; timers.delete(id); timer.fn(); };
 t.shown = () => (elements.notices.hidden ? [] : elements.notices.children.map((c) => [c.dataset.kind, c.textContent]));
 const AsyncFunction = (async () => {}).constructor;
 new AsyncFunction('t', input.body)(t)
@@ -2070,7 +2096,7 @@ return out;
     /// demais tem resposta, cada aviso fica ate o seu motivo acabar (o da
     /// tela nao some debaixo do do som, nem o da chave nao salva), e depois
     /// de a ligacao cair ha "Conectar de novo" -- que nao apaga a chave -- e
-    /// o nativo fica a saber que ja nada sai.
+    /// a sessao reconecta mesmo sem um handle de retomada.
     #[test]
     fn the_shipped_page_keeps_every_notice_and_recovers_after_a_drop() {
         let theme = json!({ "--bg": "#202124" });
@@ -2118,12 +2144,18 @@ out.dropped = {
   changeKeyHidden: elements['error-key'].hidden, error: elements.error.textContent,
   notices: t.shown(), last: posts[posts.length - 1]
 };
-// Os botoes das fontes de uma sessao morta nao abrem nada.
+// Desligar fontes durante a reconexao nao abre uma captura nova.
 const before = { sockets: sockets.length, requests: requests.length };
 elements['t-mic'].click();
 elements['t-camera'].click();
 await flush();
 out.deadToggles = { sockets: sockets.length - before.sockets, requests: requests.length - before.requests };
+t.runTimeout();
+for (let i = 0; i < 3; i++) await flush();
+sockets[1].open();
+sockets[1].receive('{"setupComplete":{}}');
+await flush();
+out.reconnected = { sockets: sockets.length, last: posts[posts.length - 1] };
 elements.restart.click();
 out.restart = { errorHidden: elements['error-box'].hidden, last: posts[posts.length - 1] };
 out.posts = posts;
@@ -2182,28 +2214,98 @@ return out;
         assert_eq!(
             out["dropped"],
             json!({
-                "errorHidden": false,
+                "errorHidden": true,
                 "restartHidden": false,
-                "changeKeyHidden": true,
-                "error": "A conexão caiu (rede ou servidor indisponível).",
+                "changeKeyHidden": false,
+                "error": "",
                 "notices": [save_notice],
-                "last": r#"{"action":"stopped","args":{}}"#
+                "last": r#"{"action":"ready","args":{}}"#
             })
         );
         assert_eq!(out["deadToggles"], json!({ "sockets": 0, "requests": 0 }));
+        assert_eq!(
+            out["reconnected"],
+            json!({ "sockets": 2, "last": r#"{"action":"ready","args":{}}"# })
+        );
         assert_eq!(
             out["restart"],
             json!({ "errorHidden": true, "last": r#"{"action":"ready","args":{}}"# })
         );
         assert_eq!(
             parsed_posts(&out["posts"]),
-            [LiveMessage::Ready, LiveMessage::Stopped, LiveMessage::Ready],
+            [LiveMessage::Ready, LiveMessage::Ready],
             "nem a colagem grande nem Conectar de novo apagam a chave"
         );
     }
 
     #[test]
-    fn live_js_declares_all_40_tools_and_handles_tool_calls_and_responses() {
+    fn shipped_live_shortcuts_dispatch_once_and_resume_audio() {
+        let theme = json!({});
+        let out = run_page(
+            r#"
+const { vm, sandbox, input, flush, elements, posts, contexts, docListeners } = t;
+const key = (overrides) => {
+  const event = Object.assign({ key: 'm', ctrlKey: false, altKey: true, shiftKey: true,
+    defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {} }, overrides);
+  for (const fn of docListeners.keydown || []) fn(event);
+  return event.defaultPrevented;
+};
+vm.runInContext(input.askScript, sandbox);
+const titles = Object.fromEntries(input.shortcuts.map(row => [row.id, elements[row.id].title]));
+elements.key.value = input.key;
+key({key:'Enter', ctrlKey:true, altKey:false, shiftKey:false});
+key({key:'Enter', ctrlKey:true, altKey:false, shiftKey:false}); // disabled: no duplicate save
+const saved = posts.filter(p => JSON.parse(p).action === 'save_key').length;
+// A keydown already handled by the field must not overwrite its error.
+vm.runInContext(input.askScript, sandbox);
+elements.key.value = 'A'.repeat(1100);
+const fieldEvent = {key:'Enter', ctrlKey:true, preventDefault() { this.defaultPrevented = true; }};
+for (const fn of elements.key.listeners.keydown) fn(fieldEvent);
+for (const fn of docListeners.keydown) fn(fieldEvent);
+const oversizeError = elements['key-error'].textContent;
+vm.runInContext(input.startScript, sandbox);
+for (let i = 0; i < 6; i++) await flush();
+const before = contexts[0].state;
+const handled = key({});
+await flush();
+const after = { state: contexts[0].state, mic: elements['t-mic'].getAttribute('aria-pressed') };
+for (const overrides of [{repeat:true}, {isComposing:true}, {defaultPrevented:true}, {ctrlKey:true}]) key(overrides);
+elements['t-mic'].disabled = true; key({}); elements['t-mic'].disabled = false;
+elements['t-mic'].hiddenAncestor = true; key({}); elements['t-mic'].hiddenAncestor = false;
+const guarded = elements['t-mic'].getAttribute('aria-pressed');
+key({});
+await flush();
+return {titles, saved, oversizeError, before, handled, after, guarded, restored: elements['t-mic'].getAttribute('aria-pressed')};
+"#,
+            json!({ "suspended": true }),
+            json!({
+                "askScript": live_ask_key_script(&theme, None),
+                "startScript": live_start_script(&key(TEST_KEY), &theme, None),
+                "shortcuts": live_panel_shortcuts(),
+            }),
+        );
+        assert_eq!(out["saved"], 1);
+        assert_eq!(out["oversizeError"], LIVE_INVALID_KEY_NOTICE);
+        assert_eq!(out["before"], "suspended");
+        assert_eq!(out["handled"], true);
+        assert_eq!(out["after"], json!({ "state": "running", "mic": "false" }));
+        assert_eq!(out["guarded"], "false");
+        assert_eq!(out["restored"], "true");
+        for row in live_panel_shortcuts().as_array().expect("shortcuts") {
+            let id = row["id"].as_str().expect("id");
+            assert_eq!(
+                out["titles"][id],
+                format!(
+                    "{} ({})",
+                    row["label"].as_str().unwrap(),
+                    row["keys"].as_str().unwrap()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn live_js_declares_all_tools_and_handles_tool_calls_and_responses() {
         let out = node_core(
             r#"
 const setup = core.setupMessage();
@@ -2351,5 +2453,115 @@ return {
                 }),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod requested_interaction_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn requested_mouse_coordinates_validate_types_ranges_and_primary_edges() {
+        assert_eq!(
+            live_mouse_point(&json!({"x":0.5,"y":1.0,"normalized":true}), (1920, 1080)),
+            Some((960, 1079))
+        );
+        assert_eq!(
+            live_mouse_point(&json!({"x":-1200,"y":400}), (1920, 1080)),
+            Some((-1200, 400))
+        );
+        for params in [
+            json!({"x":2,"y":0,"normalized":true}),
+            json!({"x":0,"y":-0.1,"normalized":true}),
+            json!({"x":"1","y":2}),
+            json!({"x":1e30,"y":0}),
+            json!({"y":0}),
+            json!({"x":0,"y":0,"normalized":"true"}),
+        ] {
+            assert_eq!(live_mouse_point(&params, (1920, 1080)), None, "{params}");
+        }
+        assert_eq!(
+            live_mouse_point(&json!({"x":0,"y":0,"normalized":true}), (0, 0)),
+            None
+        );
+    }
+    #[test]
+    fn requested_destinations_encode_untrusted_address_text() {
+        let text = "Rua A & pickup=malicioso # Campinas";
+        let maps = live_destination_url("browser_maps", text, "").unwrap();
+        assert_eq!(maps.host_str(), Some("www.google.com"));
+        assert_eq!(
+            maps.query_pairs().find(|(k, _)| k == "query").unwrap().1,
+            text
+        );
+        let uber = live_destination_url("browser_uber", text, "Centro").unwrap();
+        assert_eq!(uber.host_str(), Some("m.uber.com"));
+        assert_eq!(
+            uber.query_pairs()
+                .find(|(k, _)| k == "dropoff[formatted_address]")
+                .unwrap()
+                .1,
+            text
+        );
+        assert!(live_destination_url("other", text, "").is_none());
+        assert!(live_destination_url("browser_maps", " ", "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod requested_live_status_tests {
+    use super::*;
+    #[test]
+    fn requested_live_status_never_claims_capture_in_standby() {
+        let mut panel = LivePanel::off();
+        assert_eq!(live_home_status(panel.indicator()), None);
+        panel.open(());
+        assert_eq!(panel.indicator(), LiveIndicator::Standby);
+        assert!(
+            live_home_status(panel.indicator())
+                .unwrap()
+                .contains("sem sessao ativa")
+        );
+        panel.follow(LiveStep::Start(String::new()));
+        assert!(live_window_title(panel.indicator()).contains("Live ativo"));
+        panel.minimize();
+        assert_eq!(panel.indicator(), LiveIndicator::Live);
+        panel.follow(LiveStep::Stopped);
+        assert!(live_window_title(panel.indicator()).contains("sem sessao ativa"));
+        panel.close();
+        assert_eq!(live_window_title(panel.indicator()), "NeuralIA");
+    }
+}
+
+#[cfg(test)]
+mod requested_live_shortcut_tests {
+    use super::*;
+    #[test]
+    fn requested_every_live_button_has_a_unique_shortcut_in_native_config() {
+        let rows = live_panel_shortcuts();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 12);
+        let mut keys = std::collections::HashSet::new();
+        for row in rows {
+            assert!(keys.insert(row["keys"].as_str().unwrap()));
+            assert!(LIVE_HTML.contains(&format!("id=\"{}\"", row["id"].as_str().unwrap())));
+        }
+        for id in [
+            "min",
+            "off",
+            "save",
+            "t-screen",
+            "t-camera",
+            "t-mic",
+            "t-captions",
+            "t-record",
+            "t-translate",
+            "t-copilot",
+            "restart",
+            "change-key",
+        ] {
+            assert!(rows.iter().any(|row| row["id"] == id), "{id}");
+        }
+        assert!(live_ask_key_script(&serde_json::json!({}), None).contains("shortcuts"));
     }
 }

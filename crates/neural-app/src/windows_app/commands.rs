@@ -27,6 +27,40 @@ use super::*;
 pub(in crate::windows_app) enum CommandId {
     /// Liga ou desliga a rolagem automatica.
     AutoScroll,
+    FocusAddress,
+    NavBack,
+    NavForward,
+    LiveToggle,
+    LiveStop,
+    PrivatePanel,
+    AboutPanel,
+    ShortcutMap,
+    PomodoroToggle,
+    BreathPanel,
+    MeetPanel,
+    TeamsPanel,
+    OutlookPanel,
+    WhatsAppPanel,
+    YoutubePanel,
+    GmailPanel,
+    PanelMinimize,
+    PanelFullscreen,
+    PanelClose,
+    TranslatePage,
+    ColumnOne,
+    ColumnTwo,
+    ColumnThree,
+    TabList,
+    WindowMin,
+    WindowMax,
+    PrintPage,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    NextTab,
+    PrevTab,
+    ToggleGroup,
+
     /// Recarrega a pagina de onde veio (ou as visiveis, da janela).
     Reload,
     /// O painel do Ctrl+H (historico, memoria e notas).
@@ -61,8 +95,41 @@ pub(in crate::windows_app) enum CommandId {
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 15] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 48] = [
         CommandId::AutoScroll,
+        CommandId::FocusAddress,
+        CommandId::NavBack,
+        CommandId::NavForward,
+        CommandId::LiveToggle,
+        CommandId::LiveStop,
+        CommandId::PrivatePanel,
+        CommandId::AboutPanel,
+        CommandId::ShortcutMap,
+        CommandId::PomodoroToggle,
+        CommandId::BreathPanel,
+        CommandId::MeetPanel,
+        CommandId::TeamsPanel,
+        CommandId::OutlookPanel,
+        CommandId::WhatsAppPanel,
+        CommandId::YoutubePanel,
+        CommandId::GmailPanel,
+        CommandId::PanelMinimize,
+        CommandId::PanelFullscreen,
+        CommandId::PanelClose,
+        CommandId::TranslatePage,
+        CommandId::ColumnOne,
+        CommandId::ColumnTwo,
+        CommandId::ColumnThree,
+        CommandId::TabList,
+        CommandId::WindowMin,
+        CommandId::WindowMax,
+        CommandId::PrintPage,
+        CommandId::ZoomIn,
+        CommandId::ZoomOut,
+        CommandId::ZoomReset,
+        CommandId::NextTab,
+        CommandId::PrevTab,
+        CommandId::ToggleGroup,
         CommandId::Reload,
         CommandId::History,
         CommandId::NewTab,
@@ -187,12 +254,325 @@ pub(in crate::windows_app) struct CommandRow {
 /// `keymap_chords_are_unique_per_scope`).
 pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
     CommandRow {
+        id: CommandId::PrintPage,
+        key: "imprimir",
+        label: "Imprimir página",
+        category: CommandCategory::Navegacao,
+        keywords: &["imprimir"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'P'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ZoomIn,
+        key: "zoom-mais",
+        label: "Aumentar zoom",
+        category: CommandCategory::Navegacao,
+        keywords: &["zoom-mais"],
+        chords: &[
+            ChordSpec::global(Chord::ctrl(0xBB)),
+            ChordSpec::global(Chord::ctrl_shift(0xBB)),
+            ChordSpec::global(Chord::ctrl(0x6B)),
+        ],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ZoomOut,
+        key: "zoom-menos",
+        label: "Diminuir zoom",
+        category: CommandCategory::Navegacao,
+        keywords: &["zoom-menos"],
+        chords: &[
+            ChordSpec::global(Chord::ctrl(0xBD)),
+            ChordSpec::global(Chord::ctrl(0x6D)),
+        ],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ZoomReset,
+        key: "zoom-reset",
+        label: "Restaurar zoom",
+        category: CommandCategory::Navegacao,
+        keywords: &["zoom-reset"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'0'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::NextTab,
+        key: "proxima-aba",
+        label: "Próxima aba",
+        category: CommandCategory::Navegacao,
+        keywords: &["proxima-aba"],
+        chords: &[ChordSpec::global(Chord::ctrl(0x09))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::PrevTab,
+        key: "aba-anterior",
+        label: "Aba anterior",
+        category: CommandCategory::Navegacao,
+        keywords: &["aba-anterior"],
+        chords: &[ChordSpec::global(Chord::ctrl_shift(0x09))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ToggleGroup,
+        key: "alternar-grupo",
+        label: "Expandir ou recolher grupo da aba ativa",
+        category: CommandCategory::Navegacao,
+        keywords: &["alternar-grupo"],
+        chords: &[ChordSpec::global(Chord::alt(b'C'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::LiveStop,
+        key: "desligar-live",
+        label: "Desligar Gemini Live",
+        category: CommandCategory::Ferramentas,
+        keywords: &["desligar-live"],
+        chords: &[ChordSpec::global(Chord {
+            vk: b'G' as u32,
+            ctrl: false,
+            shift: true,
+            alt: true,
+        })],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::FocusAddress,
+        key: "endereco",
+        label: "Barra de endereço",
+        category: CommandCategory::Ferramentas,
+        keywords: &["endereco"],
+        chords: &[
+            ChordSpec::global(Chord::ctrl(b'L')),
+            ChordSpec::global(Chord::alt(b'D')),
+            ChordSpec::global(Chord::key(0x75)),
+        ],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::NavBack,
+        key: "voltar",
+        label: "Voltar",
+        category: CommandCategory::Ferramentas,
+        keywords: &["voltar"],
+        chords: &[ChordSpec::global(Chord::alt(0x25))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::NavForward,
+        key: "avancar",
+        label: "Avançar",
+        category: CommandCategory::Ferramentas,
+        keywords: &["avancar"],
+        chords: &[ChordSpec::global(Chord::alt(0x27))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::LiveToggle,
+        key: "gemini-live",
+        label: "Abrir, minimizar ou restaurar Gemini Live",
+        category: CommandCategory::Ferramentas,
+        keywords: &["gemini-live"],
+        chords: &[ChordSpec::global(Chord::alt(b'G'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::PrivatePanel,
+        key: "privado",
+        label: "Navegação privada",
+        category: CommandCategory::Ferramentas,
+        keywords: &["privado"],
+        chords: &[ChordSpec::global(Chord::ctrl_shift(b'N'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::AboutPanel,
+        key: "sobre",
+        label: "Sobre o NeuralIA",
+        category: CommandCategory::Ferramentas,
+        keywords: &["sobre"],
+        chords: &[ChordSpec::global(Chord::key(0x70))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ShortcutMap,
+        key: "atalhos",
+        label: "Mapa de teclas de atalho",
+        category: CommandCategory::Ferramentas,
+        keywords: &["atalhos"],
+        chords: &[ChordSpec::global(Chord::ctrl_shift(0x70))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::PomodoroToggle,
+        key: "pomodoro",
+        label: "Iniciar ou pausar Pomodoro",
+        category: CommandCategory::Ferramentas,
+        keywords: &["pomodoro"],
+        chords: &[ChordSpec::global(Chord::alt(b'P'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::BreathPanel,
+        key: "respiracao",
+        label: "Respiração guiada",
+        category: CommandCategory::Ferramentas,
+        keywords: &["respiracao"],
+        chords: &[ChordSpec::global(Chord::alt(b'B'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::MeetPanel,
+        key: "meet",
+        label: "Google Meet",
+        category: CommandCategory::Ferramentas,
+        keywords: &["meet"],
+        chords: &[ChordSpec::global(Chord::alt(b'1'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::TeamsPanel,
+        key: "teams",
+        label: "Microsoft Teams",
+        category: CommandCategory::Ferramentas,
+        keywords: &["teams"],
+        chords: &[ChordSpec::global(Chord::alt(b'2'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::OutlookPanel,
+        key: "outlook",
+        label: "Outlook",
+        category: CommandCategory::Ferramentas,
+        keywords: &["outlook"],
+        chords: &[ChordSpec::global(Chord::alt(b'3'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::WhatsAppPanel,
+        key: "whatsapp",
+        label: "WhatsApp",
+        category: CommandCategory::Ferramentas,
+        keywords: &["whatsapp"],
+        chords: &[ChordSpec::global(Chord::alt(b'4'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::YoutubePanel,
+        key: "youtube",
+        label: "YouTube",
+        category: CommandCategory::Ferramentas,
+        keywords: &["youtube"],
+        chords: &[ChordSpec::global(Chord::alt(b'5'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::GmailPanel,
+        key: "gmail",
+        label: "Gmail",
+        category: CommandCategory::Ferramentas,
+        keywords: &["gmail"],
+        chords: &[ChordSpec::global(Chord::alt(b'6'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::PanelMinimize,
+        key: "minimizar-painel",
+        label: "Minimizar ou restaurar painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["minimizar-painel"],
+        chords: &[ChordSpec::global(Chord::alt(b'M'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::PanelFullscreen,
+        key: "tela-cheia-painel",
+        label: "Tela cheia do painel de serviços",
+        category: CommandCategory::Ferramentas,
+        keywords: &["tela-cheia-painel"],
+        chords: &[ChordSpec::global(Chord::alt(b'F'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::PanelClose,
+        key: "fechar-painel",
+        label: "Fechar painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["fechar-painel"],
+        chords: &[ChordSpec::global(Chord::alt(b'W'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::TranslatePage,
+        key: "traduzir-pagina",
+        label: "Traduzir página",
+        category: CommandCategory::Ferramentas,
+        keywords: &["traduzir-pagina"],
+        chords: &[ChordSpec::global(Chord::alt(b'T'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ColumnOne,
+        key: "coluna-1",
+        label: "Expandir ou restaurar primeira IA",
+        category: CommandCategory::Ferramentas,
+        keywords: &["coluna-1"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'1'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ColumnTwo,
+        key: "coluna-2",
+        label: "Expandir ou restaurar segunda IA",
+        category: CommandCategory::Ferramentas,
+        keywords: &["coluna-2"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'2'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ColumnThree,
+        key: "coluna-3",
+        label: "Expandir ou restaurar terceira IA",
+        category: CommandCategory::Ferramentas,
+        keywords: &["coluna-3"],
+        chords: &[ChordSpec::global(Chord::ctrl(b'3'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::TabList,
+        key: "lista-abas",
+        label: "Lista das abas da coluna",
+        category: CommandCategory::Ferramentas,
+        keywords: &["lista-abas"],
+        chords: &[ChordSpec::global(Chord::alt(0x28))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::WindowMin,
+        key: "minimizar-janela",
+        label: "Minimizar janela",
+        category: CommandCategory::Ferramentas,
+        keywords: &["minimizar-janela"],
+        chords: &[ChordSpec::global(Chord::key(0x78))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::WindowMax,
+        key: "maximizar-janela",
+        label: "Maximizar ou restaurar janela",
+        category: CommandCategory::Ferramentas,
+        keywords: &["maximizar-janela"],
+        chords: &[ChordSpec::global(Chord::key(0x79))],
+        alias: None,
+    },
+    CommandRow {
         id: CommandId::AutoScroll,
         key: "rolagem-automatica",
         label: "Rolagem automática",
         category: CommandCategory::Pagina,
         keywords: &["rolar", "rolagem", "scroll", "ler", "leitura"],
-        chords: &[ChordSpec::window(Chord::ctrl(b'R'))],
+        chords: &[ChordSpec::global(Chord::key(0x77))],
         alias: None,
     },
     CommandRow {
@@ -201,7 +581,11 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Recarregar a página",
         category: CommandCategory::Pagina,
         keywords: &["recarregar", "atualizar", "reload"],
-        chords: &[ChordSpec::window(Chord::ctrl_shift(b'R'))],
+        chords: &[
+            ChordSpec::global(Chord::ctrl(b'R')),
+            ChordSpec::global(Chord::ctrl_shift(b'R')),
+            ChordSpec::global(Chord::key(0x74)),
+        ],
         alias: None,
     },
     CommandRow {
@@ -210,7 +594,7 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Histórico, memória e notas",
         category: CommandCategory::HistoricoMemoria,
         keywords: &["histórico", "historico", "memória", "notas", "painel"],
-        chords: &[ChordSpec::window(Chord::ctrl(b'H'))],
+        chords: &[ChordSpec::global(Chord::ctrl(b'H'))],
         alias: None,
     },
     CommandRow {
@@ -219,7 +603,10 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Nova pergunta",
         category: CommandCategory::PesquisaIa,
         keywords: &["nova", "aba", "pergunta", "perguntar"],
-        chords: &[ChordSpec::window(Chord::ctrl(b'N'))],
+        chords: &[
+            ChordSpec::global(Chord::ctrl(b'T')),
+            ChordSpec::global(Chord::ctrl(b'N')),
+        ],
         alias: None,
     },
     CommandRow {
@@ -265,10 +652,10 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
     CommandRow {
         id: CommandId::CloseSplit,
         key: "fechar-fonte",
-        label: "Fechar a fonte aberta ao lado",
+        label: "Fechar a aba ativa",
         category: CommandCategory::FonteAoLado,
         keywords: &["fechar", "fonte", "lado", "split"],
-        chords: &[],
+        chords: &[ChordSpec::global(Chord::ctrl(b'W'))],
         alias: None,
     },
     CommandRow {
@@ -277,7 +664,7 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Expandir ou reduzir a fonte aberta ao lado",
         category: CommandCategory::FonteAoLado,
         keywords: &["expandir", "reduzir", "fonte", "lado", "tela cheia"],
-        chords: &[ChordSpec::window(Chord::key(
+        chords: &[ChordSpec::global(Chord::key(
             windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F11 as u8,
         ))],
         alias: None,
@@ -341,6 +728,39 @@ pub(in crate::windows_app) fn command_row(id: CommandId) -> Option<&'static Comm
 /// um comando que nao depende da pagina faz de qualquer origem.
 fn chrome_event(id: CommandId) -> UserEvent {
     match id {
+        CommandId::PrintPage => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ZoomIn => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ZoomOut => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ZoomReset => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::NextTab => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::PrevTab => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ToggleGroup => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::FocusAddress => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::NavBack => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::NavForward => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::LiveStop => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::LiveToggle => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::PrivatePanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::AboutPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ShortcutMap => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::PomodoroToggle => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::BreathPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::MeetPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::TeamsPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::OutlookPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::WhatsAppPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::YoutubePanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::GmailPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::PanelMinimize => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::PanelFullscreen => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::PanelClose => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::TranslatePage => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ColumnOne => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ColumnTwo => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ColumnThree => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::TabList => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::WindowMin => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::WindowMax => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::AutoScroll => UserEvent::ToggleAutoScroll,
         CommandId::Reload => UserEvent::ReloadPage,
         CommandId::History => UserEvent::ShowHistory,
@@ -349,7 +769,7 @@ fn chrome_event(id: CommandId) -> UserEvent {
         CommandId::NewNote => UserEvent::NewNote,
         CommandId::ClearHistory => UserEvent::ClearHistory,
         CommandId::Home => UserEvent::HomeRequested,
-        CommandId::CloseSplit => UserEvent::CloseSplit,
+        CommandId::CloseSplit => UserEvent::CloseActiveTab(CommandOrigin::Window),
         CommandId::SplitFullscreen => UserEvent::ToggleColumnFullscreen,
         CommandId::MinimizePage => UserEvent::MinimizeActivePage(CommandOrigin::Window),
         CommandId::MinimizeAll => UserEvent::MinimizeAllColumns,
@@ -370,11 +790,45 @@ fn chrome_event(id: CommandId) -> UserEvent {
 /// divergirem: a coluna recarrega-se a si, o Split privado recusa a nota.
 fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
     match id {
+        CommandId::PrintPage => None,
+        CommandId::ZoomIn => None,
+        CommandId::ZoomOut => None,
+        CommandId::ZoomReset => None,
+        CommandId::NextTab => None,
+        CommandId::PrevTab => None,
+        CommandId::ToggleGroup => None,
+
+        CommandId::LiveStop => None,
         CommandId::Reload => Some(IpcAction::Reload),
         CommandId::NewNote => Some(IpcAction::Note {
             via: NoteVia::Shortcut,
         }),
         CommandId::NewTab => Some(IpcAction::NewTab { col: column }),
+        CommandId::FocusAddress |
+        CommandId::NavBack |
+        CommandId::NavForward |
+        CommandId::LiveToggle |
+        CommandId::PrivatePanel |
+        CommandId::AboutPanel |
+        CommandId::ShortcutMap |
+        CommandId::PomodoroToggle |
+        CommandId::BreathPanel |
+        CommandId::MeetPanel |
+        CommandId::TeamsPanel |
+        CommandId::OutlookPanel |
+        CommandId::WhatsAppPanel |
+        CommandId::YoutubePanel |
+        CommandId::GmailPanel |
+        CommandId::PanelMinimize |
+        CommandId::PanelFullscreen |
+        CommandId::PanelClose |
+        CommandId::TranslatePage |
+        CommandId::ColumnOne |
+        CommandId::ColumnTwo |
+        CommandId::ColumnThree |
+        CommandId::TabList |
+        CommandId::WindowMin |
+        CommandId::WindowMax |
         CommandId::AutoScroll
         | CommandId::History
         | CommandId::OpenEpub
@@ -399,6 +853,25 @@ pub(in crate::windows_app) fn resolve_command(
     id: CommandId,
     origin: CommandOrigin,
 ) -> Option<UserEvent> {
+    if is_native_shortcut(id) {
+        if matches!(origin, CommandOrigin::Host(WebViewHost::Column(index) | WebViewHost::Split(index) | WebViewHost::PrivateSplit(index)) if index >= COMPARATOR_COLUMNS)
+        {
+            return None;
+        }
+        return (origin != CommandOrigin::Host(WebViewHost::GmailMonitor))
+            .then_some(UserEvent::NativeShortcut(id, origin));
+    }
+    if id == CommandId::CloseSplit {
+        return match origin {
+            CommandOrigin::Host(WebViewHost::GmailMonitor) => None,
+            CommandOrigin::Host(
+                WebViewHost::Column(index)
+                | WebViewHost::Split(index)
+                | WebViewHost::PrivateSplit(index),
+            ) if index >= COMPARATOR_COLUMNS => None,
+            _ => Some(UserEvent::CloseActiveTab(origin)),
+        };
+    }
     if id == CommandId::MinimizePage {
         return match origin {
             CommandOrigin::Host(WebViewHost::GmailMonitor) => None,
@@ -525,5 +998,315 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::WindowMinimize
         | BarHit::WindowMaximize
         | BarHit::AddressBar => None,
+    }
+}
+
+pub(in crate::windows_app) fn is_native_shortcut(id: CommandId) -> bool {
+    if matches!(
+        id,
+        CommandId::PrintPage
+            | CommandId::ZoomIn
+            | CommandId::ZoomOut
+            | CommandId::ZoomReset
+            | CommandId::NextTab
+            | CommandId::PrevTab
+            | CommandId::ToggleGroup
+    ) {
+        return true;
+    }
+    if id == CommandId::LiveStop {
+        return true;
+    }
+    matches!(
+        id,
+        CommandId::FocusAddress
+            | CommandId::NavBack
+            | CommandId::NavForward
+            | CommandId::LiveToggle
+            | CommandId::PrivatePanel
+            | CommandId::AboutPanel
+            | CommandId::ShortcutMap
+            | CommandId::PomodoroToggle
+            | CommandId::BreathPanel
+            | CommandId::MeetPanel
+            | CommandId::TeamsPanel
+            | CommandId::OutlookPanel
+            | CommandId::WhatsAppPanel
+            | CommandId::YoutubePanel
+            | CommandId::GmailPanel
+            | CommandId::PanelMinimize
+            | CommandId::PanelFullscreen
+            | CommandId::PanelClose
+            | CommandId::TranslatePage
+            | CommandId::ColumnOne
+            | CommandId::ColumnTwo
+            | CommandId::ColumnThree
+            | CommandId::TabList
+            | CommandId::WindowMin
+            | CommandId::WindowMax
+    )
+}
+
+impl App {
+    pub(in crate::windows_app) fn run_native_shortcut(
+        &mut self,
+        id: CommandId,
+        origin: CommandOrigin,
+    ) {
+        use crate::panel_chrome::ServiceInput;
+        use crate::windows_app::app::navigation::HistoryStep;
+        use crate::windows_app::bar_layout::ToolAction;
+        let column = match origin {
+            CommandOrigin::Host(
+                WebViewHost::Column(index)
+                | WebViewHost::Split(index)
+                | WebViewHost::PrivateSplit(index),
+            ) => index,
+            _ => self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.expanded)
+                .unwrap_or(0),
+        };
+        match id {
+            CommandId::PrintPage => match origin {
+                CommandOrigin::Host(WebViewHost::Column(index)) => {
+                    self.print_target(PageTarget::Column(index))
+                }
+                CommandOrigin::Host(WebViewHost::Split(_) | WebViewHost::PrivateSplit(_)) => {
+                    self.print_target(PageTarget::Split)
+                }
+                _ => self.print_page(),
+            },
+            CommandId::ZoomIn => {
+                let event: Option<UserEvent> = Some(UserEvent::ZoomIn);
+                if let Some(event) = event {
+                    let _ = self.proxy.send_event(event);
+                }
+            }
+            CommandId::ZoomOut => {
+                let event: Option<UserEvent> = Some(UserEvent::ZoomOut);
+                if let Some(event) = event {
+                    let _ = self.proxy.send_event(event);
+                }
+            }
+            CommandId::ZoomReset => {
+                let event: Option<UserEvent> = Some(UserEvent::ZoomReset);
+                if let Some(event) = event {
+                    let _ = self.proxy.send_event(event);
+                }
+            }
+            CommandId::NextTab => self.cycle_context_shortcut(column, false),
+            CommandId::PrevTab => self.cycle_context_shortcut(column, true),
+            CommandId::ToggleGroup => self.toggle_active_group_shortcut(column),
+            CommandId::FocusAddress => {
+                self.focus_omnibox();
+            }
+            CommandId::NavBack => {
+                if let CommandOrigin::Host(WebViewHost::Column(index)) = origin {
+                    self.navigate_column(index, HistoryStep::Back);
+                } else {
+                    self.navigate_history(HistoryStep::Back);
+                }
+            }
+            CommandId::NavForward => {
+                if let CommandOrigin::Host(WebViewHost::Column(index)) = origin {
+                    self.navigate_column(index, HistoryStep::Forward);
+                } else {
+                    self.navigate_history(HistoryStep::Forward);
+                }
+            }
+            CommandId::LiveStop => {
+                self.close_live_panel();
+            }
+            CommandId::LiveToggle => {
+                self.toggle_live_panel();
+            }
+            CommandId::PrivatePanel => {
+                self.open_private_panel();
+            }
+            CommandId::AboutPanel => {
+                self.show_about();
+            }
+            CommandId::ShortcutMap => {
+                {
+                    self.show_about();
+                    self.panel_run("window.neuraliaShowSection('shortcuts');".to_string());
+                };
+            }
+            CommandId::PomodoroToggle => {
+                self.run_tool_action(ToolAction::PomodoroClick);
+            }
+            CommandId::BreathPanel => {
+                self.open_service_panel(Service::Breath);
+            }
+            CommandId::MeetPanel => {
+                self.open_service_panel(Service::Meet);
+            }
+            CommandId::TeamsPanel => {
+                self.open_service_panel(Service::Teams);
+            }
+            CommandId::OutlookPanel => {
+                self.open_service_panel(Service::Outlook);
+            }
+            CommandId::WhatsAppPanel => {
+                self.open_service_panel(Service::WhatsApp);
+            }
+            CommandId::YoutubePanel => {
+                self.open_service_panel(Service::YouTube);
+            }
+            CommandId::GmailPanel => {
+                self.open_service_panel(Service::Gmail);
+            }
+            CommandId::PanelMinimize | CommandId::PanelFullscreen | CommandId::PanelClose => {
+                let target = panel_shortcut_target(
+                    origin,
+                    self.live_panel.is_open(),
+                    self.live_panel.is_docked(),
+                    self.side_panel.is_open(),
+                    self.service_panel.is_some(),
+                );
+                match panel_shortcut_action(id, target, self.live_panel.is_minimized()) {
+                    PanelShortcutAction::MinimizeLive => self.minimize_live_panel(),
+                    PanelShortcutAction::RestoreLive => self.restore_live_panel(),
+                    PanelShortcutAction::CloseSidePanel => {
+                        self.close_side_panel(PanelExit::CloseButton)
+                    }
+                    PanelShortcutAction::MinimizeService => {
+                        self.service_input(ServiceInput::Minimize)
+                    }
+                    PanelShortcutAction::FullscreenService => {
+                        self.service_input(ServiceInput::ToggleFullscreen)
+                    }
+                    PanelShortcutAction::CloseService => self.conceal_service_panel(),
+                    PanelShortcutAction::Nothing => {}
+                }
+            }
+            CommandId::TranslatePage => {
+                self.translation_event(TranslateEvent::Requested(WebViewHost::Column(column)));
+            }
+            CommandId::ColumnOne => {
+                self.expand_comparator(0);
+            }
+            CommandId::ColumnTwo => {
+                self.expand_comparator(1);
+            }
+            CommandId::ColumnThree => {
+                self.expand_comparator(2);
+            }
+            CommandId::TabList => {
+                self.show_tab_list_menu(column);
+            }
+            CommandId::WindowMin => {
+                if let Some(window) = &self.window {
+                    window.set_minimized(true);
+                }
+            }
+            CommandId::WindowMax => {
+                if let Some(window) = &self.window {
+                    window.set_maximized(!window.is_maximized());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub(in crate::windows_app) fn shortcut_text(chord: Chord) -> String {
+    let key = match chord.vk {
+        0x70..=0x87 => format!("F{}", chord.vk - 0x70 + 1),
+        0x25 => "←".into(),
+        0x27 => "→".into(),
+        0x28 => "↓".into(),
+        0x09 => "Tab".into(),
+        0xBB => "+".into(),
+        0x6B => "Num+".into(),
+        0xBD => "-".into(),
+        0x6D => "Num-".into(),
+        0x24 => "Home".into(),
+        0x2e => "Delete".into(),
+        value => char::from_u32(value).unwrap_or('?').to_string(),
+    };
+    format!(
+        "{}{}{}{}",
+        if chord.ctrl { "Ctrl+" } else { "" },
+        if chord.shift { "Shift+" } else { "" },
+        if chord.alt { "Alt+" } else { "" },
+        key
+    )
+}
+
+pub(in crate::windows_app) fn shortcut_map_script() -> String {
+    let mut rows: Vec<_> = COMMANDS.iter().map(|row| serde_json::json!({
+        "label": row.label, "keys": row.chords.iter().map(|spec| shortcut_text(spec.chord)).collect::<Vec<_>>().join(" / ")
+    })).collect();
+    if let Some(live_rows) = crate::gemini_live::live_panel_shortcuts().as_array() {
+        rows.extend(live_rows.iter().filter(|row| row["native"] != true).map(|row|
+            serde_json::json!({"label":format!("Gemini Live: {}",row["label"].as_str().unwrap_or("")),"keys":row["keys"]})));
+    }
+    format!(
+        "window.neuraliaSetShortcuts && window.neuraliaSetShortcuts({});",
+        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum PanelShortcutTarget {
+    Live,
+    SidePanel,
+    Service,
+    Nothing,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum PanelShortcutAction {
+    MinimizeLive,
+    RestoreLive,
+    CloseSidePanel,
+    MinimizeService,
+    FullscreenService,
+    CloseService,
+    Nothing,
+}
+pub(in crate::windows_app) fn panel_shortcut_target(
+    origin: CommandOrigin,
+    live_open: bool,
+    live_docked: bool,
+    side_open: bool,
+    service_open: bool,
+) -> PanelShortcutTarget {
+    match origin {
+        CommandOrigin::Host(WebViewHost::Live) => PanelShortcutTarget::Live,
+        CommandOrigin::Host(WebViewHost::SidePanel) => PanelShortcutTarget::SidePanel,
+        CommandOrigin::Host(WebViewHost::Service(_)) => PanelShortcutTarget::Service,
+        _ if live_docked => PanelShortcutTarget::Live,
+        _ if side_open => PanelShortcutTarget::SidePanel,
+        _ if service_open => PanelShortcutTarget::Service,
+        _ if live_open => PanelShortcutTarget::Live,
+        _ => PanelShortcutTarget::Nothing,
+    }
+}
+pub(in crate::windows_app) fn panel_shortcut_action(
+    command: CommandId,
+    target: PanelShortcutTarget,
+    live_minimized: bool,
+) -> PanelShortcutAction {
+    match (command, target) {
+        (CommandId::PanelMinimize, PanelShortcutTarget::Live) if live_minimized => {
+            PanelShortcutAction::RestoreLive
+        }
+        (CommandId::PanelMinimize | CommandId::PanelClose, PanelShortcutTarget::Live) => {
+            PanelShortcutAction::MinimizeLive
+        }
+        (CommandId::PanelMinimize | CommandId::PanelClose, PanelShortcutTarget::SidePanel) => {
+            PanelShortcutAction::CloseSidePanel
+        }
+        (CommandId::PanelMinimize, PanelShortcutTarget::Service) => {
+            PanelShortcutAction::MinimizeService
+        }
+        (CommandId::PanelFullscreen, PanelShortcutTarget::Service) => {
+            PanelShortcutAction::FullscreenService
+        }
+        (CommandId::PanelClose, PanelShortcutTarget::Service) => PanelShortcutAction::CloseService,
+        _ => PanelShortcutAction::Nothing,
     }
 }

@@ -4,7 +4,8 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_DELETE, VK_F1, VK_OEM_1, VK_TAB,
+    VK_BACK, VK_DELETE, VK_DOWN, VK_F1, VK_HOME, VK_LEFT, VK_OEM_1, VK_OEM_MINUS, VK_OEM_PLUS,
+    VK_RIGHT, VK_TAB, VK_UP,
 };
 use winit::keyboard::ModifiersState;
 
@@ -412,14 +413,24 @@ pub(in crate::windows_app) fn window_accelerator_input(
         Key::Character(text) => {
             let mut chars = text.chars();
             let letter = chars.next()?;
-            if chars.next().is_some() || !letter.is_ascii_alphanumeric() {
+            if chars.next().is_some() {
                 return None;
             }
-            u32::from(letter.to_ascii_uppercase())
+            match letter {
+                '+' | '=' => u32::from(VK_OEM_PLUS),
+                '-' | '_' => u32::from(VK_OEM_MINUS),
+                letter if letter.is_ascii_alphanumeric() => u32::from(letter.to_ascii_uppercase()),
+                _ => return None,
+            }
         }
         Key::Named(NamedKey::Delete) => u32::from(VK_DELETE),
         Key::Named(NamedKey::Backspace) => u32::from(VK_BACK),
         Key::Named(NamedKey::Tab) => u32::from(VK_TAB),
+        Key::Named(NamedKey::Home) => u32::from(VK_HOME),
+        Key::Named(NamedKey::ArrowLeft) => u32::from(VK_LEFT),
+        Key::Named(NamedKey::ArrowRight) => u32::from(VK_RIGHT),
+        Key::Named(NamedKey::ArrowUp) => u32::from(VK_UP),
+        Key::Named(NamedKey::ArrowDown) => u32::from(VK_DOWN),
         Key::Named(named) => {
             let index = FUNCTION_KEYS.iter().position(|key| key == named)?;
             u32::from(VK_F1) + index as u32

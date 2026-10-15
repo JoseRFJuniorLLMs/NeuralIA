@@ -77,7 +77,7 @@ pub(in crate::windows_app) fn service_icon_hint(
 fn service_button_hint(service: Service, badge: Option<ServiceBadge>) -> Option<String> {
     if badge.is_none() && service.keeps_running_in_background() {
         Some(format!(
-            "{} aberto ao lado · clique para ocultar, continua em segundo plano",
+            "{} aberto ao lado · clique para minimizar, continua em segundo plano",
             service.label()
         ))
     } else {
@@ -98,19 +98,9 @@ pub(in crate::windows_app) fn service_panel_hint(
 ) -> Option<String> {
     match hit {
         BarHit::ServiceStrip(StripButton::Minimize) if badge.is_some() => Some(format!(
-            "Restaurar {}: volta ao painel e continua a tocar",
+            "Restaurar {}: volta ao painel e continua a tocar (Alt+M)",
             service.label()
         )),
-        BarHit::ServiceStrip(StripButton::Close) if service == Service::YouTube => Some(format!(
-            "Ocultar {}: recolhe também os controles, pausa o vídeo e deixa a sessão em segundo plano",
-            service.label()
-        )),
-        BarHit::ServiceStrip(StripButton::Close) if service.keeps_running_in_background() => {
-            Some(format!(
-                "Ocultar {}: recolhe também os controles e continua em segundo plano",
-                service.label()
-            ))
-        }
         BarHit::ServiceStrip(StripButton::Minimize) => Some(format!(
             "Minimizar {}: mantém os controles disponíveis e a sessão continua em segundo plano (Ctrl+Shift+M)",
             service.label()
@@ -309,7 +299,12 @@ impl App {
         {
             let _ = panel.webview.evaluate_script(YOUTUBE_PAUSE_SCRIPT);
         }
+        let service = self.service_panel.as_ref().map(|panel| panel.service);
         self.close_service_panel();
+        if let Some(service) = service {
+            self.background_services
+                .retain(|panel| panel.service != service);
+        }
     }
 
     pub(in crate::windows_app) fn close_service_panel(&mut self) {
@@ -787,6 +782,11 @@ impl App {
         let _ = panel.focus_parent();
         drop(panel);
         debug_log(format_args!("live panel: desligado"));
+        if let Some(window) = &self.window {
+            window.set_title(crate::gemini_live::live_window_title(
+                self.live_panel.indicator(),
+            ));
+        }
         self.fit_comparator_to_panel();
         self.after_panel_change();
         self.request_redraw();
@@ -819,6 +819,11 @@ impl App {
             LiveAction::Tool(call) => self.execute_live_tool_call(call),
             LiveAction::Nothing => {}
         }
+        if let Some(window) = &self.window {
+            window.set_title(crate::gemini_live::live_window_title(
+                self.live_panel.indicator(),
+            ));
+        }
         self.request_redraw();
     }
 
@@ -848,6 +853,57 @@ impl App {
         };
 
         let result: serde_json::Value = match call.name.as_str() {
+            "desktop_move_mouse" => {
+                use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SetCursorPos,
+                };
+                let primary =
+                    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+                match crate::gemini_live::live_mouse_point(&call.params, primary) {
+                    Some((x, y))
+                        if unsafe {
+                            !MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL).is_null()
+                        } =>
+                    {
+                        let ok = unsafe { SetCursorPos(x, y) != 0 };
+                        serde_json::json!({"ok": ok, "x": x, "y": y, "clicked": false})
+                    }
+                    _ => {
+                        serde_json::json!({"ok": false, "error": "Coordenadas inválidas ou fora dos monitores"})
+                    }
+                }
+            }
+            "browser_maps" | "browser_uber" => {
+                match crate::gemini_live::live_destination_url(
+                    &call.name,
+                    &str_arg("destination"),
+                    &str_arg("origin"),
+                ) {
+                    Some(url) => {
+                        self.web(url.to_string());
+                        serde_json::json!({"ok": true, "status": "opened", "url": url.as_str(), "completed": false,
+                            "message": "Site aberto. A corrida exige revisão e confirmação no site."})
+                    }
+                    None => serde_json::json!({"ok": false, "error": "Destino inválido ou vazio"}),
+                }
+            }
+            "browser_agent_plan" => {
+                let plan = str_arg("plan");
+                match parse_browser_agent_plan(&plan) {
+                    Ok((url, _))
+                        if neural_core::validate_web_url(&url)
+                            .is_ok_and(|url| !neural_core::is_local_network_target(&url)) =>
+                    {
+                        self.start_browser_agent(&plan);
+                        serde_json::json!({"ok": self.active_agent.is_some(), "status": "started", "completed": false})
+                    }
+                    Ok(_) => {
+                        serde_json::json!({"ok": false, "error": "Destino privado ou inválido"})
+                    }
+                    Err(error) => serde_json::json!({"ok": false, "error": error}),
+                }
+            }
             // 1. Historico Inteligente & Memoria Semantica
             "history_list_recent" => {
                 let limit = usize_arg("limit", 20).clamp(1, 100);
@@ -1844,6 +1900,7 @@ impl App {
         if !self.side_panel.is_open() {
             return;
         }
+        self.panel_run(shortcut_map_script());
         self.panel_run(PANEL_SHOW_ABOUT_SCRIPT.to_string());
     }
 
@@ -1861,6 +1918,7 @@ impl App {
         };
         match message {
             PanelMessage::Ready => {
+                self.panel_run(shortcut_map_script());
                 if let Some(result) = self.privacy.recent_history(PANEL_RECENT_LIMIT) {
                     self.panel_show_history(result);
                 }
@@ -2156,10 +2214,7 @@ mod youtube_transition_tests {
             assert!(service.keeps_running_in_background());
             assert_eq!(
                 service_panel_hint(BarHit::ServiceStrip(StripButton::Close), service, None),
-                Some(format!(
-                    "Ocultar {}: recolhe também os controles e continua em segundo plano",
-                    service.label()
-                ))
+                Some(format!("Fechar {} (Alt+W)", service.label()))
             );
         }
         assert!(Service::YouTube.keeps_running_in_background());
@@ -2169,7 +2224,7 @@ mod youtube_transition_tests {
                 Service::YouTube,
                 None
             ),
-            Some("Ocultar YouTube: recolhe também os controles, pausa o vídeo e deixa a sessão em segundo plano".to_string())
+            Some("Fechar YouTube (Alt+W)".to_string())
         );
         assert_eq!(
             service_panel_hint(
@@ -2177,7 +2232,7 @@ mod youtube_transition_tests {
                 Service::YouTube,
                 Some(crate::panel_chrome::ServiceBadge::Playing)
             ),
-            Some("Restaurar YouTube: volta ao painel e continua a tocar".to_string())
+            Some("Restaurar YouTube: volta ao painel e continua a tocar (Alt+M)".to_string())
         );
         for service in [Service::Meet, Service::Breath] {
             assert!(!service.keeps_running_in_background());

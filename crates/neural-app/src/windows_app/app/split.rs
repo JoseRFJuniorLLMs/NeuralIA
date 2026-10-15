@@ -117,6 +117,11 @@ pub(in crate::windows_app) unsafe extern "system" fn comparator_splitter_subclas
         // Sem esta linha nenhum WM_LBUTTONDOWN chega, o SetCapture nunca corre
         // e o arrasto do divisor e codigo morto. O botao de saida (1299) e a
         // palette (1410) ja carregavam este mesmo override.
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR => {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_SIZEWE, LoadCursorW, SetCursor};
+            SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_SIZEWE));
+            return 1;
+        }
         WM_NCHITTEST => return HTCLIENT as LRESULT,
         WM_LBUTTONDOWN => {
             SetCapture(hwnd);
@@ -590,6 +595,7 @@ impl App {
         self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
+        self.return_home_if_all_minimized();
         self.request_redraw();
     }
 
@@ -715,6 +721,15 @@ impl App {
                 SetWindowPos(
                     hwnd,
                     std::ptr::null_mut(),
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOACTIVATE,
+                );
+                SetWindowPos(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::HWND_TOP,
                     x,
                     y,
                     width,

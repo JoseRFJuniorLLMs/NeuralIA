@@ -105,7 +105,14 @@ pub(in crate::windows_app) fn tool_hint_at(
         Tool::Pomodoro => pomodoro.hint(now),
         Tool::Notes | Tool::Obsidian | Tool::Breath | Tool::About => None,
     };
-    tool_hint(tool, session.as_deref())
+    let key = match tool {
+        Tool::Pomodoro => "Alt+P",
+        Tool::Breath => "Alt+B",
+        Tool::About => "F1",
+        Tool::Notes => "Ctrl+Shift+Z",
+        Tool::Obsidian => "Ctrl+H",
+    };
+    format!("{} ({key})", tool_hint(tool, session.as_deref()))
 }
 
 /// A dica de um alvo da barra, como `App::bar_tooltip_text` a mostra: as

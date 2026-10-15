@@ -210,6 +210,7 @@ pub(in crate::windows_app) enum UserEvent {
     PrintPage,
     PrintTarget(PageTarget),
     FocusOmnibox,
+    NativeShortcut(CommandId, CommandOrigin),
     /// O foco entrou ou saiu da omnibox: a barra salta de tamanho e o EDIT
     /// nativo acompanha a pílula.
     OmniboxFocus,
@@ -324,6 +325,7 @@ pub(in crate::windows_app) enum UserEvent {
     },
     NewTab(usize),
     CloseSplit,
+    CloseActiveTab(CommandOrigin),
     ToggleSplitFullscreen,
     MinimizeActivePage(CommandOrigin),
     MinimizeAllColumns,
@@ -1194,14 +1196,32 @@ fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
         BarHit::ColumnReload(_) => Some("F5"),
         BarHit::ColumnMinimize(_) | BarHit::SplitMinimize => Some("Ctrl+Shift+M"),
         BarHit::Column(_) | BarHit::SplitExpand => Some("F11"),
-        BarHit::AddTab(_) => Some("Ctrl+N"),
+        BarHit::AddTab(_) => Some("Ctrl+T"),
         BarHit::ColumnBookmark(_) | BarHit::SplitBookmark => Some("Ctrl+D"),
-        BarHit::WindowMinimize => Some("Win+↓"),
-        BarHit::WindowMaximize if maximized => Some("Win+↓"),
-        BarHit::WindowMaximize => Some("Win+↑"),
+        BarHit::WindowMinimize => Some("F9"),
+        BarHit::WindowMaximize if maximized => Some("F10"),
+        BarHit::WindowMaximize => Some("F10"),
         BarHit::WindowClose => Some("Alt+F4"),
         BarHit::AddressBar => Some("Ctrl+L"),
+        BarHit::ServiceStrip(StripButton::Minimize) => Some("Alt+M"),
+        BarHit::ServiceStrip(StripButton::Fullscreen) => Some("Alt+F"),
+        BarHit::ServiceStrip(StripButton::Close) => Some("Alt+W"),
         BarHit::Downloads => Some("Ctrl+J"),
+        BarHit::Private => Some("Ctrl+Shift+N"),
+        BarHit::GeminiLive => Some("Alt+G"),
+        BarHit::ColumnTranslate(_) => Some("Alt+T"),
+        BarHit::TabOverflow(_) => Some("Alt+↓"),
+        BarHit::ContextTab { .. } => Some("Ctrl+Tab / Ctrl+Shift+Tab"),
+        BarHit::ContextGroup { .. } => Some("Alt+C"),
+        BarHit::SplitClose | BarHit::CloseTab { .. } => Some("Ctrl+W"),
+        BarHit::GmailToggle | BarHit::Service(Service::Gmail) => Some("Alt+6"),
+        BarHit::Service(Service::Meet) => Some("Alt+1"),
+        BarHit::Service(Service::Teams) => Some("Alt+2"),
+        BarHit::Service(Service::Outlook) => Some("Alt+3"),
+        BarHit::Service(Service::WhatsApp) => Some("Alt+4"),
+        BarHit::Service(Service::YouTube) => Some("Alt+5"),
+        BarHit::Service(Service::Breath) => Some("Alt+B"),
+
         _ => None,
     }
 }
@@ -7524,6 +7544,19 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             Some((border_color, border_width * scale)),
             theme.bar_bg,
         );
+        SetTextColor(target, rgb3(theme.fg_muted));
+        let mut label = RECT {
+            left: (address.x + 18.0 * scale) as i32,
+            top: address.y as i32,
+            right: (address.x + 52.0 * scale) as i32,
+            bottom: (address.y + address.height) as i32,
+        };
+        draw_text(
+            target,
+            "URL",
+            &mut label,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        );
     }
 
     SelectObject(target, old_font);
@@ -8205,9 +8238,9 @@ const GO_GRADIENT_END: Rgb = (124, 58, 237);
 /// O que o aviso do meio da janela diz quando a rolagem muda.
 fn auto_scroll_message(on: bool) -> String {
     if on {
-        format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  Ctrl+R desliga")
+        format!("Rolagem automática ligada — {AUTO_SCROLL_SECONDS}s  ·  F8 desliga")
     } else {
-        "Rolagem automática desligada  ·  Ctrl+R liga".to_string()
+        "Rolagem automática desligada  ·  F8 liga".to_string()
     }
 }
 
@@ -8241,9 +8274,9 @@ impl SharedFlag {
 /// rolagem ligada oferece desativar, desligada oferece ativar.
 fn auto_scroll_menu_label(on: bool) -> &'static str {
     if on {
-        "Desativar rolagem automática (Ctrl+R)"
+        "Desativar rolagem automática (F8)"
     } else {
-        "Ativar rolagem automática (Ctrl+R)"
+        "Ativar rolagem automática (F8)"
     }
 }
 

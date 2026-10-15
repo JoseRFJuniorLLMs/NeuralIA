@@ -422,6 +422,9 @@ impl App {
     /// isso vira "sair da tela cheia" quando a coluna ja esta expandida. Sem a
     /// barra nativa em tela cheia, esse botao e o Esc sao o caminho de volta.
     pub(in crate::windows_app) fn expand_comparator(&mut self, idx: usize) {
+        if self.surface == Surface::Home && self.comparator.is_some() {
+            self.surface = Surface::Comparator;
+        }
         if let Some(comp) = &mut self.comparator
             && idx < comp.views.len()
             && comp.minimized[idx]
@@ -531,6 +534,7 @@ impl App {
         self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
+        self.return_home_if_all_minimized();
         self.request_redraw();
     }
 
@@ -577,11 +581,35 @@ impl App {
         }
     }
 
+    pub(in crate::windows_app) fn return_home_if_all_minimized(&mut self) {
+        let empty = self.comparator.as_ref().is_some_and(|comp| {
+            all_pages_minimized(
+                &comp.minimized,
+                comp.views.len(),
+                comp.split.as_ref().is_some_and(|split| !split.minimized),
+            )
+        });
+        if !empty {
+            return;
+        }
+        self.minimize_live_panel();
+        self.service_panel_for_transition();
+        self.close_side_panel(PanelExit::Home);
+        self.surface = Surface::Home;
+        self.caption_reveal.reset();
+        self.hide_comparator_splitters();
+        self.sync_exit_button();
+        self.sync_home_button();
+        self.sync_caption_buttons();
+        self.show_omnibox(true);
+        self.position_omnibox();
+        self.needs_clear = true;
+        self.request_redraw();
+    }
+
     pub(in crate::windows_app) fn minimize_all_columns(&mut self) {
         let Some(comp) = &mut self.comparator else {
-            if let Some(window) = &self.window {
-                window.set_minimized(true);
-            }
+            self.request_home();
             return;
         };
         for index in 0..comp.views.len().min(COMPARATOR_COLUMNS) {
@@ -608,6 +636,7 @@ impl App {
         self.sync_caption_buttons();
         self.show_omnibox_passive(true);
         self.position_omnibox();
+        self.return_home_if_all_minimized();
         self.request_redraw();
     }
 
@@ -1042,4 +1071,17 @@ impl App {
             _ => claude_search_url(query),
         }
     }
+}
+
+pub(in crate::windows_app) fn all_pages_minimized(
+    minimized: &[bool; COMPARATOR_COLUMNS],
+    count: usize,
+    split_visible: bool,
+) -> bool {
+    count > 0
+        && !split_visible
+        && minimized
+            .iter()
+            .take(count.min(COMPARATOR_COLUMNS))
+            .all(|x| *x)
 }

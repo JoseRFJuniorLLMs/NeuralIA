@@ -1,0 +1,14 @@
+[
+  {"id":"min","label":"Minimizar Gemini Live","keys":"Ctrl+Shift+M","key":"m","ctrl":true,"shift":true,"alt":false,"native":true},
+  {"id":"off","label":"Desligar Gemini Live","keys":"Alt+Shift+G","key":"g","ctrl":false,"shift":true,"alt":true,"native":true},
+  {"id":"save","label":"Salvar chave e conectar","keys":"Ctrl+Enter","key":"enter","ctrl":true,"shift":false,"alt":false},
+  {"id":"t-screen","label":"Ativar ou desativar captura de tela","keys":"Alt+Shift+S","key":"s","ctrl":false,"shift":true,"alt":true},
+  {"id":"t-camera","label":"Ativar ou desativar câmera","keys":"Alt+Shift+C","key":"c","ctrl":false,"shift":true,"alt":true},
+  {"id":"t-mic","label":"Ativar ou desativar microfone","keys":"Alt+Shift+M","key":"m","ctrl":false,"shift":true,"alt":true},
+  {"id":"t-captions","label":"Legendas ao vivo","keys":"Alt+Shift+L","key":"l","ctrl":false,"shift":true,"alt":true},
+  {"id":"t-record","label":"Iniciar ou parar gravação","keys":"Alt+Shift+R","key":"r","ctrl":false,"shift":true,"alt":true},
+  {"id":"t-translate","label":"Ativar ou desativar intérprete","keys":"Alt+Shift+T","key":"t","ctrl":false,"shift":true,"alt":true},
+  {"id":"t-copilot","label":"Ativar ou desativar copiloto de reunião","keys":"Alt+Shift+V","key":"v","ctrl":false,"shift":true,"alt":true},
+  {"id":"restart","label":"Reconectar Gemini Live","keys":"Alt+Shift+K","key":"k","ctrl":false,"shift":true,"alt":true},
+  {"id":"change-key","fallback":"error-key","label":"Trocar chave do Gemini Live","keys":"Alt+Shift+E","key":"e","ctrl":false,"shift":true,"alt":true}
+]

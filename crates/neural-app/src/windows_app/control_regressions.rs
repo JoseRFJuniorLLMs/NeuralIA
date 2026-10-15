@@ -174,7 +174,7 @@ fn minimize_shortcuts_dispatch_the_actual_host_and_do_not_repeat() {
 }
 
 #[test]
-fn minimized_service_keeps_controls_while_hide_retires_the_strip() {
+fn minimized_service_keeps_controls_while_close_discards_the_panel() {
     let mut state = ServicePanelState::default();
     assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
     let frame = state.frame(
@@ -193,8 +193,8 @@ fn minimized_service_keeps_controls_while_hide_retires_the_strip() {
             Service::WhatsApp,
             None
         )
-        .expect("ocultar")
-        .contains("recolhe também os controles")
+        .expect("fechar")
+        .contains("Fechar")
     );
     assert!(
         service_panel_hint(

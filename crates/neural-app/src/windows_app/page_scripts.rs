@@ -1429,9 +1429,8 @@ pub(in crate::windows_app) const NEURALIA_KEYMAP_SCRIPT: &str = r#"
       }
       if (key === 'u') { e.preventDefault(); act('viewsource'); return; }
       switch (key) {
-        // Ctrl+R liga/desliga a rolagem automatica (pedido do dono);
-        // recarregar fica no F5 e no Ctrl+Shift+R.
-        case 'r': e.preventDefault(); act('autoscroll'); return;
+        // Ctrl+R recarrega como no Chrome; F8 controla a rolagem automática.
+        case 'r': e.preventDefault(); act('reload'); return;
         case 'l': e.preventDefault(); act('omnibox'); return;
         case 'h': e.preventDefault(); act('history'); return;
         case 'n':

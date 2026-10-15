@@ -659,10 +659,10 @@ impl StripButton {
     pub fn hint(self, service: &str) -> String {
         match self {
             StripButton::Minimize => {
-                format!("Minimizar {service}: sai da frente e continua a tocar")
+                format!("Minimizar {service}: sai da frente e continua a tocar (Alt+M)")
             }
-            StripButton::Fullscreen => format!("{service} em tela cheia (Esc volta)"),
-            StripButton::Close => format!("Fechar {service}"),
+            StripButton::Fullscreen => format!("{service} em tela cheia (Alt+F; Esc volta)"),
+            StripButton::Close => format!("Fechar {service} (Alt+W)"),
         }
     }
 

@@ -735,7 +735,7 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
 "#,
     include_str!("../../../../assets/panel/panel.css"),
     r#"</style></head><body>
-<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Zettelkasten</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Zettelkasten</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button><button class="tab" id="tab-shortcuts" role="tab" aria-selected="false">Teclas de atalho</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
 "#,
     include_str!("../../../../assets/panel/history.html"),
     include_str!("../../../../assets/panel/notes.html"),
@@ -743,6 +743,7 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
     include_str!("../../../../assets/panel/bookmarks.html"),
     include_str!("../../../../assets/panel/downloads.html"),
     include_str!("../../../../assets/panel/about.html"),
+    r#"<div class="view" id="view-shortcuts" hidden><main><h2>Teclas de atalho</h2><p>Atalhos do NeuralIA. No painel, pressione F2, digite o número do hint do botão e Enter. Esc cancela. Os números acompanham os botões desta sessão; ações ocultas ou desativadas não são executadas.</p><table><thead><tr><th>Ação</th><th>Atalho</th></tr></thead><tbody id="shortcut-rows"></tbody></table></main></div>"#,
     "<script>\n",
     include_str!("../../../../assets/panel/core.js"),
     include_str!("../../../../assets/panel/history.js"),
@@ -751,6 +752,7 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
     include_str!("../../../../assets/panel/bookmarks.js"),
     include_str!("../../../../assets/panel/downloads.js"),
     include_str!("../../../../assets/panel/about.js"),
+    include_str!("../../../../assets/panel/key-hints.js"),
     include_str!("../../../../assets/panel/tabs.js"),
     "</script></body></html>"
 );

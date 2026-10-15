@@ -276,6 +276,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ReloadTarget(target) => self.reload_target(target),
             UserEvent::PrintPage => self.print_page(),
             UserEvent::PrintTarget(target) => self.print_target(target),
+            UserEvent::NativeShortcut(id, origin) => self.run_native_shortcut(id, origin),
             UserEvent::FocusOmnibox => self.focus_omnibox(),
             UserEvent::OmniboxFocus => {
                 if self.surface == Surface::Comparator {
@@ -470,6 +471,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             UserEvent::NewTab(index) => self.new_tab(index),
             UserEvent::CloseSplit => self.close_split(),
+            UserEvent::CloseActiveTab(origin) => self.close_active_tab(origin),
             UserEvent::ToggleSplitFullscreen => self.toggle_split_fullscreen(),
             UserEvent::OpenPalette(index) => {
                 if self.surface == Surface::Comparator {
@@ -696,7 +698,8 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(window) = &self.window {
                             draw_home(
                                 window,
-                                self.status.as_deref(),
+                                crate::gemini_live::live_home_status(self.live_panel.indicator())
+                                    .or(self.status.as_deref()),
                                 self.home_go_hover,
                                 self.home_tool_hover,
                                 self.pomodoro_bar_label(),

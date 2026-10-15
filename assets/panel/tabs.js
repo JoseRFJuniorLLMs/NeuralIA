@@ -3,13 +3,13 @@
     history: byId('tab-history'), notes: byId('tab-notes'),
     obsidian: byId('tab-obsidian'),
     bookmarks: byId('tab-bookmarks'), downloads: byId('tab-downloads'),
-    about: byId('tab-about')
+    about: byId('tab-about'), shortcuts: byId('tab-shortcuts')
   };
   const views = {
     history: byId('view-history'), notes: byId('view-notes'),
     obsidian: byId('view-obsidian'),
     bookmarks: byId('view-bookmarks'), downloads: byId('view-downloads'),
-    about: byId('view-about')
+    about: byId('view-about'), shortcuts: byId('view-shortcuts')
   };
   function showSection(name) {
     const key = name === 'notes' || name === 'notas' ? 'notes'
@@ -17,6 +17,7 @@
       : name === 'history' || name === 'historico' ? 'history'
       : name === 'bookmarks' || name === 'favoritos' ? 'bookmarks'
       : name === 'downloads' ? 'downloads'
+      : name === 'shortcuts' ? 'shortcuts'
       : name === 'about' || name === 'sobre' ? 'about' : '';
     if (!key) return false;
     // Sair das Notas salva o editor; se nao der agora, fica-se nas Notas.
@@ -64,12 +65,25 @@
   tabs.obsidian.addEventListener('click', () => showSection('obsidian'));
   tabs.bookmarks.addEventListener('click', () => showSection('bookmarks'));
   tabs.downloads.addEventListener('click', () => showSection('downloads'));
+  tabs.shortcuts.addEventListener('click', () => showSection('shortcuts'));
   tabs.about.addEventListener('click', () => showSection('about'));
   byId('close').addEventListener('click', close);
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.preventDefault(); close(); }
   });
 
+  let nativeShortcutRows = [], panelShortcutRows = [];
+  function renderShortcutMap() {
+    const rows = nativeShortcutRows.concat(panelShortcutRows);
+    const body = byId('shortcut-rows'); body.replaceChildren();
+    for (const row of rows) {
+      const tr = document.createElement('tr');
+      for (const value of [row.label, row.keys]) { const td = document.createElement('td'); td.textContent = value; tr.appendChild(td); }
+      body.appendChild(tr);
+    }
+  }
+  window.neuraliaSetShortcuts = rows => { nativeShortcutRows = rows; renderShortcutMap(); };
+  installPanelKeyHints(document, rows => { panelShortcutRows = rows; renderShortcutMap(); });
   theme(__THEME__);
   q.focus();
   post('ready');

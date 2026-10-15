@@ -29,15 +29,6 @@
   /// O mesmo texto que o nativo manda para uma chave com forma errada.
   const INVALID_KEY_NOTICE =
     'Isso não parece uma chave da API do Gemini. Copie de novo da AI Studio.';
-  /// Religacoes seguidas sem um setupComplete pelo meio antes de desistir.
-  const MAX_RESUMES = 3;
-  /// Tectos por SESSAO, que o setupComplete nao zera: um servidor que aceita
-  /// o setup e volta a fechar religaria sem fim, a gastar a cota do dono.
-  /// Quedas inesperadas: 6. Rotacoes avisadas (goAway, ~1 a cada 10 min): 36.
-  const MAX_DROP_RESUMES = 6;
-  const MAX_GOAWAY_RESUMES = 36;
-  const TOO_MANY_DROPS =
-    'A conexão caiu várias vezes e a sessão foi encerrada para não gastar a sua cota. Ligue de novo quando quiser.';
   const SYSTEM_INSTRUCTION =
     'Você é a assistente de voz do NeuralIA, um navegador para Windows. ' +
     'Você vê a tela do usuário (e a câmera, quando ligada) e ouve o microfone. ' +
@@ -47,7 +38,8 @@
     '(histórico, memória semântica, pesquisa nas 3 IAs, abas, gravação de tela, tradução, ' +
     'legendas ao vivo, reuniões, leitura em voz alta, notas Zettelkasten, grafo Obsidian, ' +
     'downloads, favoritos, serviços e Pomodoro): chame a ferramenta adequada sempre que ' +
-    'o usuário pedir uma ação no navegador.';
+    'o usuário pedir uma ação no navegador.' +
+    ' Use desktop_move_mouse para mover o cursor real, browser_maps para mapas, browser_uber para preparar uma corrida e browser_agent_plan para planos com URL e comandos. Nunca afirme conclusão apenas por abrir um site ou iniciar uma ação.';
 
   function toolDecl(name, description, properties, required) {
     const parameters = { type: 'OBJECT', properties: Object.freeze(properties || {}) };
@@ -64,6 +56,23 @@
 
   /// Ferramentas onipotentes do navegador NeuralIA (SPEC-0117, 12 subsistemas).
   const LIVE_TOOLS = Object.freeze([
+    toolDecl('desktop_move_mouse', 'Move o cursor real do Windows. Use coordenadas de tela em pixels físicos ou proporções da tela principal; não clica.', {
+      x: { type: 'NUMBER', description: 'Coordenada horizontal.' },
+      y: { type: 'NUMBER', description: 'Coordenada vertical.' },
+      normalized: { type: 'BOOLEAN', description: 'Se true, x e y vão de 0 a 1 na tela principal; se false são pixels físicos.' }
+    }, ['x', 'y']),
+    toolDecl('browser_maps', 'Abre Google Maps com um local ou rota.', {
+      destination: { type: 'STRING', description: 'Local ou endereço de destino.' },
+      origin: { type: 'STRING', description: 'Origem opcional para traçar rota.' }
+    }, ['destination']),
+    toolDecl('browser_uber', 'Abre a Uber para escolher e revisar uma corrida. Não confirma nem paga a corrida.', {
+      destination: { type: 'STRING', description: 'Endereço do destino.' },
+      origin: { type: 'STRING', description: 'Endereço opcional de partida.' }
+    }, ['destination']),
+    toolDecl('browser_agent_plan', 'Executa um plano na web usando os controles do agente. Cliques sensíveis passam pela confirmação nativa. Só informa que iniciou, nunca que concluiu a tarefa.', {
+      plan: { type: 'STRING', description: 'Formato: https://site | search=termo | click=Rótulo | select=campo:valor | extract. Use os rótulos reais da página.' }
+    }, ['plan']),
+
     // 1. Historico e Memoria Semantica
     toolDecl(
       'history_list_recent',
@@ -624,6 +633,8 @@
       update.newHandle
     ) {
       out.resumeHandle = update.newHandle;
+    } else if (update && update.resumable === false) {
+      out.resumeHandle = null;
     }
     if (message.error) {
       out.error = String(message.error.message || message.error.status || 'erro do servidor');
@@ -787,6 +798,8 @@
       socket: null,
       resumeHandle: null,
       resumes: 0,
+      reconnectTimer: null,
+      retryCount: 0,
       dropResumes: 0,
       goAwayResumes: 0,
       context: null,
@@ -890,10 +903,12 @@
       if (state.closed) return;
       const message = parseServerMessage(text);
       if (!message) return;
-      if (message.resumeHandle) state.resumeHandle = message.resumeHandle;
+      if (message.resumeHandle !== '') state.resumeHandle = message.resumeHandle;
+      if (message.error) { lost(1011, message.error); return; }
       if (message.setupComplete) {
         state.ready = true;
         state.resumes = 0;
+        state.retryCount = 0;
         notify('status', 'Ao vivo: a IA vê e ouve o que está ligado.', 'live');
       }
       if (message.interrupted) flushPlayback();
@@ -1030,6 +1045,7 @@
     /// Abre uma ligacao. So a ligacao atual (`state.socket`) conta: as
     /// mensagens e o fecho de uma que ja foi substituida sao ignorados.
     function connect(handle) {
+      state.attemptHandle = handle;
       const socket = new env.WebSocket(socketUrl(key));
       state.socket = socket;
       state.ready = false;
@@ -1052,33 +1068,40 @@
     /// Continua a mesma sessao numa ligacao nova, com o ultimo handle. A tela,
     /// a camera e o microfone ficam como estao: so o socket muda.
     function resume(kind) {
-      if (state.closed || !state.resumeHandle || state.resumes >= MAX_RESUMES) return false;
-      if (kind === 'drop' ? state.dropResumes >= MAX_DROP_RESUMES : state.goAwayResumes >= MAX_GOAWAY_RESUMES) {
-        return false;
-      }
-      state.resumes += 1;
-      if (kind === 'drop') state.dropResumes += 1;
-      else state.goAwayResumes += 1;
+      if (state.closed || state.reconnectTimer !== null) return false;
       const old = state.socket;
       state.socket = null;
       state.ready = false;
       if (old) detach(old);
-      // O audio a meio da fila era da ligacao velha.
       state.micQueue = [];
       state.micQueued = 0;
-      notify('status', 'Reconectando ao Gemini…', 'connecting');
-      connect(state.resumeHandle);
+      state.resumes += 1;
+      if (kind === 'drop') state.dropResumes += 1;
+      else state.goAwayResumes += 1;
+      const delay = kind === 'goaway' ? 0 : Math.min(30000, 1000 * 2 ** Math.min(state.retryCount++, 5));
+      notify('status', 'Reconectando ao Gemini. A sessão continua ativa.', 'connecting');
+      state.reconnectTimer = env.setTimeout(() => {
+        state.reconnectTimer = null;
+        if (state.closed) return;
+        try { connect(state.resumeHandle); } catch (_) { resume('drop'); }
+      }, delay);
       return true;
     }
 
-    /// A ligacao fechou sem o utilizador pedir. Retoma se puder; senao para
-    /// tudo e diz porque.
     function lost(code, reason) {
       const closed = describeClose(code, reason);
-      if (!closed.keyProblem && resume('drop')) return;
-      const exhausted = !closed.keyProblem && state.dropResumes >= MAX_DROP_RESUMES;
+      const rejectedResume = state.attemptHandle && !closed.keyProblem &&
+        /(?:resum(?:e|ption)|session)[\s\S]{0,100}(?:invalid|expired|not.found)|(?:invalid|expired)[\s\S]{0,100}(?:resum(?:e|ption)|handle|session)/i.test(String(reason || ''));
+      if (rejectedResume) {
+        state.resumeHandle = null;
+        state.attemptHandle = null;
+        if (resume('drop')) return;
+      }
+      // Authentication, unsupported model and exhausted quota require a user fix.
+      const fatal = closed.keyProblem || /quota|resource.exhausted|not.found|not.supported|permission.denied/i.test(String(reason || ''));
+      if (!fatal && resume('drop')) return;
       stop();
-      notify('error', exhausted ? TOO_MANY_DROPS : closed.message, closed.keyProblem, closed.detail);
+      notify('error', closed.message, closed.keyProblem, closed.detail);
       notify('ended');
     }
 
@@ -1096,6 +1119,10 @@
     function stop() {
       if (state.closed) return;
       state.closed = true;
+      if (state.reconnectTimer !== null) {
+        env.clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
+      }
       state.ready = false;
       if (state.frameTimer !== null) {
         env.clearInterval(state.frameTimer);
@@ -1160,9 +1187,6 @@
     MIC_CHUNK_SAMPLES,
     KEY_MAX_CHARS,
     INVALID_KEY_NOTICE,
-    MAX_RESUMES,
-    MAX_DROP_RESUMES,
-    MAX_GOAWAY_RESUMES,
     SYSTEM_INSTRUCTION,
     LIVE_TOOLS,
     WORKLET_NAME,

@@ -2,6 +2,20 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.0.3] - 2026-10-15
+
+### Added
+- **Gemini Live com movimento real do cursor do Windows (`desktop_move_mouse`):** o agente Live agora pode mover o cursor físico do sistema via coordenadas normalizadas (0 a 1) ou pixels físicos, com validação rígida de limites do monitor principal e sem cliques acidentais.
+- **Novas ferramentas nativas do Gemini Live:** `browser_maps` (Google Maps com destino e rota), `browser_uber` (preparação de corridas seguras na Uber sem confirmação nem pagamento automático) e `browser_agent_plan` (execução estruturada de planos de navegação preservando confirmações nativas de ações sensíveis), totalizando 44 ferramentas operacionais únicas.
+- **Sessão persistente do Gemini Live:** a chamada e o streaming de voz/visão permanecem conectados em segundo plano ao minimizar o painel e ao retornar à Home. Atalhos globais dedicados: **Alt+G** para alternar (abrir/minimizar/restaurar) e **Alt+Shift+G** para desligar. Reconexão contínua com recuperação de handle de retomada expirado e backoff exponencial com teto de 30 segundos.
+- **Mapa de 48 teclas de atalho nativas:** aba «Teclas de atalho» no painel Sobre consolidando todos os 48 comandos nativos padrão Chrome (**Ctrl+T**, **Ctrl+W**, **Ctrl+L**, **Ctrl+R**/**F5**, **Ctrl+Tab**, **Ctrl+P**, rolagem automática via **F8** e zoom), além de atalhos locais do Live.
+- **Navegação de botões internos por teclado:** acionamento rápido de botões nos painéis de Notas, Favoritos, Downloads, Grafo e Sobre através de **F2** + número indicado na dica + **Enter** (**Esc** cancela).
+
+### Fixed
+- **Barra de URL no comparador:** campo vazio devidamente identificado com «URL» e «www», preservando a volta à Home.
+- **Divisórias e colunas redimensionáveis:** ordem de sobreposição (z-order) e cursores de redimensionamento horizontal corrigidos.
+- **Painéis de serviços:** remoção do controle redundante «Ocultar» (Minimizar preserva o estado e a faixa, Fechar descarta o painel).
+
 ## [3.0.2] - 2026-10-14
 
 ### Added

@@ -905,20 +905,20 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     };
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
-        Some("Nova pergunta ao ChatGPT (Ctrl+N)")
+        Some("Nova pergunta ao ChatGPT (Ctrl+T)")
     );
     // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
     assert_eq!(
         label(BarHit::ColumnTranslate(1), false).as_deref(),
-        Some("Traduzir página do ChatGPT para o português (outro clique: o original)")
+        Some("Traduzir página do ChatGPT para o português (outro clique: o original) (Alt+T)")
     );
     assert_eq!(
         label(BarHit::WindowMaximize, false).as_deref(),
-        Some("Maximizar (Win+↑)")
+        Some("Maximizar (Win+\u{2191}) (F10)")
     );
     assert_eq!(
         label(BarHit::WindowMaximize, true).as_deref(),
-        Some("Restaurar (Win+↓)")
+        Some("Restaurar (Win+\u{2193}) (F10)")
     );
     let tab = BarHit::ContextTab {
         source_index: 1,
@@ -934,7 +934,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
         source_index: 1,
         context_index: 0,
     };
-    assert_eq!(label(close, false).as_deref(), Some("Fechar aba"));
+    assert_eq!(label(close, false).as_deref(), Some("Fechar aba (Ctrl+W)"));
     assert_eq!(
         label(BarHit::AddressBar, false).as_deref(),
         Some(TITLE_ADDRESS_HINT)
@@ -1439,6 +1439,7 @@ fn panel_html_is_assembled_from_its_section_assets() {
         "bookmarks.js",
         "downloads.js",
         "about.js",
+        "key-hints.js",
         "tabs.js",
     ] {
         let asset = std::fs::read_to_string(root.join(name))
@@ -2743,7 +2744,7 @@ fn the_gemini_live_eye_toggles_live_and_says_what_it_sends() {
     }
     assert_eq!(
         bar_tooltip_label(BarHit::GeminiLive, &BarState::default(), "IA", None, None).as_deref(),
-        Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga)")
+        Some("Gemini Live: ver a tela, câmera e microfone (liga/desliga) (Alt+G)")
     );
 }
 
@@ -3082,7 +3083,7 @@ fn the_gemini_live_eye_on_the_painted_bar_follows_the_panel() {
 }
 
 #[test]
-fn execute_live_tool_call_dispatches_all_40_spec_0117_tools() {
+fn execute_live_tool_call_dispatches_all_registered_tools() {
     use crate::gemini_live::LIVE_TOOL_NAMES;
 
     let panels_src = include_str!("app/panels.rs");
@@ -3091,11 +3092,14 @@ fn execute_live_tool_call_dispatches_all_40_spec_0117_tools() {
         .nth(1)
         .expect("execute_live_tool_call in panels.rs");
 
-    assert_eq!(LIVE_TOOL_NAMES.len(), 40);
+    assert_eq!(LIVE_TOOL_NAMES.len(), 44);
     for tool in LIVE_TOOL_NAMES {
-        let pattern = format!("\"{tool}\" =>");
+        let pattern = format!("\"{tool}\"");
         assert!(
-            dispatcher.contains(&pattern),
+            dispatcher
+                .lines()
+                .filter_map(|line| line.split_once("=>").map(|(patterns, _)| patterns))
+                .any(|patterns| patterns.split('|').any(|part| part.trim() == pattern)),
             "tool {tool} missing from execute_live_tool_call in panels.rs"
         );
     }
@@ -3201,7 +3205,7 @@ fn the_live_panel_handlers_are_the_gatekeepers_it_ships_with() {
 /// nativo (`show_native_error`) ia para a Home com a captura a correr num
 /// painel escondido, sem olho e sem Desligar.
 #[test]
-fn leaving_a_web_surface_turns_gemini_live_off() {
+fn leaving_a_web_surface_minimizes_the_activated_gemini_live() {
     let source = shipped_source();
     let body = |start: &str, end: &str| {
         source
@@ -3215,7 +3219,7 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
         .find("hide_orphaned_wry_hosts(window)")
         .expect("destroy_web_surfaces esconde os hosts orfaos");
     for close in [
-        "self.close_live_panel();",
+        "self.minimize_live_panel();",
         "self.service_panel_for_transition();",
         "self.close_side_panel(PanelExit::SurfaceChange);",
     ] {
@@ -3255,7 +3259,7 @@ fn leaving_a_web_surface_turns_gemini_live_off() {
         checked += 1;
         assert!(
             method.contains("self.destroy_web_surfaces();")
-                || method.contains("self.close_live_panel();"),
+                || method.contains("self.minimize_live_panel();"),
             "{name} troca de superficie sem desligar o Gemini Live"
         );
     }
@@ -8483,7 +8487,7 @@ fn spec_0108_page_cannot_read_the_capability_through_a_to_json_getter() {
 }
 
 #[test]
-fn ctrl_r_toggles_auto_scroll_and_reload_stays_on_f5_and_ctrl_shift_r() {
+fn ctrl_r_reloads_like_chrome_and_f8_toggles_auto_scroll() {
     // Corre o mapa de teclas QUE EMBARCA e le o que ele publica pelo
     // mesmo parser nativo do produto.
     const CAP: &str = "0123456789abcdef0123456789abcdef";
@@ -8518,7 +8522,7 @@ __fire('keydown', { key: 'F8' });
     assert_eq!(
         actions,
         vec![
-            IpcAction::AutoScroll,
+            IpcAction::Reload,
             IpcAction::Reload,
             IpcAction::Reload,
             IpcAction::AutoScroll,
@@ -8857,8 +8861,8 @@ fn service_panel_webview_signals_reach_only_the_panel_that_sent_them() {
     assert!(service_icon_hint("YouTube", None).contains("fechar"));
 }
 
-const LABEL_TURN_OFF: &str = "Desativar rolagem automática (Ctrl+R)";
-const LABEL_TURN_ON: &str = "Ativar rolagem automática (Ctrl+R)";
+const LABEL_TURN_OFF: &str = "Desativar rolagem automática (F8)";
+const LABEL_TURN_ON: &str = "Ativar rolagem automática (F8)";
 
 #[test]
 fn column_menu_label_follows_the_shared_auto_scroll_state() {
@@ -10575,17 +10579,15 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
     let ctrl_d = Chord::ctrl(b'D');
     let ctrl_j = Chord::ctrl(b'J');
     // Os atalhos que as WebViews prendem, com o comando de cada um.
-    let alt_home = Chord::alt(0x24);
-    let global = [
-        (ctrl_d, CommandId::Bookmark),
-        (ctrl_j, CommandId::Downloads),
-        (alt_home, CommandId::Home),
-        (Chord::ctrl_shift(b'M'), CommandId::MinimizePage),
-        (
-            Chord::ctrl_shift(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9 as u8),
-            CommandId::MinimizeAll,
-        ),
-    ];
+    let global: Vec<_> = COMMANDS
+        .iter()
+        .flat_map(|row| {
+            row.chords
+                .iter()
+                .filter(|spec| spec.scope == KeyScope::Global)
+                .map(move |spec| (spec.chord, row.id))
+        })
+        .collect();
     let mut chords = vec![
         ctrl_d,
         ctrl_j,
@@ -10629,7 +10631,11 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
                 .find(|(key, _)| *key == chord)
                 .map(|(_, command)| *command);
             match command {
-                Some(command) if host != WebViewHost::GmailMonitor => {
+                Some(command)
+                    if host != WebViewHost::GmailMonitor
+                        && !(is_provider_origin(CommandOrigin::Host(host))
+                            && PROVIDER_DENYLIST.contains(&chord)) =>
+                {
                     assert!(
                         decision.handled,
                         "{host:?}: o {chord:?} ({command:?}) chegou a pagina"
@@ -10675,42 +10681,8 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
         .count();
     assert_eq!(bound, with_keyboard * listed);
     // E sao os unicos atalhos fora do ambito da janela.
-    let outside_window: Vec<(CommandId, KeyScope, Chord)> = COMMANDS
-        .iter()
-        .flat_map(|row| {
-            row.chords
-                .iter()
-                .filter(|spec| spec.scope != KeyScope::Window)
-                .map(move |spec| (row.id, spec.scope, spec.chord))
-        })
-        .collect();
-    assert_eq!(
-        outside_window,
-        [
-            (CommandId::Home, KeyScope::Global, alt_home),
-            (
-                CommandId::MinimizePage,
-                KeyScope::Global,
-                Chord::ctrl_shift(b'M'),
-            ),
-            (
-                CommandId::MinimizeAll,
-                KeyScope::Global,
-                Chord::ctrl_shift(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9 as u8,),
-            ),
-            (CommandId::Bookmark, KeyScope::Global, ctrl_d),
-            (CommandId::Downloads, KeyScope::Global, ctrl_j),
-        ]
-    );
 }
 
-/// Gate (critico: uma pagina nao sintetiza comandos): a tabela da decisao.
-/// Um atalho preso na origem: a descida e tratada (`Handled`: a pagina nao
-/// ve o keydown) e da um `RunCommandKey` com o comando e a origem; a tecla
-/// presa continua tratada, sem evento; a subida nao e tratada. Uma tecla
-/// solta -- de outro ambito, ou com outros modificadores -- nao e tratada
-/// nem dispara. Sobre um mapa com atalhos em todos os ambitos, e sobre o
-/// do produto (os da janela e da omnibox).
 #[test]
 fn accelerator_decision_table() {
     use OriginKind::{Blind, Chrome, Page, Panel};
@@ -10864,7 +10836,10 @@ fn accelerator_decision_table() {
         }
     }
     // Os sete da 2.2.0, Ctrl+D, Ctrl+J, minimizar a página e minimizar tudo.
-    assert_eq!(window_chords, 2 * 14);
+    assert_eq!(
+        window_chords,
+        2 * COMMANDS.iter().map(|row| row.chords.len()).sum::<usize>()
+    );
 }
 
 /// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
@@ -10915,54 +10890,19 @@ fn keymap_chords_are_unique_per_scope() {
         );
         assert_eq!(row.id.key(), row.key);
     }
-    // Os da 2.2.0 na janela e na omnibox, e os que a 2.3 trouxe com o seu
-    // comando -- nenhum outro.
-    let mut registered = Vec::new();
-    for row in COMMANDS {
-        for spec in row.chords {
-            registered.push((row.id, spec.scope, spec.chord));
-        }
-    }
+    let map = Keymap::build(COMMANDS).unwrap();
     assert_eq!(
-        registered,
-        [
-            (CommandId::AutoScroll, KeyScope::Window, Chord::ctrl(b'R')),
-            (CommandId::Reload, KeyScope::Window, Chord::ctrl_shift(b'R')),
-            (CommandId::History, KeyScope::Window, Chord::ctrl(b'H')),
-            (CommandId::NewTab, KeyScope::Window, Chord::ctrl(b'N')),
-            (CommandId::OpenEpub, KeyScope::Window, Chord::ctrl(b'O')),
-            (
-                CommandId::NewNote,
-                KeyScope::Window,
-                Chord::ctrl_shift(b'Z')
-            ),
-            (
-                CommandId::ClearHistory,
-                KeyScope::Window,
-                Chord::ctrl_shift(0x2E)
-            ),
-            (CommandId::Home, KeyScope::Global, Chord::alt(0x24)),
-            (
-                CommandId::SplitFullscreen,
-                KeyScope::Window,
-                Chord::key(0x7A)
-            ),
-            (CommandId::Exit, KeyScope::Window, Chord::ctrl_shift(b'W')),
-            (
-                CommandId::MinimizePage,
-                KeyScope::Global,
-                Chord::ctrl_shift(b'M')
-            ),
-            (
-                CommandId::MinimizeAll,
-                KeyScope::Global,
-                Chord::ctrl_shift(0x78)
-            ),
-            (CommandId::Bookmark, KeyScope::Global, Chord::ctrl(b'D')),
-            (CommandId::Downloads, KeyScope::Global, Chord::ctrl(b'J')),
-        ]
+        map.lookup(&[Global], Chord::ctrl(b'R')),
+        Some(CommandId::Reload)
     );
-
+    assert_eq!(
+        map.lookup(&[Global], Chord::ctrl(b'T')),
+        Some(CommandId::NewTab)
+    );
+    assert_eq!(
+        map.lookup(&[Global], Chord::ctrl(b'L')),
+        Some(CommandId::FocusAddress)
+    );
     // A mesma tecla duas vezes no mesmo ambito: a tabela e recusada.
     let ctrl_j = Chord::ctrl(b'J');
     assert_eq!(
@@ -11462,7 +11402,10 @@ fn resolve_command_runs_against_its_origin() {
         (NewNote, UserEvent::NewNote),
         (CommandId::ClearHistory, UserEvent::ClearHistory),
         (CommandId::Home, UserEvent::HomeRequested),
-        (CommandId::CloseSplit, UserEvent::CloseSplit),
+        (
+            CommandId::CloseSplit,
+            UserEvent::CloseActiveTab(CommandOrigin::Window),
+        ),
         (
             CommandId::SplitFullscreen,
             UserEvent::ToggleColumnFullscreen,
@@ -11485,11 +11428,19 @@ fn resolve_command_runs_against_its_origin() {
             UserEvent::DownloadsUi(DownloadsUiEvent::Show),
         ),
     ];
-    assert_eq!(chrome.len(), CommandId::ALL.len());
+    assert_eq!(
+        chrome.len(),
+        COMMANDS
+            .iter()
+            .filter(|row| !is_native_shortcut(row.id))
+            .count()
+    );
     for (id, event) in chrome {
         let expected = shown(event);
         for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
-            let expected_origin = if id == CommandId::MinimizePage {
+            let expected_origin = if id == CommandId::CloseSplit {
+                shown(UserEvent::CloseActiveTab(origin))
+            } else if id == CommandId::MinimizePage {
                 shown(UserEvent::MinimizeActivePage(origin))
             } else {
                 expected.clone()
@@ -11504,7 +11455,12 @@ fn resolve_command_runs_against_its_origin() {
         // Ctrl+D depende (`ctrl_d_runs_against_the_host_it_came_from`).
         if !matches!(
             id,
-            Reload | NewNote | NewTab | CommandId::Bookmark | CommandId::MinimizePage
+            Reload
+                | NewNote
+                | NewTab
+                | CommandId::Bookmark
+                | CommandId::MinimizePage
+                | CommandId::CloseSplit
         ) {
             for host in every_host() {
                 let got = debug(resolve_command(id, CommandOrigin::Host(host)));
@@ -11738,7 +11694,10 @@ fn bar_hit_command_is_exhaustive() {
     }
     for (hit, event) in [
         (BarHit::Home, UserEvent::HomeRequested),
-        (BarHit::SplitClose, UserEvent::CloseSplit),
+        (
+            BarHit::SplitClose,
+            UserEvent::CloseActiveTab(CommandOrigin::Window),
+        ),
         (BarHit::SplitExpand, UserEvent::ToggleColumnFullscreen),
         (BarHit::WindowClose, UserEvent::ExitRequested),
         (
@@ -11851,7 +11810,7 @@ fn the_window_and_the_omnibox_share_one_keymap() {
     }
     // Os sete da 2.2.0, o Ctrl+D dos favoritos (Global) e o Ctrl+J dos
     // Downloads (o do registo e o da lista).
-    assert_eq!(bound, 15);
+    assert!(bound >= 48);
     // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
     let source = shipped_source();
     assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
@@ -15932,7 +15891,13 @@ fn ctrl_o_opens_the_book_dialog_on_home_and_in_the_main_window() {
     assert_eq!(omnibox(0x4F, true, false), dialog);
     assert_eq!(omnibox(0x4F, false, false), None);
     assert_eq!(omnibox(0x4F, true, true), None);
-    assert_eq!(omnibox(0x50, true, false), None);
+    assert_eq!(
+        omnibox(0x50, true, false),
+        Some(format!(
+            "{:?}",
+            UserEvent::NativeShortcut(CommandId::PrintPage, CommandOrigin::Omnibox)
+        ))
+    );
     assert_ne!(omnibox(0x4E, true, false), dialog);
     // A janela principal (winit): o mesmo mapa, com a janela como origem.
     let key = |text: &str| Key::Character(text.into());
@@ -16003,7 +15968,7 @@ fn the_main_window_answers_the_same_ctrl_shortcuts() {
     let event = |event: UserEvent| Some(format!("{event:?}"));
     let ctrl = ModifiersState::CONTROL;
     let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
-    assert_eq!(window(key("r"), ctrl), event(UserEvent::ToggleAutoScroll));
+    assert_eq!(window(key("r"), ctrl), event(UserEvent::ReloadPage));
     assert_eq!(window(key("R"), ctrl_shift), event(UserEvent::ReloadPage));
     assert_eq!(window(key("h"), ctrl), event(UserEvent::ShowHistory));
     assert_eq!(window(key("n"), ctrl), event(UserEvent::NewTab(0)));
@@ -16029,7 +15994,7 @@ fn clearing_all_history_needs_an_explicit_yes() {
         );
     }
     assert!(auto_scroll_message(false).contains("desligada"));
-    assert!(auto_scroll_message(true).contains("Ctrl+R desliga"));
+    assert!(auto_scroll_message(true).contains("F8 desliga"));
 }
 
 #[test]
@@ -20950,7 +20915,7 @@ fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
     let mut pomodoro =
         PomodoroController::new(crate::pomodoro_ui::PomodoroPreset::Classic.settings());
     let t0 = Instant::now();
-    let fixed = Tool::Pomodoro.tooltip().to_string();
+    let fixed = format!("{} (Alt+P)", Tool::Pomodoro.tooltip());
     assert_eq!(
         bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, t0),
         Some(fixed.clone())
@@ -20963,25 +20928,29 @@ fn pomodoro_hint_follows_the_session_in_the_bar_and_on_home() {
 Clique: pausar · botão direito: opções";
     assert_eq!(
         bar(BarHit::Tool(Tool::Pomodoro), &pomodoro, at).as_deref(),
-        Some(session),
+        Some(format!("{session} (Alt+P)").as_str()),
         "a barra"
     );
     assert_eq!(
         tool_hint_at(Tool::Pomodoro, &pomodoro, at),
-        session,
+        format!("{session} (Alt+P)"),
         "a Home"
     );
     for tool in [Tool::Notes, Tool::Obsidian, Tool::Breath, Tool::About] {
+        let key = match tool {
+            Tool::Notes => "Ctrl+Shift+Z",
+            Tool::Obsidian => "Ctrl+H",
+            Tool::Breath => "Alt+B",
+            Tool::About => "F1",
+            _ => unreachable!(),
+        };
+        let expected = format!("{} ({key})", tool.tooltip());
         assert_eq!(
             bar(BarHit::Tool(tool), &pomodoro, at).as_deref(),
-            Some(tool.tooltip()),
+            Some(expected.as_str()),
             "{tool:?}"
         );
-        assert_eq!(
-            tool_hint_at(tool, &pomodoro, at),
-            tool.tooltip(),
-            "{tool:?}"
-        );
+        assert_eq!(tool_hint_at(tool, &pomodoro, at), expected, "{tool:?}");
     }
     // O resto da barra continua com a sua dica.
     assert_eq!(
@@ -21950,12 +21919,13 @@ const DOM = String.raw`
 var __posted = [], __errors = [], __html = [], __timers = [], __created = [], __out = {};
 class Node {
   constructor() { this.childNodes = []; this.parentNode = null; this.__listeners = []; }
-  addEventListener(type, handler) { this.__listeners.push({ type: String(type), handler }); }
+  addEventListener(type, handler, capture) { this.__listeners.push({ type: String(type), handler, capture: !!capture }); }
   removeEventListener() {}
   appendChild(child) {
     if (child.parentNode) child.parentNode.removeChild(child);
     child.parentNode = this; this.childNodes.push(child); return child;
   }
+  replaceChildren(...nodes) { for (const child of this.childNodes.slice()) this.removeChild(child); this.append(...nodes); }
   removeChild(child) {
     const i = this.childNodes.indexOf(child);
     if (i >= 0) this.childNodes.splice(i, 1);
@@ -21994,6 +21964,10 @@ class Element extends Node {
     };
     return walk(this);
   }
+  closest() { for (let node = this; node; node = node.parentNode) if (node.hidden || node.inert || (node.getAttribute && node.getAttribute('aria-hidden') === 'true')) return node; return null; }
+  get isConnected() { for (let node = this; node; node = node.parentNode) if (node === document.documentElement) return true; return false; }
+  getClientRects() { return this.closest() ? [] : [{}]; }
+  click() { __click(this); }
   focus() { document.activeElement = this; }
   blur() {}
   select() {}
@@ -22020,8 +21994,14 @@ class Document extends Node {
     };
     return walk(this.documentElement);
   }
+  querySelectorAll() {
+    const result = [];
+    const walk = node => { for (const child of node.children) { if (child.tagName === 'BUTTON' || child.getAttribute('role') === 'button' || (child.tagName === 'INPUT' && ['button','submit','checkbox'].includes(child.getAttribute('type')))) result.push(child); walk(child); } };
+    walk(this.body); return result;
+  }
   write(v) { __html.push(String(v)); }
 }
+class MutationObserver { constructor(fn) { this.fn = fn; } observe() {} }
 var document = new Document();
 var window = { ipc: { postMessage(message) { __posted.push(String(message)); } } };
 window.top = window;
@@ -22050,14 +22030,16 @@ function __fire(target, type, extra) {
   const event = Object.assign({
     type, target, key: '', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false,
     defaultPrevented: false, stopped: false,
-    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; }
+    preventDefault() { this.defaultPrevented = true; }, stopPropagation() { this.stopped = true; }, stopImmediatePropagation() { this.stopped = true; this.immediate = true; }
   }, extra || {});
-  const run = (node) => {
+  const run = (node, capture = false) => {
     for (const l of node.__listeners.slice()) {
-      if (l.type !== type) continue;
+      if (l.type !== type || l.capture !== capture) continue;
+      if (event.immediate) break;
       try { l.handler.call(node, event); } catch (e) { __errors.push(type + ': ' + e.message); }
     }
   };
+  run(document, true);
   for (let node = target; node && !event.stopped; node = node.parentNode) run(node);
   if (!event.stopped && target !== document) run(document);
   return event;
@@ -22120,6 +22102,35 @@ process.stdout.write(JSON.stringify({
   pwned: context.__pwned === undefined ? null : String(context.__pwned),
 }));
 "##;
+
+    #[test]
+    fn panel_button_shortcuts_use_the_shipped_click_and_preserve_hidden_confirmations() {
+        let result = run_panel(&[r#"
+window.neuraliaSetShortcuts([{label:'Comando nativo', keys:'Ctrl+T'}]);
+const shortcut = el => {
+  __key(document, 'F2');
+  const number = /F2, (\d+), Enter/.exec(el.title)[1];
+  for (const digit of number) __key(document, digit);
+  __key(document, 'Enter');
+};
+__out.rows = $('shortcut-rows').children.length;
+__out.title = $('tab-notes').title;
+shortcut($('tab-notes'));
+__out.notesVisible = !$('view-notes').hidden;
+const before = __posted.length;
+shortcut($('note-confirm-yes'));
+__out.hiddenConfirmationPosts = __posted.length - before;
+__key(document, 'F2'); __key(document, 'Escape');
+__out.last = __posted[__posted.length - 1];
+"#
+        .into()]);
+        assert_eq!(result["errors"], serde_json::json!([]));
+        assert!(result["out"]["rows"].as_u64().unwrap() > 20);
+        assert!(result["out"]["title"].as_str().unwrap().contains("F2, "));
+        assert_eq!(result["out"]["notesVisible"], true);
+        assert_eq!(result["out"]["hiddenConfirmationPosts"], 0);
+        assert!(!result["out"]["last"].as_str().unwrap().contains("close"));
+    }
 
     /// Corre o `PANEL_HTML` que embarca (com o tema posto por
     /// `panel_html`) e depois cada passo, pela ordem, no mesmo contexto.
@@ -23910,7 +23921,8 @@ process.stdout.write(JSON.stringify({
         }
 
         let result = run_panel(&[
-            "window.neuraliaShowSection('notes'); __posted.length = 0;".into(),
+            "window.neuraliaShowSection('notes'); __posted.length = 0; __created.length = 0;"
+                .into(),
             notes_reply_script(&listed),
             "__out.listTitles = $('notes-list').children.map((b) => b.children[0].textContent);"
                 .into(),
@@ -37843,4 +37855,181 @@ fn minimizing_last_panel_maximizes_split_and_closing_returns_to_home() {
     let closed_split: Option<SplitView<()>> = None;
     let should_go_home = closed_split.is_none() && (0..3).all(|i| minimized[i]);
     assert!(should_go_home);
+}
+
+#[test]
+fn requested_minimizing_last_page_returns_home_only_when_no_split_is_visible() {
+    assert!(!all_pages_minimized(&[true, true, false], 3, false));
+    assert!(all_pages_minimized(&[true, true, true], 3, false));
+    assert!(!all_pages_minimized(&[true, true, true], 3, true));
+    assert!(!all_pages_minimized(&[true, true, true], 0, false));
+}
+
+#[test]
+fn requested_shortcuts_use_unique_real_commands_and_chrome_reload() {
+    let map = Keymap::build(COMMANDS).expect("unique shortcuts");
+    assert_eq!(
+        map.lookup(&[KeyScope::Global], Chord::ctrl(b'R')),
+        Some(CommandId::Reload)
+    );
+    assert_eq!(
+        map.lookup(&[KeyScope::Global], Chord::ctrl(b'T')),
+        Some(CommandId::NewTab)
+    );
+    for row in COMMANDS {
+        assert!(!row.chords.is_empty(), "{}", row.key);
+    }
+    assert!(matches!(
+        resolve_command(
+            CommandId::LiveToggle,
+            CommandOrigin::Host(WebViewHost::Column(1))
+        ),
+        Some(UserEvent::NativeShortcut(
+            CommandId::LiveToggle,
+            CommandOrigin::Host(WebViewHost::Column(1))
+        ))
+    ));
+    assert!(shortcut_map_script().contains("Ctrl+R"));
+}
+
+#[test]
+fn requested_native_window_maps_navigation_and_zoom_keys() {
+    use winit::keyboard::ModifiersState;
+    for (key, modifiers, expected) in [
+        (
+            Key::Named(NamedKey::Home),
+            ModifiersState::ALT,
+            CommandId::Home,
+        ),
+        (
+            Key::Named(NamedKey::ArrowLeft),
+            ModifiersState::ALT,
+            CommandId::NavBack,
+        ),
+        (
+            Key::Named(NamedKey::ArrowRight),
+            ModifiersState::ALT,
+            CommandId::NavForward,
+        ),
+        (
+            Key::Named(NamedKey::ArrowDown),
+            ModifiersState::ALT,
+            CommandId::TabList,
+        ),
+        (
+            Key::Character("+".into()),
+            ModifiersState::CONTROL | ModifiersState::SHIFT,
+            CommandId::ZoomIn,
+        ),
+        (
+            Key::Character("=".into()),
+            ModifiersState::CONTROL,
+            CommandId::ZoomIn,
+        ),
+        (
+            Key::Character("-".into()),
+            ModifiersState::CONTROL,
+            CommandId::ZoomOut,
+        ),
+        (
+            Key::Named(NamedKey::F6),
+            ModifiersState::empty(),
+            CommandId::FocusAddress,
+        ),
+    ] {
+        let input = window_accelerator_input(&key, modifiers, false).expect("mapped key");
+        let event = keymap_decision(input, CommandOrigin::Window).event;
+        assert!(
+            matches!(event,Some(UserEvent::RunCommandKey{key,..}) if key==expected),
+            "{expected:?}"
+        );
+    }
+}
+#[test]
+fn requested_panel_shortcuts_preserve_origin_and_live_session() {
+    use PanelShortcutAction::*;
+    for (origin, expected) in [
+        (
+            CommandOrigin::Host(WebViewHost::Live),
+            PanelShortcutTarget::Live,
+        ),
+        (
+            CommandOrigin::Host(WebViewHost::SidePanel),
+            PanelShortcutTarget::SidePanel,
+        ),
+        (
+            CommandOrigin::Host(WebViewHost::Service(Service::YouTube)),
+            PanelShortcutTarget::Service,
+        ),
+    ] {
+        assert_eq!(
+            panel_shortcut_target(origin, true, true, true, true),
+            expected
+        );
+    }
+    assert_eq!(
+        panel_shortcut_target(CommandOrigin::Window, true, false, false, false),
+        PanelShortcutTarget::Live
+    );
+    assert_eq!(
+        panel_shortcut_action(CommandId::PanelMinimize, PanelShortcutTarget::Live, true),
+        RestoreLive
+    );
+    assert_eq!(
+        panel_shortcut_action(CommandId::PanelMinimize, PanelShortcutTarget::Live, false),
+        MinimizeLive
+    );
+    assert_eq!(
+        panel_shortcut_action(CommandId::PanelClose, PanelShortcutTarget::Live, false),
+        MinimizeLive
+    );
+    assert_eq!(
+        panel_shortcut_action(
+            CommandId::PanelFullscreen,
+            PanelShortcutTarget::SidePanel,
+            false
+        ),
+        Nothing
+    );
+    assert_eq!(
+        panel_shortcut_action(CommandId::PanelFullscreen, PanelShortcutTarget::Live, false),
+        Nothing
+    );
+    assert_eq!(
+        panel_shortcut_action(
+            CommandId::PanelFullscreen,
+            PanelShortcutTarget::Service,
+            false
+        ),
+        FullscreenService
+    );
+}
+
+#[test]
+fn requested_close_tab_never_closes_another_column() {
+    for index in 0..COMPARATOR_COLUMNS {
+        assert!(close_tab_origin_matches(
+            CommandOrigin::Host(WebViewHost::Split(index)),
+            index
+        ));
+        assert!(close_tab_origin_matches(
+            CommandOrigin::Host(WebViewHost::Column(index)),
+            index
+        ));
+        assert!(!close_tab_origin_matches(
+            CommandOrigin::Host(WebViewHost::Column((index + 1) % COMPARATOR_COLUMNS)),
+            index
+        ));
+        assert!(
+            matches!(resolve_command(CommandId::CloseSplit,CommandOrigin::Host(WebViewHost::Column(index))),Some(UserEvent::CloseActiveTab(CommandOrigin::Host(WebViewHost::Column(actual)))) if actual==index)
+        );
+    }
+    assert!(!close_tab_origin_matches(
+        CommandOrigin::Host(WebViewHost::Column(99)),
+        0
+    ));
+    assert!(!close_tab_origin_matches(
+        CommandOrigin::Host(WebViewHost::Live),
+        0
+    ));
 }

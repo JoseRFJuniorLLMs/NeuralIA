@@ -96,7 +96,18 @@ impl App {
         }
         // Sem foco nao ha o que arrastar nem de onde sair: as auxiliares que
         // so servem o rato saem da frente ate a janela voltar.
-        self.hide_comparator_splitters();
+        let app_is_foreground =
+            self.window
+                .as_ref()
+                .and_then(window_hwnd)
+                .is_some_and(|owner| unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() == owner
+                });
+        if app_is_foreground {
+            self.sync_comparator_splitters();
+        } else {
+            self.hide_comparator_splitters();
+        }
         self.hide_exit_button();
         // A pega filha acompanha a janela, mesmo com foco numa WebView.
         self.sync_panel_handle();
@@ -257,9 +268,9 @@ impl App {
             let pad_x = (address.height / 2.0).max(18.0 * scale);
             let pad_y = 4.0 * scale;
             UiRect {
-                x: address.x + pad_x,
+                x: address.x + pad_x + 38.0 * scale,
                 y: address.y + pad_y,
-                width: (address.width - 2.0 * pad_x).max(1.0),
+                width: (address.width - 2.0 * pad_x - 38.0 * scale).max(1.0),
                 height: (address.height - 2.0 * pad_y).max(1.0),
             }
         } else {
@@ -299,7 +310,7 @@ impl App {
             let cue_text = if self.surface == Surface::Home {
                 "Pergunte algo ou cole uma URL"
             } else {
-                "Digite aqui a URL"
+                "URL — www.exemplo.com"
             };
             let cue: Vec<u16> = cue_text.encode_utf16().chain(std::iter::once(0)).collect();
             SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
@@ -400,13 +411,8 @@ impl App {
             let _ = webview.focus_parent();
             drop(webview);
         }
-        // Os paineis da direita tambem sao superficies web e nao sobrevivem a
-        // esta saida. O do Gemini Live em especial: so escondido pelo
-        // `hide_orphaned_wry_hosts` la em baixo, continuava vivo a mandar a
-        // tela, a camera e o microfone ao Google, sem o olho vermelho (a barra
-        // so se pinta no comparador) e sem o botao Desligar -- bastava um erro
-        // nativo (`show_native_error`) ou um link para a Web completa.
-        self.close_live_panel();
+        // O Live ativado acompanha toda a sessao, inclusive na Home.
+        self.minimize_live_panel();
         self.service_panel_for_transition();
         // O do Ctrl+H pela saida unica: o texto de uma nota a meio vai para
         // o disco antes de a pagina sair (gate
@@ -488,7 +494,7 @@ impl App {
         self.caption_reveal.reset();
         self.close_side_panel(PanelExit::Home);
         self.service_panel_for_transition();
-        self.close_live_panel();
+        self.minimize_live_panel();
         self.next_generation();
         self.surface = Surface::Home;
 
@@ -1473,22 +1479,24 @@ impl App {
             && let Some(hint) =
                 service_panel_hint(hit, panel.service, panel.state.badge(panel.audio))
         {
-            return Some(hint);
+            return Some(with_shortcut(hint, bar_hit_shortcut(hit, false)));
         }
         for panel in &self.background_services {
             if let Some(hint) =
                 service_panel_hint(hit, panel.service, panel.state.badge(panel.audio))
             {
-                return Some(hint);
+                return Some(with_shortcut(hint, bar_hit_shortcut(hit, false)));
             }
         }
         if hit == BarHit::GeminiLive {
             if self.live_panel.is_minimized() {
-                return Some("Gemini Live minimizado · clique para voltar ao painel".to_string());
+                return Some(
+                    "Gemini Live minimizado — restaurar (Alt+G); desligar (Alt+Shift+G)"
+                        .to_string(),
+                );
             } else if self.live_panel.is_open() {
                 return Some(
-                    "Gemini Live aberto ao lado · clique para minimizar (continua em segundo plano)"
-                        .to_string(),
+                    "Gemini Live ativo — minimizar (Alt+G); desligar (Alt+Shift+G)".to_string(),
                 );
             }
         }

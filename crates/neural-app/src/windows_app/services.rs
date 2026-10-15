@@ -827,9 +827,6 @@ pub(in crate::windows_app) fn draw_service_chrome(
                     },
                     match button {
                         StripButton::Minimize if badge.is_some() => "\u{21A9} Restaurar",
-                        StripButton::Close if service.keeps_running_in_background() => {
-                            "\u{00D7} Ocultar"
-                        }
                         _ => button.label(),
                     },
                     style,
