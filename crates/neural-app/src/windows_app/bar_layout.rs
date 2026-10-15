@@ -1349,10 +1349,16 @@ pub(in crate::windows_app) fn right_controls(
             width: 30.0 * scale,
             height: row_h,
         };
+        let label_right = expand.x - gap - 30.0 * scale - gap;
+        let mut label_x = label_right - split_label_w * scale;
+        let floor = private.x + private.width;
+        if label_x < floor {
+            label_x = floor;
+        }
         let label = UiRect {
-            x: expand.x - gap - 30.0 * scale - gap - split_label_w * scale,
+            x: label_x,
             y: row_y,
-            width: split_label_w * scale,
+            width: (label_right - label_x).max(0.0),
             height: row_h,
         };
         (label, expand, close)

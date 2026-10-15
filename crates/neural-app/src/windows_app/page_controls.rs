@@ -289,10 +289,18 @@ mod tests {
                 CommandOrigin::Host(WebViewHost::External),
             ] {
                 let event = keymap_decision(input, origin).event;
-                assert!(
-                    matches!(event, Some(UserEvent::RunCommandKey { key: actual, .. }) if actual == key),
-                    "{key:?} em {origin:?}"
-                );
+                // F11 fica da janela. Na página (YouTube numa coluna, ou a
+                // própria Web) continua a ser da página.
+                let window_only =
+                    key == CommandId::SplitFullscreen && matches!(origin, CommandOrigin::Host(_));
+                if window_only {
+                    assert!(event.is_none(), "{key:?} em {origin:?}");
+                } else {
+                    assert!(
+                        matches!(event, Some(UserEvent::RunCommandKey { key: actual, .. }) if actual == key),
+                        "{key:?} em {origin:?}"
+                    );
+                }
             }
         }
     }

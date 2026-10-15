@@ -10573,6 +10573,11 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
         (ctrl_d, CommandId::Bookmark),
         (ctrl_j, CommandId::Downloads),
         (alt_home, CommandId::Home),
+        (Chord::ctrl_shift(b'M'), CommandId::MinimizePage),
+        (
+            Chord::ctrl_shift(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9 as u8),
+            CommandId::MinimizeAll,
+        ),
     ];
     let mut chords = vec![
         ctrl_d,
@@ -10676,6 +10681,16 @@ fn accelerator_lookup_binds_only_the_global_chords_on_webviews() {
         outside_window,
         [
             (CommandId::Home, KeyScope::Global, alt_home),
+            (
+                CommandId::MinimizePage,
+                KeyScope::Global,
+                Chord::ctrl_shift(b'M'),
+            ),
+            (
+                CommandId::MinimizeAll,
+                KeyScope::Global,
+                Chord::ctrl_shift(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9 as u8,),
+            ),
             (CommandId::Bookmark, KeyScope::Global, ctrl_d),
             (CommandId::Downloads, KeyScope::Global, ctrl_j),
         ]
@@ -10841,9 +10856,8 @@ fn accelerator_decision_table() {
             }
         }
     }
-    // Os sete da 2.2.0, o Ctrl+D dos favoritos e o Ctrl+J dos Downloads
-    // (os dois `Global`, valem tambem la).
-    assert_eq!(window_chords, 2 * 12);
+    // Os sete da 2.2.0, Ctrl+D, Ctrl+J, minimizar a página e minimizar tudo.
+    assert_eq!(window_chords, 2 * 14);
 }
 
 /// Gate (critico): um atalho por ambito. Dois comandos com a mesma tecla no
@@ -29705,7 +29719,6 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             file("busca.search-ms", b"texto"),
             file("pasta.library-ms", b"texto"),
             file("ajuda.chm", b"texto"),
-            file("pagina.html", b"<script></script>"),
             file("imagem.svg", b"<svg><script/></svg>"),
             file("pacote.zip", b"PK\x03\x04"),
             file("LEIAME", b"texto"),
@@ -29716,6 +29729,7 @@ fn b<'a>(&'a mut self, show_home: bool) -> &'a str {
             file("relatorio.pdf", PDF),
             file("foto.png", b"\x89PNG\r\n\x1a\n"),
             file("notas.txt", b"ola"),
+            file("pagina.html", b"<script></script>"),
             file("musica.mp3", b"ID3"),
         ];
         let mut shell = RecordingShell::default();

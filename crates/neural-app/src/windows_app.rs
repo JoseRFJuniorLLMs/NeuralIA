@@ -7845,6 +7845,18 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("adblock.rs", include_str!("windows_app/adblock.rs")),
     ("distraction.rs", include_str!("windows_app/distraction.rs")),
     ("bookmarks.rs", include_str!("windows_app/bookmarks.rs")),
+    (
+        "bookmarks/tests_groups.rs",
+        include_str!("windows_app/bookmarks/tests_groups.rs"),
+    ),
+    (
+        "page_controls.rs",
+        include_str!("windows_app/page_controls.rs"),
+    ),
+    (
+        "control_regressions.rs",
+        include_str!("windows_app/control_regressions.rs"),
+    ),
     ("agents_hub.rs", include_str!("windows_app/agents_hub.rs")),
     ("tests.rs", include_str!("windows_app/tests.rs")),
 ];
