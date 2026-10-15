@@ -1351,7 +1351,15 @@ pub(in crate::windows_app) fn right_controls(
         };
         let label_right = expand.x - gap - 30.0 * scale - gap;
         let mut label_x = label_right - split_label_w * scale;
-        let floor = private.x + private.width;
+        // O chao e o Privado sem o Pomodoro. Com o timer, o botao anda para
+        // a esquerda; se o rotulo o seguisse, as colunas da segunda linha
+        // mudavam ao arrancar a sessao.
+        let floor = if pomodoro_label.is_none() {
+            private.x + private.width
+        } else {
+            let parked = home_tool_buttons(client_width, scale, None);
+            parked[0].x - icon_gap
+        };
         if label_x < floor {
             label_x = floor;
         }

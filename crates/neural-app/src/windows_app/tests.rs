@@ -8212,13 +8212,20 @@ fn shipped_source() -> String {
         .replace("pub(in crate::windows_app) fn ", "fn ");
     let mut out = without_test_modules(&root);
     for (name, content) in ALL_MODULES {
-        if *name != "tests.rs" {
-            let source = content
-                .replace("\r\n", "\n")
-                .replace("pub(in crate::windows_app) fn ", "fn ");
-            out.push('\n');
-            out.push_str(&without_test_modules(&source));
+        // Ficheiros que so os testes compilam. Entram em ALL_MODULES para o
+        // gate da arvore, mas nao no produto: um `BookmarkStore::open` ou um
+        // `StoreRegistry` de teste passaria a contar como codigo que embarca.
+        if matches!(
+            *name,
+            "tests.rs" | "control_regressions.rs" | "bookmarks/tests_groups.rs"
+        ) {
+            continue;
         }
+        let source = content
+            .replace("\r\n", "\n")
+            .replace("pub(in crate::windows_app) fn ", "fn ");
+        out.push('\n');
+        out.push_str(&without_test_modules(&source));
     }
     out.push_str("\n#[cfg(test)]\nmod tests {\n");
     out
