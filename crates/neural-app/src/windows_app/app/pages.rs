@@ -129,6 +129,7 @@ impl App {
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Pdf);
                 self.webview = Some(webview);
                 self.surface = Surface::Pdf;
+                self.sync_page_controls();
                 self.page_source = Some(url.to_string());
                 self.record(HistoryKind::Read, url.to_string(), url.to_string());
                 let mut document = MemoryDocument::new(
@@ -303,6 +304,7 @@ impl App {
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Epub);
                 self.webview = Some(webview);
                 self.surface = Surface::Epub;
+                self.sync_page_controls();
             }
             Err(error) => {
                 self.show_native_error(format!("WebView2 não pôde abrir os livros: {error}"));
@@ -521,6 +523,7 @@ impl App {
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::External);
                 self.webview = Some(webview);
                 self.surface = Surface::External;
+                self.sync_page_controls();
                 if !allow_local {
                     let title = Url::parse(url)
                         .ok()
@@ -566,6 +569,7 @@ impl App {
                 self.accel_spike_hook(&webview, crate::accel_spike::SpikeHost::Reader);
                 self.webview = Some(webview);
                 self.surface = Surface::Reader;
+                self.sync_page_controls();
                 self.page_source = Some(article.source_url.clone());
                 self.begin_reading_session(false);
             }

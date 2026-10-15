@@ -431,6 +431,16 @@ impl App {
                 DestroyWindow(buttons);
             }
         }
+        if let Some(controls) = self.page_controls.take() {
+            unsafe {
+                DestroyWindow(controls);
+            }
+        }
+        if let Some(controls) = self.page_controls.take() {
+            unsafe {
+                DestroyWindow(controls);
+            }
+        }
         for splitter in &mut self.splitters {
             if let Some(hwnd) = splitter.take() {
                 unsafe {
@@ -1122,6 +1132,12 @@ impl App {
         // Em fullscreen e o controlo nativo permanente de saida. Nao depende
         // de hover nem de redimensionar o WebView.
         let wanted = (self.surface == Surface::Comparator && self.is_fullscreen_column())
+            || (self.surface != Surface::Home
+                && self.surface != Surface::Comparator
+                && self
+                    .window
+                    .as_ref()
+                    .is_some_and(|window| window.fullscreen().is_some()))
             || self.service_frame().is_some_and(|frame| frame.exit_button);
 
         if !wanted {
@@ -1556,6 +1572,11 @@ impl App {
             maximized: self.window.as_ref().is_some_and(Window::is_maximized),
             bookmarked: self.bookmarks.column_stars(),
             split_bookmarked: self.bookmarks.split_star(),
+            split_minimized: self
+                .comparator
+                .as_ref()
+                .and_then(|comp| comp.split.as_ref())
+                .is_some_and(|split| split.minimized),
             downloads: downloads_badge(&self.downloads.manager),
             omnibox_focused: self
                 .omnibox

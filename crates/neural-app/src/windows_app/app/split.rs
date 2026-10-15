@@ -37,7 +37,48 @@ pub(in crate::windows_app) struct SplitView<V = WebView> {
     /// a mesma fonte pode existir em dois grupos diferentes.
     pub(in crate::windows_app) context_id: Option<u64>,
     pub(in crate::windows_app) fullscreen: bool,
+    /// Minimizar preserva a pagina e a sessao; fechar descarta a WebView.
+    pub(in crate::windows_app) minimized: bool,
     pub(in crate::windows_app) private: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum SplitPresentation {
+    Hidden,
+    Docked(usize),
+    Only,
+    Fullscreen,
+}
+
+/// A geometria usa o mesmo estado que o comando de minimizar. Uma fonte
+/// sozinha ocupa o conteudo abaixo da barra, que continua a permitir restaurar.
+pub(in crate::windows_app) fn split_presentation<V>(
+    split: &SplitView<V>,
+    minimized: &[bool],
+) -> SplitPresentation {
+    if split.minimized {
+        SplitPresentation::Hidden
+    } else if split.fullscreen {
+        SplitPresentation::Fullscreen
+    } else {
+        minimized
+            .get(split.source_index)
+            .filter(|value| !**value)
+            .map(|_| split.source_index)
+            .or_else(|| minimized.iter().position(|value| !*value))
+            .map_or(SplitPresentation::Only, SplitPresentation::Docked)
+    }
+}
+
+pub(in crate::windows_app) fn set_split_minimized<V>(split: &mut SplitView<V>, minimized: bool) {
+    split.minimized = minimized;
+    split.fullscreen = false;
+}
+
+pub(in crate::windows_app) fn toggle_split_fullscreen_state<V>(split: &mut SplitView<V>) -> bool {
+    split.minimized = false;
+    split.fullscreen = !split.fullscreen;
+    split.fullscreen
 }
 
 pub(in crate::windows_app) fn split_build_is_current(
@@ -416,6 +457,7 @@ impl App {
                         source_index,
                         context_id,
                         fullscreen: false,
+                        minimized: false,
                         private,
                     });
                 }
@@ -498,20 +540,13 @@ impl App {
             .comparator
             .as_mut()
             .and_then(|comp| comp.split.as_mut())
-            .map(|split| {
-                split.fullscreen = !split.fullscreen;
-                split.fullscreen
-            })
+            .map(toggle_split_fullscreen_state)
         else {
             return;
         };
 
-        if !fullscreen && let Some(comp) = &mut self.comparator {
-            let all_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
-            if all_minimized && let Some(split) = &comp.split {
-                let src = split.source_index.min(comp.views.len().saturating_sub(1));
-                comp.minimized[src] = false;
-            }
+        if let Some(comp) = &mut self.comparator {
+            comp.expanded = None;
         }
 
         if let Some(window) = &self.window {
@@ -527,6 +562,34 @@ impl App {
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
+        self.request_redraw();
+    }
+
+    pub(in crate::windows_app) fn toggle_split_minimized(&mut self) {
+        let Some(split) = self
+            .comparator
+            .as_mut()
+            .and_then(|comp| comp.split.as_mut())
+        else {
+            return;
+        };
+        let minimized = !split.minimized;
+        set_split_minimized(split, minimized);
+        if let Some(comp) = &mut self.comparator {
+            comp.expanded = None;
+        }
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+        }
+        self.bar_hover = None;
+        self.needs_clear = true;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.sync_exit_button();
+        self.sync_home_button();
+        self.sync_caption_buttons();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
         self.request_redraw();
     }
 
@@ -563,7 +626,7 @@ impl App {
             // divisores (popups, acima das WebViews) ficavam a flutuar sobre
             // o video.
             let show = self.surface == Surface::Comparator
-                && comp.split.is_none()
+                && comp.split.as_ref().is_none_or(|split| split.minimized)
                 && comp.expanded.is_none()
                 && !self.service_covers_window();
             // Um divisor por fronteira entre colunas visiveis: o fim de cada
@@ -669,7 +732,7 @@ impl App {
         let (Some(window), Some(comp)) = (&self.window, &mut self.comparator) else {
             return;
         };
-        if comp.split.is_some() || comp.expanded.is_some() {
+        if comp.split.as_ref().is_some_and(|split| !split.minimized) || comp.expanded.is_some() {
             return;
         }
 

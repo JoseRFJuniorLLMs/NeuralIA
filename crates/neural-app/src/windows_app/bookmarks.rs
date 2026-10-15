@@ -196,6 +196,12 @@ pub(in crate::windows_app) enum BookmarkJob {
     ScanTabGroups {
         local_app_data: PathBuf,
     },
+    /// Grupos escolhidos no dialogo, guardados como pastas de favoritos.
+    ImportGroups {
+        groups: Vec<neural_core::chrome_groups::ChromeTabGroup>,
+        folder_title: String,
+        now_ms: u64,
+    },
 }
 
 /// Os grupos de um perfil, ja prontos para a barra.
@@ -285,7 +291,16 @@ pub(in crate::windows_app) fn scan_chromium_tab_groups(
     let mut found = Vec::new();
     for browser in ChromiumBrowser::ALL {
         let user_data = browser.user_data_dir(local_app_data);
-        for profile in chromium_profiles_in(&user_data) {
+        let mut profiles = chromium_profiles_in(&user_data);
+        // Guardar um grupo nao exige ter favoritos no perfil. Sem Local
+        // State, o Default tambem pode ter apenas Preferences/Sync Data.
+        if profiles.is_empty() && user_data.join("Default").is_dir() {
+            profiles.push(ChromiumProfile {
+                dir: "Default".to_string(),
+                name: "Default".to_string(),
+            });
+        }
+        for profile in profiles {
             let groups =
                 neural_core::chrome_groups::read_profile_tab_groups(&user_data.join(&profile.dir));
             if groups.is_empty() {
@@ -353,6 +368,11 @@ pub(in crate::windows_app) fn run_bookmark_job(
         BookmarkJob::ScanTabGroups { local_app_data } => {
             BookmarkReply::TabGroups(scan_chromium_tab_groups(&local_app_data))
         }
+        BookmarkJob::ImportGroups {
+            groups,
+            folder_title,
+            now_ms,
+        } => import_items(store, folder_title, tab_groups_as_bookmarks(groups), now_ms),
         BookmarkJob::Export { path } => {
             // O que esta no disco agora (outra janela pode ter mudado).
             store.load();
@@ -370,6 +390,60 @@ pub(in crate::windows_app) fn run_bookmark_job(
                 )),
             }
         }
+    }
+}
+
+/// Mantem cada grupo como pasta, e os titulos/ordem das abas como favoritos.
+/// O BookmarkStore valida os URLs, limpa titulos e elimina repetidos antes
+/// de gravar, tal como nas outras importacoes. Um titulo so com quebras
+/// vira «Grupo sem nome»; uma quebra no meio vira um espaco.
+fn tab_groups_as_bookmarks(
+    groups: Vec<neural_core::chrome_groups::ChromeTabGroup>,
+) -> Vec<neural_core::bookmarks::ImportedItem> {
+    use neural_core::bookmarks::ImportedItem;
+    groups
+        .into_iter()
+        .map(|group| ImportedItem::Folder {
+            title: group_folder_title(&group.title),
+            added_ms: None,
+            children: group
+                .tabs
+                .into_iter()
+                .map(|tab| ImportedItem::Link {
+                    title: tab.title,
+                    url: tab.url,
+                    added_ms: None,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn group_folder_title(raw: &str) -> String {
+    let title = clean_title(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        "Grupo sem nome".to_string()
+    } else {
+        title
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabGroupDestination {
+    Bookmarks,
+    TabBar,
+}
+
+/// O primeiro destino funciona inclusive na Home. A barra exige uma
+/// pesquisa aberta; cancelar o menu nunca importa.
+fn tab_group_destination(tabs_available: bool, picked: usize) -> Option<TabGroupDestination> {
+    match picked {
+        1 => Some(TabGroupDestination::Bookmarks),
+        2 if tabs_available => Some(TabGroupDestination::TabBar),
+        _ => None,
     }
 }
 
@@ -1067,18 +1141,13 @@ impl App {
     }
 
     /// Os grupos que a thread leu: escolhe o perfil e, se houver varios, o
-    /// grupo. Caem na primeira coluna de IA visivel.
+    /// grupo. Podem ficar nos Favoritos em qualquer superficie ou na
+    /// primeira coluna de IA visivel quando ha uma pesquisa aberta.
     fn offer_tab_groups(&mut self, profiles: Vec<ProfileTabGroups>) {
         if profiles.is_empty() {
             self.bookmarks_panel_render(Some(
                 "O Chrome e o Edge não têm grupos de abas guardados. No Chrome: botão direito no grupo e Guardar grupo.",
             ));
-            return;
-        }
-        if self.surface != Surface::Comparator || self.comparator.is_none() {
-            let notice = "Abra uma pesquisa de IA para receber os grupos de abas.";
-            self.bookmarks_panel_render(Some(notice));
-            self.show_splash(notice.to_string(), 4);
             return;
         }
         let profile = match profiles.len() {
@@ -1102,6 +1171,8 @@ impl App {
             self.bookmarks_panel_render(Some(""));
             return;
         };
+        let folder_title =
+            import_folder_title(&format!("{} · grupos de abas", profile.label), local_day());
         let chosen = match profile.groups.len() {
             0 => {
                 self.bookmarks_panel_render(Some(""));
@@ -1143,7 +1214,32 @@ impl App {
                 }
             }
         };
-        self.apply_imported_tab_groups(chosen);
+        let tabs_available = self.surface == Surface::Comparator
+            && self
+                .comparator
+                .as_ref()
+                .is_some_and(|comp| !comp.views.is_empty());
+        let picked = if tabs_available {
+            let mut menu = PopupMenu::default();
+            menu.push(MenuCommand::new(0, "Destino dos grupos").disabled(""));
+            menu.push(MenuCommand::new(1, "Guardar nos Favoritos"));
+            menu.push(MenuCommand::new(2, "Abrir na barra de abas"));
+            self.track_menu(&menu, cursor_point(), MenuButton::Left)
+        } else {
+            1
+        };
+        match tab_group_destination(tabs_available, picked) {
+            Some(TabGroupDestination::Bookmarks) => {
+                self.bookmarks_panel_render(Some("A importar grupos para os Favoritos…"));
+                self.submit_bookmark_job(BookmarkJob::ImportGroups {
+                    groups: chosen,
+                    folder_title,
+                    now_ms: now_ms(),
+                });
+            }
+            Some(TabGroupDestination::TabBar) => self.apply_imported_tab_groups(chosen),
+            None => self.bookmarks_panel_render(Some("")),
+        }
     }
 
     fn apply_imported_tab_groups(
@@ -1247,3 +1343,6 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests_groups;

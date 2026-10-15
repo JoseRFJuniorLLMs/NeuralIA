@@ -2,12 +2,16 @@
 //!
 //! O Chrome já não deixa a lista em `Preferences` (`specifics_to_data_migration`).
 //! O que vale é o LevelDB de `Sync Data`: cada registo `saved_tab_group-dt-<uuid>`
-//! traz um protobuf `SavedTabGroupSpecifics` (grupo ou aba). Os blocos comprimidos
-//! ficam de fora; lê-se o que está em texto, que é o que o log e os blocos sem
-//! compressão deixam. Sem crates novas.
+//! traz um protobuf `SavedTabGroupSpecifics` (grupo ou aba). Tabelas `.ldb`
+//! comprimidas com Snappy passam por `leveldb`; o log e os blocos sem
+//! compressão continuam a ser lidos em texto.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+
+mod leveldb;
 
 const MARKER: &[u8] = b"saved_tab_group-dt-";
 const MAX_GROUPS: usize = 64;
@@ -178,10 +182,9 @@ fn clip(value: &str, max_chars: usize) -> String {
 }
 
 fn http_url(value: &str) -> bool {
-    let value = value.trim();
-    (value.starts_with("http://") || value.starts_with("https://"))
-        && value.len() <= MAX_URL_CHARS
+    value.len() <= MAX_URL_CHARS
         && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+        && crate::bookmarks::bookmarkable_url(value).is_some()
 }
 
 fn is_uuid(bytes: &[u8]) -> bool {
@@ -201,6 +204,10 @@ fn read_varint(data: &[u8], index: &mut usize) -> Option<u64> {
     while *index < data.len() && shift < 64 {
         let byte = data[*index];
         *index += 1;
+        // O decimo byte de um varint u64 so pode guardar o bit 63.
+        if shift == 63 && byte > 1 {
+            return None;
+        }
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Some(result);
@@ -220,8 +227,8 @@ fn message(data: &[u8]) -> Option<Vec<Field<'_>>> {
     let mut fields = Vec::new();
     while index < data.len() {
         let tag = read_varint(data, &mut index)?;
-        let field = (tag >> 3) as u32;
-        if field == 0 {
+        let field = u32::try_from(tag >> 3).ok()?;
+        if field == 0 || field >= (1 << 29) {
             return None;
         }
         match tag & 7 {
@@ -233,7 +240,7 @@ fn message(data: &[u8]) -> Option<Vec<Field<'_>>> {
                 index += 8;
             }
             2 => {
-                let len = read_varint(data, &mut index)? as usize;
+                let len = usize::try_from(read_varint(data, &mut index)?).ok()?;
                 if len > data.len() - index {
                     return None;
                 }
@@ -365,7 +372,7 @@ fn from_specifics(body: &[u8], key_guid: &str, depth: u8) -> Option<Record> {
 
 fn try_record(data: &[u8], key_guid: &str) -> Option<(usize, Record)> {
     let mut index = 0;
-    let len = read_varint(data, &mut index)? as usize;
+    let len = usize::try_from(read_varint(data, &mut index)?).ok()?;
     if !(8..=8192).contains(&len) || index + len > data.len() {
         return None;
     }
@@ -420,8 +427,31 @@ fn absorb_bytes(index: &mut Index, bytes: &[u8]) {
     }
 }
 
+/// Uma tabela LevelDB entrega as chaves e os valores já descomprimidos.
+/// Um extrato que não é tabela, ou que não passa na conferência, continua
+/// a ser varrido em texto.
+fn absorb_profile_file(index: &mut Index, bytes: &[u8]) {
+    if leveldb::is_table(bytes) {
+        let mut budget = leveldb::Budget {
+            bytes: MAX_FILE_BYTES,
+            entries: 100_000,
+        };
+        if let Some(entries) = leveldb::read_table(bytes, &mut budget) {
+            for (mut key, value) in entries {
+                key.extend_from_slice(&value);
+                absorb_bytes(index, &key);
+            }
+            return;
+        }
+    }
+    absorb_bytes(index, bytes);
+}
+
 /// Os grupos num extrato de LevelDB (`.ldb` ou `.log`), em texto.
 pub fn parse_saved_tab_groups(bytes: &[u8]) -> Vec<ChromeTabGroup> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Vec::new();
+    }
     let mut index = Index::default();
     absorb_bytes(&mut index, bytes);
     index.finish()
@@ -566,24 +596,34 @@ pub fn read_profile_tab_groups(profile_dir: &Path) -> Vec<ChromeTabGroup> {
             if total >= MAX_PROFILE_BYTES {
                 break;
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let limit = MAX_FILE_BYTES.min(MAX_PROFILE_BYTES - total);
+            let Some(bytes) = read_file_capped(&path, limit) else {
                 continue;
             };
-            let take = bytes
-                .len()
-                .min(MAX_FILE_BYTES)
-                .min(MAX_PROFILE_BYTES - total);
-            total += take;
-            absorb_bytes(&mut index, &bytes[..take]);
+            total += bytes.len();
+            absorb_profile_file(&mut index, &bytes);
         }
     }
     let parsed = index.finish();
     if !parsed.is_empty() {
         return parsed;
     }
-    std::fs::read(profile_dir.join("Preferences"))
+    read_file_capped(&profile_dir.join("Preferences"), MAX_PREFERENCES_BYTES)
         .map(|bytes| groups_from_preferences(&bytes))
         .unwrap_or_default()
+}
+
+/// Confere o tamanho antes de alocar e limita a leitura se o ficheiro
+/// crescer enquanto o Chrome o grava. Um extrato parcial nao e importado.
+fn read_file_capped(path: &Path, limit: usize) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit as u64 + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() <= limit).then_some(bytes)
 }
 
 fn is_leveldb_payload(path: &Path) -> bool {
@@ -619,7 +659,7 @@ fn file_rank(path: &Path) -> (u8, String) {
 mod tests {
     use super::*;
 
-    fn varint(mut value: u64) -> Vec<u8> {
+    pub(super) fn varint(mut value: u64) -> Vec<u8> {
         let mut out = Vec::new();
         loop {
             let mut byte = (value & 0x7f) as u8;
@@ -690,6 +730,40 @@ mod tests {
     }
 
     #[test]
+    fn compressed_leveldb_table_yields_the_same_saved_group() {
+        let group_guid = "11111111-1111-1111-1111-111111111111";
+        let tab_guid = "22222222-2222-2222-2222-222222222222";
+        let group = [proto_var(1, 3), proto_str(2, "Comprimido"), proto_var(3, 2)].concat();
+        let specifics = [proto_str(1, group_guid), delimited(4, &group)].concat();
+        let tab = [
+            proto_str(1, group_guid),
+            proto_var(2, 1),
+            proto_str(3, "https://example.com/comprimido"),
+            proto_str(4, "Aba"),
+        ]
+        .concat();
+        let tab_specifics = [proto_str(1, tab_guid), delimited(5, &tab)].concat();
+        let file = leveldb::fixture_table(
+            &[
+                (b"group".to_vec(), wrap(group_guid, &specifics)),
+                (b"tab".to_vec(), wrap(tab_guid, &tab_specifics)),
+            ],
+            true,
+        );
+        let mut index = Index::default();
+        absorb_profile_file(&mut index, &file);
+        let groups = index.finish();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].title, "Comprimido");
+        assert_eq!(groups[0].tabs[0].url, "https://example.com/comprimido");
+        let mut corrupt = file.clone();
+        corrupt[0] ^= 1;
+        let mut broken = Index::default();
+        absorb_profile_file(&mut broken, &corrupt);
+        assert!(broken.finish().is_empty());
+    }
+
+    #[test]
     fn preferences_specifics_keep_only_web_tabs() {
         let json = br#"{
             "saved_tab_groups": { "specifics": [
@@ -705,6 +779,97 @@ mod tests {
         assert_eq!(groups[0].title, "Leitura");
         assert_eq!(groups[0].color, 5);
         assert_eq!(groups[0].tabs.len(), 1);
+    }
+
+    #[test]
+    fn chrome_group_urls_require_real_web_hosts_and_reject_local_app_origins() {
+        let urls = [
+            "https://example.com/ok",
+            "HTTP://example.org/path",
+            "http://",
+            "https://#fragment",
+            "https://neuralia-pdf.localhost/viewer.html",
+            "http://neuralia-epub.localhost/library",
+            "javascript:alert(1)",
+            "file:///C:/secret.txt",
+            "chrome://settings",
+            "https://example.com/with space",
+            "https://example.com/with\nnewline",
+        ];
+        let tabs: Vec<_> = urls
+            .iter()
+            .map(|url| serde_json::json!({"url":url}))
+            .collect();
+        let preferences = serde_json::json!({"saved_tab_groups":{"specifics":[{
+            "title":"Seguro", "saved_tabs":tabs
+        }]}});
+        let parsed = groups_from_preferences(&serde_json::to_vec(&preferences).unwrap());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].tabs.len(), 2);
+        assert_eq!(parsed[0].tabs[0].url, "HTTP://example.org/path");
+        assert_eq!(parsed[0].tabs[1].url, "https://example.com/ok");
+    }
+
+    #[test]
+    fn chrome_group_protobuf_rejects_overflowing_varints_and_field_numbers() {
+        let mut cursor = 0;
+        let overflow = [&[0xff; 9][..], &[0x02]].concat();
+        assert_eq!(read_varint(&overflow, &mut cursor), None);
+        let mut cursor = 0;
+        assert_eq!(read_varint(&varint(u64::MAX), &mut cursor), Some(u64::MAX));
+        // Antes, o cast para u32 transformava este campo gigante no campo 1.
+        let oversized_tag = [varint(((1u64 << 32) | 1) << 3), varint(7)].concat();
+        assert!(message(&oversized_tag).is_none());
+        assert!(message(&[0x0a, 0xff, 0x7f]).is_none());
+    }
+
+    #[test]
+    fn chrome_group_reads_and_public_parser_enforce_byte_limits() {
+        let root = std::env::temp_dir().join(format!(
+            "neuralia-groups-caps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let file = root.join("large.ldb");
+        let mut bytes = wrap(
+            "11111111-1111-1111-1111-111111111111",
+            &[
+                proto_str(1, "11111111-1111-1111-1111-111111111111"),
+                delimited(4, &proto_str(2, "Grupo")),
+            ]
+            .concat(),
+        );
+        bytes.extend(wrap(
+            "22222222-2222-2222-2222-222222222222",
+            &[
+                proto_str(1, "22222222-2222-2222-2222-222222222222"),
+                delimited(
+                    5,
+                    &[
+                        proto_str(1, "11111111-1111-1111-1111-111111111111"),
+                        proto_str(3, "https://example.com/ok"),
+                    ]
+                    .concat(),
+                ),
+            ]
+            .concat(),
+        ));
+        assert_eq!(parse_saved_tab_groups(&bytes).len(), 1);
+        std::fs::write(&file, &bytes).unwrap();
+        assert_eq!(read_file_capped(&file, bytes.len()), Some(bytes.clone()));
+        assert!(read_file_capped(&file, bytes.len() - 1).is_none());
+        bytes.resize(MAX_FILE_BYTES + 1, 0);
+        assert!(parse_saved_tab_groups(&bytes).is_empty());
+        let oversized = File::options().write(true).open(&file).unwrap();
+        oversized.set_len((MAX_FILE_BYTES + 1) as u64).unwrap();
+        drop(oversized);
+        assert!(read_file_capped(&file, MAX_FILE_BYTES).is_none());
+        std::fs::remove_file(&file).unwrap();
+        std::fs::remove_dir(&root).unwrap();
     }
 
     #[test]

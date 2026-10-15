@@ -306,6 +306,7 @@ pub(in crate::windows_app) struct BarState {
     pub(in crate::windows_app) bookmarked: [bool; COMPARATOR_COLUMNS],
     /// A da fonte aberta ao lado.
     pub(in crate::windows_app) split_bookmarked: bool,
+    pub(in crate::windows_app) split_minimized: bool,
     /// Os downloads a correr (downloads-ui): a seta do canto pinta-se na cor
     /// de destaque e a dica diz quantos e quanto falta.
     pub(in crate::windows_app) downloads: DownloadsBadge,
@@ -1154,6 +1155,8 @@ pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) tools: [UiRect; 3],
     /// Rotulo, expandir e fechar da gaveta; `None` quando nao ha gaveta.
     pub(in crate::windows_app) split: Option<(UiRect, UiRect, UiRect)>,
+    /// Minimizar/restaurar a fonte sem destruir a pagina ou a sessao.
+    pub(in crate::windows_app) split_minimize: Option<UiRect>,
     /// ‹ e › da fonte da gaveta, a esquerda do rotulo.
     pub(in crate::windows_app) split_nav: Option<(UiRect, UiRect)>,
     /// A estrela dos favoritos da fonte da gaveta, entre o › e o rotulo.
@@ -1322,7 +1325,7 @@ pub(in crate::windows_app) fn right_controls(
     // Linha 2 (Row 2): apenas os controlos da gaveta do Split View, se aberta.
     let logical = |value: f64| value / scale;
     let split_fixed = if split_active {
-        30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
+        30.0 + 5.0 + 30.0 + 5.0 + 30.0 + 5.0 + 6.0 + 26.0 + 4.0 + 26.0 + 6.0
     } else {
         0.0
     };
@@ -1347,12 +1350,19 @@ pub(in crate::windows_app) fn right_controls(
             height: row_h,
         };
         let label = UiRect {
-            x: expand.x - gap - split_label_w * scale,
+            x: expand.x - gap - 30.0 * scale - gap - split_label_w * scale,
             y: row_y,
             width: split_label_w * scale,
             height: row_h,
         };
         (label, expand, close)
+    });
+
+    let split_minimize = split.map(|(_, expand, _)| UiRect {
+        x: expand.x - gap - 30.0 * scale,
+        y: row_y,
+        width: 30.0 * scale,
+        height: row_h,
     });
 
     let size = row_h - 4.0 * scale;
@@ -1385,6 +1395,7 @@ pub(in crate::windows_app) fn right_controls(
         live,
         tools,
         split,
+        split_minimize,
         split_nav,
         split_bookmark,
     }
@@ -1517,6 +1528,12 @@ pub(in crate::windows_app) fn right_controls_hit(
         if expand.contains(x, y) {
             return Some(BarHit::SplitExpand);
         }
+    }
+    if controls
+        .split_minimize
+        .is_some_and(|rect| rect.contains(x, y))
+    {
+        return Some(BarHit::SplitMinimize);
     }
     if controls
         .split_bookmark

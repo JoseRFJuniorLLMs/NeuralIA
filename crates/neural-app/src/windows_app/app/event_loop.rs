@@ -283,6 +283,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ToggleColumnFullscreen => self.toggle_column_fullscreen(),
+            UserEvent::MinimizeActivePage(origin) => self.minimize_active_page(origin),
+            UserEvent::MinimizeAllColumns => self.minimize_all_columns(),
             UserEvent::OpenDevTools => self.open_devtools(),
             UserEvent::OpenDevToolsTarget(target) => self.open_devtools_target(target),
             UserEvent::ViewSource => self.view_source(),
@@ -743,6 +745,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Resized(size) => {
+                self.sync_page_controls();
                 debug_log(format_args!(
                     "resized {}x{} surface={:?}",
                     size.width, size.height, self.surface
@@ -783,6 +786,7 @@ impl ApplicationHandler<UserEvent> for App {
             // Resized os sincronizava, por isso arrastar a janela deixava-os
             // para tras, no sitio onde ela estava antes.
             WindowEvent::Moved(_) => {
+                self.sync_page_controls();
                 self.position_splash();
                 self.position_toast();
                 self.position_search_card();

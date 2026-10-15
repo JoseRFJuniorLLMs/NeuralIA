@@ -26,6 +26,9 @@ sha2 = "0.11.0"
 # estavam no Cargo.lock como transitivos; nenhum crate novo entra.
 flate2 = "1.1.10"
 quick-xml = { version = "0.42.0", default-features = false }
+# Grupos guardados do Chrome: blocos LevelDB com Snappy raw. O tamanho
+# descomprimido e conferido antes da alocacao; sem dependencias transitivas.
+snap = "1.1.2"
 scraper = "0.27"
 serde.workspace = true
 serde_json.workspace = true

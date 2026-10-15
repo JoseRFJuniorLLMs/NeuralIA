@@ -40,6 +40,8 @@
       node.box.setAttribute('data-tone', String(data.tone || ''));
       node.name.textContent = String(data.name || '');
       node.status.textContent = String(data.status || '');
+      node.buttons.open.textContent = data.preview ? 'Pré-visualizar' : 'Abrir';
+      node.buttons.open.title = data.preview ? 'Abrir pré-visualização no painel' : 'Abrir no aplicativo padrão';
       const percent = typeof data.percent === 'number' ? Math.max(0, Math.min(100, data.percent)) : null;
       node.bar.hidden = data.tone !== 'running';
       node.fill.style.width = percent === null ? '100%' : percent + '%';

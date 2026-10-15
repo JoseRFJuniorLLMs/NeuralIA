@@ -2,6 +2,17 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.0.2] - 2026-10-14
+
+### Added
+- **Minimizar tudo.** Ctrl+Shift+F9 minimiza todas as colunas de IA e a fonte ao lado. Cada uma fica em chip na barra, com a sessão. Ctrl+Shift+M minimiza a página que tem o foco (coluna, fonte, serviço ou a janela).
+- **Páginas abertas pela barra** (Web, Leitura, PDF e EPUB) têm minimizar, tela cheia e fechar. F11 entra e sai da tela cheia. As dicas desses botões trazem o atalho.
+- **Pré-visualização de downloads** dentro do NeuralIA para PDF, EPUB, TXT, HTML e imagem (PNG, JPG, GIF, WEBP, BMP). O botão passa a dizer Pré-visualizar. O HTML abre só como leitura, sem script.
+- **Grupos de abas do Chrome/Edge nos Favoritos.** «Importar grupos de abas» grava cada grupo como pasta, também na Home. Com uma pesquisa de IA aberta, dá para escolher Favoritos ou a barra de abas. Tabelas LevelDB comprimidas entram na leitura.
+
+### Fixed
+- **Minimizar e Ocultar** no painel de um serviço deixam de fazer a mesma coisa. Minimizar mantém a faixa e os controles. Ocultar recolhe a faixa. Na fonte ao lado, minimizar, expandir e fechar são três botões.
+
 ## [3.0.1] - 2026-10-14
 
 ### Fixed

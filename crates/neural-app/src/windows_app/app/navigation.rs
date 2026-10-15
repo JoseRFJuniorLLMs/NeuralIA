@@ -724,6 +724,15 @@ impl App {
     /// Um nivel para tras. O Escape da janela nativa e o Escape apanhado dentro
     /// das paginas acabam os dois aqui.
     pub(in crate::windows_app) fn go_back(&mut self) {
+        if self.surface != Surface::Comparator
+            && self
+                .window
+                .as_ref()
+                .is_some_and(|window| window.fullscreen().is_some())
+        {
+            self.leave_column_fullscreen();
+            return;
+        }
         if self.surface == Surface::Comparator {
             if self
                 .comparator
@@ -1096,11 +1105,33 @@ impl App {
     }
 
     pub(in crate::windows_app) fn toggle_column_fullscreen(&mut self) {
+        if let Some(comp) = &self.comparator
+            && comp.split.as_ref().is_some_and(|split| !split.minimized)
+        {
+            self.toggle_split_fullscreen();
+            return;
+        }
         let index = match &self.comparator {
-            Some(comp) => comp.expanded.unwrap_or(0),
-            None => return,
+            Some(comp) => comp
+                .expanded
+                .or_else(|| (0..comp.views.len()).find(|index| !comp.minimized[*index])),
+            None => {
+                if let Some(window) = &self.window {
+                    window.set_fullscreen(if window.fullscreen().is_some() {
+                        None
+                    } else {
+                        Some(winit::window::Fullscreen::Borderless(None))
+                    });
+                }
+                self.sync_exit_button();
+                self.sync_page_controls();
+                self.request_redraw();
+                return;
+            }
         };
-        self.expand_comparator(index);
+        if let Some(index) = index {
+            self.expand_comparator(index);
+        }
     }
 
     fn schedule_auto_scroll_in(&self, seconds: u64) {
@@ -1199,15 +1230,23 @@ impl App {
         }
         if let Some(comp) = &self.comparator {
             if let Some(split) = &comp.split {
-                if split.fullscreen {
-                    action(&split.webview);
-                    return;
+                match split_presentation(
+                    split,
+                    &comp.minimized[..comp.views.len().min(COMPARATOR_COLUMNS)],
+                ) {
+                    SplitPresentation::Fullscreen | SplitPresentation::Only => {
+                        action(&split.webview);
+                        return;
+                    }
+                    SplitPresentation::Docked(source) => {
+                        if let Some(view) = comp.views.get(source) {
+                            action(&view.webview);
+                        }
+                        action(&split.webview);
+                        return;
+                    }
+                    SplitPresentation::Hidden => {}
                 }
-                if let Some(view) = comp.views.get(split.source_index) {
-                    action(&view.webview);
-                }
-                action(&split.webview);
-                return;
             }
 
             match comp.expanded {
@@ -1217,8 +1256,10 @@ impl App {
                     }
                 }
                 None => {
-                    for view in &comp.views {
-                        action(&view.webview);
+                    for (index, view) in comp.views.iter().enumerate() {
+                        if !comp.minimized[index] {
+                            action(&view.webview);
+                        }
                     }
                 }
             }

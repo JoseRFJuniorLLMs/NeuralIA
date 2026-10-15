@@ -325,6 +325,8 @@ pub(in crate::windows_app) enum UserEvent {
     NewTab(usize),
     CloseSplit,
     ToggleSplitFullscreen,
+    MinimizeActivePage(CommandOrigin),
+    MinimizeAllColumns,
     /// A pagina so pode PEDIR a palette (Ctrl+K/T ou o botao +): a coluna e
     /// a do proprio WebView; texto e destino nunca viajam por este canal.
     OpenPalette(usize),
@@ -547,6 +549,7 @@ pub(in crate::windows_app) enum BarHit {
     /// nao mostra incluidas.
     TabOverflow(usize),
     SplitExpand,
+    SplitMinimize,
     SplitClose,
     Private,
     /// A faixa por cima do painel de servicos: minimizar, tela cheia, fechar.
@@ -688,8 +691,9 @@ fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarC
     // Em ecra completo ou com a gaveta aberta o conteudo ja nao esta em
     // faixas por peso, por isso a barra tambem nao finge que esta: reparte-se
     // em partes iguais e nenhuma coluna vira chip.
-    if comp.expanded.is_some() || comp.split.is_some() {
+    if comp.expanded.is_some() {
         return BarColumns {
+            minimized: comp.minimized,
             split_active: comp.split.is_some(),
             panel_width: comp.panel_width,
             pomodoro_label,
@@ -700,7 +704,7 @@ fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarC
         count: comp.views.len(),
         weights: comp.weights,
         minimized: comp.minimized,
-        split_active: false,
+        split_active: comp.split.is_some(),
         panel_width: comp.panel_width,
         pomodoro_label,
     }
@@ -1135,6 +1139,13 @@ pub(in crate::windows_app) fn bar_tooltip_label(
             format!("Todas as abas do {provider}, também as que não cabem na barra")
         }
         BarHit::SplitExpand => "Expandir ou reduzir a fonte aberta ao lado".to_string(),
+        BarHit::SplitMinimize => {
+            if state.split_minimized {
+                "Restaurar a fonte aberta ao lado".to_string()
+            } else {
+                "Minimizar a fonte aberta ao lado".to_string()
+            }
+        }
         BarHit::SplitClose => "Fechar a fonte aberta ao lado".to_string(),
         BarHit::Private => {
             "Painel privado: abre ao lado sem gravar histórico nem memória".to_string()
@@ -1181,6 +1192,7 @@ fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
         BarHit::Back | BarHit::ColumnBack(_) => Some("Alt+←"),
         BarHit::Forward | BarHit::ColumnForward(_) => Some("Alt+→"),
         BarHit::ColumnReload(_) => Some("F5"),
+        BarHit::ColumnMinimize(_) | BarHit::SplitMinimize => Some("Ctrl+Shift+M"),
         BarHit::Column(_) | BarHit::SplitExpand => Some("F11"),
         BarHit::AddTab(_) => Some("Ctrl+N"),
         BarHit::ColumnBookmark(_) | BarHit::SplitBookmark => Some("Ctrl+D"),
@@ -3536,6 +3548,7 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) exit_button: Option<HWND>,
     pub(in crate::windows_app) home_button: Option<HWND>,
     pub(in crate::windows_app) caption_buttons: Option<HWND>,
+    pub(in crate::windows_app) page_controls: Option<HWND>,
     /// Na Home os botoes da janela so se veem com o rato perto deles.
     pub(in crate::windows_app) caption_reveal: CaptionReveal,
     pub(in crate::windows_app) splitters: [Option<HWND>; COMPARATOR_COLUMNS - 1],
@@ -3795,6 +3808,7 @@ impl App {
             exit_button: None,
             home_button: None,
             caption_buttons: None,
+            page_controls: None,
             caption_reveal: CaptionReveal::default(),
             splitters: [None; COMPARATOR_COLUMNS - 1],
             // Ligada por omissao: a aplicacao serve para ler.
@@ -7432,9 +7446,15 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
                 target,
                 label,
                 &if private_split {
-                    format!("Privado · {source}")
+                    format!(
+                        "{}Privado · {source}",
+                        if state.split_minimized { "↩ " } else { "" }
+                    )
                 } else {
-                    format!("Fonte · {source}")
+                    format!(
+                        "{}Fonte · {source}",
+                        if state.split_minimized { "↩ " } else { "" }
+                    )
                 },
                 PillStyle::new(theme.surface, theme.surface_line, theme.fg_muted),
                 scale,
@@ -7451,6 +7471,17 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             font,
             theme,
         );
+        if let Some(minimize) = controls.split_minimize {
+            draw_button(
+                target,
+                minimize,
+                if state.split_minimized { "↩" } else { "−" },
+                hover == Some(BarHit::SplitMinimize),
+                scale,
+                font,
+                theme,
+            );
+        }
         // A estrela da fonte, entre o › dela e o rotulo.
         if let Some(star) = controls.split_bookmark {
             draw_button(
@@ -7904,6 +7935,7 @@ pub(in crate::windows_app) use downloads_ui::*;
 pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;
+pub(in crate::windows_app) mod page_controls;
 pub(in crate::windows_app) use keymap::*;
 pub(in crate::windows_app) mod translation;
 pub(in crate::windows_app) use translation::*;

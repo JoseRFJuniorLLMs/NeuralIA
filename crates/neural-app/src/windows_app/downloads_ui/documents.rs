@@ -7,6 +7,12 @@ use std::sync::{Arc, Mutex};
 pub(in crate::windows_app) enum PreparedDocument {
     Pdf(Vec<u8>),
     Text(String),
+    Html(String),
+    Image {
+        html: String,
+        bytes: Vec<u8>,
+        mime: &'static str,
+    },
     Epub {
         runtime: EpubRuntime,
         id: String,
@@ -21,6 +27,8 @@ impl std::fmt::Debug for PreparedDocument {
         f.write_str(match self {
             Self::Pdf(_) => "PDF",
             Self::Text(_) => "TXT",
+            Self::Html(_) => "HTML",
+            Self::Image { .. } => "Imagem",
             Self::Epub { .. } => "EPUB",
         })
     }
@@ -30,10 +38,132 @@ pub(in crate::windows_app) fn is_internal_document(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .is_some_and(|ext| {
-            ["pdf", "epub", "txt"]
-                .iter()
-                .any(|kind| ext.eq_ignore_ascii_case(kind))
+            [
+                "pdf", "epub", "txt", "html", "htm", "xhtml", "png", "jpg", "jpeg", "gif", "webp",
+                "bmp",
+            ]
+            .iter()
+            .any(|kind| ext.eq_ignore_ascii_case(kind))
         })
+}
+
+/// HTML is accepted only by the read-only preview, never by ShellExecute.
+/// Keep the same filename checks as ordinary downloads, including ADS/bidi.
+pub(in crate::windows_app) fn internal_document_name_allowed(path: &Path) -> bool {
+    is_internal_document(path)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                neural_core::file_risk::classify_download_name(name)
+                    == neural_core::file_risk::RiskClass::Safe
+            })
+}
+
+pub(in crate::windows_app) fn internal_document_target_allowed(path: &Path) -> bool {
+    if !internal_document_name_allowed(path) {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = Vec::new();
+    file.take(neural_core::file_risk::SNIFF_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .is_ok()
+        && document_bytes_safe(&head)
+}
+
+const TEXT_MAX_BYTES: usize = 8 * 1024 * 1024;
+const HTML_MAX_BYTES: usize = 2 * 1024 * 1024;
+const IMAGE_MAX_BYTES: usize = 32 * 1024 * 1024;
+const PREVIEW_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; script-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'none'";
+
+fn document_title(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn article_preview_html(article: &neural_core::ReaderArticle) -> String {
+    neural_core::reader_html(article).replace("</head>",
+        "<style>pre{white-space:pre-wrap;overflow-wrap:anywhere}.top a,.source{display:none}</style></head>")
+}
+
+fn text_preview_html(path: &Path, text: String) -> String {
+    article_preview_html(&neural_core::ReaderArticle {
+        source_url: String::new(),
+        title: document_title(path),
+        byline: None,
+        excerpt: None,
+        blocks: vec![neural_core::ReaderBlock::Code(text)],
+    })
+}
+
+fn image_mime(ext: &str, bytes: &[u8]) -> Result<&'static str, String> {
+    // This signature parser does not decompress the image. Chromium renders
+    // the immutable, bounded snapshot with an explicit MIME and nosniff.
+    let format =
+        image::guess_format(bytes).map_err(|_| "O arquivo não contém uma imagem válida.")?;
+    match (ext.to_ascii_lowercase().as_str(), format) {
+        ("png", image::ImageFormat::Png) => Ok("image/png"),
+        ("jpg" | "jpeg", image::ImageFormat::Jpeg) => Ok("image/jpeg"),
+        ("gif", image::ImageFormat::Gif) => Ok("image/gif"),
+        ("webp", image::ImageFormat::WebP) => Ok("image/webp"),
+        ("bmp", image::ImageFormat::Bmp) => Ok("image/bmp"),
+        _ => Err("A imagem não corresponde à extensão do arquivo.".into()),
+    }
+}
+
+fn image_preview_html(path: &Path) -> String {
+    let title = neural_core::render::escape_html(&document_title(path)).into_owned();
+    format!(
+        r#"<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>body{{margin:0;padding:20px;font-family:Segoe UI,system-ui,sans-serif;color:#eee;background:#181b20}}h1{{font-size:18px;overflow-wrap:anywhere}}p{{font-size:13px;color:#bbc2cd}}img{{display:block;max-width:100%;height:auto;margin:auto}}</style></head><body><h1>{title}</h1><p>Pré-visualização da imagem · role para ver o arquivo inteiro</p><img src="/preview-image" alt="{title}"></body></html>"#
+    )
+}
+
+/// Serve only our generated page and its in-memory raster snapshot. There
+/// is no filesystem lookup, network fetch, supplied URL, or active HTML.
+fn serve_preview_asset(
+    html: &str,
+    image: Option<(&[u8], &'static str)>,
+    request: &wry::http::Request<Vec<u8>>,
+) -> wry::http::Response<std::borrow::Cow<'static, [u8]>> {
+    let valid_origin = Url::parse(&request.uri().to_string())
+        .is_ok_and(|url| url.origin().ascii_serialization() == PDF_ORIGIN);
+    let (status, mime, body) = if !valid_origin {
+        (403, "text/plain; charset=utf-8", Vec::new())
+    } else if !matches!(
+        *request.method(),
+        wry::http::Method::GET | wry::http::Method::HEAD
+    ) {
+        (405, "text/plain; charset=utf-8", Vec::new())
+    } else {
+        match request.uri().path() {
+            "/preview.html" => (200, "text/html; charset=utf-8", html.as_bytes().to_vec()),
+            "/preview-image" if image.is_some() => {
+                let (bytes, mime) = image.expect("checked image");
+                (200, mime, bytes.to_vec())
+            }
+            _ => (404, "text/plain; charset=utf-8", Vec::new()),
+        }
+    };
+    wry::http::Response::builder()
+        .status(status)
+        .header("Content-Type", mime)
+        .header("Content-Security-Policy", PREVIEW_CSP)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Cache-Control", "no-store")
+        .header("Content-Length", body.len())
+        .body(std::borrow::Cow::Owned(
+            if request.method() == wry::http::Method::HEAD {
+                Vec::new()
+            } else {
+                body
+            },
+        ))
+        .expect("static preview response")
 }
 
 fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
@@ -46,15 +176,18 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, String> {
         return Err("O arquivo ultrapassa o limite do leitor interno.".into());
     }
     // Recheck the bytes we actually read, as the file may have changed since click.
-    if bytes.starts_with(b"MZ")
-        || matches!(
-            neural_core::file_risk::sniff_download(&bytes[..bytes.len().min(4096)]),
-            neural_core::file_risk::SniffRisk::Dangerous
-        )
-    {
+    if !document_bytes_safe(&bytes) {
         return Err("O conteúdo do arquivo não é um documento seguro.".into());
     }
     Ok(bytes)
+}
+
+fn document_bytes_safe(bytes: &[u8]) -> bool {
+    !bytes.starts_with(b"MZ")
+        && !matches!(
+            neural_core::file_risk::sniff_download(&bytes[..bytes.len().min(4096)]),
+            neural_core::file_risk::SniffRisk::Dangerous
+        )
 }
 
 fn prepare_document(
@@ -62,7 +195,7 @@ fn prepare_document(
     library: PathBuf,
     notify: Box<dyn Fn(EpubNotice) + Send>,
 ) -> Result<PreparedDocument, String> {
-    if default_app_target(path).is_none() || !is_internal_document(path) {
+    if !internal_document_name_allowed(path) {
         return Err("Este arquivo não pode ser aberto pelo leitor.".into());
     }
     let ext = path
@@ -77,22 +210,49 @@ fn prepare_document(
         return Ok(PreparedDocument::Pdf(bytes));
     }
     if ext.eq_ignore_ascii_case("txt") {
-        let bytes = read_bounded(path, 8 * 1024 * 1024)?;
+        let bytes = read_bounded(path, TEXT_MAX_BYTES)?;
         let text = decode_text(&bytes)?;
-        let article = neural_core::ReaderArticle {
-            source_url: String::new(),
-            title: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            byline: None,
-            excerpt: None,
-            blocks: vec![neural_core::ReaderBlock::Code(text)],
+        return Ok(PreparedDocument::Text(text_preview_html(path, text)));
+    }
+    if ["html", "htm", "xhtml"]
+        .iter()
+        .any(|kind| ext.eq_ignore_ascii_case(kind))
+    {
+        let bytes = read_bounded(path, HTML_MAX_BYTES)?;
+        let source = decode_text(&bytes)?;
+        let url = Url::parse(&format!("{PDF_ORIGIN}/preview.html")).expect("static preview URL");
+        let html = match neural_core::reader::extract_article_bounded(
+            &url,
+            &source,
+            Some(Instant::now() + Duration::from_secs(5)),
+            &|| false,
+        ) {
+            Ok(mut article) => {
+                article.source_url.clear();
+                article_preview_html(&article)
+            }
+            // Tiny/empty HTML has no article: its escaped source is still
+            // useful, and never falls back to executing the original file.
+            Err(_) => text_preview_html(path, source),
         };
-        let html = neural_core::reader_html(&article).replace("</head>",
-            "<style>pre{white-space:pre-wrap;overflow-wrap:anywhere}.top a{display:none}</style></head>");
-        return Ok(PreparedDocument::Text(html));
+        return Ok(PreparedDocument::Html(html));
+    }
+    if ["png", "jpg", "jpeg", "gif", "webp", "bmp"]
+        .iter()
+        .any(|kind| ext.eq_ignore_ascii_case(kind))
+    {
+        let bytes = read_bounded(path, IMAGE_MAX_BYTES)?;
+        let mime = image_mime(ext, &bytes)?;
+        return Ok(PreparedDocument::Image {
+            html: image_preview_html(path),
+            bytes,
+            mime,
+        });
+    }
+    // EPUB's library parser owns the archive bounds, path validation and
+    // format checks. Recheck the disk head before handing it to that parser.
+    if default_app_target(path).is_none() {
+        return Err("Este arquivo não pode ser aberto pelo leitor.".into());
     }
     // Import uses the existing library worker/parser and file locks. This
     // temporary worker's channels stay alive in the viewer's protocol closures.
@@ -168,7 +328,7 @@ impl App {
         let generation = self.downloads_ui.document_generation;
         let library = self.config.data_dir.join("library");
         let proxy = self.proxy.clone();
-        self.show_splash("Abrindo documento no painel…".into(), 2);
+        self.show_splash("Preparando a pré-visualização…".into(), 2);
         if let Err(error) = std::thread::Builder::new()
             .name("download-document".into())
             .spawn(move || {
@@ -241,14 +401,21 @@ impl App {
                     WebViewHost::Pdf,
                 )
             }
-            PreparedDocument::Text(html) => (
-                builder.with_custom_protocol("neuralia-pdf".into(), move |_, request| {
-                    let found = request.uri().path() == "/text.html";
-                    wry::http::Response::builder().status(if found { 200 } else { 404 })
-                        .header("Content-Type", "text/html; charset=utf-8")
-                        .header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; base-uri 'none'; object-src 'none'")
-                        .body(std::borrow::Cow::Owned(if found { html.as_bytes().to_vec() } else { Vec::new() })).expect("static response")
-                }).with_url(format!("{PDF_ORIGIN}/text.html"))
+            PreparedDocument::Text(html) | PreparedDocument::Html(html) => (
+                builder
+                    .with_custom_protocol("neuralia-pdf".into(), move |_, request| {
+                        serve_preview_asset(&html, None, &request)
+                    })
+                    .with_url(format!("{PDF_ORIGIN}/preview.html"))
+                    .with_initialization_script(SPLIT_SCROLL_RAIL_SCRIPT),
+                WebViewHost::Pdf,
+            ),
+            PreparedDocument::Image { html, bytes, mime } => (
+                builder
+                    .with_custom_protocol("neuralia-pdf".into(), move |_, request| {
+                        serve_preview_asset(&html, Some((&bytes, mime)), &request)
+                    })
+                    .with_url(format!("{PDF_ORIGIN}/preview.html"))
                     .with_initialization_script(SPLIT_SCROLL_RAIL_SCRIPT),
                 WebViewHost::Pdf,
             ),
@@ -270,8 +437,13 @@ impl App {
                         },
                     )
                     .with_ipc_handler(move |request| {
-                        if let Some(request) = handle_epub_ipc(&request.uri().to_string(), request.body(), &worker) {
-                            let _ = epub_proxy.send_event(UserEvent::DownloadDocumentUi { generation, request });
+                        if let Some(request) =
+                            handle_epub_ipc(&request.uri().to_string(), request.body(), &worker)
+                        {
+                            let _ = epub_proxy.send_event(UserEvent::DownloadDocumentUi {
+                                generation,
+                                request,
+                            });
                         }
                         if request.body() == r#"{"action":"close"}"#
                             && let Some(post) = side_panel::PanelPost::parse(ticket, request.body())
@@ -572,6 +744,277 @@ mod gates {
     impl Drop for Files {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[derive(Default)]
+    struct PreviewShell(Vec<PathBuf>);
+    impl ShellHost for PreviewShell {
+        fn shell_execute(&mut self, _verb: &'static str, file: &Path) -> Result<(), String> {
+            self.0.push(file.to_path_buf());
+            Ok(())
+        }
+        fn reveal_in_folder(&mut self, _file: &Path) -> Result<(), String> {
+            panic!("preview must not reveal a folder")
+        }
+    }
+
+    #[test]
+    fn download_previews_route_only_validated_files_without_shell() {
+        let files = Files::new();
+        let mut shell = PreviewShell::default();
+        for (name, data) in [
+            ("note.txt", b"hello".as_slice()),
+            ("report.pdf", b"%PDF-1.7\n".as_slice()),
+            ("page.HTML", b"<p>hello</p>".as_slice()),
+            (
+                "photo.PNG",
+                include_bytes!("../../../../../assets/neuralia-home-reader.png").as_slice(),
+            ),
+        ] {
+            let path = files.file(name, data);
+            assert!(internal_document_target_allowed(&path), "{name}");
+            assert_eq!(
+                shell_open_checked(&path, &mut shell),
+                OpenOutcome::InternalDocument(path.clone())
+            );
+            std::fs::write(&path, b"MZ replaced executable").unwrap();
+            assert!(!internal_document_target_allowed(&path), "changed {name}");
+            assert_eq!(shell_open_checked(&path, &mut shell), OpenOutcome::Refused);
+        }
+        for name in [
+            "CON.html",
+            "page.html.exe",
+            "page.hta",
+            "photo.svg",
+            "page\u{202e}.html",
+        ] {
+            let path = files.0.join(name);
+            if name != "CON.html" {
+                std::fs::write(&path, b"<p>hello</p>").unwrap();
+            }
+            assert!(!internal_document_name_allowed(&path), "{name}");
+            assert_eq!(
+                shell_open_checked(&path, &mut shell),
+                OpenOutcome::Refused,
+                "{name}"
+            );
+        }
+        assert!(shell.0.is_empty(), "a preview reached ShellExecute");
+        let outcome = RecordOutcome::Completed {
+            warn: false,
+            inspection: Inspection::Checked,
+        };
+        let html = files.file("page.htm", b"<p>hello</p>");
+        assert_eq!(file_actions(outcome, Some(&html)), (true, true));
+        let rows = [
+            PanelRow {
+                id: 1,
+                name: "page.htm".into(),
+                status: "Concluído".into(),
+                percent: None,
+                open: true,
+                show: true,
+                cancel: false,
+                tone: "done",
+            },
+            PanelRow {
+                id: 2,
+                name: "movie.mp4".into(),
+                status: "Concluído".into(),
+                percent: None,
+                open: true,
+                show: true,
+                cancel: false,
+                tone: "done",
+            },
+        ];
+        let script = downloads_render_script(&rows, false);
+        let json = script
+            .split_once(".render(")
+            .unwrap()
+            .1
+            .strip_suffix(");")
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(data["rows"][0]["preview"], true);
+        assert_eq!(data["rows"][1]["preview"], false);
+    }
+
+    #[test]
+    fn html_download_preview_preserves_content_and_removes_active_markup() {
+        let files = Files::new();
+        let path = files.file("article.xhtml", br#"<!doctype html><title>A &amp; B</title><article><h1>Local article</h1><p onclick="alert(1)">Visible content &amp; detail.</p><script>window.pwned=1</script><iframe src="https://evil.invalid"></iframe><img src="file:///secret.txt"><form action="https://evil.invalid"><input value="secret"></form><a href="javascript:alert(1)">Visible link</a></article>"#);
+        // The shell still refuses HTML. Its internal reader is the only path.
+        assert!(default_app_target(&path).is_none());
+        let PreparedDocument::Html(html) = files.prepare(&path).unwrap() else {
+            panic!("HTML not internal");
+        };
+        assert!(html.contains("Visible content &amp; detail."));
+        assert!(html.contains("A &amp; B"));
+        for dangerous in [
+            "window.pwned",
+            "onclick=",
+            "<iframe",
+            "file:///secret",
+            "<form",
+            "javascript:alert",
+        ] {
+            assert!(!html.contains(dangerous), "retained {dangerous}");
+        }
+        let tiny = files.file("tiny.html", b"<div>x</div><script>alert(1)</script>");
+        let PreparedDocument::Html(html) = files.prepare(&tiny).unwrap() else {
+            panic!("tiny HTML not internal");
+        };
+        assert!(html.contains("&lt;div&gt;x&lt;/div&gt;"));
+        assert!(!html.contains("<script>"));
+        let mut utf16 = vec![0xff, 0xfe];
+        utf16.extend(
+            "<p>Ação em UTF-16</p>"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        let encoded = files.file("utf16.htm", &utf16);
+        let PreparedDocument::Html(html) = files.prepare(&encoded).unwrap() else {
+            panic!("UTF-16 HTML not internal");
+        };
+        assert!(html.contains("Ação em UTF-16"));
+    }
+
+    #[test]
+    fn image_download_preview_pins_bytes_mime_and_escapes_the_title() {
+        let files = Files::new();
+        let original = include_bytes!("../../../../../assets/neuralia-home-reader.png");
+        let path = files.file("photo & holiday.PNG", original);
+        let PreparedDocument::Image { html, bytes, mime } = files.prepare(&path).unwrap() else {
+            panic!("image not internal");
+        };
+        std::fs::write(&path, b"MZ swapped executable").unwrap();
+        assert_eq!(bytes, original);
+        assert_eq!(mime, "image/png");
+        assert!(html.contains("photo &amp; holiday.PNG"));
+        assert!(html.contains("src=\"/preview-image\""));
+        assert!(files.prepare(&path).is_err());
+        let disguised = files.file("fake.jpg", original);
+        assert!(files.prepare(&disguised).is_err());
+        let invalid = files.file("fake.png", b"<html><script>alert(1)</script></html>");
+        assert!(files.prepare(&invalid).is_err());
+        for (ext, signature, mime) in [
+            ("jpg", b"\xff\xd8\xff".as_slice(), "image/jpeg"),
+            ("gif", b"GIF89a".as_slice(), "image/gif"),
+            ("webp", b"RIFF\0\0\0\0WEBP".as_slice(), "image/webp"),
+            ("bmp", b"BM".as_slice(), "image/bmp"),
+        ] {
+            assert_eq!(image_mime(ext, signature).unwrap(), mime);
+            assert!(image_mime("png", signature).is_err());
+        }
+    }
+
+    #[test]
+    fn download_preview_read_limits_apply_to_the_real_prepare_path() {
+        let files = Files::new();
+        for (name, limit) in [
+            ("large.html", HTML_MAX_BYTES),
+            ("large.txt", TEXT_MAX_BYTES),
+            ("large.png", IMAGE_MAX_BYTES),
+        ] {
+            let path = files.file(name, b"plain");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len((limit + 1) as u64)
+                .unwrap();
+            let error = files.prepare(&path).unwrap_err();
+            assert!(error.contains("ultrapassa o limite"), "{name}: {error}");
+        }
+        let path = files.file("exact.txt", b"four");
+        assert_eq!(read_bounded(&path, 4).unwrap(), b"four");
+        assert!(read_bounded(&path, 3).is_err());
+    }
+
+    #[test]
+    fn preview_protocol_exposes_only_immutable_assets_at_its_own_origin() {
+        let files = Files::new();
+        let path = files.file("visible.txt", b"Visible local text");
+        let PreparedDocument::Text(html) = files.prepare(&path).unwrap() else {
+            panic!("TXT not internal");
+        };
+        let image = include_bytes!("../../../../../assets/neuralia-home-reader.png");
+        let request = |url: &str, method| {
+            wry::http::Request::builder()
+                .method(method)
+                .uri(url)
+                .body(Vec::new())
+                .unwrap()
+        };
+        let response = serve_preview_asset(
+            &html,
+            Some((image, "image/png")),
+            &request(&format!("{PDF_ORIGIN}/preview.html"), "GET"),
+        );
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body().as_ref(), html.as_bytes());
+        assert_eq!(
+            response.headers()["Content-Type"],
+            "text/html; charset=utf-8"
+        );
+        for directive in [
+            "default-src 'none'",
+            "script-src 'none'",
+            "frame-src 'none'",
+            "form-action 'none'",
+            "connect-src 'none'",
+            "img-src 'self' data:",
+        ] {
+            assert!(
+                response.headers()["Content-Security-Policy"]
+                    .to_str()
+                    .unwrap()
+                    .contains(directive),
+                "{directive}"
+            );
+        }
+        assert_eq!(response.headers()["X-Content-Type-Options"], "nosniff");
+        assert_eq!(response.headers()["Cache-Control"], "no-store");
+        let response = serve_preview_asset(
+            &html,
+            Some((image, "image/png")),
+            &request(&format!("{PDF_ORIGIN}/preview-image"), "GET"),
+        );
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["Content-Type"], "image/png");
+        assert_eq!(response.body().as_ref(), image);
+        let head = serve_preview_asset(
+            &html,
+            None,
+            &request(&format!("{PDF_ORIGIN}/preview.html"), "HEAD"),
+        );
+        assert_eq!(head.status(), 200);
+        assert!(head.body().is_empty());
+        assert_eq!(
+            head.headers()["Content-Length"].to_str().unwrap(),
+            html.len().to_string()
+        );
+        for (url, method, expected) in [
+            (format!("{PDF_ORIGIN}/../../secret.txt"), "GET", 404),
+            (format!("{PDF_ORIGIN}/preview-image"), "GET", 404),
+            (format!("{PDF_ORIGIN}/preview.html"), "POST", 405),
+            ("https://evil.invalid/preview.html".into(), "GET", 403),
+            (
+                "http://neuralia-pdf.localhost.evil.invalid/preview.html".into(),
+                "GET",
+                403,
+            ),
+            (
+                "http://neuralia-pdf.localhost:81/preview.html".into(),
+                "GET",
+                403,
+            ),
+        ] {
+            let response = serve_preview_asset(&html, None, &request(&url, method));
+            assert_eq!(response.status(), expected, "{url}");
+            assert!(response.body().is_empty(), "{url}");
         }
     }
 

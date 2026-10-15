@@ -45,6 +45,10 @@ pub(in crate::windows_app) enum CommandId {
     CloseSplit,
     /// Expandir ou reduzir a fonte aberta ao lado.
     SplitFullscreen,
+    /// Minimizar ou restaurar a página que recebeu o atalho.
+    MinimizePage,
+    /// Minimizar todas as colunas e a fonte sem perder a sessão.
+    MinimizeAll,
     /// Fechar a NeuralIA (as abas ficam gravadas).
     Exit,
     /// Ctrl+D: a pagina de onde veio para os favoritos; na Home (ou num
@@ -57,7 +61,7 @@ pub(in crate::windows_app) enum CommandId {
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 13] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 15] = [
         CommandId::AutoScroll,
         CommandId::Reload,
         CommandId::History,
@@ -68,6 +72,8 @@ impl CommandId {
         CommandId::Home,
         CommandId::CloseSplit,
         CommandId::SplitFullscreen,
+        CommandId::MinimizePage,
+        CommandId::MinimizeAll,
         CommandId::Exit,
         CommandId::Bookmark,
         CommandId::Downloads,
@@ -286,6 +292,26 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         alias: None,
     },
     CommandRow {
+        id: CommandId::MinimizePage,
+        key: "minimizar-pagina",
+        label: "Minimizar ou restaurar a página",
+        category: CommandCategory::Pagina,
+        keywords: &["minimizar", "restaurar", "página", "coluna", "fonte"],
+        chords: &[ChordSpec::global(Chord::ctrl_shift(b'M'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::MinimizeAll,
+        key: "minimizar-tudo",
+        label: "Minimizar todas as páginas",
+        category: CommandCategory::Pagina,
+        keywords: &["minimizar", "tudo", "colunas", "fontes"],
+        chords: &[ChordSpec::global(Chord::ctrl_shift(
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9 as u8,
+        ))],
+        alias: None,
+    },
+    CommandRow {
         id: CommandId::Bookmark,
         key: "adicionar-favorito",
         label: "Adicionar aos favoritos",
@@ -324,7 +350,9 @@ fn chrome_event(id: CommandId) -> UserEvent {
         CommandId::ClearHistory => UserEvent::ClearHistory,
         CommandId::Home => UserEvent::HomeRequested,
         CommandId::CloseSplit => UserEvent::CloseSplit,
-        CommandId::SplitFullscreen => UserEvent::ToggleSplitFullscreen,
+        CommandId::SplitFullscreen => UserEvent::ToggleColumnFullscreen,
+        CommandId::MinimizePage => UserEvent::MinimizeActivePage(CommandOrigin::Window),
+        CommandId::MinimizeAll => UserEvent::MinimizeAllColumns,
         CommandId::Exit => UserEvent::ExitRequested,
         CommandId::Bookmark => UserEvent::Bookmarks(BookmarksEvent::Request {
             target: BookmarkTarget::Window,
@@ -354,6 +382,8 @@ fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
         | CommandId::Home
         | CommandId::CloseSplit
         | CommandId::SplitFullscreen
+        | CommandId::MinimizePage
+        | CommandId::MinimizeAll
         | CommandId::Exit
         | CommandId::Downloads
         // Nativo: a origem e o hospedeiro (`bookmark_target`), nunca um
@@ -369,6 +399,17 @@ pub(in crate::windows_app) fn resolve_command(
     id: CommandId,
     origin: CommandOrigin,
 ) -> Option<UserEvent> {
+    if id == CommandId::MinimizePage {
+        return match origin {
+            CommandOrigin::Host(WebViewHost::GmailMonitor) => None,
+            CommandOrigin::Host(
+                WebViewHost::Column(index)
+                | WebViewHost::Split(index)
+                | WebViewHost::PrivateSplit(index),
+            ) if index >= COMPARATOR_COLUMNS => None,
+            _ => Some(UserEvent::MinimizeActivePage(origin)),
+        };
+    }
     // O Ctrl+D leva a origem inteira: a pagina e a do hospedeiro que
     // recebeu a tecla (a coluna 2 e a coluna 2), a janela na Home abre os
     // Favoritos.
@@ -466,6 +507,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::ColumnMinimize(_)
         | BarHit::ColumnBookmark(_)
         | BarHit::SplitBookmark
+        | BarHit::SplitMinimize
         | BarHit::Column(_)
         | BarHit::AddTab(_)
         | BarHit::ContextTab { .. }

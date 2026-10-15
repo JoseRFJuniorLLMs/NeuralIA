@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, PoisonError, RwLock};
 
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_DELETE, VK_F1, VK_OEM_1, VK_TAB,
+    VK_BACK, VK_DELETE, VK_F1, VK_F11, VK_OEM_1, VK_TAB,
 };
 use winit::keyboard::ModifiersState;
 
@@ -324,6 +324,24 @@ pub(in crate::windows_app) fn accelerator_decision(
     let chord = Chord::of(input);
     if is_provider_origin(origin) && PROVIDER_DENYLIST.contains(&chord) {
         return pass;
+    }
+    // F11 nas páginas da barra (Web, Leitura, PDF, EPUB) é tela cheia da
+    // janela. Nas colunas continua a ser da página, para o YouTube o usar.
+    if chord == Chord::key(VK_F11 as u8)
+        && matches!(
+            origin,
+            CommandOrigin::Host(
+                WebViewHost::External | WebViewHost::Reader | WebViewHost::Pdf | WebViewHost::Epub
+            )
+        )
+    {
+        return AcceleratorDecision {
+            handled: true,
+            event: (!input.repeat).then_some(UserEvent::RunCommandKey {
+                key: CommandId::SplitFullscreen,
+                origin,
+            }),
+        };
     }
     let Some(key) = keymap.lookup(scope_chain(origin), chord) else {
         return pass;

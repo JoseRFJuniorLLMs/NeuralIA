@@ -17,6 +17,28 @@ pub(in crate::windows_app) fn write_research_export(
     Ok(path)
 }
 
+/// A transicao que embarca: inclui a ultima coluna e conserva o Split vivo.
+pub(in crate::windows_app) fn minimize_column_state<V>(
+    minimized: &mut [bool; COMPARATOR_COLUMNS],
+    columns: usize,
+    index: usize,
+    expanded: &mut Option<usize>,
+    split: Option<&mut SplitView<V>>,
+) -> bool {
+    if !can_minimize_column(minimized, columns, index) {
+        return false;
+    }
+    minimized[index] = true;
+    *expanded = None;
+    if let Some(split) = split
+        && split.source_index == index
+        && let Some(other) = (0..columns.min(COMPARATOR_COLUMNS)).find(|i| !minimized[*i])
+    {
+        split.source_index = other;
+    }
+    true
+}
+
 impl App {
     #[cfg(feature = "accel-spike")]
     pub(in crate::windows_app) fn export_current_research_to_disk(
@@ -406,11 +428,12 @@ impl App {
         {
             comp.minimized[idx] = false;
             comp.expanded = None;
-            if let Some(split) = &mut comp.split
-                && split.fullscreen
-            {
+            if let Some(split) = &mut comp.split {
                 split.fullscreen = false;
                 split.source_index = idx;
+            }
+            if let Some(window) = &self.window {
+                window.set_fullscreen(None);
             }
             self.bar_hover = None;
             self.forget_tab_gesture();
@@ -418,6 +441,11 @@ impl App {
             self.update_comparator_layout();
             self.sync_comparator_splitters();
             self.sync_comparator_buttons();
+            self.sync_exit_button();
+            self.sync_home_button();
+            self.sync_caption_buttons();
+            self.show_omnibox_passive(true);
+            self.position_omnibox();
             self.request_redraw();
             return;
         }
@@ -425,7 +453,7 @@ impl App {
         if self
             .comparator
             .as_ref()
-            .is_some_and(|comp| comp.split.is_some())
+            .is_some_and(|comp| comp.split.as_ref().is_some_and(|split| !split.minimized))
         {
             self.close_split();
         }
@@ -472,31 +500,20 @@ impl App {
         let Some(comp) = &self.comparator else {
             return;
         };
-        // A ultima coluna visivel tambem minimiza: vira chip e fica no
-        // comparador. Fechar a barra lateral com todas as IAs ja minimizadas
-        // e que volta a Home.
         if !can_minimize_column(&comp.minimized, comp.views.len(), idx) {
             return;
         }
 
         let mut was_expanded = false;
         if let Some(comp) = &mut self.comparator {
-            was_expanded = comp.expanded == Some(idx);
-            comp.expanded = None;
-            comp.minimized[idx] = true;
-
-            let all_ai_minimized = (0..comp.views.len()).all(|i| comp.minimized[i]);
-            if all_ai_minimized {
-                // "2 - quando eu minimizar o ultimo painel , a barra lateral maximiza."
-                if let Some(split) = &mut comp.split {
-                    split.fullscreen = true;
-                }
-            } else if let Some(split) = &mut comp.split
-                && split.source_index == idx
-                && let Some(other) = (0..comp.views.len()).find(|&i| !comp.minimized[i])
-            {
-                split.source_index = other;
-            }
+            was_expanded = comp.expanded.is_some();
+            minimize_column_state(
+                &mut comp.minimized,
+                comp.views.len(),
+                idx,
+                &mut comp.expanded,
+                comp.split.as_mut(),
+            );
         }
 
         if was_expanded && let Some(window) = &self.window {
@@ -509,6 +526,83 @@ impl App {
         self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_comparator_buttons();
+        self.sync_exit_button();
+        self.sync_home_button();
+        self.sync_caption_buttons();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
+        self.request_redraw();
+    }
+
+    pub(in crate::windows_app) fn minimize_active_page(&mut self, origin: CommandOrigin) {
+        match origin {
+            CommandOrigin::Host(WebViewHost::Service(_)) => {
+                self.service_input(ServiceInput::Minimize);
+                return;
+            }
+            CommandOrigin::Host(WebViewHost::Live) => {
+                self.minimize_live_panel();
+                return;
+            }
+            _ => {}
+        }
+        if self.surface != Surface::Comparator {
+            if let Some(window) = &self.window {
+                window.set_minimized(true);
+            }
+            return;
+        }
+        let comp = self.comparator.as_ref();
+        let column = match origin {
+            CommandOrigin::Host(WebViewHost::Column(index)) => Some(index),
+            CommandOrigin::Host(WebViewHost::Split(_) | WebViewHost::PrivateSplit(_)) => None,
+            _ if comp
+                .is_some_and(|comp| comp.split.as_ref().is_some_and(|split| !split.minimized)) =>
+            {
+                None
+            }
+            _ => comp.and_then(|comp| {
+                comp.expanded
+                    .or_else(|| (0..comp.views.len()).find(|index| !comp.minimized[*index]))
+            }),
+        };
+        if let Some(column) = column {
+            self.minimize_comparator(column);
+        } else if self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some())
+        {
+            self.toggle_split_minimized();
+        }
+    }
+
+    pub(in crate::windows_app) fn minimize_all_columns(&mut self) {
+        let Some(comp) = &mut self.comparator else {
+            if let Some(window) = &self.window {
+                window.set_minimized(true);
+            }
+            return;
+        };
+        for index in 0..comp.views.len().min(COMPARATOR_COLUMNS) {
+            minimize_column_state(
+                &mut comp.minimized,
+                comp.views.len(),
+                index,
+                &mut comp.expanded,
+                comp.split.as_mut(),
+            );
+        }
+        if let Some(split) = &mut comp.split {
+            set_split_minimized(split, true);
+        }
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+        }
+        self.bar_hover = None;
+        self.needs_clear = true;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.sync_exit_button();
         self.sync_home_button();
         self.sync_caption_buttons();
@@ -551,6 +645,11 @@ impl App {
             self.toggle_split_fullscreen();
         } else if self.surface == Surface::Comparator {
             self.restore_comparator();
+        } else {
+            self.leave_fullscreen();
+            self.sync_exit_button();
+            self.sync_page_controls();
+            self.request_redraw();
         }
     }
 
@@ -585,37 +684,50 @@ impl App {
         // Fonte lateral: a IA que originou o link continua visível, as demais
         // ficam vivas e preservam estado para reaparecer ao fechar a gaveta.
         if let Some(split) = &comp.split {
-            if split.fullscreen {
+            let presentation = split_presentation(
+                split,
+                &comp.minimized[..comp.views.len().min(COMPARATOR_COLUMNS)],
+            );
+            if presentation == SplitPresentation::Hidden {
+                let _ = split.webview.set_visible(false);
+            } else if matches!(
+                presentation,
+                SplitPresentation::Fullscreen | SplitPresentation::Only
+            ) {
                 for view in &comp.views {
                     let _ = view.webview.set_visible(false);
                 }
-                let (x, y, width, height) = fullscreen_page_bounds(window_w, logical_h);
+                let (x, y, width, height) = if presentation == SplitPresentation::Fullscreen {
+                    fullscreen_page_bounds(window_w, logical_h)
+                } else {
+                    (0.0, content_y, logical_w, content_h)
+                };
                 let _ = split.webview.set_bounds(wry::Rect {
                     position: LogicalPosition::new(x, y).into(),
                     size: LogicalSize::new(width, height).into(),
                 });
                 let _ = split.webview.set_visible(true);
                 return;
-            }
-
-            let ai_width = (logical_w * 0.54).clamp(logical_w * 0.38, logical_w * 0.68);
-            for (index, view) in comp.views.iter().enumerate() {
-                if index == split.source_index {
-                    let _ = view.webview.set_bounds(wry::Rect {
-                        position: LogicalPosition::new(0.0, content_y).into(),
-                        size: LogicalSize::new(ai_width, content_h).into(),
-                    });
-                    let _ = view.webview.set_visible(true);
-                } else {
-                    let _ = view.webview.set_visible(false);
+            } else if let SplitPresentation::Docked(source_index) = presentation {
+                let ai_width = (logical_w * 0.54).clamp(logical_w * 0.38, logical_w * 0.68);
+                for (index, view) in comp.views.iter().enumerate() {
+                    if index == source_index {
+                        let _ = view.webview.set_bounds(wry::Rect {
+                            position: LogicalPosition::new(0.0, content_y).into(),
+                            size: LogicalSize::new(ai_width, content_h).into(),
+                        });
+                        let _ = view.webview.set_visible(true);
+                    } else {
+                        let _ = view.webview.set_visible(false);
+                    }
                 }
+                let _ = split.webview.set_bounds(wry::Rect {
+                    position: LogicalPosition::new(ai_width, content_y).into(),
+                    size: LogicalSize::new((logical_w - ai_width).max(1.0), content_h).into(),
+                });
+                let _ = split.webview.set_visible(true);
+                return;
             }
-            let _ = split.webview.set_bounds(wry::Rect {
-                position: LogicalPosition::new(ai_width, content_y).into(),
-                size: LogicalSize::new((logical_w - ai_width).max(1.0), content_h).into(),
-            });
-            let _ = split.webview.set_visible(true);
-            return;
         }
 
         match comp.expanded {

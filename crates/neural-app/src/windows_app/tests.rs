@@ -3,6 +3,8 @@ use crate::gemini_live::{LiveAction, live_page_url, live_panel_allows_navigation
 use crate::panel_chrome::panel_width_from_drag;
 use std::ffi::OsString;
 use windows_sys::Win32::Graphics::Gdi::GetDIBits;
+#[path = "control_regressions.rs"]
+mod control_regressions;
 /// O fundo da Home acompanha a marca, nao disputa com ela.
 ///
 /// A versao anterior lancava particulas das margens e fazia-as convergir
@@ -10925,6 +10927,16 @@ fn keymap_chords_are_unique_per_scope() {
                 Chord::key(0x7A)
             ),
             (CommandId::Exit, KeyScope::Window, Chord::ctrl_shift(b'W')),
+            (
+                CommandId::MinimizePage,
+                KeyScope::Global,
+                Chord::ctrl_shift(b'M')
+            ),
+            (
+                CommandId::MinimizeAll,
+                KeyScope::Global,
+                Chord::ctrl_shift(0x78)
+            ),
             (CommandId::Bookmark, KeyScope::Global, Chord::ctrl(b'D')),
             (CommandId::Downloads, KeyScope::Global, Chord::ctrl(b'J')),
         ]
@@ -11430,7 +11442,15 @@ fn resolve_command_runs_against_its_origin() {
         (CommandId::ClearHistory, UserEvent::ClearHistory),
         (CommandId::Home, UserEvent::HomeRequested),
         (CommandId::CloseSplit, UserEvent::CloseSplit),
-        (CommandId::SplitFullscreen, UserEvent::ToggleSplitFullscreen),
+        (
+            CommandId::SplitFullscreen,
+            UserEvent::ToggleColumnFullscreen,
+        ),
+        (
+            CommandId::MinimizePage,
+            UserEvent::MinimizeActivePage(CommandOrigin::Window),
+        ),
+        (CommandId::MinimizeAll, UserEvent::MinimizeAllColumns),
         (CommandId::Exit, UserEvent::ExitRequested),
         (
             CommandId::Bookmark,
@@ -11448,15 +11468,23 @@ fn resolve_command_runs_against_its_origin() {
     for (id, event) in chrome {
         let expected = shown(event);
         for origin in [CommandOrigin::Window, CommandOrigin::Omnibox] {
+            let expected_origin = if id == CommandId::MinimizePage {
+                shown(UserEvent::MinimizeActivePage(origin))
+            } else {
+                expected.clone()
+            };
             assert_eq!(
                 debug(resolve_command(id, origin)),
-                expected,
+                expected_origin,
                 "{id:?} {origin:?}"
             );
         }
         // Os que nao dependem da pagina: o mesmo de qualquer hospedeiro. O
         // Ctrl+D depende (`ctrl_d_runs_against_the_host_it_came_from`).
-        if !matches!(id, Reload | NewNote | NewTab | CommandId::Bookmark) {
+        if !matches!(
+            id,
+            Reload | NewNote | NewTab | CommandId::Bookmark | CommandId::MinimizePage
+        ) {
             for host in every_host() {
                 let got = debug(resolve_command(id, CommandOrigin::Host(host)));
                 if host == WebViewHost::GmailMonitor {
@@ -11645,6 +11673,7 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::ColumnTranslate(2), None),
         (BarHit::ColumnBookmark(2), None),
         (BarHit::SplitBookmark, None),
+        (BarHit::SplitMinimize, None),
         (BarHit::Column(2), None),
         (BarHit::AddTab(0), None),
         (
@@ -11689,7 +11718,7 @@ fn bar_hit_command_is_exhaustive() {
     for (hit, event) in [
         (BarHit::Home, UserEvent::HomeRequested),
         (BarHit::SplitClose, UserEvent::CloseSplit),
-        (BarHit::SplitExpand, UserEvent::ToggleSplitFullscreen),
+        (BarHit::SplitExpand, UserEvent::ToggleColumnFullscreen),
         (BarHit::WindowClose, UserEvent::ExitRequested),
         (
             BarHit::Downloads,
@@ -11801,7 +11830,7 @@ fn the_window_and_the_omnibox_share_one_keymap() {
     }
     // Os sete da 2.2.0, o Ctrl+D dos favoritos (Global) e o Ctrl+J dos
     // Downloads (o do registo e o da lista).
-    assert_eq!(bound, 13);
+    assert_eq!(bound, 15);
     // Os dois caminhos passam pelo mapa (presenca); a lista antiga saiu.
     let source = shipped_source();
     assert!(source.contains("let decision = keymap_decision(input, CommandOrigin::Window);"));
@@ -20393,6 +20422,9 @@ fn right_control_rects(controls: RightControls) -> Vec<UiRect> {
     if let Some((back, forward)) = controls.split_nav {
         rects.extend([back, forward]);
     }
+    if let Some(minimize) = controls.split_minimize {
+        rects.push(minimize);
+    }
     rects
         .into_iter()
         .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
@@ -24063,6 +24095,7 @@ for (let i = 0; i < 5; i++) {
             source_index: 0,
             context_id: None,
             fullscreen: false,
+            minimized: false,
             private,
         };
         let (normal, private, main) = (split(false), split(true), 70u8);
@@ -24401,6 +24434,7 @@ __state('salva');
             source_index: 0,
             context_id: None,
             fullscreen: false,
+            minimized: false,
             private: true,
         };
         // Chega ao Split privado e sabe que e ele: o aviso diz "Modo
@@ -24424,6 +24458,7 @@ __state('salva');
             source_index: 0,
             context_id: None,
             fullscreen: false,
+            minimized: false,
             private: false,
         };
         for (target, split, expected) in [
@@ -37772,6 +37807,7 @@ fn minimizing_last_panel_maximizes_split_and_closing_returns_to_home() {
         source_index: 2,
         context_id: None,
         fullscreen: false,
+        minimized: false,
         private: false,
     };
     let mut minimized = [true, true, false];

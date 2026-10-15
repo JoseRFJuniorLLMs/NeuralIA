@@ -102,12 +102,19 @@ pub(in crate::windows_app) fn service_panel_hint(
             service.label()
         )),
         BarHit::ServiceStrip(StripButton::Close) if service == Service::YouTube => Some(format!(
-            "Ocultar {}: pausa o vídeo e deixa a sessão em segundo plano",
+            "Ocultar {}: recolhe também os controles, pausa o vídeo e deixa a sessão em segundo plano",
             service.label()
         )),
-        BarHit::ServiceStrip(StripButton::Close) if service.keeps_running_in_background() => Some(
-            format!("Ocultar {}: continua em segundo plano", service.label()),
-        ),
+        BarHit::ServiceStrip(StripButton::Close) if service.keeps_running_in_background() => {
+            Some(format!(
+                "Ocultar {}: recolhe também os controles e continua em segundo plano",
+                service.label()
+            ))
+        }
+        BarHit::ServiceStrip(StripButton::Minimize) => Some(format!(
+            "Minimizar {}: mantém os controles disponíveis e a sessão continua em segundo plano (Ctrl+Shift+M)",
+            service.label()
+        )),
         BarHit::ServiceStrip(button) => Some(button.hint(service.label())),
         BarHit::GmailToggle if service == Service::Gmail => service_button_hint(service, badge),
         BarHit::Service(hit_service) if hit_service == service => {
@@ -2150,7 +2157,7 @@ mod youtube_transition_tests {
             assert_eq!(
                 service_panel_hint(BarHit::ServiceStrip(StripButton::Close), service, None),
                 Some(format!(
-                    "Ocultar {}: continua em segundo plano",
+                    "Ocultar {}: recolhe também os controles e continua em segundo plano",
                     service.label()
                 ))
             );
@@ -2162,7 +2169,7 @@ mod youtube_transition_tests {
                 Service::YouTube,
                 None
             ),
-            Some("Ocultar YouTube: pausa o vídeo e deixa a sessão em segundo plano".to_string())
+            Some("Ocultar YouTube: recolhe também os controles, pausa o vídeo e deixa a sessão em segundo plano".to_string())
         );
         assert_eq!(
             service_panel_hint(

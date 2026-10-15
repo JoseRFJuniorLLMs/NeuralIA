@@ -1043,7 +1043,7 @@ pub(in crate::windows_app) struct PanelRow {
     pub(in crate::windows_app) name: String,
     pub(in crate::windows_app) status: String,
     pub(in crate::windows_app) percent: Option<u8>,
-    /// «Abrir»: so um arquivo acabado cujo tipo o `DefaultAppTarget` aceita.
+    /// «Abrir»: um arquivo acabado aceito pelo sistema ou leitor interno.
     pub(in crate::windows_app) open: bool,
     /// «Mostrar na pasta»: um arquivo que ficou no disco.
     pub(in crate::windows_app) show: bool,
@@ -1135,7 +1135,11 @@ fn file_actions(outcome: RecordOutcome, path: Option<&Path>) -> (bool, bool) {
         return (false, false);
     };
     match outcome {
-        RecordOutcome::Completed { .. } => (default_app_name_allowed(file_name_of(path)), true),
+        RecordOutcome::Completed { .. } => (
+            default_app_name_allowed(file_name_of(path))
+                || documents::internal_document_name_allowed(path),
+            true,
+        ),
         RecordOutcome::NotDeleted { .. } => (false, true),
         _ => (false, false),
     }
@@ -1297,6 +1301,7 @@ pub(in crate::windows_app) fn downloads_render_script(
                 "status": row.status,
                 "percent": row.percent,
                 "open": row.open,
+                "preview": row.open && documents::is_internal_document(Path::new(&row.name)),
                 "show": row.show,
                 "cancel": row.cancel,
                 "tone": row.tone,
@@ -1374,12 +1379,15 @@ pub(in crate::windows_app) fn shell_open_checked(
     path: &Path,
     shell: &mut impl ShellHost,
 ) -> OpenOutcome {
+    // Previewable formats stay in the isolated viewer. HTML never becomes
+    // a DefaultAppTarget or reaches the external shell; the worker validates
+    // the immutable bytes before installing any preview.
+    if documents::internal_document_target_allowed(path) {
+        return OpenOutcome::InternalDocument(path.to_path_buf());
+    }
     let Some(target) = default_app_target(path) else {
         return OpenOutcome::Refused;
     };
-    if documents::is_internal_document(target.path()) {
-        return OpenOutcome::InternalDocument(target.path().to_path_buf());
-    }
     match shell.shell_execute(SHELL_OPEN_VERB, target.path()) {
         Ok(()) => OpenOutcome::Opened,
         Err(error) => OpenOutcome::Failed(error),
