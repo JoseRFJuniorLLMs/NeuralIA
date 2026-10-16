@@ -292,11 +292,6 @@ impl App {
     /// não passam por aqui: o painel lateral minimiza.
     #[allow(dead_code)]
     pub(in crate::windows_app) fn conceal_service_panel(&mut self) {
-        if let Some(panel) = &self.service_panel
-            && panel.service == Service::YouTube
-        {
-            let _ = panel.webview.evaluate_script(YOUTUBE_PAUSE_SCRIPT);
-        }
         let service = self.service_panel.as_ref().map(|panel| panel.service);
         self.close_service_panel();
         if let Some(service) = service {
@@ -314,11 +309,16 @@ impl App {
         if service == Service::Gmail {
             self.maybe_start_gmail_monitor();
         }
-        // Trocar de serviço também minimiza: a conta fica, o som para.
+        // Trocar de serviço também minimiza: a conta e o som continuam ativos.
         let mut panel = self.service_panel.take().expect("painel conferido acima");
-        let _ = panel.webview.evaluate_script(SERVICE_PAUSE_SCRIPT);
         let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
-        let _ = panel.webview.set_visible(false);
+        let _ = panel.webview.set_bounds(logical_rect(Area {
+            x: -9999.0,
+            y: -9999.0,
+            width: 320.0,
+            height: 320.0,
+        }));
+        let _ = panel.webview.set_visible(true);
         let _ = panel.webview.focus_parent();
         if self.surface == Surface::Home
             && let Some(edit) = self.omnibox
@@ -429,10 +429,15 @@ impl App {
                     raise_webview_host(&panel.webview);
                 }
             }
-            // Minimizado: sai da frente. O som já foi parado
-            // (`SERVICE_PAUSE_SCRIPT`) antes de esconder. A conta fica.
+            // Minimizado: sai da frente, mas continua funcionando e tocando som em segundo plano.
             None => {
-                let _ = panel.webview.set_visible(false);
+                let _ = panel.webview.set_bounds(logical_rect(Area {
+                    x: -9999.0,
+                    y: -9999.0,
+                    width: 320.0,
+                    height: 320.0,
+                }));
+                let _ = panel.webview.set_visible(true);
                 let _ = panel.webview.focus_parent();
             }
         }

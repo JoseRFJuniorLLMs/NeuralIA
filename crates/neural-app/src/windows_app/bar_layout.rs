@@ -371,6 +371,8 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) tab_overflow_counts: [usize; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) columns_len: usize,
     pub(in crate::windows_app) address: UiRect,
+    pub(in crate::windows_app) address_search: UiRect,
+    pub(in crate::windows_app) address_go: UiRect,
     pub(in crate::windows_app) window_minimize: UiRect,
     pub(in crate::windows_app) window_maximize: UiRect,
     pub(in crate::windows_app) window_close: UiRect,
@@ -450,6 +452,8 @@ impl BarLayout {
                 tab_overflow_counts: [0; COMPARATOR_COLUMNS],
                 columns_len: 0,
                 address: empty,
+                address_search: empty,
+                address_go: empty,
                 window_minimize: empty,
                 window_maximize: empty,
                 window_close: empty,
@@ -780,6 +784,8 @@ impl BarLayout {
             tab_overflow_counts: overflow_counts,
             columns_len,
             address,
+            address_search: empty,
+            address_go: empty,
             window_minimize,
             window_maximize,
             window_close,
@@ -796,6 +802,14 @@ impl BarLayout {
         self.column_buttons[column][button as usize]
     }
 
+    pub(in crate::windows_app) fn apply_omnibox_focus(&mut self, client_width: f64, scale: f64) {
+        let sprung = sprung_title_address(client_width, self.address, scale);
+        let (search, go) = comparator_address_buttons(sprung, scale);
+        self.address = sprung;
+        self.address_search = search;
+        self.address_go = go;
+    }
+
     pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
         if !self.visible || y > self.height {
             return None;
@@ -808,6 +822,12 @@ impl BarLayout {
         }
         if self.window_minimize.contains(x, y) {
             return Some(BarHit::WindowMinimize);
+        }
+        if self.address_go.contains(x, y) {
+            return Some(BarHit::AddressGo);
+        }
+        if self.address_search.contains(x, y) {
+            return Some(BarHit::AddressSearch);
         }
         if self.address.contains(x, y) {
             return Some(BarHit::AddressBar);
@@ -1267,8 +1287,42 @@ pub(in crate::windows_app) fn sprung_title_address(
         x,
         y: 4.0 * scale,
         width: sprung_w,
-        height: 44.0 * scale,
+        height: 48.0 * scale,
     }
+}
+
+/// Botoes "Pesquisar" e "Pesquisar com IA" dentro da barra saltada do comparador,
+/// com a mesma proporcao e estilo da tela Home.
+pub(in crate::windows_app) fn comparator_address_buttons(
+    address: UiRect,
+    scale: f64,
+) -> (UiRect, UiRect) {
+    let scale = scale.max(1.0);
+    let inset = 6.0 * scale;
+    let right_inset = 10.0 * scale;
+    let gap = 6.0 * scale;
+    let ideal_ai = 135.0 * scale;
+    let ideal_search = 85.0 * scale;
+    let chrome = inset + right_inset + gap;
+    let room = (address.width - 120.0 * scale).max(chrome + 40.0 * scale);
+    let fit = ((room - chrome) / (ideal_ai + ideal_search)).clamp(0.5, 1.0);
+    let ai_w = ideal_ai * fit;
+    let search_w = ideal_search * fit;
+    let button_h = (address.height - inset * 2.0).max(1.0);
+
+    let go = UiRect {
+        x: address.x + address.width - right_inset - ai_w,
+        y: address.y + inset,
+        width: ai_w,
+        height: button_h,
+    };
+    let search = UiRect {
+        x: go.x - gap - search_w,
+        y: go.y,
+        width: search_w,
+        height: button_h,
+    };
+    (search, go)
 }
 
 /// Altura da fonte (negativa, como o `CreateFontW` pede) do endereço na barra

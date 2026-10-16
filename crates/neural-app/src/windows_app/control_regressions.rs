@@ -203,7 +203,7 @@ fn minimized_service_keeps_controls_while_close_discards_the_panel() {
         .expect("minimizar")
         .contains("mantém os controles")
     );
-    assert!(service_should_pause(false, true));
+    assert!(!service_should_pause(false, true));
     assert!(!service_should_pause(true, true));
     assert!(!service_should_pause(true, false));
     assert!(SERVICE_PAUSE_SCRIPT.contains("pause()"));

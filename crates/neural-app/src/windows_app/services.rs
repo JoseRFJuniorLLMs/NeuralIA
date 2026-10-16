@@ -87,12 +87,12 @@ try{var list=document.querySelectorAll('video,audio');for(var i=0;i<list.length;
 try{var p=document.getElementById('movie_player');if(p&&typeof p.pauseVideo==='function'){p.pauseVideo();}}catch(e){}\
 })();";
 
-/// Entrou em minimizado: o som tem de parar. Restaurar e os outros passos, não.
+/// Serviços minimizados continuam tocando som e funcionando em segundo plano.
 pub(in crate::windows_app) fn service_should_pause(
-    was_minimized: bool,
-    now_minimized: bool,
+    _was_minimized: bool,
+    _now_minimized: bool,
 ) -> bool {
-    !was_minimized && now_minimized
+    false
 }
 
 /// Para onde vai o teclado quando um painel ao lado fecha.

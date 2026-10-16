@@ -1211,7 +1211,14 @@ impl App {
                 source_index,
                 group_index,
             }) => self.toggle_context_group(source_index, group_index),
-            Some(BarHit::TabOverflow(index)) => self.show_tab_list_menu(index),
+            Some(BarHit::AddressGo) => {
+                debug_log(format_args!("click address: pesquisar com IA"));
+                self.search_with_ais();
+            }
+            Some(BarHit::AddressSearch) => {
+                debug_log(format_args!("click address: pesquisar normal"));
+                self.search_on_google();
+            }
             Some(BarHit::AddressBar) => {
                 if let Some(edit) = self.omnibox {
                     unsafe {

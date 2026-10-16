@@ -73,7 +73,10 @@ impl ApplicationHandler<UserEvent> for App {
             self.request_redraw();
         }
 
-        let interval = if self.surface == Surface::Home && home_animation_enabled() {
+        let neural_active = (self.surface == Surface::Home
+            || (self.surface == Surface::Comparator && self.comparator_has_no_panels()))
+            && home_animation_enabled();
+        let interval = if neural_active {
             // O `Occluded` do Windows nao cobre a minimizacao em todos os
             // casos, por isso pergunta-se tambem a janela.
             let minimized = self
@@ -450,7 +453,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let input = input.trim().to_string();
                     if !input.is_empty() {
                         if self.surface == Surface::Comparator {
-                            self.submit_title_address(input);
+                            self.submit_smart_search(input);
                         } else {
                             self.handle_input(input);
                         }
@@ -719,6 +722,9 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.service_strip_physical(),
                                 )
                             });
+                            if self.comparator_has_no_panels() && home_animation_enabled() {
+                                draw_comparator_neural_background(window);
+                            }
                             if show_bar {
                                 draw_comparator_bar(window, comp, state, &self.live_panel);
                             }

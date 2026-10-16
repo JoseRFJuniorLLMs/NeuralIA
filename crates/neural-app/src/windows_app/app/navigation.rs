@@ -623,6 +623,85 @@ impl App {
         }
         self.web(url);
     }
+}
+
+/// Deteta se o texto digitado é um site/URL (ex: www.google.com, google.com, http/https, localhost).
+pub(in crate::windows_app) fn detect_web_target(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(trimmed.to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("www.") && !trimmed.contains(char::is_whitespace) {
+        return Some(format!("https://{trimmed}"));
+    }
+    if (lower == "localhost" || lower.starts_with("localhost:"))
+        && !trimmed.contains(char::is_whitespace)
+    {
+        return Some(format!("http://{trimmed}"));
+    }
+    if !trimmed.contains(char::is_whitespace)
+        && trimmed.contains('.')
+        && !trimmed.starts_with('.')
+        && !trimmed.ends_with('.')
+    {
+        let parts: Vec<&str> = trimmed.split('.').collect();
+        if parts.len() >= 2
+            && parts.last().map_or(false, |tld| {
+                let tld_clean = tld.split(['/', '?', '#', ':']).next().unwrap_or(tld);
+                tld_clean.len() >= 2 && tld_clean.chars().all(|c| c.is_ascii_alphabetic())
+            })
+        {
+            return Some(format!("https://{trimmed}"));
+        }
+    }
+    None
+}
+
+impl App {
+    /// Barra de pesquisa inteligente do comparador:
+    /// - Se for site (ex: google.com, www.google.com), navega diretamente para o site
+    /// - Se for pergunta / termos de busca, envia a pesquisa para as 3 IAs dos painéis
+    pub(in crate::windows_app) fn submit_smart_search(&mut self, input: String) {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        match route_input(trimmed) {
+            InputRoute::Pomodoro(command) => {
+                self.pomodoro_command(command);
+                return;
+            }
+            InputRoute::Theme(choice) => {
+                self.choose_theme(choice);
+                return;
+            }
+            InputRoute::Distraction(command) => {
+                self.distraction_command(command);
+                return;
+            }
+            InputRoute::About => {
+                self.show_about();
+                return;
+            }
+            InputRoute::UpdateCheck => {
+                self.check_and_apply_update(true);
+                return;
+            }
+            _ => {}
+        }
+
+        if let Some(url) = detect_web_target(trimmed) {
+            self.web(url);
+            return;
+        }
+
+        self.compare(CompareRequest::ask(trimmed.to_string()));
+    }
 
     /// Endereco digitado no controlo nativo: usa as mesmas rotas da palette,
     /// incluindo o painel privado, nunca uma load_url sem validacao.

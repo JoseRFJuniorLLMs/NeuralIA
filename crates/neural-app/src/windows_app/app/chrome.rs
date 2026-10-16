@@ -266,11 +266,18 @@ impl App {
             }
             title_pill_height = Some(address.height);
             let pad_x = (address.height / 2.0).max(18.0 * scale);
-            let pad_y = 4.0 * scale;
+            let pad_y = 6.0 * scale;
+            let text_left = address.x + pad_x + 18.0 * scale;
+            let text_right = if edit_focused {
+                let (search_btn, _) = comparator_address_buttons(address, scale);
+                search_btn.x - 8.0 * scale
+            } else {
+                address.x + address.width - pad_x
+            };
             UiRect {
-                x: address.x + pad_x + 38.0 * scale,
+                x: text_left,
                 y: address.y + pad_y,
-                width: (address.width - 2.0 * pad_x - 38.0 * scale).max(1.0),
+                width: (text_right - text_left).max(1.0),
                 height: (address.height - 2.0 * pad_y).max(1.0),
             }
         } else {
@@ -307,11 +314,7 @@ impl App {
                 SetWindowRgn(edit, rgn, 1);
             }
             apply_omnibox_interactivity(edit, self.surface);
-            let cue_text = if self.surface == Surface::Home {
-                "Pergunte algo ou cole uma URL"
-            } else {
-                "URL — www.exemplo.com"
-            };
+            let cue_text = "Pergunte algo ou cole uma URL";
             let cue: Vec<u16> = cue_text.encode_utf16().chain(std::iter::once(0)).collect();
             SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
             if self.surface == Surface::Comparator && !address_visible {
@@ -559,14 +562,9 @@ impl App {
         self.show_about_panel();
     }
 
-    /// Verificação automática de atualização na inicialização (tela inicial).
+    /// Verificação automática de atualização em cada inicialização do NeuralIA.
     pub(in crate::windows_app) fn check_daily_update(&mut self) {
-        static CHECKED_IN_SESSION: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if CHECKED_IN_SESSION.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            return; // Já verificado nesta sessão
-        }
-        self.check_and_apply_update(false);
+        self.check_and_apply_update(true);
     }
 
     /// Executa a checagem e atualização automática com barra de progresso na tela.
@@ -898,11 +896,11 @@ impl App {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return None;
         };
-        // O mesmo plano que o desenho usa. Se aqui se contassem so as abas, o
-        // rato acertaria noutro sitio que nao o que esta no ecra.
-        Some(BarLayout::with_rows(
-            window.inner_size().width as f64,
-            window.scale_factor(),
+        let client_width = window.inner_size().width as f64;
+        let scale = window.scale_factor();
+        let mut layout = BarLayout::with_rows(
+            client_width,
+            scale,
             self.bar_visible(),
             bar_columns(comp, self.pomodoro_bar_label()),
             tab_rows_focused(
@@ -911,7 +909,14 @@ impl App {
                 active_context(comp),
                 comp.bar_focus,
             ),
-        ))
+        );
+        let omnibox_focused = self
+            .omnibox
+            .is_some_and(|edit| unsafe { GetFocus() == edit });
+        if omnibox_focused {
+            layout.apply_omnibox_focus(client_width, scale);
+        }
+        Some(layout)
     }
 
     /// Home nativo da barra. O desenho da barra continua existindo por baixo,

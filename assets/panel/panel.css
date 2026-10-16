@@ -79,25 +79,50 @@ h2{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute
 .obsidian-hud-btn{width:32px;height:32px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--fg);font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,.25);transition:background .15s,border-color .15s}
 .obsidian-hud-btn:hover{background:var(--surface);border-color:var(--accent)}
 .obsidian-hud-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
-.about-main{overflow:auto;flex:1;display:flex;justify-content:center;align-items:flex-start;padding:12px 14px 20px}
-.about-card{max-width:440px;width:100%;background:var(--surface);border:1px solid var(--line);border-radius:16px;overflow:hidden;box-shadow:0 6px 24px rgba(0,0,0,.2)}
-.about-badge-wrap{width:100%;background:#0b1928;display:flex;justify-content:center;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line)}
-.about-badge-img{width:100%;max-width:100%;height:auto;max-height:140px;object-fit:contain;border-radius:6px;display:block}
-.about-body{padding:16px 18px;display:flex;flex-direction:column;gap:14px}
-.about-header{text-align:center}
-.about-title{font-size:17px;font-weight:700;margin:0 0 4px;color:var(--fg);letter-spacing:.01em}
-.about-subtitle{font-size:13px;font-weight:600;color:var(--accent);margin-bottom:3px}
-.about-meta{font-size:11.5px;color:var(--muted)}
-.about-info-grid{display:flex;flex-direction:column;gap:9px;background:var(--bg);padding:12px 14px;border-radius:12px;border:1px solid var(--line)}
-.about-info-row{display:flex;justify-content:space-between;align-items:center;font-size:13px}
-.about-info-label{color:var(--muted);font-weight:600}
-.about-info-val{color:var(--fg);font-weight:500}
-.about-version-tag{background:var(--surface);padding:3px 8px;border-radius:6px;font-weight:700;color:var(--accent);border:1px solid var(--line)}
-.about-links{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
-.about-link-btn{font-size:12px;padding:6px 14px}
-.about-action-wrap{display:flex;justify-content:center;margin-top:4px}
-.about-update-btn{width:100%;font-size:14px;font-weight:700;padding:10px 16px;display:flex;align-items:center;justify-content:center;gap:8px}
-.about-update-icon{font-size:16px}
+#view-about{background:#080f1a radial-gradient(circle at 50% 25%, rgba(14, 165, 233, 0.09) 0%, transparent 75%)}
+.about-main{overflow:auto;flex:1;display:flex;flex-direction:column;align-items:center;padding:16px 14px 28px;gap:12px}
+.about-top-bar{display:flex;justify-content:space-between;align-items:center;width:100%;max-width:580px;padding:0 4px}
+.about-greeting{font-size:16px;font-weight:700;color:#f1f5f9;letter-spacing:-0.01em}
+.about-user-status{display:flex;align-items:center;gap:7px;background:rgba(15, 23, 42, 0.65);padding:4px 10px 4px 5px;border-radius:999px;border:1px solid rgba(255, 255, 255, 0.08)}
+.about-user-avatar-sm{width:24px;height:24px;border-radius:50%;object-fit:cover}
+.about-online-dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 8px #22c55e}
+.about-online-label{font-size:11px;font-weight:600;color:#94a3b8}
+.about-card{width:100%;max-width:580px;background:#0c1829;border:1px solid rgba(56, 189, 248, 0.16);border-radius:16px;box-shadow:0 8px 32px rgba(0, 0, 0, 0.35);position:relative;overflow:hidden}
+.about-profile-card{display:flex;align-items:center;gap:18px;padding:18px 22px}
+.about-profile-avatar-wrap{flex-shrink:0;width:82px;height:82px;border-radius:50%;padding:2.5px;background:linear-gradient(135deg, #38bdf8, #0284c7);box-shadow:0 0 16px rgba(56, 189, 248, 0.35)}
+.about-profile-avatar{width:100%;height:100%;border-radius:50%;object-fit:cover;display:block}
+.about-profile-details{display:flex;flex-direction:column;gap:4px;min-width:0}
+.about-title{font-size:19px;font-weight:700;color:#f8fafc;margin:0;letter-spacing:-0.01em}
+.about-subtitle{font-size:13.5px;font-weight:600;color:#38bdf8;margin:0}
+.about-meta{font-size:12px;color:#94a3b8;margin:0}
+.about-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:12px;width:100%;max-width:580px}
+.about-subcard{padding:16px;display:flex;flex-direction:column;gap:12px}
+.about-card-title{font-size:14px;font-weight:700;color:#f1f5f9;letter-spacing:-0.01em;margin-bottom:2px}
+.about-info-grid{display:flex;flex-direction:column;gap:9px}
+.about-info-row{display:flex;justify-content:space-between;align-items:center;font-size:12.5px;gap:8px}
+.about-info-label{color:#94a3b8;font-weight:500;white-space:nowrap}
+.about-info-val{color:#e2e8f0;font-weight:600;text-align:right}
+.about-version-tag{background:rgba(56, 189, 248, 0.12);color:#38bdf8;padding:2px 8px;border-radius:6px;border:1px solid rgba(56, 189, 248, 0.25)}
+.about-connections-grid{display:flex;gap:10px;justify-content:space-between}
+.about-connection-tile{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;padding:12px 6px;background:rgba(15, 23, 42, 0.6);border:1px solid rgba(255, 255, 255, 0.08);border-radius:12px;color:#f1f5f9;cursor:pointer;transition:all .2s ease;text-decoration:none}
+.about-connection-tile:hover{background:rgba(56, 189, 248, 0.15);border-color:#38bdf8;transform:translateY(-2px)}
+.about-conn-icon-wrap{width:38px;height:38px;border-radius:10px;background:rgba(30, 41, 59, 0.8);display:flex;align-items:center;justify-content:center}
+.about-conn-svg{width:20px;height:20px}
+.about-conn-emoji{font-size:22px}
+.about-conn-name{font-size:11px;font-weight:600;color:#cbd5e1}
+.about-conn-handle{font-size:9.5px;color:#64748b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:80px}
+.about-logo-card{justify-content:center;align-items:center;min-height:120px}
+.about-sphere-wrap{display:flex;align-items:center;justify-content:center;position:relative;width:100%;height:100%}
+.about-sphere-img{max-height:85px;width:auto;object-fit:contain;filter:drop-shadow(0 0 18px rgba(14, 165, 233, 0.5))}
+.about-action-card{justify-content:center;min-height:120px}
+.about-action-wrap{display:flex;align-items:center;justify-content:center;flex:1}
+.about-update-btn{width:100%;padding:13px 20px;border-radius:9999px;background:linear-gradient(135deg, #0284c7 0%, #0ea5e9 50%, #38bdf8 100%);color:#fff;font-size:14.5px;font-weight:700;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 20px rgba(14, 165, 233, 0.45);transition:all .2s ease;letter-spacing:.02em}
+.about-update-btn:hover{transform:scale(1.02);box-shadow:0 6px 26px rgba(14, 165, 233, 0.65)}
+.about-institutional-badge{display:flex;align-items:center;justify-content:center;gap:14px;width:100%;max-width:580px;padding:10px 16px;margin-top:2px}
+.about-brasao-img{width:54px;height:54px;object-fit:contain;filter:drop-shadow(0 2px 8px rgba(0,0,0,0.4));flex-shrink:0}
+.about-inst-text{display:flex;flex-direction:column;gap:2px}
+.about-inst-name{font-size:12px;font-weight:700;color:#f1f5f9;letter-spacing:.06em}
+.about-inst-dept{font-size:10.5px;font-weight:600;color:#94a3b8;letter-spacing:.04em}
 
 #view-obsidian .row{flex-wrap:wrap}
 #oq{flex:1;min-width:100px;width:auto}

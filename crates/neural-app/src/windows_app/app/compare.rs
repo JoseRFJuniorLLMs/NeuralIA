@@ -719,29 +719,22 @@ impl App {
     }
 
     pub(in crate::windows_app) fn return_home_if_all_minimized(&mut self) {
-        let empty = self.comparator.as_ref().is_some_and(|comp| {
+        let empty = self.comparator_has_no_panels();
+        if !empty {
+            return;
+        }
+        self.hide_comparator_splitters();
+        self.request_redraw();
+    }
+
+    pub(in crate::windows_app) fn comparator_has_no_panels(&self) -> bool {
+        self.comparator.as_ref().is_some_and(|comp| {
             all_pages_minimized(
                 &comp.minimized,
                 comp.views.len(),
                 comp.split.as_ref().is_some_and(|split| !split.minimized),
             )
-        });
-        if !empty {
-            return;
-        }
-        self.minimize_live_panel();
-        self.service_panel_for_transition();
-        self.close_side_panel(PanelExit::Home);
-        self.surface = Surface::Home;
-        self.caption_reveal.reset();
-        self.hide_comparator_splitters();
-        self.sync_exit_button();
-        self.sync_home_button();
-        self.sync_caption_buttons();
-        self.show_omnibox(true);
-        self.position_omnibox();
-        self.needs_clear = true;
-        self.request_redraw();
+        })
     }
 
     pub(in crate::windows_app) fn minimize_all_columns(&mut self) {

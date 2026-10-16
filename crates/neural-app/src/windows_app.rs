@@ -572,6 +572,10 @@ pub(in crate::windows_app) enum BarHit {
     WindowClose,
     /// A barra de endereço/URL na linha superior do comparador.
     AddressBar,
+    /// Botão "Pesquisar" dentro da barra do comparador.
+    AddressSearch,
+    /// Botão "Pesquisar com IA" dentro da barra do comparador.
+    AddressGo,
 }
 
 /// O menu que o botao direito abre na barra.
@@ -1182,6 +1186,8 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::WindowMaximize => caption_tooltip_label(1, maximized).to_string(),
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
         BarHit::AddressBar => TITLE_ADDRESS_HINT.to_string(),
+        BarHit::AddressSearch => "Pesquisar no Google".to_string(),
+        BarHit::AddressGo => "Pesquisar com IA".to_string(),
     };
     let owned = match hit {
         BarHit::ColumnMinimize(index) => column_toggle_shortcut(index),
@@ -1223,6 +1229,7 @@ fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
         BarHit::WindowMaximize => Some("F10"),
         BarHit::WindowClose => Some("Alt+F4"),
         BarHit::AddressBar => Some("Ctrl+L"),
+        BarHit::AddressSearch | BarHit::AddressGo => None,
         BarHit::ServiceStrip(StripButton::Minimize) => Some("Alt+M"),
         BarHit::ServiceStrip(StripButton::Fullscreen) => Some("Alt+F"),
         BarHit::Downloads => Some("Ctrl+J"),
@@ -6926,6 +6933,105 @@ fn draw_home(
     }
 }
 
+pub(in crate::windows_app) fn draw_comparator_neural_background(window: &Window) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+
+    let hwnd = handle.hwnd.get() as HWND;
+    let scale = window.scale_factor().max(1.0);
+
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.is_null() {
+            return;
+        }
+
+        let mut client = RECT::default();
+        if GetClientRect(hwnd, &mut client) == 0 {
+            let _ = ReleaseDC(hwnd, hdc);
+            return;
+        }
+
+        let width = (client.right - client.left) as f64;
+        let height = (client.bottom - client.top) as f64;
+        let theme = Theme::system();
+
+        let mem_dc = CreateCompatibleDC(hdc);
+        let mem_bmp = if mem_dc.is_null() {
+            std::ptr::null_mut()
+        } else {
+            CreateCompatibleBitmap(hdc, client.right.max(1), client.bottom.max(1))
+        };
+        let buffered = !mem_dc.is_null() && !mem_bmp.is_null();
+        let target = if buffered { mem_dc } else { hdc };
+        let old_bmp = if buffered {
+            SelectObject(mem_dc, mem_bmp as _)
+        } else {
+            std::ptr::null_mut()
+        };
+
+        let background = CreateSolidBrush(rgb3(theme.page_bg));
+        FillRect(target, &client, background);
+        DeleteObject(background as _);
+        SetBkMode(target, TRANSPARENT as i32);
+
+        if home_animation_enabled() {
+            draw_neural_background(target, width, height, scale, &theme);
+        }
+
+        if buffered {
+            BitBlt(
+                hdc,
+                0,
+                0,
+                client.right.max(1),
+                client.bottom.max(1),
+                mem_dc,
+                0,
+                0,
+                SRCCOPY,
+            );
+            SelectObject(mem_dc, old_bmp);
+            DeleteObject(mem_bmp as _);
+            DeleteDC(mem_dc);
+        } else if !mem_dc.is_null() {
+            DeleteDC(mem_dc);
+        }
+
+        let _ = ReleaseDC(hwnd, hdc);
+    }
+}
+
+unsafe fn draw_search_lens(hdc: *mut core::ffi::c_void, rect: RECT, color: Rgb, scale: f64) {
+    let pen_w = (1.8 * scale).round().max(1.0) as i32;
+    let pen = CreatePen(PS_SOLID, pen_w, rgb3(color));
+    let old_pen = SelectObject(hdc, pen as _);
+    let null_brush = GetStockObject(NULL_BRUSH);
+    let old_brush = SelectObject(hdc, null_brush);
+
+    let h = (rect.bottom - rect.top) as f64;
+    let w = (rect.right - rect.left) as f64;
+    let size = h.min(w) * 0.50;
+    let r = (size * 0.38).round() as i32;
+    let cx = (rect.left + rect.right) / 2 - (r / 2);
+    let cy = (rect.top + rect.bottom) / 2 - (r / 2);
+
+    Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
+
+    let offset = (r as f64 * 0.7071).round() as i32;
+    let handle_len = (r as f64 * 1.05).round() as i32;
+    MoveToEx(hdc, cx + offset, cy + offset, std::ptr::null_mut());
+    LineTo(hdc, cx + offset + handle_len, cy + offset + handle_len);
+
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(pen as _);
+}
+
 // O arrasto das abas (2.1.7), a etiqueta do Pomodoro e o resto do estado
 // chegam da `App` num `BarState` so (`App::bar_state`).
 fn draw_comparator_bar<W>(
@@ -7081,7 +7187,7 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
         Some((tabs, column_groups, focus)) => (tabs, column_groups, *focus),
         None => (contexts, groups, focus),
     };
-    let layout = BarLayout::with_rows(
+    let mut layout = BarLayout::with_rows(
         width as f64,
         scale,
         visible,
@@ -7093,6 +7199,9 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             focus,
         ),
     );
+    if state.omnibox_focused {
+        layout.apply_omnibox_focus(width as f64, scale);
+    }
     if !layout.visible {
         return;
     }
@@ -7552,10 +7661,7 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
 
     // Por cima das abas: com foco a pílula salta (mais alta e mais larga) e
     // tapa o que ficou por baixo. A borda azul é a mesma de sempre.
-    let mut address = title_address_rect(width as f64, scale, columns.pomodoro_label);
-    if state.omnibox_focused {
-        address = sprung_title_address(width as f64, address, scale);
-    }
+    let address = layout.address;
     if address.width > 0.0 {
         let (border_color, border_width) = theme.omnibox_border(state.omnibox_focused);
         fill_pill(
@@ -7566,19 +7672,52 @@ unsafe fn paint_comparator_bar_with_contexts<W>(
             Some((border_color, border_width * scale)),
             theme.bar_bg,
         );
-        SetTextColor(target, rgb3(theme.fg_muted));
-        let mut label = RECT {
-            left: (address.x + 18.0 * scale) as i32,
-            top: address.y as i32,
-            right: (address.x + 52.0 * scale) as i32,
-            bottom: (address.y + address.height) as i32,
+
+        // Ícone de lupa desenhado na extremidade esquerda
+        let lens_rect = RECT {
+            left: (address.x + 8.0 * scale) as i32,
+            top: (address.y + 4.0 * scale) as i32,
+            right: (address.x + 32.0 * scale) as i32,
+            bottom: (address.y + address.height - 4.0 * scale) as i32,
         };
-        draw_text(
-            target,
-            "URL",
-            &mut label,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
+        draw_search_lens(target, lens_rect, theme.fg_muted, scale);
+
+        // Se com foco, desenha os dois botões idênticos aos da Home: Pesquisar e Pesquisar com IA
+        if state.omnibox_focused {
+            let (search_btn, go_btn) = (layout.address_search, layout.address_go);
+            let search_hover = hover == Some(BarHit::AddressSearch);
+            let go_hover = hover == Some(BarHit::AddressGo);
+
+            let search_bg = if search_hover {
+                mix(theme.surface, theme.fg, 0.20)
+            } else {
+                mix(theme.surface, theme.fg, 0.10)
+            };
+            draw_pill(
+                target,
+                search_btn,
+                "Pesquisar",
+                PillStyle::new(search_bg, theme.surface_line, theme.fg),
+                scale,
+                font,
+                theme.surface,
+            );
+
+            let ai_blue = if go_hover {
+                mix(SEARCH_AI_BLUE, (255, 255, 255), 0.14)
+            } else {
+                SEARCH_AI_BLUE
+            };
+            draw_pill(
+                target,
+                go_btn,
+                "Pesquisar com IA",
+                PillStyle::new(ai_blue, ai_blue, (255, 255, 255)),
+                scale,
+                font,
+                theme.surface,
+            );
+        }
     }
 
     SelectObject(target, old_font);
