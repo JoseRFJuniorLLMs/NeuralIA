@@ -59,7 +59,7 @@ use crate::windows_app::{
 };
 
 /// A dica do icone do servico aberto: minimizado, diz que volta ao clique (e
-/// se continua a tocar); aberto, que fecha.
+/// se continua a tocar); aberto, que minimiza.
 pub(in crate::windows_app) fn service_icon_hint(
     label: &str,
     badge: Option<ServiceBadge>,

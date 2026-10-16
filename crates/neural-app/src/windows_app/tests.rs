@@ -8863,7 +8863,7 @@ fn service_panel_webview_signals_reach_only_the_panel_that_sent_them() {
         "YouTube minimizado, a tocar · clique para voltar ao painel"
     );
     assert!(service_icon_hint("YouTube", Some(ServiceBadge::Minimized)).contains("voltar"));
-    assert!(service_icon_hint("YouTube", None).contains("fechar"));
+    assert!(service_icon_hint("YouTube", None).contains("minimizar"));
 }
 
 const LABEL_TURN_OFF: &str = "Desativar rolagem automática (F8)";
