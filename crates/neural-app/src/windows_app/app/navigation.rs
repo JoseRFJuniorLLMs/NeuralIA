@@ -296,6 +296,7 @@ pub(in crate::windows_app) fn route_palette(
 }
 
 /// Contexto escolhido apenas pelo estado nativo, sem metadados de pagina.
+#[allow(dead_code)]
 pub(in crate::windows_app) fn title_address_context(
     split: Option<(usize, bool)>,
     expanded: Option<usize>,
@@ -644,17 +645,12 @@ pub(in crate::windows_app) fn detect_web_target(input: &str) -> Option<String> {
         return Some(format!("http://{trimmed}"));
     }
     if !trimmed.contains(char::is_whitespace)
-        && trimmed.contains('.')
         && !trimmed.starts_with('.')
         && !trimmed.ends_with('.')
+        && let Some((_, tld)) = trimmed.rsplit_once('.')
     {
-        let parts: Vec<&str> = trimmed.split('.').collect();
-        if parts.len() >= 2
-            && parts.last().map_or(false, |tld| {
-                let tld_clean = tld.split(['/', '?', '#', ':']).next().unwrap_or(tld);
-                tld_clean.len() >= 2 && tld_clean.chars().all(|c| c.is_ascii_alphabetic())
-            })
-        {
+        let tld_clean = tld.split(['/', '?', '#', ':']).next().unwrap_or(tld);
+        if tld_clean.len() >= 2 && tld_clean.chars().all(|c| c.is_ascii_alphabetic()) {
             return Some(format!("https://{trimmed}"));
         }
     }
@@ -672,11 +668,11 @@ impl App {
         }
 
         match route_input(trimmed) {
-            InputRoute::Pomodoro(command) => {
+            InputRoute::Pomodoro(Some(command)) => {
                 self.pomodoro_command(command);
                 return;
             }
-            InputRoute::Theme(choice) => {
+            InputRoute::Theme(Some(choice)) => {
                 self.choose_theme(choice);
                 return;
             }
@@ -700,11 +696,12 @@ impl App {
             return;
         }
 
-        self.compare(CompareRequest::ask(trimmed.to_string()));
+        self.compare(CompareRequest::ask(input));
     }
 
     /// Endereco digitado no controlo nativo: usa as mesmas rotas da palette,
     /// incluindo o painel privado, nunca uma load_url sem validacao.
+    #[allow(dead_code)]
     pub(in crate::windows_app) fn submit_title_address(&mut self, input: String) {
         let Some(comp) = self.comparator.as_ref() else {
             return;

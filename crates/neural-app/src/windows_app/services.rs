@@ -77,6 +77,7 @@ impl Service {
 }
 
 /// Pausa o video ao ocultar o YouTube.
+#[allow(dead_code)]
 pub(in crate::windows_app) const YOUTUBE_PAUSE_SCRIPT: &str =
     "(function(){try{var v=document.querySelector('video');if(v)v.pause();}catch(e){}})();";
 

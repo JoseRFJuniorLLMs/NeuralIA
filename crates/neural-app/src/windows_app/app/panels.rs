@@ -44,10 +44,9 @@ use crate::windows_app::{
         PANEL_SHOW_OBSIDIAN_SCRIPT,
     },
     services::{
-        SERVICE_PAUSE_SCRIPT, Service, ServicePanel, YOUTUBE_PAUSE_SCRIPT, logical_rect,
-        open_panel_width_for, raise_webview_host, register_service_panel_events,
-        service_event_is_current, service_panel_permission, service_should_pause,
-        start_whatsapp_with_notifications,
+        Service, ServicePanel, logical_rect, open_panel_width_for, raise_webview_host,
+        register_service_panel_events, service_event_is_current, service_panel_permission,
+        service_should_pause, start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
