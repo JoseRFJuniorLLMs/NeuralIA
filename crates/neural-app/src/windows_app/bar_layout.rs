@@ -544,11 +544,9 @@ impl BarLayout {
         } else {
             chips_w + 8.0 * scale
         };
-        let bar_right = (controls_left
-            - 8.0 * scale
-            - reserved
-            - columns.restore_strip.max(0.0) * scale)
-            .max(pad);
+        let bar_right =
+            (controls_left - 8.0 * scale - reserved - columns.restore_strip.max(0.0) * scale)
+                .max(pad);
 
         for (slot, span) in spans.iter().enumerate() {
             let mut left = span.x * scale + group_pad;

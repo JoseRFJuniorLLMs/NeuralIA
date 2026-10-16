@@ -479,11 +479,7 @@ impl ServicePanelState {
     /// recuperam a janela inteira: a faixa de restaurar fica na barra, por
     /// cima, e nao deixa uma coluna vazia.
     pub fn reserved_width(&self, width: f64) -> f64 {
-        if self.minimized {
-            0.0
-        } else {
-            width
-        }
+        if self.minimized { 0.0 } else { width }
     }
 
     /// Onde fica a WebView do painel; `None` = escondida (minimizado).
