@@ -50,6 +50,12 @@ pub(in crate::windows_app) enum CommandId {
     ColumnOne,
     ColumnTwo,
     ColumnThree,
+    /// Minimiza ou restaura a primeira IA (Gemini).
+    MinimizeColumnOne,
+    /// Minimiza ou restaura a segunda IA (ChatGPT).
+    MinimizeColumnTwo,
+    /// Minimiza ou restaura a terceira IA (Claude).
+    MinimizeColumnThree,
     TabList,
     WindowMin,
     WindowMax,
@@ -95,7 +101,7 @@ pub(in crate::windows_app) enum CommandId {
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 48] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 51] = [
         CommandId::AutoScroll,
         CommandId::FocusAddress,
         CommandId::NavBack,
@@ -120,6 +126,9 @@ impl CommandId {
         CommandId::ColumnOne,
         CommandId::ColumnTwo,
         CommandId::ColumnThree,
+        CommandId::MinimizeColumnOne,
+        CommandId::MinimizeColumnTwo,
+        CommandId::MinimizeColumnThree,
         CommandId::TabList,
         CommandId::WindowMin,
         CommandId::WindowMax,
@@ -540,6 +549,33 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         alias: None,
     },
     CommandRow {
+        id: CommandId::MinimizeColumnOne,
+        key: "minimizar-ia-1",
+        label: "Minimizar ou restaurar a primeira IA",
+        category: CommandCategory::PesquisaIa,
+        keywords: &["minimizar", "restaurar", "gemini", "coluna"],
+        chords: &[ChordSpec::global(Chord::alt_shift(b'1'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::MinimizeColumnTwo,
+        key: "minimizar-ia-2",
+        label: "Minimizar ou restaurar a segunda IA",
+        category: CommandCategory::PesquisaIa,
+        keywords: &["minimizar", "restaurar", "chatgpt", "coluna"],
+        chords: &[ChordSpec::global(Chord::alt_shift(b'2'))],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::MinimizeColumnThree,
+        key: "minimizar-ia-3",
+        label: "Minimizar ou restaurar a terceira IA",
+        category: CommandCategory::PesquisaIa,
+        keywords: &["minimizar", "restaurar", "claude", "coluna"],
+        chords: &[ChordSpec::global(Chord::alt_shift(b'3'))],
+        alias: None,
+    },
+    CommandRow {
         id: CommandId::TabList,
         key: "lista-abas",
         label: "Lista das abas da coluna",
@@ -758,6 +794,9 @@ fn chrome_event(id: CommandId) -> UserEvent {
         CommandId::ColumnOne => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::ColumnTwo => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::ColumnThree => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::MinimizeColumnOne => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::MinimizeColumnTwo => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::MinimizeColumnThree => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::TabList => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::WindowMin => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::WindowMax => UserEvent::NativeShortcut(id, CommandOrigin::Window),
@@ -826,6 +865,9 @@ fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
         CommandId::ColumnOne |
         CommandId::ColumnTwo |
         CommandId::ColumnThree |
+        CommandId::MinimizeColumnOne |
+        CommandId::MinimizeColumnTwo |
+        CommandId::MinimizeColumnThree |
         CommandId::TabList |
         CommandId::WindowMin |
         CommandId::WindowMax |
@@ -1041,6 +1083,9 @@ pub(in crate::windows_app) fn is_native_shortcut(id: CommandId) -> bool {
             | CommandId::ColumnOne
             | CommandId::ColumnTwo
             | CommandId::ColumnThree
+            | CommandId::MinimizeColumnOne
+            | CommandId::MinimizeColumnTwo
+            | CommandId::MinimizeColumnThree
             | CommandId::TabList
             | CommandId::WindowMin
             | CommandId::WindowMax
@@ -1178,7 +1223,7 @@ impl App {
                     PanelShortcutAction::FullscreenService => {
                         self.service_input(ServiceInput::ToggleFullscreen)
                     }
-                    PanelShortcutAction::CloseService => self.conceal_service_panel(),
+                    PanelShortcutAction::CloseService => self.service_input(ServiceInput::Close),
                     PanelShortcutAction::Nothing => {}
                 }
             }
@@ -1194,6 +1239,9 @@ impl App {
             CommandId::ColumnThree => {
                 self.expand_comparator(2);
             }
+            CommandId::MinimizeColumnOne => self.toggle_ai_column(0),
+            CommandId::MinimizeColumnTwo => self.toggle_ai_column(1),
+            CommandId::MinimizeColumnThree => self.toggle_ai_column(2),
             CommandId::TabList => {
                 self.show_tab_list_menu(column);
             }
@@ -1210,6 +1258,20 @@ impl App {
             _ => {}
         }
     }
+}
+
+/// O atalho de minimizar ou restaurar a coluna `index` (0 Gemini, 1 ChatGPT,
+/// 2 Claude), lido do registo para a dica e o comando nunca divergirem.
+pub(in crate::windows_app) fn column_toggle_shortcut(index: usize) -> Option<String> {
+    let id = match index {
+        0 => CommandId::MinimizeColumnOne,
+        1 => CommandId::MinimizeColumnTwo,
+        2 => CommandId::MinimizeColumnThree,
+        _ => return None,
+    };
+    command_row(id)
+        .and_then(|row| row.chords.first())
+        .map(|spec| shortcut_text(spec.chord))
 }
 
 pub(in crate::windows_app) fn shortcut_text(chord: Chord) -> String {

@@ -39,6 +39,81 @@ pub(in crate::windows_app) fn minimize_column_state<V>(
     true
 }
 
+/// O que o atalho da coluna fez ao estado, sem janela.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum ColumnToggle {
+    Minimized,
+    Restored,
+    Ignored,
+}
+
+/// Minimiza a coluna visível ou restaura a que está em chip. A última coluna
+/// também minimiza. Um índice fora fica como está.
+pub(in crate::windows_app) fn toggle_column_minimized_state<V>(
+    minimized: &mut [bool; COMPARATOR_COLUMNS],
+    columns: usize,
+    index: usize,
+    expanded: &mut Option<usize>,
+    split: Option<&mut SplitView<V>>,
+) -> ColumnToggle {
+    if index >= columns.min(COMPARATOR_COLUMNS) {
+        return ColumnToggle::Ignored;
+    }
+    if minimized[index] {
+        minimized[index] = false;
+        *expanded = None;
+        if let Some(split) = split {
+            split.fullscreen = false;
+            split.source_index = index;
+        }
+        return ColumnToggle::Restored;
+    }
+    if minimize_column_state(minimized, columns, index, expanded, split) {
+        ColumnToggle::Minimized
+    } else {
+        ColumnToggle::Ignored
+    }
+}
+
+/// O que `browser_layout` do Gemini Live pede. Os nomes longos são os que a
+/// ferramenta declara ao modelo; os curtos continuam a valer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum BrowserLayoutAction {
+    Expand(usize),
+    Minimize(usize),
+    RestoreColumn(usize),
+    ToggleColumn(usize),
+    RestoreAll,
+    CloseSplit,
+    ToggleSplitFullscreen,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    Home,
+    Unknown,
+}
+
+pub(in crate::windows_app) fn parse_browser_layout(
+    action: &str,
+    column: usize,
+) -> BrowserLayoutAction {
+    let column = column.min(COMPARATOR_COLUMNS.saturating_sub(1));
+    match action {
+        "expand" | "expand_column" => BrowserLayoutAction::Expand(column),
+        "minimize" | "minimize_column" => BrowserLayoutAction::Minimize(column),
+        "restore_column" => BrowserLayoutAction::RestoreColumn(column),
+        "toggle_column" => BrowserLayoutAction::ToggleColumn(column),
+        "restore" | "restore_columns" => BrowserLayoutAction::RestoreAll,
+        "close_split" => BrowserLayoutAction::CloseSplit,
+        "toggle_split_fullscreen" => BrowserLayoutAction::ToggleSplitFullscreen,
+        "zoom_in" => BrowserLayoutAction::ZoomIn,
+        "zoom_out" => BrowserLayoutAction::ZoomOut,
+        "zoom_reset" => BrowserLayoutAction::ZoomReset,
+        "home" => BrowserLayoutAction::Home,
+        _ => BrowserLayoutAction::Unknown,
+    }
+}
+
 impl App {
     #[cfg(feature = "accel-spike")]
     pub(in crate::windows_app) fn export_current_research_to_disk(
@@ -536,6 +611,67 @@ impl App {
         self.position_omnibox();
         self.return_home_if_all_minimized();
         self.request_redraw();
+    }
+
+    /// O atalho da coluna: visível minimiza, chip restaura. A sessão fica.
+    pub(in crate::windows_app) fn toggle_ai_column(&mut self, idx: usize) {
+        if self.surface == Surface::Home && self.comparator.is_some() {
+            self.surface = Surface::Comparator;
+        }
+        let step = {
+            let Some(comp) = &mut self.comparator else {
+                return;
+            };
+            toggle_column_minimized_state(
+                &mut comp.minimized,
+                comp.views.len(),
+                idx,
+                &mut comp.expanded,
+                comp.split.as_mut(),
+            )
+        };
+        if step == ColumnToggle::Ignored {
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.set_fullscreen(None);
+        }
+        self.bar_hover = None;
+        self.forget_tab_gesture();
+        self.needs_clear = true;
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
+        self.sync_comparator_buttons();
+        self.sync_exit_button();
+        self.sync_home_button();
+        self.sync_caption_buttons();
+        self.show_omnibox_passive(true);
+        self.position_omnibox();
+        if step == ColumnToggle::Minimized {
+            self.return_home_if_all_minimized();
+        }
+        self.request_redraw();
+    }
+
+    /// Restaura uma coluna em chip sem a expandir em tela cheia.
+    pub(in crate::windows_app) fn restore_ai_column(&mut self, idx: usize) {
+        let minimized = self.comparator.as_ref().is_some_and(|comp| {
+            idx < comp.views.len() && idx < COMPARATOR_COLUMNS && comp.minimized[idx]
+        });
+        if minimized {
+            self.toggle_ai_column(idx);
+        }
+    }
+
+    /// Tira todas as colunas de chip e sai da tela cheia.
+    pub(in crate::windows_app) fn restore_all_ai_columns(&mut self) {
+        if self.comparator.is_some() && self.surface == Surface::Home {
+            self.surface = Surface::Comparator;
+        }
+        if let Some(comp) = &mut self.comparator {
+            comp.minimized = [false; COMPARATOR_COLUMNS];
+        }
+        self.restore_comparator();
     }
 
     pub(in crate::windows_app) fn minimize_active_page(&mut self, origin: CommandOrigin) {

@@ -1117,6 +1117,9 @@ pub(in crate::windows_app) fn bar_tooltip_label(
             "{TRANSLATE_PAGE_LABEL} do {provider} para o português (outro clique: o original)"
         ),
         BarHit::ColumnMinimize(_) => format!("Minimizar {provider}"),
+        BarHit::Column(index) if state.minimized.get(index).copied().unwrap_or(false) => {
+            format!("Restaurar {provider}")
+        }
         BarHit::ColumnBookmark(index) => {
             bookmark_star_tooltip(state.bookmarked.get(index).copied().unwrap_or(false)).to_string()
         }
@@ -1174,7 +1177,17 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::WindowClose => caption_tooltip_label(2, maximized).to_string(),
         BarHit::AddressBar => TITLE_ADDRESS_HINT.to_string(),
     };
-    Some(with_shortcut(text, bar_hit_shortcut(hit, maximized)))
+    let owned = match hit {
+        BarHit::ColumnMinimize(index) => column_toggle_shortcut(index),
+        BarHit::Column(index) if state.minimized.get(index).copied().unwrap_or(false) => {
+            column_toggle_shortcut(index)
+        }
+        _ => None,
+    };
+    let keys = owned
+        .as_deref()
+        .or_else(|| bar_hit_shortcut(hit, maximized));
+    Some(with_shortcut(text, keys))
 }
 
 /// Acrescenta o atalho quando a dica ainda nao o diz.
@@ -1194,7 +1207,8 @@ fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
         BarHit::Back | BarHit::ColumnBack(_) => Some("Alt+←"),
         BarHit::Forward | BarHit::ColumnForward(_) => Some("Alt+→"),
         BarHit::ColumnReload(_) => Some("F5"),
-        BarHit::ColumnMinimize(_) | BarHit::SplitMinimize => Some("Ctrl+Shift+M"),
+        BarHit::ColumnMinimize(_) => None,
+        BarHit::SplitMinimize => Some("Ctrl+Shift+M"),
         BarHit::Column(_) | BarHit::SplitExpand => Some("F11"),
         BarHit::AddTab(_) => Some("Ctrl+T"),
         BarHit::ColumnBookmark(_) | BarHit::SplitBookmark => Some("Ctrl+D"),
@@ -1205,7 +1219,6 @@ fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
         BarHit::AddressBar => Some("Ctrl+L"),
         BarHit::ServiceStrip(StripButton::Minimize) => Some("Alt+M"),
         BarHit::ServiceStrip(StripButton::Fullscreen) => Some("Alt+F"),
-        BarHit::ServiceStrip(StripButton::Close) => Some("Alt+W"),
         BarHit::Downloads => Some("Ctrl+J"),
         BarHit::Private => Some("Ctrl+Shift+N"),
         BarHit::GeminiLive => Some("Alt+G"),
@@ -1393,9 +1406,12 @@ fn caption_button_style(index: usize, hovered: bool, theme: &Theme) -> PillStyle
 
 /// O que a dica centrada diz sobre um controlo injetado numa coluna. Vazio
 /// quando o rato saiu dele: a dica some.
-fn column_hint_text(hint: ColumnHint, provider: &str) -> String {
+fn column_hint_text(hint: ColumnHint, provider: &str, col: usize) -> String {
     match hint {
-        ColumnHint::Minimize => format!("Minimizar {provider}"),
+        ColumnHint::Minimize => with_shortcut(
+            format!("Minimizar {provider}"),
+            column_toggle_shortcut(col).as_deref(),
+        ),
         ColumnHint::Expand => format!("Expandir {provider} (F11)"),
         ColumnHint::None => String::new(),
     }

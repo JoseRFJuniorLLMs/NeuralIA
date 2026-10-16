@@ -31,7 +31,7 @@ impl App {
                 return;
             }
             CommandOrigin::Host(WebViewHost::Service(_)) => {
-                self.conceal_service_panel();
+                self.service_input(ServiceInput::Close);
                 return;
             }
             _ => {}

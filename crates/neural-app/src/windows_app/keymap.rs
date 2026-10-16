@@ -100,6 +100,16 @@ impl Chord {
         }
     }
 
+    /// Alt+Shift+tecla. Sem Ctrl, pelo mesmo motivo do `alt`.
+    pub(in crate::windows_app) const fn alt_shift(vk: u8) -> Chord {
+        Chord {
+            vk: vk as u32,
+            ctrl: false,
+            shift: true,
+            alt: true,
+        }
+    }
+
     /// A tecla sozinha (so F1-F24 servem de atalho assim).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(in crate::windows_app) const fn key(vk: u8) -> Chord {

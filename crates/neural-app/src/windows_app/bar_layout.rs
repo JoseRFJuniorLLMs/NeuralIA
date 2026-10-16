@@ -307,6 +307,9 @@ pub(in crate::windows_app) struct BarState {
     /// A da fonte aberta ao lado.
     pub(in crate::windows_app) split_bookmarked: bool,
     pub(in crate::windows_app) split_minimized: bool,
+    /// Colunas de IA recolhidas em chip. A dica do chip diz restaurar, com o
+    /// atalho dessa coluna.
+    pub(in crate::windows_app) minimized: [bool; COMPARATOR_COLUMNS],
     /// Os downloads a correr (downloads-ui): a seta do canto pinta-se na cor
     /// de destaque e a dica diz quantos e quanto falta.
     pub(in crate::windows_app) downloads: DownloadsBadge,

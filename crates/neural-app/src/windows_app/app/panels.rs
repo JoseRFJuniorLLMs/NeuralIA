@@ -44,9 +44,10 @@ use crate::windows_app::{
         PANEL_SHOW_OBSIDIAN_SCRIPT,
     },
     services::{
-        Service, ServicePanel, YOUTUBE_PAUSE_SCRIPT, close_service_panel_in, logical_rect,
+        SERVICE_PAUSE_SCRIPT, Service, ServicePanel, YOUTUBE_PAUSE_SCRIPT, logical_rect,
         open_panel_width_for, raise_webview_host, register_service_panel_events,
-        service_event_is_current, service_panel_permission, start_whatsapp_with_notifications,
+        service_event_is_current, service_panel_permission, service_should_pause,
+        start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
@@ -70,14 +71,14 @@ pub(in crate::windows_app) fn service_icon_hint(
         Some(ServiceBadge::Minimized) => {
             format!("{label} minimizado · clique para voltar ao painel")
         }
-        None => format!("{label} aberto ao lado · clique para fechar"),
+        None => format!("{label} aberto ao lado · clique para minimizar"),
     }
 }
 
 fn service_button_hint(service: Service, badge: Option<ServiceBadge>) -> Option<String> {
     if badge.is_none() && service.keeps_running_in_background() {
         Some(format!(
-            "{} aberto ao lado · clique para minimizar, continua em segundo plano",
+            "{} aberto ao lado · clique para minimizar, o som para e a conta fica (Alt+M)",
             service.label()
         ))
     } else {
@@ -88,7 +89,7 @@ fn service_button_hint(service: Service, badge: Option<ServiceBadge>) -> Option<
 /// A dica que o painel de servicos aberto (`service`, no modo `badge`) da
 /// ao alvo `hit` da barra: a faixa dele e o botao que o abriu -- o icone do
 /// servico ou, na Respiracao, o botao dela nas ferramentas, onde o ponto de
-/// minimizado fica (`service_icon_rect`) e que o clique restaura ou fecha
+/// minimizado fica (`service_icon_rect`) e que o clique restaura ou minimiza
 /// (`open_service_panel`). `None`: o alvo nao e do painel, e a dica e a de
 /// sempre.
 pub(in crate::windows_app) fn service_panel_hint(
@@ -98,11 +99,11 @@ pub(in crate::windows_app) fn service_panel_hint(
 ) -> Option<String> {
     match hit {
         BarHit::ServiceStrip(StripButton::Minimize) if badge.is_some() => Some(format!(
-            "Restaurar {}: volta ao painel e continua a tocar (Alt+M)",
+            "Restaurar {}: volta ao painel, parado (Alt+M)",
             service.label()
         )),
         BarHit::ServiceStrip(StripButton::Minimize) => Some(format!(
-            "Minimizar {}: mantém os controles disponíveis e a sessão continua em segundo plano (Ctrl+Shift+M)",
+            "Minimizar {}: para o que está a tocar e mantém os controles (Alt+M)",
             service.label()
         )),
         BarHit::ServiceStrip(button) => Some(button.hint(service.label())),
@@ -155,18 +156,14 @@ where
 }
 
 pub(in crate::windows_app) fn service_transition_input(
-    service: Service,
+    _service: Service,
     state: ServicePanelState,
 ) -> Option<ServiceInput> {
-    if service.keeps_running_in_background() {
-        (!state.minimized()).then_some(ServiceInput::Minimize)
-    } else {
-        Some(ServiceInput::Close)
-    }
+    (!state.minimized()).then_some(ServiceInput::Minimize)
 }
 
 impl App {
-    /// Os icones da barra: o servico abre no painel ao lado; de novo, fecha
+    /// Os icones da barra: o servico abre no painel ao lado; de novo, minimiza
     /// -- ou, minimizado, volta (`ServicePanelState`).
     pub(in crate::windows_app) fn open_service_panel(&mut self, service: Service) {
         if let Some(panel) = self
@@ -291,8 +288,9 @@ impl App {
         }
     }
 
-    /// Ocultar: no YouTube pausa o video e so depois esconde. Minimizar nao
-    /// passa por aqui, e trocar de servico tambem nao (o video continua).
+    /// Descarte real do painel. A faixa, o ícone, o Alt+W e o Gemini Live
+    /// não passam por aqui: o painel lateral minimiza.
+    #[allow(dead_code)]
     pub(in crate::windows_app) fn conceal_service_panel(&mut self) {
         if let Some(panel) = &self.service_panel
             && panel.service == Service::YouTube
@@ -316,26 +314,21 @@ impl App {
         if service == Service::Gmail {
             self.maybe_start_gmail_monitor();
         }
-        if service.keeps_running_in_background() {
-            let mut panel = self.service_panel.take().expect("painel conferido acima");
-            let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
-            let _ = panel.webview.set_visible(false);
-            let _ = panel.webview.focus_parent();
-            if self.surface == Surface::Home
-                && let Some(edit) = self.omnibox
-            {
-                unsafe { SetFocus(edit) };
-            }
-            panel.state = ServicePanelState::default();
-            let _ = panel.state.step(ServiceInput::Minimize);
-            self.background_services.push(panel);
-            debug_log(format_args!("service panel: {service:?} em segundo plano"));
-        } else {
-            // O teclado volta a omnibox (Home) ou a janela: `release_panel`
-            // (gate `closing_a_panel_gives_the_keyboard_back`).
-            close_service_panel_in(&mut self.service_panel, self.surface, self.omnibox);
-            debug_log(format_args!("service panel: fechado"));
+        // Trocar de serviço também minimiza: a conta fica, o som para.
+        let mut panel = self.service_panel.take().expect("painel conferido acima");
+        let _ = panel.webview.evaluate_script(SERVICE_PAUSE_SCRIPT);
+        let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+        let _ = panel.webview.set_visible(false);
+        let _ = panel.webview.focus_parent();
+        if self.surface == Surface::Home
+            && let Some(edit) = self.omnibox
+        {
+            unsafe { SetFocus(edit) };
         }
+        panel.state = ServicePanelState::default();
+        let _ = panel.state.step(ServiceInput::Minimize);
+        self.background_services.push(panel);
+        debug_log(format_args!("service panel: {service:?} minimizado"));
         let window_fullscreen = self
             .window
             .as_ref()
@@ -428,9 +421,8 @@ impl App {
                     raise_webview_host(&panel.webview);
                 }
             }
-            // Minimizado: sai da frente, a pagina continua viva (o som
-            // continua, como numa aba em segundo plano), e o teclado nao fica
-            // preso nela -- uma tecla perdida pausava o video.
+            // Minimizado: sai da frente. O som já foi parado
+            // (`SERVICE_PAUSE_SCRIPT`) antes de esconder. A conta fica.
             None => {
                 let _ = panel.webview.set_visible(false);
                 let _ = panel.webview.focus_parent();
@@ -440,15 +432,35 @@ impl App {
 
     /// Um passo do painel de servicos: faixa, icone, a propria pagina, Esc.
     pub(in crate::windows_app) fn service_input(&mut self, input: ServiceInput) {
-        let Some(panel) = self.service_panel.as_mut() else {
+        let Some(was_minimized) = self
+            .service_panel
+            .as_ref()
+            .map(|panel| panel.state.minimized())
+        else {
             return;
         };
-        match panel.state.step(input) {
+        let effect = self
+            .service_panel
+            .as_mut()
+            .expect("painel conferido")
+            .state
+            .step(input);
+        let now_minimized = self
+            .service_panel
+            .as_ref()
+            .is_some_and(|panel| panel.state.minimized());
+        if service_should_pause(was_minimized, now_minimized)
+            && let Some(panel) = &self.service_panel
+        {
+            let _ = panel.webview.evaluate_script(SERVICE_PAUSE_SCRIPT);
+        }
+        match effect {
             ServiceEffect::Relayout => self.apply_service_frame(),
             ServiceEffect::ExitPageFullscreen => {
-                let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+                if let Some(panel) = &self.service_panel {
+                    let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+                }
             }
-            ServiceEffect::Close => self.conceal_service_panel(),
             ServiceEffect::Nothing => {}
         }
     }
@@ -731,8 +743,8 @@ impl App {
     }
 
     pub(in crate::windows_app) fn open_live_panel(&mut self) {
-        // Um painel de cada vez -- o de servicos minimizado nao esta a vista e
-        // continua a tocar.
+        // Um painel de cada vez. O de servicos minimizado ja parou o som e
+        // fica fora da vista, com a conta.
         self.close_docked_service_panel();
         self.close_side_panel(PanelExit::OtherPanel);
         let Some(bounds) = self.live_panel_rect() else {
@@ -1064,23 +1076,30 @@ impl App {
             }
             "browser_layout" => {
                 let action = str_arg("action");
-                let col = usize_arg("column", 0).min(2);
-                match action.as_str() {
-                    "expand" => self.expand_comparator(col),
-                    "minimize" => self.minimize_comparator(col),
-                    "restore" => self.restore_comparator(),
-                    "close_split" => self.close_split(),
-                    "toggle_split_fullscreen" => self.toggle_split_fullscreen(),
-                    "home" => {
+                let col = usize_arg("column", 0);
+                let parsed = parse_browser_layout(&action, col);
+                let ok = parsed != BrowserLayoutAction::Unknown;
+                match parsed {
+                    BrowserLayoutAction::Expand(col) => self.expand_comparator(col),
+                    BrowserLayoutAction::Minimize(col) => self.minimize_comparator(col),
+                    BrowserLayoutAction::RestoreColumn(col) => self.restore_ai_column(col),
+                    BrowserLayoutAction::ToggleColumn(col) => self.toggle_ai_column(col),
+                    BrowserLayoutAction::RestoreAll => self.restore_all_ai_columns(),
+                    BrowserLayoutAction::CloseSplit => self.close_split(),
+                    BrowserLayoutAction::ToggleSplitFullscreen => self.toggle_split_fullscreen(),
+                    BrowserLayoutAction::ZoomIn => self.step_zoom(1),
+                    BrowserLayoutAction::ZoomOut => self.step_zoom(-1),
+                    BrowserLayoutAction::ZoomReset => self.set_zoom(1.0),
+                    BrowserLayoutAction::Home => {
                         let _ = self.request_home();
                     }
-                    _ => self.restore_comparator(),
+                    BrowserLayoutAction::Unknown => {}
                 }
                 serde_json::json!({
-                    "ok": true,
+                    "ok": ok,
                     "tool": "browser_layout",
                     "action": action,
-                    "column": col,
+                    "column": col.min(COMPARATOR_COLUMNS.saturating_sub(1)),
                 })
             }
             "browser_tabs" => {
@@ -1564,7 +1583,7 @@ impl App {
                     _ => None,
                 };
                 match (svc, action.as_str()) {
-                    (_, "close") => self.conceal_service_panel(),
+                    (_, "close") => self.service_input(ServiceInput::Close),
                     (_, "minimize") => self.service_input(ServiceInput::Minimize),
                     (_, "fullscreen") => self.service_input(ServiceInput::ToggleFullscreen),
                     (Some(target), _) => self.open_service_panel(target),
@@ -1751,8 +1770,8 @@ impl App {
     }
 
     pub(in crate::windows_app) fn open_side_panel(&mut self) {
-        // Um painel de cada vez -- o de servicos minimizado nao esta a vista e
-        // continua a tocar.
+        // Um painel de cada vez. O de servicos minimizado ja parou o som e
+        // fica fora da vista, com a conta.
         self.close_docked_service_panel();
         self.minimize_live_panel();
         let Some(bounds) = self.side_panel_rect() else {
@@ -2212,19 +2231,22 @@ mod youtube_transition_tests {
             Service::Gmail,
         ] {
             assert!(service.keeps_running_in_background());
-            assert_eq!(
-                service_panel_hint(BarHit::ServiceStrip(StripButton::Close), service, None),
-                Some(format!("Fechar {} (Alt+W)", service.label()))
+            assert!(
+                service_panel_hint(BarHit::ServiceStrip(StripButton::Minimize), service, None)
+                    .expect("minimizar")
+                    .contains("Minimizar")
             );
+            assert_eq!(StripButton::ALL.len(), 2);
         }
         assert!(Service::YouTube.keeps_running_in_background());
-        assert_eq!(
+        assert!(
             service_panel_hint(
-                BarHit::ServiceStrip(StripButton::Close),
+                BarHit::ServiceStrip(StripButton::Minimize),
                 Service::YouTube,
                 None
-            ),
-            Some("Fechar YouTube (Alt+W)".to_string())
+            )
+            .expect("minimizar")
+            .contains("para o que está a tocar")
         );
         assert_eq!(
             service_panel_hint(
@@ -2232,7 +2254,7 @@ mod youtube_transition_tests {
                 Service::YouTube,
                 Some(crate::panel_chrome::ServiceBadge::Playing)
             ),
-            Some("Restaurar YouTube: volta ao painel e continua a tocar (Alt+M)".to_string())
+            Some("Restaurar YouTube: volta ao painel, parado (Alt+M)".to_string())
         );
         for service in [Service::Meet, Service::Breath] {
             assert!(!service.keeps_running_in_background());
@@ -2284,11 +2306,11 @@ mod youtube_transition_tests {
     }
 
     #[test]
-    fn other_services_keep_the_old_close_policy() {
-        for service in [Service::Meet, Service::Breath] {
+    fn every_service_transition_minimizes() {
+        for service in [Service::Meet, Service::Breath, Service::YouTube] {
             assert_eq!(
                 service_transition_input(service, ServicePanelState::default()),
-                Some(ServiceInput::Close)
+                Some(ServiceInput::Minimize)
             );
         }
     }

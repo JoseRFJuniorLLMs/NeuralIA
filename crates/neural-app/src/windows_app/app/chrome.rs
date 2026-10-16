@@ -1399,7 +1399,7 @@ impl App {
                 else {
                     return;
                 };
-                let request = hover_tooltip(owner, &column_hint_text(hint, provider));
+                let request = hover_tooltip(owner, &column_hint_text(hint, provider, col));
                 self.column_hint = Some(ColumnHintOwner { col, request });
             }
             ColumnHintStep::Clear => {
@@ -1585,6 +1585,11 @@ impl App {
                 .as_ref()
                 .and_then(|comp| comp.split.as_ref())
                 .is_some_and(|split| split.minimized),
+            minimized: self
+                .comparator
+                .as_ref()
+                .map(|comp| comp.minimized)
+                .unwrap_or([false; COMPARATOR_COLUMNS]),
             downloads: downloads_badge(&self.downloads.manager),
             omnibox_focused: self
                 .omnibox

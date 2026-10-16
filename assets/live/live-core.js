@@ -149,9 +149,9 @@
       {
         action: {
           type: 'STRING',
-          description: 'Ação: expand_column, minimize_column, restore_columns, toggle_split_fullscreen, close_split, zoom_in, zoom_out ou zoom_reset.'
+          description: 'Ação: minimize_column, restore_column, toggle_column, expand_column, restore_columns, toggle_split_fullscreen, close_split, zoom_in, zoom_out ou zoom_reset.'
         },
-        column: { type: 'INTEGER', description: 'Índice da coluna (0=Gemini, 1=ChatGPT, 2=Claude).' }
+        column: { type: 'INTEGER', description: 'Índice da coluna (0=Gemini Shift+Alt+1, 1=ChatGPT Shift+Alt+2, 2=Claude Shift+Alt+3).' }
       },
       ['action']
     ),
@@ -368,10 +368,10 @@
     // 10. Servicos em Segundo Plano e Midia
     toolDecl(
       'services_panel',
-      'Abre, minimiza para segundo plano ou fecha um serviço integrado (WhatsApp, YouTube, Gmail, Outlook, Teams, Meet, Breath).',
+      'Abre ou minimiza um serviço integrado (WhatsApp, YouTube, Gmail, Outlook, Teams, Meet, Breath). O painel lateral não fecha: close também minimiza.',
       {
         service: { type: 'STRING', description: 'Serviço: whatsapp, youtube, gmail, outlook, teams, meet ou breath.' },
-        action: { type: 'STRING', description: 'Ação: open (padrão), minimize ou close.' }
+        action: { type: 'STRING', description: 'Ação: open (padrão) ou minimize. close minimiza e não descarta a conta.' }
       },
       ['service']
     ),

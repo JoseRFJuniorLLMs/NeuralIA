@@ -353,7 +353,7 @@ pub enum ServiceInput {
     PageFullscreen(bool),
     /// Esc com o painel em tela cheia.
     Escape,
-    /// "× Fechar" da faixa.
+    /// Pedido de fechar. O painel lateral não fecha: minimiza.
     Close,
 }
 
@@ -365,8 +365,6 @@ pub enum ServiceEffect {
     /// Pedir a pagina que saia da tela cheia dela (`document.exitFullscreen`);
     /// o fim chega depois como `PageFullscreen(false)`.
     ExitPageFullscreen,
-    /// Destruir o painel.
-    Close,
     Nothing,
 }
 
@@ -413,29 +411,26 @@ impl ServicePanelState {
         !self.minimized && !self.fullscreen()
     }
 
+    /// Sai da frente sem largar a conta. Vale encostado e em tela cheia.
+    fn minimize_in_place(&mut self) -> ServiceEffect {
+        if self.minimized {
+            return ServiceEffect::Nothing;
+        }
+        self.page_fullscreen = false;
+        self.app_fullscreen = false;
+        self.minimized = true;
+        ServiceEffect::Relayout
+    }
+
     pub fn step(&mut self, input: ServiceInput) -> ServiceEffect {
         match input {
-            ServiceInput::Close => ServiceEffect::Close,
-            ServiceInput::Minimize => {
-                // A faixa de restaurar usa o mesmo botao: minimizado, ele volta
-                // ao painel. Em tela cheia nao ha faixa, e o botao nao faz nada.
-                if self.minimized {
-                    self.minimized = false;
-                    return ServiceEffect::Relayout;
-                }
-                if !self.docked() {
-                    return ServiceEffect::Nothing;
-                }
-                self.minimized = true;
-                ServiceEffect::Relayout
-            }
-            ServiceInput::IconClick => {
+            ServiceInput::Close => self.minimize_in_place(),
+            ServiceInput::Minimize | ServiceInput::IconClick => {
                 if self.minimized {
                     self.minimized = false;
                     ServiceEffect::Relayout
                 } else {
-                    // Aberto: o icone fecha, como sempre fez.
-                    ServiceEffect::Close
+                    self.minimize_in_place()
                 }
             }
             ServiceInput::ToggleFullscreen => {
@@ -519,8 +514,8 @@ impl ServicePanelState {
     }
 
     /// A faixa nativa de controlos, por cima do painel encostado. Minimizado,
-    /// encolhe para uma barra de restaurar encostada a direita: o video
-    /// continua, e o botao Minimizar passa a restaurar.
+    /// encolhe para uma barra de restaurar encostada a direita: o som já
+    /// parou, a conta fica, e o botao Minimizar passa a restaurar.
     pub fn strip_area(&self, width: f64, logical_w: f64, top: f64, strip: f64) -> Option<Area> {
         if strip <= 0.0 {
             return None;
@@ -632,26 +627,21 @@ pub struct ServiceFrame {
     pub resize_handle: bool,
 }
 
-/// Os tres botoes da faixa, encostados a direita dela, por esta ordem.
+/// Os botoes da faixa, encostados a direita: minimizar e tela cheia.
+/// Não há fechar. O painel lateral minimiza.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StripButton {
     Minimize,
     Fullscreen,
-    Close,
 }
 
 impl StripButton {
-    pub const ALL: [StripButton; 3] = [
-        StripButton::Minimize,
-        StripButton::Fullscreen,
-        StripButton::Close,
-    ];
+    pub const ALL: [StripButton; 2] = [StripButton::Minimize, StripButton::Fullscreen];
 
     pub fn label(self) -> &'static str {
         match self {
             StripButton::Minimize => "\u{2014} Minimizar",
             StripButton::Fullscreen => "\u{26F6} Tela cheia",
-            StripButton::Close => "\u{00D7} Fechar",
         }
     }
 
@@ -659,10 +649,9 @@ impl StripButton {
     pub fn hint(self, service: &str) -> String {
         match self {
             StripButton::Minimize => {
-                format!("Minimizar {service}: sai da frente e continua a tocar (Alt+M)")
+                format!("Minimizar {service}: sai da frente e para o que está a tocar (Alt+M)")
             }
             StripButton::Fullscreen => format!("{service} em tela cheia (Alt+F; Esc volta)"),
-            StripButton::Close => format!("Fechar {service} (Alt+W)"),
         }
     }
 
@@ -670,32 +659,35 @@ impl StripButton {
         match self {
             StripButton::Minimize => ServiceInput::Minimize,
             StripButton::Fullscreen => ServiceInput::ToggleFullscreen,
-            StripButton::Close => ServiceInput::Close,
         }
     }
 }
 
 /// Onde ficam os botoes dentro da faixa, nas unidades dela (`scale` converte
-/// as larguras logicas). Se a faixa for estreita demais, os botoes encolhem
-/// por igual e nunca saem dela.
-pub fn strip_buttons(strip: Area, scale: f64) -> [Area; 3] {
+/// as larguras logicas). Se a faixa for estreita, os dois encolhem e ficam
+/// dentro dela.
+pub fn strip_buttons(strip: Area, scale: f64) -> [Area; 2] {
     let scale = scale.max(0.1);
     let margin = 6.0 * scale;
     let gap = 6.0 * scale;
     let height = (strip.height - 2.0 * margin).max(1.0);
-    let wanted = [112.0 * scale, 112.0 * scale, 88.0 * scale];
-    let room = (strip.width - 2.0 * margin - 2.0 * gap).max(3.0);
+    let mut wanted = [120.0 * scale, 112.0 * scale];
+    let room = (strip.width - 2.0 * margin - gap).max(2.0);
     let total: f64 = wanted.iter().sum();
-    let shrink = (room / total).min(1.0);
+    if total > room {
+        let shrink = room / total;
+        wanted[0] *= shrink;
+        wanted[1] *= shrink;
+    }
     let mut right = strip.x + strip.width - margin;
     let mut out = [Area {
         x: 0.0,
         y: 0.0,
         width: 0.0,
         height: 0.0,
-    }; 3];
-    for index in (0..3).rev() {
-        let width = wanted[index] * shrink;
+    }; 2];
+    for index in (0..2).rev() {
+        let width = wanted[index];
         out[index] = Area {
             x: right - width,
             y: strip.y + margin,
@@ -1120,15 +1112,19 @@ mod tests {
         );
         assert!(state.docked());
 
-        // Minimizar so a partir do painel encostado.
+        // Em tela cheia também minimiza. Não há fechar.
         state.step(ServiceInput::ToggleFullscreen);
-        assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Nothing);
-        state.step(ServiceInput::ToggleFullscreen);
+        assert!(state.fullscreen());
+        assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
+        assert!(state.minimized());
+        assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
+        assert!(state.docked());
 
-        // Aberto, o icone fecha; o x fecha de qualquer modo.
-        assert_eq!(state.step(ServiceInput::IconClick), ServiceEffect::Close);
-        state.step(ServiceInput::Minimize);
-        assert_eq!(state.step(ServiceInput::Close), ServiceEffect::Close);
+        // Aberto, o icone minimiza. Um pedido de fechar também minimiza.
+        assert_eq!(state.step(ServiceInput::IconClick), ServiceEffect::Relayout);
+        assert!(state.minimized());
+        assert_eq!(state.step(ServiceInput::Close), ServiceEffect::Nothing);
+        assert!(state.minimized());
     }
 
     #[test]
@@ -1208,7 +1204,7 @@ mod tests {
         }
         // Por ordem da esquerda para a direita, sem se tocarem.
         assert!(buttons[0].x + buttons[0].width < buttons[1].x);
-        assert!(buttons[1].x + buttons[1].width < buttons[2].x);
+        assert_eq!(StripButton::ALL.len(), 2);
         // O resto da faixa (o nome do servico) nao e botao.
         assert_eq!(strip_hit(strip, 1.0, 1060.0, 105.0), None);
         // Faixa estreita: encolhem, nunca saem dela.
@@ -1224,11 +1220,15 @@ mod tests {
             StripButton::Fullscreen.input(),
             ServiceInput::ToggleFullscreen
         );
-        assert_eq!(StripButton::Close.input(), ServiceInput::Close);
+        assert!(
+            StripButton::ALL
+                .iter()
+                .all(|button| !button.label().contains("Fechar"))
+        );
         assert!(
             StripButton::Minimize
                 .hint("YouTube")
-                .contains("continua a tocar")
+                .contains("para o que está a tocar")
         );
     }
 }

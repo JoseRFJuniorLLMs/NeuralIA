@@ -186,15 +186,13 @@ fn minimized_service_keeps_controls_while_close_discards_the_panel() {
     );
     assert!(frame.panel.is_none());
     assert!(frame.strip.is_some());
-    assert_eq!(state.step(ServiceInput::Close), ServiceEffect::Close);
+    assert_eq!(state.step(ServiceInput::Close), ServiceEffect::Nothing);
+    assert!(state.minimized());
+    assert_eq!(StripButton::ALL.len(), 2);
     assert!(
-        service_panel_hint(
-            BarHit::ServiceStrip(StripButton::Close),
-            Service::WhatsApp,
-            None
-        )
-        .expect("fechar")
-        .contains("Fechar")
+        StripButton::ALL
+            .iter()
+            .all(|button| !button.label().contains("Fechar"))
     );
     assert!(
         service_panel_hint(
@@ -205,4 +203,165 @@ fn minimized_service_keeps_controls_while_close_discards_the_panel() {
         .expect("minimizar")
         .contains("mantém os controles")
     );
+    assert!(service_should_pause(false, true));
+    assert!(!service_should_pause(true, true));
+    assert!(!service_should_pause(true, false));
+    assert!(SERVICE_PAUSE_SCRIPT.contains("pause()"));
+    assert!(SERVICE_PAUSE_SCRIPT.contains("pauseVideo"));
+}
+
+/// Cada IA tem o seu atalho de minimizar e restaurar, na dica do botão e no
+/// chip, e o Gemini Live aceita esses nomes em vez de restaurar tudo.
+#[test]
+fn each_ai_column_has_its_own_minimize_and_restore_shortcut() {
+    let keys = ["Shift+Alt+1", "Shift+Alt+2", "Shift+Alt+3"];
+    let names = ["Google Gemini", "ChatGPT", "Claude"];
+    let commands = [
+        CommandId::MinimizeColumnOne,
+        CommandId::MinimizeColumnTwo,
+        CommandId::MinimizeColumnThree,
+    ];
+    let keymap = Keymap::build(COMMANDS).expect("atalhos unicos");
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(column_toggle_shortcut(index).as_deref(), Some(*key));
+        assert_eq!(
+            command_row(commands[index])
+                .and_then(|row| row.chords.first())
+                .map(|spec| shortcut_text(spec.chord))
+                .as_deref(),
+            Some(*key)
+        );
+        let minimize = bar_tooltip_label(
+            BarHit::ColumnMinimize(index),
+            &BarState::default(),
+            names[index],
+            None,
+            None,
+        );
+        assert_eq!(
+            minimize.as_deref(),
+            Some(format!("Minimizar {} ({key})", names[index]).as_str())
+        );
+        assert_eq!(
+            column_hint_text(ColumnHint::Minimize, names[index], index),
+            format!("Minimizar {} ({key})", names[index])
+        );
+        let mut state = BarState::default();
+        state.minimized[index] = true;
+        let chip = bar_tooltip_label(BarHit::Column(index), &state, names[index], None, None);
+        assert_eq!(
+            chip.as_deref(),
+            Some(format!("Restaurar {} ({key})", names[index]).as_str())
+        );
+        let input = AcceleratorInput {
+            vk: u32::from(b'1') + index as u32,
+            down: true,
+            ctrl: false,
+            shift: true,
+            alt: true,
+            repeat: false,
+        };
+        let decision = accelerator_decision(&keymap, input, CommandOrigin::Window);
+        assert!(decision.handled);
+        assert!(matches!(
+            decision.event,
+            Some(UserEvent::RunCommandKey { key: id, origin: CommandOrigin::Window }) if id == commands[index]
+        ));
+        assert_eq!(
+            format!(
+                "{:?}",
+                resolve_command(
+                    commands[index],
+                    CommandOrigin::Host(WebViewHost::Column(index))
+                )
+            ),
+            format!(
+                "{:?}",
+                Some(UserEvent::NativeShortcut(
+                    commands[index],
+                    CommandOrigin::Host(WebViewHost::Column(index))
+                ))
+            )
+        );
+    }
+    let open = bar_tooltip_label(
+        BarHit::Column(1),
+        &BarState::default(),
+        "ChatGPT",
+        None,
+        None,
+    );
+    assert_eq!(open.as_deref(), Some("ChatGPT: expandir esta coluna (F11)"));
+
+    let mut minimized = [false; COMPARATOR_COLUMNS];
+    let mut expanded = Some(1usize);
+    let mut split = source_page();
+    assert_eq!(
+        toggle_column_minimized_state(
+            &mut minimized,
+            COMPARATOR_COLUMNS,
+            1,
+            &mut expanded,
+            Some(&mut split)
+        ),
+        ColumnToggle::Minimized
+    );
+    assert!(minimized[1]);
+    assert_eq!(expanded, None);
+    assert_eq!(
+        toggle_column_minimized_state(
+            &mut minimized,
+            COMPARATOR_COLUMNS,
+            1,
+            &mut expanded,
+            Some(&mut split)
+        ),
+        ColumnToggle::Restored
+    );
+    assert!(!minimized[1]);
+    assert_eq!(split.source_index, 1);
+    assert!(!split.fullscreen);
+    assert_eq!(
+        toggle_column_minimized_state::<&str>(&mut minimized, 3, 9, &mut expanded, None),
+        ColumnToggle::Ignored
+    );
+
+    assert_eq!(
+        parse_browser_layout("minimize_column", 2),
+        BrowserLayoutAction::Minimize(2)
+    );
+    assert_eq!(
+        parse_browser_layout("restore_column", 0),
+        BrowserLayoutAction::RestoreColumn(0)
+    );
+    assert_eq!(
+        parse_browser_layout("toggle_column", 1),
+        BrowserLayoutAction::ToggleColumn(1)
+    );
+    assert_eq!(
+        parse_browser_layout("restore_columns", 0),
+        BrowserLayoutAction::RestoreAll
+    );
+    assert_eq!(
+        parse_browser_layout("zoom_in", 0),
+        BrowserLayoutAction::ZoomIn
+    );
+    assert_eq!(
+        parse_browser_layout("nope", 1),
+        BrowserLayoutAction::Unknown
+    );
+    let live = crate::gemini_live::LIVE_CORE_JS;
+    for name in ["minimize_column", "restore_column", "toggle_column"] {
+        assert!(live.contains(name), "o Gemini Live nao declara {name}");
+    }
+    let panels = include_str!("app/panels.rs");
+    let layout = panels
+        .split("\"browser_layout\" =>")
+        .nth(1)
+        .expect("browser_layout");
+    assert!(layout.contains("parse_browser_layout"));
+    assert!(layout.contains("BrowserLayoutAction::Minimize"));
+    assert!(layout.contains("BrowserLayoutAction::RestoreColumn"));
+    assert!(layout.contains("BrowserLayoutAction::ToggleColumn"));
+    assert!(!layout.contains("_ => self.restore_comparator()"));
 }

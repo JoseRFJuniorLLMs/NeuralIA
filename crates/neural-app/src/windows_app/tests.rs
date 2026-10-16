@@ -8581,13 +8581,18 @@ __on('neuralia-comp-expand', 'mouseleave');
         .iter()
         .filter_map(|message| parse_ipc_message(message.as_str()?, CAP, 3))
         .map(|action| match App::column_ipc_event_impl(1, action) {
-            Some(UserEvent::ColumnHint { col: 1, hint }) => column_hint_text(hint, "ChatGPT"),
+            Some(UserEvent::ColumnHint { col: 1, hint }) => column_hint_text(hint, "ChatGPT", 1),
             other => panic!("a coluna publicou outra coisa: {other:?}"),
         })
         .collect();
     assert_eq!(
         texts,
-        ["Minimizar ChatGPT", "", "Expandir ChatGPT (F11)", ""],
+        [
+            "Minimizar ChatGPT (Shift+Alt+2)",
+            "",
+            "Expandir ChatGPT (F11)",
+            ""
+        ],
         "o mouseenter sintetico nao pode pedir dica"
     );
 
@@ -11678,7 +11683,8 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::SplitExpand, Some(SplitFullscreen)),
         (BarHit::SplitClose, Some(CloseSplit)),
         (BarHit::Private, None),
-        (BarHit::ServiceStrip(StripButton::Close), None),
+        (BarHit::ServiceStrip(StripButton::Minimize), None),
+        (BarHit::ServiceStrip(StripButton::Fullscreen), None),
         (BarHit::Service(Service::Meet), None),
         (BarHit::GmailToggle, None),
         (BarHit::Tool(Tool::Pomodoro), None),
@@ -21713,7 +21719,7 @@ fn a_minimized_service_marks_the_button_that_opened_it() {
 /// Gate: o botao que abriu o painel de servicos -- o icone do servico ou,
 /// na Respiracao, o botao dela nas ferramentas, onde fica o ponto de
 /// minimizado -- diz o que o clique faz no modo do painel: minimizado,
-/// que volta (e se continua a tocar); aberto, que fecha. Sem o painel
+/// que volta (e se continua a tocar); aberto, que minimiza. Sem o painel
 /// dele aberto, a dica e a de sempre.
 #[test]
 fn the_button_that_opened_a_service_panel_hints_its_state() {
@@ -21729,7 +21735,7 @@ fn the_button_that_opened_a_service_panel_hints_its_state() {
         ),
         (
             None,
-            format!("{breath} aberto ao lado · clique para fechar"),
+            format!("{breath} aberto ao lado · clique para minimizar"),
         ),
     ] {
         assert_eq!(

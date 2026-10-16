@@ -76,10 +76,24 @@ impl Service {
     }
 }
 
-/// Pausa o video ao ocultar o YouTube. Minimizar nao corre isto: a faixa de
-/// restaurar deixa o video a tocar.
+/// Pausa o video ao ocultar o YouTube.
 pub(in crate::windows_app) const YOUTUBE_PAUSE_SCRIPT: &str =
     "(function(){try{var v=document.querySelector('video');if(v)v.pause();}catch(e){}})();";
+
+/// Minimizar para o que está a tocar. Não fecha a conta: a página fica,
+/// parada, até restaurar. O painel lateral não fecha.
+pub(in crate::windows_app) const SERVICE_PAUSE_SCRIPT: &str = "(function(){\
+try{var list=document.querySelectorAll('video,audio');for(var i=0;i<list.length;i++){list[i].pause();}}catch(e){}\
+try{var p=document.getElementById('movie_player');if(p&&typeof p.pauseVideo==='function'){p.pauseVideo();}}catch(e){}\
+})();";
+
+/// Entrou em minimizado: o som tem de parar. Restaurar e os outros passos, não.
+pub(in crate::windows_app) fn service_should_pause(
+    was_minimized: bool,
+    now_minimized: bool,
+) -> bool {
+    !was_minimized && now_minimized
+}
 
 /// Para onde vai o teclado quando um painel ao lado fecha.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +154,9 @@ pub(in crate::windows_app) fn release_panel<V: PanelView>(
     }
 }
 
-/// Fecha o painel de servico que houver, com o teclado devolvido por
-/// `release_panel`. `false`: nao havia nenhum. No app a vista e o
-/// `ServicePanel` inteiro (a WebView dele); nos gates, uma de mentira.
+/// Fecha um painel de mentira nos gates do teclado. O painel lateral do
+/// produto não passa por aqui: minimiza.
+#[allow(dead_code)]
 pub(in crate::windows_app) fn close_service_panel_in<V: PanelView>(
     slot: &mut Option<V>,
     surface: Surface,
@@ -720,7 +734,7 @@ pub(in crate::windows_app) fn save_gmail_setting(
 
 /// O que o painel de servicos acrescenta ao chrome nativo: o ponto no icone
 /// do servico minimizado (vermelho a tocar, na cor de destaque em silencio) e
-/// a faixa [— Minimizar] [⛶ Tela cheia] [× Fechar] por cima do painel.
+/// a faixa [— Minimizar] [⛶ Tela cheia] por cima do painel. Não há fechar.
 pub(in crate::windows_app) fn draw_service_chrome(
     window: &Window,
     split_active: bool,
@@ -812,10 +826,10 @@ pub(in crate::windows_app) fn draw_service_chrome(
             );
             for (rect, button) in buttons.iter().zip(StripButton::ALL) {
                 let hovered = hover == Some(BarHit::ServiceStrip(button));
-                let style = match (button, hovered) {
-                    (StripButton::Close, _) => caption_button_style(2, hovered, &theme),
-                    (_, true) => PillStyle::new(theme.surface_line, theme.surface_line, theme.fg),
-                    (_, false) => PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+                let style = if hovered {
+                    PillStyle::new(theme.surface_line, theme.surface_line, theme.fg)
+                } else {
+                    PillStyle::new(theme.surface, theme.surface_line, theme.fg)
                 };
                 draw_pill(
                     hdc,
