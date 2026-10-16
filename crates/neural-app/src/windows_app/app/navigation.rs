@@ -696,7 +696,7 @@ impl App {
             return;
         }
 
-        self.compare(CompareRequest::ask(input));
+        self.handle_input(format!("compare:{trimmed}"));
     }
 
     /// Endereco digitado no controlo nativo: usa as mesmas rotas da palette,
