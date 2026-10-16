@@ -2,6 +2,15 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.1.0] - 2026-10-15
+
+### Added
+- **Atalho por coluna de IA.** Shift+Alt+1 minimiza ou restaura o Gemini, Shift+Alt+2 o ChatGPT e Shift+Alt+3 o Claude. O atalho aparece na dica do botão minimizar e no chip da coluna já minimizada. O Gemini Live aceita `minimize_column`, `restore_column` e `toggle_column`. Uma ação desconhecida deixa de restaurar as três colunas.
+- **51 comandos nativos** no mapa de atalhos (eram 48).
+
+### Fixed
+- **O painel lateral só minimiza.** WhatsApp, YouTube, Teams, Outlook, Gmail, Meet e Respiração deixam de ter o botão × Fechar. Minimizar para o que está a tocar e mantém a conta. O clique no ícone, Alt+W, Ctrl+W nesse painel e o `close` do Gemini Live minimizam. Trocar de serviço também minimiza o anterior e para o som.
+
 ## [3.0.3] - 2026-10-15
 
 ### Added
