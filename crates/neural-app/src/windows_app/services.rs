@@ -205,9 +205,9 @@ pub(in crate::windows_app) fn service_key_event(
     is_escape_down(virtual_key, key_down).then_some(UserEvent::ServiceEscape(generation))
 }
 
-/// A largura que as colunas cedem ao painel da direita aberto. Minimizado, o
-/// servico deixa so a faixa de restaurar; se o historico ou o Gemini Live
-/// estiverem abertos, e esse painel que ocupa o lugar.
+/// A largura que as colunas cedem ao painel da direita aberto. Minimizado,
+/// as colunas recuperam a janela; se o historico ou o Gemini Live estiverem
+/// abertos, e esse painel que ocupa o lugar, sem faixa vazia no meio.
 pub(in crate::windows_app) fn reserved_panel_width(
     service: Option<ServicePanelState>,
     live_open: bool,
@@ -505,8 +505,8 @@ pub(in crate::windows_app) fn start_whatsapp_with_notifications(
 /// o painel dele fica ao lado das colunas como os outros (o estado vem do
 /// `ServicePanel`, igual para todos); o do Gemini Live (`live_panel`) tem a
 /// largura dos servicos. As larguras sao as escolhidas pela borda
-/// (`panel-width.json`). Minimizado, cede so a faixa de restaurar
-/// (`reserved_panel_width`).
+/// (`panel-width.json`). Minimizado, nao cede largura: a faixa de restaurar
+/// fica na barra (`reserved_panel_width`).
 pub(in crate::windows_app) fn open_panel_width_for(
     surface: Surface,
     service: Option<ServicePanelState>,

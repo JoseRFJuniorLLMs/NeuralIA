@@ -475,11 +475,12 @@ impl ServicePanelState {
         }
     }
 
-    /// A largura que o comparador cede ao painel. Minimizado, so a faixa de
-    /// restaurar (o video continua); ocultar e que devolve a janela toda.
+    /// A largura que o comparador cede ao painel. Minimizado, as colunas
+    /// recuperam a janela inteira: a faixa de restaurar fica na barra, por
+    /// cima, e nao deixa uma coluna vazia.
     pub fn reserved_width(&self, width: f64) -> f64 {
         if self.minimized {
-            restore_bar_width(width)
+            0.0
         } else {
             width
         }
@@ -514,8 +515,9 @@ impl ServicePanelState {
     }
 
     /// A faixa nativa de controlos, por cima do painel encostado. Minimizado,
-    /// encolhe para uma barra de restaurar encostada a direita: o som já
-    /// parou, a conta fica, e o botao Minimizar passa a restaurar.
+    /// sobe para a barra (os `strip` px imediatamente acima de `top`): o
+    /// som já parou, a conta fica, o botao passa a restaurar, e as colunas
+    /// ocupam o lugar do painel sem um buraco por baixo da faixa.
     pub fn strip_area(&self, width: f64, logical_w: f64, top: f64, strip: f64) -> Option<Area> {
         if strip <= 0.0 {
             return None;
@@ -527,7 +529,7 @@ impl ServicePanelState {
             }
             return Some(Area {
                 x: (logical_w - bar).max(0.0),
-                y: top,
+                y: (top - strip).max(0.0),
                 width: bar,
                 height: strip,
             });
@@ -1003,14 +1005,14 @@ mod tests {
         // ganha o ponto -- vermelho a tocar, neutro em silencio.
         assert_eq!(state.step(ServiceInput::Minimize), ServiceEffect::Relayout);
         assert!(state.minimized());
-        assert_eq!(state.reserved_width(560.0), 320.0);
+        assert_eq!(state.reserved_width(560.0), 0.0);
         assert_eq!(state.panel_area(560.0, 1600.0, 900.0, 88.0, 34.0), None);
         let restore = state
             .strip_area(560.0, 1600.0, 88.0, 34.0)
             .expect("faixa de restaurar");
         assert_eq!(
             (restore.x, restore.y, restore.width, restore.height),
-            (1280.0, 88.0, 320.0, 34.0)
+            (1280.0, 54.0, 320.0, 34.0)
         );
         assert_eq!(state.strip_area(560.0, 1600.0, 88.0, 0.0), None);
         // O mesmo botao, na faixa, volta ao painel encostado.
@@ -1152,11 +1154,12 @@ mod tests {
         assert!(docked.strip.is_some() && docked.resize_handle);
         assert!(!docked.window_fullscreen && !docked.exit_button);
 
-        // Minimizado: o video sai, fica a faixa de restaurar, sem pega.
+        // Minimizado: o video sai, a faixa sobe para a barra, as colunas
+        // recuperam a largura, sem pega.
         state.step(ServiceInput::Minimize);
         let minimized = frame(&state);
         assert_eq!(minimized.panel, None);
-        assert_eq!(minimized.reserved_width, 320.0);
+        assert_eq!(minimized.reserved_width, 0.0);
         assert_eq!(
             minimized
                 .strip

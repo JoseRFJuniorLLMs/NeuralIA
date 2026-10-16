@@ -645,6 +645,10 @@ pub(in crate::windows_app) struct ComparatorState {
     /// Largura logica ocupada a direita por um painel lateral aberto (0 sem
     /// painel): as colunas repartem so o que sobra, como no Chrome.
     pub(in crate::windows_app) panel_width: f64,
+    /// Largura logica da faixa de restaurar na barra, quando um servico esta
+    /// minimizado. Nao tira largura as colunas: so impede as abas de
+    /// entrarem por baixo dos botoes.
+    pub(in crate::windows_app) restore_strip: f64,
 }
 
 /// Janelas da palette nativa: o popup que desenha a caixa e o EDIT onde o
@@ -698,6 +702,7 @@ fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarC
             minimized: comp.minimized,
             split_active: comp.split.is_some(),
             panel_width: comp.panel_width,
+            restore_strip: comp.restore_strip,
             pomodoro_label,
             ..BarColumns::even(comp.views.len())
         };
@@ -708,6 +713,7 @@ fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarC
         minimized: comp.minimized,
         split_active: comp.split.is_some(),
         panel_width: comp.panel_width,
+        restore_strip: comp.restore_strip,
         pomodoro_label,
     }
 }

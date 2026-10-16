@@ -282,6 +282,7 @@ mod bar_geometry {
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
             panel_width: 0.0,
+            restore_strip: 0.0,
             pomodoro_label: None,
         }
     }
@@ -359,6 +360,7 @@ mod bar_geometry {
             minimized: [false, true, false],
             split_active: false,
             panel_width: 0.0,
+            restore_strip: 0.0,
             pomodoro_label: None,
         };
         let layout = BarLayout::with_contexts(1120.0, 1.0, true, columns, [0; COMPARATOR_COLUMNS]);
@@ -8777,8 +8779,8 @@ fn the_history_panel_scrollbar_is_thin_and_follows_the_theme() {
 }
 
 /// Arrastar a borda do painel muda a largura dele e as colunas das IAs
-/// refluem ate a borda nova, sem buraco nem sobreposicao; minimizado, fica
-/// so a faixa de restaurar. E a mesma conta que o layout, os divisores e o
+/// refluem ate a borda nova, sem buraco nem sobreposicao; minimizado, as
+/// colunas recuperam a janela. E a mesma conta que o layout, os divisores e o
 /// arrasto dos divisores usam.
 #[test]
 fn the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized() {
@@ -8820,15 +8822,12 @@ fn the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized() {
         assert!((300.0..=960.0).contains(&panel_w), "{panel_w}");
     }
 
-    // Minimizado: fica a faixa de restaurar. O resto da janela volta as colunas.
+    // Minimizado: as colunas recuperam a janela. A faixa fica na barra.
     let mut minimized = ServicePanelState::default();
     minimized.step(ServiceInput::Minimize);
     let reserved = reserved_panel_width(Some(minimized), false, false, 600.0, 440.0);
-    assert_eq!(reserved, 320.0);
-    assert_eq!(
-        comparator_logical_width(window_w, reserved),
-        window_w - 320.0
-    );
+    assert_eq!(reserved, 0.0);
+    assert_eq!(comparator_logical_width(window_w, reserved), window_w);
     // Minimizado e com o historico aberto ao lado: conta o historico.
     assert_eq!(
         reserved_panel_width(Some(minimized), false, true, 600.0, 440.0),
@@ -8836,6 +8835,33 @@ fn the_columns_reflow_to_the_panel_edge_and_reclaim_it_when_minimized() {
     );
     // Os outros paineis cedem a largura deles.
     assert_eq!(reserved_panel_width(None, true, false, 600.0, 440.0), 600.0);
+    // A faixa de restaurar fica na barra, acima das colunas, e as abas param
+    // antes dela. Por baixo, a janela e das colunas.
+    let strip = minimized
+        .strip_area(600.0, window_w, COMPARATOR_CHROME_HEIGHT, 34.0)
+        .expect("faixa na barra");
+    assert!(strip.y + strip.height <= COMPARATOR_CHROME_HEIGHT + 1e-6);
+    let layout = BarLayout::with_contexts(
+        window_w,
+        1.0,
+        true,
+        BarColumns {
+            restore_strip: strip.width,
+            ..BarColumns::even(1)
+        },
+        [0; COMPARATOR_COLUMNS],
+    );
+    let mut right = layout.columns[0].x + layout.columns[0].width;
+    right = right.max(layout.add_tabs[0].x + layout.add_tabs[0].width);
+    for button in ColumnButton::ALL {
+        let rect = layout.column_button(0, button);
+        right = right.max(rect.x + rect.width);
+    }
+    assert!(
+        right <= strip.x + 1.0,
+        "as abas entram na faixa de restaurar: {right} > {}",
+        strip.x
+    );
     assert_eq!(reserved_panel_width(None, false, true, 600.0, 440.0), 440.0);
     assert_eq!(reserved_panel_width(None, false, false, 600.0, 440.0), 0.0);
 }
@@ -16437,6 +16463,7 @@ fn bar_columns_follow_the_dragged_weights() {
         minimized: [false; COMPARATOR_COLUMNS],
         split_active: false,
         panel_width: 0.0,
+        restore_strip: 0.0,
         pomodoro_label: None,
     };
     // 1920 px: com 2:1:1 a terceira coluna tem 480 px, e o canto direito
@@ -16487,6 +16514,7 @@ fn minimized_columns_become_chips_next_to_the_right_controls() {
         minimized: [false, true, false],
         split_active: false,
         panel_width: 0.0,
+        restore_strip: 0.0,
         pomodoro_label: None,
     };
     let layout = BarLayout::with_contexts(1600.0, 1.0, true, state, [0; 3]);
@@ -20282,6 +20310,7 @@ fn ui_100_interaction_matrix_keeps_click_targets_unambiguous() {
                     minimized,
                     split_active,
                     panel_width: 0.0,
+                    restore_strip: 0.0,
                     pomodoro_label: None,
                 };
                 let layout =
@@ -20466,6 +20495,7 @@ fn tool_buttons_never_overlap_the_bar_at_any_width() {
                         minimized,
                         split_active,
                         panel_width: 0.0,
+                        restore_strip: 0.0,
                         pomodoro_label,
                     };
                     let layout =
@@ -20612,6 +20642,7 @@ fn the_tools_never_take_room_from_the_ai_columns() {
                 minimized,
                 split_active,
                 panel_width: 0.0,
+                restore_strip: 0.0,
                 pomodoro_label,
             },
             [3, 3, 3],

@@ -168,6 +168,9 @@ pub(in crate::windows_app) struct BarColumns {
     pub(in crate::windows_app) split_active: bool,
     /// Largura logica do painel lateral a direita; as colunas ficam antes dele.
     pub(in crate::windows_app) panel_width: f64,
+    /// Faixa de restaurar de um servico minimizado, no canto da barra. As
+    /// abas param antes dela; as colunas por baixo ocupam a janela toda.
+    pub(in crate::windows_app) restore_strip: f64,
     /// Tempo que falta no Pomodoro, ao lado do icone dele; alarga o botao.
     pub(in crate::windows_app) pomodoro_label: Option<BarLabel>,
 }
@@ -182,6 +185,7 @@ impl BarColumns {
             minimized: [false; COMPARATOR_COLUMNS],
             split_active: false,
             panel_width: 0.0,
+            restore_strip: 0.0,
             pomodoro_label: None,
         }
     }
@@ -540,7 +544,11 @@ impl BarLayout {
         } else {
             chips_w + 8.0 * scale
         };
-        let bar_right = (controls_left - 8.0 * scale - reserved).max(pad);
+        let bar_right = (controls_left
+            - 8.0 * scale
+            - reserved
+            - columns.restore_strip.max(0.0) * scale)
+            .max(pad);
 
         for (slot, span) in spans.iter().enumerate() {
             let mut left = span.x * scale + group_pad;

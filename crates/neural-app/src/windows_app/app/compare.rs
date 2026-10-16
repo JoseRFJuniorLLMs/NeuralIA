@@ -434,6 +434,7 @@ impl App {
             next_context_id: restored.next_context_id,
             bar_focus: [None; COMPARATOR_COLUMNS],
             panel_width: 0.0,
+            restore_strip: 0.0,
         });
         self.activate_comparator(true);
         if let Some(notice) = tabs_notice {

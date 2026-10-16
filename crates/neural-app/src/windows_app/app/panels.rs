@@ -377,8 +377,16 @@ impl App {
     ) -> Option<ServiceFrame> {
         let (logical_w, logical_h, top, _) = self.panel_space()?;
         // A faixa de controlos so existe no comparador, que e onde ha barra.
+        // Minimizado, ela sobe para essa barra. Se outro painel ou a gaveta
+        // ja ocupam o canto, a faixa sai: o icone do servico e que restaura.
         let other_panel = self.live_panel.is_docked() || self.side_panel.is_open();
-        let strip = if self.surface == Surface::Comparator && !(state.minimized() && other_panel) {
+        let split_open = self
+            .comparator
+            .as_ref()
+            .is_some_and(|comp| comp.split.is_some());
+        let strip = if self.surface == Surface::Comparator
+            && !(state.minimized() && (other_panel || split_open))
+        {
             SERVICE_STRIP_HEIGHT
         } else {
             0.0
@@ -1732,10 +1740,28 @@ impl App {
     /// apareciam por cima dele.
     pub(in crate::windows_app) fn fit_comparator_to_panel(&mut self) {
         let width = self.open_panel_width();
+        // Minimizado, a faixa fica na barra e as colunas ocupam a janela.
+        // A largura dela reserva o canto da barra, nao uma coluna vazia.
+        let restore_strip = self
+            .service_frame()
+            .filter(|_| {
+                self.service_panel
+                    .as_ref()
+                    .is_some_and(|panel| panel.state.minimized())
+            })
+            .and_then(|frame| frame.strip)
+            .map(|area| area.width)
+            .unwrap_or(0.0);
         let Some(comp) = &mut self.comparator else {
             return;
         };
-        if (comp.panel_width - width).abs() < 0.5 {
+        let width_same = (comp.panel_width - width).abs() < 0.5;
+        let strip_same = (comp.restore_strip - restore_strip).abs() < 0.5;
+        comp.restore_strip = restore_strip;
+        if width_same {
+            if !strip_same {
+                self.request_redraw();
+            }
             return;
         }
         comp.panel_width = width;

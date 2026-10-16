@@ -2,6 +2,11 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.1.1] - 2026-10-15
+
+### Fixed
+- **Minimizar o painel da direita devolve o lugar às colunas.** YouTube, WhatsApp e os outros serviços deixam de reservar uma coluna vazia de 320 px. O ChatGPT (e as outras colunas) ocupam essa largura. Se o histórico ou o Gemini Live estiverem abertos, são eles que ficam no lugar. Restaurar e Tela cheia sobem para a barra.
+
 ## [3.1.0] - 2026-10-15
 
 ### Added
