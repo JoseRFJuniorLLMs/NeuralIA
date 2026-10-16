@@ -7022,7 +7022,7 @@ unsafe fn draw_search_lens(hdc: *mut core::ffi::c_void, rect: RECT, color: Rgb, 
 
     Ellipse(hdc, cx - r, cy - r, cx + r + 1, cy + r + 1);
 
-    let offset = (r as f64 * 0.7071).round() as i32;
+    let offset = (r as f64 * std::f64::consts::FRAC_1_SQRT_2).round() as i32;
     let handle_len = (r as f64 * 1.05).round() as i32;
     MoveToEx(hdc, cx + offset, cy + offset, std::ptr::null_mut());
     LineTo(hdc, cx + offset + handle_len, cy + offset + handle_len);
