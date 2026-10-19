@@ -382,12 +382,9 @@ fn comparator_neural_background_never_overwrites_bar_pixels_across_scales_and_th
         (1440, 900),  // janela maximizada
         (1920, 1080), // janela maximizada alta resolucao
     ];
-    let themes = [
-        Theme::dark((0, 120, 215)),
-        Theme::light((0, 120, 215)),
-    ];
+    let themes = [Theme::dark((0, 120, 215)), Theme::light((0, 120, 215))];
     let buffer_modes = [true, false]; // true: duplo buffer; false: contingencia direta
-    let split_modes = [false, true];  // com e sem fonte lateral
+    let split_modes = [false, true]; // com e sem fonte lateral
 
     for scale in scales {
         let bar_h = (COMPARATOR_CHROME_HEIGHT * scale).round() as i32;
@@ -526,7 +523,8 @@ fn comparator_neural_background_never_overwrites_bar_pixels_across_scales_and_th
                             let content_painted = (bar_h as usize..height as usize).any(|y| {
                                 let row_start = y * stride;
                                 let row_end = row_start + stride;
-                                pixels_after[row_start..row_end] != pixels_before[row_start..row_end]
+                                pixels_after[row_start..row_end]
+                                    != pixels_before[row_start..row_end]
                             });
                             assert!(
                                 content_painted,
@@ -545,7 +543,8 @@ fn comparator_neural_background_never_overwrites_bar_pixels_across_scales_and_th
 /// testa a restauracao individual de cada IA (Gemini, ChatGPT, Claude) preservando
 /// a pagina e sessao da fonte lateral.
 #[test]
-fn minimized_columns_remain_visible_and_clickable_through_animation_frames_and_restore_preserves_page() {
+fn minimized_columns_remain_visible_and_clickable_through_animation_frames_and_restore_preserves_page()
+ {
     let mut split = source_page();
     let mut minimized = [false; COMPARATOR_COLUMNS];
     let mut expanded = Some(0);
@@ -586,7 +585,10 @@ fn minimized_columns_remain_visible_and_clickable_through_animation_frames_and_r
             // Cada chip deve ter largura positiva e retornar o hit correto
             for index in 0..3 {
                 let chip = layout.columns[index];
-                assert!(chip.width > 0.0, "Chip {index} deve ter largura positiva na escala {scale}");
+                assert!(
+                    chip.width > 0.0,
+                    "Chip {index} deve ter largura positiva na escala {scale}"
+                );
                 assert_eq!(
                     bar_hit_at(
                         Some(controls),
@@ -708,4 +710,3 @@ fn minimized_columns_remain_visible_and_clickable_through_animation_frames_and_r
     assert_eq!(split.webview, "pagina com sessao e formulario preenchido");
     assert_eq!(split.context_id, Some(42));
 }
-

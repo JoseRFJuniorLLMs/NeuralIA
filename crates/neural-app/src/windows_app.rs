@@ -7018,15 +7018,7 @@ pub(in crate::windows_app) unsafe fn paint_comparator_neural_background(
         }
 
         BitBlt(
-            dest_hdc,
-            0,
-            content_y,
-            content_w,
-            content_h,
-            mem_dc,
-            0,
-            0,
-            SRCCOPY,
+            dest_hdc, 0, content_y, content_w, content_h, mem_dc, 0, 0, SRCCOPY,
         );
         SelectObject(mem_dc, old_bmp);
         DeleteObject(mem_bmp as _);
