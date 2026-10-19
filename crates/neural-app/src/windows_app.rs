@@ -55,10 +55,10 @@ use windows_sys::Win32::{
         CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
         DT_EDITCONTROL, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL,
-        FillRect, GetDC, GetStockObject, InvalidateRect, LineTo, MoveToEx, NULL_BRUSH,
-        OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SRCCOPY, ScreenToClient,
-        SelectClipRgn, SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn,
-        StretchDIBits, TRANSPARENT,
+        FillRect, GetDC, GetStockObject, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
+        NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RestoreDC, RoundRect,
+        SRCCOPY, SaveDC, ScreenToClient, SelectClipRgn, SelectObject, SetBkColor, SetBkMode,
+        SetTextColor, SetViewportOrgEx, SetWindowRgn, StretchDIBits, TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -6956,53 +6956,105 @@ pub(in crate::windows_app) fn draw_comparator_neural_background(window: &Window)
             return;
         }
 
-        let width = (client.right - client.left) as f64;
-        let height = (client.bottom - client.top) as f64;
+        let width = client.right - client.left;
+        let height = client.bottom - client.top;
         let theme = Theme::system();
 
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = if mem_dc.is_null() {
-            std::ptr::null_mut()
-        } else {
-            CreateCompatibleBitmap(hdc, client.right.max(1), client.bottom.max(1))
-        };
-        let buffered = !mem_dc.is_null() && !mem_bmp.is_null();
-        let target = if buffered { mem_dc } else { hdc };
-        let old_bmp = if buffered {
-            SelectObject(mem_dc, mem_bmp as _)
-        } else {
-            std::ptr::null_mut()
-        };
-
-        let background = CreateSolidBrush(rgb3(theme.page_bg));
-        FillRect(target, &client, background);
-        DeleteObject(background as _);
-        SetBkMode(target, TRANSPARENT as i32);
-
-        if home_animation_enabled() {
-            draw_neural_background(target, width, height, scale, &theme);
-        }
-
-        if buffered {
-            BitBlt(
-                hdc,
-                0,
-                0,
-                client.right.max(1),
-                client.bottom.max(1),
-                mem_dc,
-                0,
-                0,
-                SRCCOPY,
-            );
-            SelectObject(mem_dc, old_bmp);
-            DeleteObject(mem_bmp as _);
-            DeleteDC(mem_dc);
-        } else if !mem_dc.is_null() {
-            DeleteDC(mem_dc);
-        }
+        paint_comparator_neural_background(hdc, width, height, scale, &theme, true);
 
         let _ = ReleaseDC(hwnd, hdc);
+    }
+}
+
+/// Desenha o fundo animado do comparador (rede neuronal) estritamente na regiao
+/// de conteudo abaixo da barra de topo (`COMPARATOR_CHROME_HEIGHT * scale`),
+/// sem tocar em nenhum pixel da barra nem dos chips de restauracao.
+///
+/// O parametro `allow_buffer` permite testar tanto o caminho normal (duplo buffer)
+/// quanto o caminho de contingencia (desenho direto com recorte no DC).
+pub(in crate::windows_app) unsafe fn paint_comparator_neural_background(
+    dest_hdc: *mut core::ffi::c_void,
+    width: i32,
+    height: i32,
+    scale: f64,
+    theme: &Theme,
+    allow_buffer: bool,
+) {
+    let bar_h = (COMPARATOR_CHROME_HEIGHT * scale).round() as i32;
+    let content_y = bar_h.min(height);
+    let content_h = (height - content_y).max(0);
+    let content_w = width.max(0);
+    if content_h <= 0 || content_w <= 0 {
+        return;
+    }
+
+    let mem_dc = if allow_buffer {
+        CreateCompatibleDC(dest_hdc)
+    } else {
+        std::ptr::null_mut()
+    };
+    let mem_bmp = if mem_dc.is_null() {
+        std::ptr::null_mut()
+    } else {
+        CreateCompatibleBitmap(dest_hdc, content_w, content_h)
+    };
+    let buffered = !mem_dc.is_null() && !mem_bmp.is_null();
+
+    if buffered {
+        let old_bmp = SelectObject(mem_dc, mem_bmp as _);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: content_w,
+            bottom: content_h,
+        };
+        let background = CreateSolidBrush(rgb3(theme.page_bg));
+        FillRect(mem_dc, &rect, background);
+        DeleteObject(background as _);
+        SetBkMode(mem_dc, TRANSPARENT as i32);
+
+        if home_animation_enabled() {
+            draw_neural_background(mem_dc, content_w as f64, content_h as f64, scale, theme);
+        }
+
+        BitBlt(
+            dest_hdc,
+            0,
+            content_y,
+            content_w,
+            content_h,
+            mem_dc,
+            0,
+            0,
+            SRCCOPY,
+        );
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(mem_bmp as _);
+        DeleteDC(mem_dc);
+    } else {
+        if !mem_dc.is_null() {
+            DeleteDC(mem_dc);
+        }
+        let saved = SaveDC(dest_hdc);
+        if saved != 0 {
+            IntersectClipRect(dest_hdc, 0, content_y, content_w, height);
+            let content_rect = RECT {
+                left: 0,
+                top: content_y,
+                right: content_w,
+                bottom: height,
+            };
+            let background = CreateSolidBrush(rgb3(theme.page_bg));
+            FillRect(dest_hdc, &content_rect, background);
+            DeleteObject(background as _);
+            SetBkMode(dest_hdc, TRANSPARENT as i32);
+
+            if home_animation_enabled() {
+                SetViewportOrgEx(dest_hdc, 0, content_y, std::ptr::null_mut());
+                draw_neural_background(dest_hdc, content_w as f64, content_h as f64, scale, theme);
+            }
+            RestoreDC(dest_hdc, saved);
+        }
     }
 }
 
@@ -7155,7 +7207,7 @@ unsafe fn paint_comparator_bar<W>(
 /// `live` e o proprio painel do Gemini Live: o olho pinta-se do estado dele,
 /// nao de um booleano que o chamador possa trocar por `false`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn paint_comparator_bar_with_contexts<W>(
+pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
     target: *mut core::ffi::c_void,
     width: i32,
     scale: f64,
