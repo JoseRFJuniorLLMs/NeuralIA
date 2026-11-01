@@ -2,6 +2,15 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.0] - 2026-11-01
+
+### Added
+- **Nova aba na barra superior:** o botão + abre um campo nativo para URL ou pergunta, e a URL abre uma nova aba persistida na coluna do comparador.
+- **Barra de endereço integrada:** digitar uma URL na omnibox do comparador agora abre uma aba de contexto sem trocar para a janela Web isolada.
+- **Áudio das IAs:** capturas de reprodução de ChatGPT, Gemini e Claude habilitadas pelo usuário, lista temporária e exportação MP3 pela interface. Não captura painéis privados.
+- **Serviços sociais:** ícones e acesso aos painéis de X, Instagram, Facebook e Chess.
+
+
 ## [3.1.1] - 2026-10-15
 
 ### Fixed

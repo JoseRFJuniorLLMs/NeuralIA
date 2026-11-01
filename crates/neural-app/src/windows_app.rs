@@ -1137,7 +1137,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         }
         BarHit::SplitBookmark => bookmark_star_tooltip(state.split_bookmarked).to_string(),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
-        BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
+        BarHit::AddTab(_) => format!("Nova aba: digite uma URL ou pergunte ao {provider}"),
         BarHit::ContextTab { .. } => {
             format!(
                 "{}\nClique: abrir ao lado · Arraste: mover · Botão direito: fechar e grupos",
@@ -7560,6 +7560,18 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
             theme,
         );
     }
+
+    // "+" do topo: abre a palette nativa, que aceita URL e cria uma aba
+    // de contexto persistida, sem criar outro motor de navegacao.
+    draw_button(
+        target,
+        layout.title_new_tab,
+        "+",
+        matches!(hover, Some(BarHit::AddTab(_))),
+        scale,
+        font,
+        theme,
+    );
 
     // ‹ e › da fonte aberta ao lado (so existem com a gaveta) e de cada IA.
     let mut pairs = vec![

@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v3.1.3** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v3.2.0** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 
@@ -28,7 +28,12 @@ No comparador, links externos abrem em **Split View** ao lado da IA que gerou a
 fonte; fechar a gaveta devolve a comparação sem perder o contexto. O chrome
 nativo tem duas faixas: no topo, como Chrome/Edge, ficam as **abas/fontes e os
 controles minimizar/maximizar/fechar**; abaixo ficam Home, Gemini, ChatGPT,
-Claude, os botões **+**, Privado e controles de Split View. O clique direito
+Claude, os botões **+**, Privado e controles de Split View. O **+ da faixa superior** abre uma nova entrada nativa para digitar uma URL
+(ou pergunta); a URL vira uma aba da coluna no comparador e entra na sessão
+persistida. A barra de endereço do topo também abre URLs em abas, sem sair do
+comparador. O novo painel **Áudio das IAs** detecta leituras de ChatGPT,
+Gemini e Claude quando ativado e permite exportação MP3 sob ação do usuário.
+O clique direito
 numa aba abre um menu nativo com abrir, tela cheia, fechar, fechar outras e
 fechar todas do grupo.
 

@@ -692,7 +692,13 @@ impl App {
         }
 
         if let Some(url) = detect_web_target(trimmed) {
-            self.web(url);
+            if self.surface == Surface::Comparator {
+                // URL na barra de endereco cria uma aba no comparador, em vez
+                // de sair para a janela Web isolada.
+                self.submit_title_address(url);
+            } else {
+                self.web(url);
+            }
             return;
         }
 

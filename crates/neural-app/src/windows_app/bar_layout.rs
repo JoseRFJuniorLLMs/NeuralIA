@@ -342,6 +342,8 @@ pub(in crate::windows_app) struct BarLayout {
     /// chip e apagado e nao leva o botao "+".
     pub(in crate::windows_app) minimized: [bool; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) add_tabs: [UiRect; COMPARATOR_COLUMNS],
+    /// Novo separador ao lado das abas na faixa superior (URL ou pergunta).
+    pub(in crate::windows_app) title_new_tab: UiRect,
     pub(in crate::windows_app) context_tabs:
         [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) context_indices:
@@ -439,6 +441,7 @@ impl BarLayout {
                 columns: [empty; COMPARATOR_COLUMNS],
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
+                title_new_tab: empty,
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_tab_counts: [0; COMPARATOR_COLUMNS],
@@ -670,16 +673,26 @@ impl BarLayout {
                 .min(window_minimize.x - 8.0 * scale)
                 .max(tabs_left)
         };
+        // Reservar o "+" mesmo quando muitas abas ocupam a faixa.
+        let title_plus_w = 26.0 * scale;
+        let title_plus_gap = 6.0 * scale;
+        let show_title_plus = tabs_right - tabs_left >= title_plus_w + title_plus_gap + 8.0 * scale;
+        let title_tabs_right = if show_title_plus {
+            tabs_right - title_plus_w - title_plus_gap
+        } else {
+            tabs_right
+        };
+        let mut title_plus_x = tabs_left;
         let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
         let mut overflow = [empty; COMPARATOR_COLUMNS];
         let mut overflow_counts = [0usize; COMPARATOR_COLUMNS];
         if (total_slots > 0 || visible_rows.iter().any(|row| row.total_tabs > 0))
-            && tabs_right > tabs_left
+            && title_tabs_right > tabs_left
         {
-            let metrics = TitleRowMetrics::fit(visible_rows, tabs_right - tabs_left, scale);
+            let metrics = TitleRowMetrics::fit(visible_rows, title_tabs_right - tabs_left, scale);
             let gap = metrics.gap;
-            let budgets = metrics.budgets(visible_rows, tabs_right - tabs_left);
+            let budgets = metrics.budgets(visible_rows, title_tabs_right - tabs_left);
             let mut x = tabs_left;
             let tab_y = 3.0 * scale;
             let tab_h = (title_h - 6.0 * scale).max(20.0 * scale);
@@ -692,7 +705,7 @@ impl BarLayout {
                 // acabou de mexer, nunca uma pilula antes das suas abas. O
                 // que sai conta no "‹N" -- nada desaparece sem aviso.
                 let (kept, hidden) = metrics.fit_row(&rows[index], budgets[index]);
-                if hidden > 0 && x + metrics.overflow <= tabs_right {
+                if hidden > 0 && x + metrics.overflow <= title_tabs_right {
                     overflow[index] = UiRect {
                         x,
                         y: tab_y,
@@ -710,10 +723,10 @@ impl BarLayout {
                         continue;
                     }
                     let width = metrics.width(slot);
-                    if x + width > tabs_right + 0.5 {
+                    if x + width > title_tabs_right + 0.5 {
                         break;
                     }
-                    let width = width.min(tabs_right - x);
+                    let width = width.min(title_tabs_right - x);
                     let rect = UiRect {
                         x,
                         y: tab_y,
@@ -759,7 +772,14 @@ impl BarLayout {
                     x += width + gap;
                 }
             }
+            title_plus_x = x;
         }
+        let title_new_tab = UiRect {
+            x: title_plus_x.min(title_tabs_right),
+            y: 3.0 * scale,
+            width: if show_title_plus { title_plus_w } else { 0.0 },
+            height: (title_h - 6.0 * scale).max(20.0 * scale),
+        };
 
         Self {
             visible: true,
@@ -771,6 +791,7 @@ impl BarLayout {
             columns: columns_rect,
             minimized: columns.minimized,
             add_tabs: plus_rect,
+            title_new_tab,
             context_tabs: tabs,
             context_indices: tab_indices,
             context_tab_counts: tab_counts,
@@ -831,6 +852,13 @@ impl BarLayout {
         }
         if self.address.contains(x, y) {
             return Some(BarHit::AddressBar);
+        }
+        if self.title_new_tab.contains(x, y) {
+            // A nova aba usa a primeira coluna visivel, nunca uma minimizada.
+            let source = (0..self.columns_len)
+                .find(|&index| !self.minimized[index])
+                .unwrap_or(0);
+            return Some(BarHit::AddTab(source));
         }
         for index in 0..self.columns_len {
             if self.tab_overflow[index].contains(x, y) {
@@ -1682,6 +1710,23 @@ pub(in crate::windows_app) fn bar_hit_at(
 #[cfg(test)]
 mod sidebar_layout_gates {
     use super::*;
+
+    #[test]
+    fn title_plus_opens_url_palette_without_covering_tabs_or_address() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for width in [1024.0, 1440.0, 1920.0] {
+                let layout = BarLayout::new(width * scale, scale, true, 3);
+                let plus = layout.title_new_tab;
+                assert!(plus.width > 0.0, "new tab must be visible at {width}@{scale}");
+                assert!(plus.x >= 90.0 * scale);
+                assert!(plus.x + plus.width <= layout.address.x || layout.address.width == 0.0);
+                assert_eq!(
+                    layout.hit(plus.x + plus.width / 2.0, plus.y + plus.height / 2.0),
+                    Some(BarHit::AddTab(0)),
+                );
+            }
+        }
+    }
 
     #[test]
     fn social_services_open_the_right_destination_and_hit_their_own_button() {
