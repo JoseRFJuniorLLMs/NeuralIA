@@ -24,6 +24,10 @@
 //! texto consegue provar: presença e, sobretudo, **ausência**.
 
 const ALL_SOURCES: &str = concat!(
+    include_str!("../src/windows_app/audio_capture.rs"),
+    "\n",
+    include_str!("../src/windows_app/audio_library.rs"),
+    "\n",
     include_str!("../src/windows_app.rs"),
     "\n",
     include_str!("../src/windows_app/theme.rs"),

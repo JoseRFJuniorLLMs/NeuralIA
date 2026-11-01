@@ -1525,6 +1525,7 @@ pub(in crate::windows_app) struct HookedBuilder<'app> {
     app: &'app App,
     builder: WebViewBuilder<'static>,
     host: WebViewHost,
+    audio_cap: Option<String>,
 }
 
 impl HookedBuilder<'_> {
@@ -1532,7 +1533,8 @@ impl HookedBuilder<'_> {
     /// ja com os ganchos do hospedeiro.
     pub(in crate::windows_app) fn build_hooked(self, window: &Window) -> wry::Result<WebView> {
         let webview = self.builder.build(window)?;
-        self.app.install_webview_hooks(&webview, self.host);
+        self.app
+            .install_webview_hooks(&webview, self.host, self.audio_cap.as_deref());
         Ok(webview)
     }
 
@@ -1543,7 +1545,8 @@ impl HookedBuilder<'_> {
         window: &Window,
     ) -> wry::Result<WebView> {
         let webview = self.builder.build_as_child(window)?;
-        self.app.install_webview_hooks(&webview, self.host);
+        self.app
+            .install_webview_hooks(&webview, self.host, self.audio_cap.as_deref());
         Ok(webview)
     }
 }
@@ -1563,13 +1566,22 @@ impl App {
     ) -> HookedBuilder<'_> {
         let proxy = self.proxy.clone();
         let epoch = self.translation.epoch(host);
-        let builder = hook_webview_builder(builder, host, local_origin, epoch, move |event| {
+        let mut builder = hook_webview_builder(builder, host, local_origin, epoch, move |event| {
             let _ = proxy.send_event(event);
         });
+        let audio_cap = (capture_host(host) && self.privacy.mode() != PrivacyMode::Private)
+            .then(remote_capability);
+        if let Some(cap) = &audio_cap {
+            builder = builder.with_initialization_script(audio_capture_initialization(
+                cap,
+                self.audio_library.enabled.load(Ordering::Acquire),
+            ));
+        }
         HookedBuilder {
             app: self,
             builder,
             host,
+            audio_cap,
         }
     }
 
@@ -1583,7 +1595,26 @@ impl App {
     /// Privado ao modulo: nenhum sitio regista por conta propria.
     /// Um runtime WebView2 sem um dos eventos deixa a WebView sem esse
     /// gancho e fica no log.
-    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {
+    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost, audio_cap: Option<&str>) {
+        if let Some(cap) = audio_cap {
+            let proxy = self.proxy.clone();
+            if let Err(error) = register_audio_capture(
+                webview,
+                host,
+                cap,
+                Arc::clone(&self.audio_library.enabled),
+                move |audio| {
+                    if let Some(pending) = PendingAudio::new(audio) {
+                        let _ = proxy.send_event(UserEvent::Audio(AudioEvent::Captured(pending)));
+                    }
+                },
+            ) {
+                debug_log(format_args!(
+                    "audio: {} sem captura ({error})",
+                    host.describe()
+                ));
+            }
+        }
         if let Err(error) = install_service_visual_script(webview, host) {
             debug_log(format_args!(
                 "service visual: {} sem timeline ({error})",
@@ -1642,6 +1673,9 @@ impl App {
     /// transicao.
     fn page_loaded(&mut self, page: WebViewHost, url: String) {
         debug_log(format_args!("webview: {} carregou", page.describe()));
+        if capture_host(page) {
+            self.sync_audio_capture_state();
+        }
         self.translation_page_loaded(page);
         self.bookmarks_page_loaded(page, &url);
         self.adblock_page_loaded(page);

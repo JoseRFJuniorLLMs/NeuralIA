@@ -9,6 +9,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExpectedVersion,
 
+    [string]$ExpectedAudioEncoderDir = "",
+
     [switch]$RequireValidSignature,
 
     # Keeps the uninstall registration and the shortcuts inside a private
@@ -182,6 +184,21 @@ function Assert-InstalledPayload([string]$Folder) {
     $installedHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
     if ($installedHash -ne $expectedHash) {
         throw "Installed NeuralIA.exe differs from the CI-tested payload."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedAudioEncoderDir)) {
+        foreach ($relative in @("ffmpeg.exe", "third_party/ffmpeg/LICENSE.txt", "third_party/ffmpeg/README.txt", "third_party/ffmpeg/PROVENANCE.json", "third_party/ffmpeg/SOURCE_CODE.txt")) {
+            $installed = Join-Path $Folder $relative
+            $expected = Join-Path $ExpectedAudioEncoderDir ([IO.Path]::GetFileName($relative))
+            if (-not (Test-Path -LiteralPath $installed -PathType Leaf) -or
+                (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath $expected -Algorithm SHA256).Hash) {
+                throw "Installed audio encoder payload differs from the verified package: $relative."
+            }
+        }
+        $encoderVersion = & (Join-Path $Folder "ffmpeg.exe") -version 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0 -or $encoderVersion -notmatch 'ffmpeg version 9\.0\.2') {
+            throw "Installed FFmpeg encoder cannot run or has the wrong version."
+        }
     }
 }
 

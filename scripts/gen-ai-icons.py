@@ -563,6 +563,57 @@ def about() -> None:
     finish(mask, solid((255, 255, 255)), "about.png")
 
 
+# ------------------------------------------------------------ Social / chess
+def x() -> None:
+    """X em circulo escuro; geometria local, sem descarregamentos."""
+    mask = Image.new("L", (N, N), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.ellipse((N*.08,N*.08,N*.92,N*.92), fill=255)
+    paint = solid((32,32,36))
+    d = ImageDraw.Draw(paint)
+    d.line((N*.29,N*.27,N*.71,N*.73), fill=(255,255,255), width=int(N*.09))
+    d.line((N*.70,N*.27,N*.30,N*.73), fill=(255,255,255), width=int(N*.055))
+    finish(mask, paint, "x.png")
+
+
+def instagram() -> None:
+    """Camera branca sobre circulo violeta."""
+    mask = Image.new("L", (N, N), 0)
+    ImageDraw.Draw(mask).ellipse((N*.08,N*.08,N*.92,N*.92), fill=255)
+    paint = solid((183,51,141))
+    d = ImageDraw.Draw(paint)
+    d.rounded_rectangle((N*.26,N*.26,N*.74,N*.74), radius=N*.12,
+                        outline=(255,255,255), width=int(N*.045))
+    d.ellipse((N*.38,N*.38,N*.62,N*.62), outline=(255,255,255), width=int(N*.04))
+    d.ellipse((N*.62,N*.31,N*.69,N*.38), fill=(255,255,255))
+    finish(mask, paint, "instagram.png")
+
+
+def facebook() -> None:
+    """f geometrico branco sobre circulo azul."""
+    mask = Image.new("L", (N, N), 0)
+    ImageDraw.Draw(mask).ellipse((N*.08,N*.08,N*.92,N*.92), fill=255)
+    paint = solid((24,119,242))
+    d = ImageDraw.Draw(paint)
+    d.line((N*.51,N*.79,N*.51,N*.38,N*.58,N*.29,N*.68,N*.29),
+           fill=(255,255,255), width=int(N*.105), joint="curve")
+    d.line((N*.36,N*.48,N*.66,N*.48), fill=(255,255,255), width=int(N*.09))
+    finish(mask, paint, "facebook.png")
+
+
+def chess() -> None:
+    """Peao claro sobre circulo verde."""
+    mask = Image.new("L", (N, N), 0)
+    ImageDraw.Draw(mask).ellipse((N*.08,N*.08,N*.92,N*.92), fill=255)
+    paint = solid((97,143,47))
+    d = ImageDraw.Draw(paint)
+    d.ellipse((N*.38,N*.22,N*.62,N*.46), fill=(255,255,255))
+    d.polygon([(N*.44,N*.43),(N*.56,N*.43),(N*.62,N*.66),(N*.38,N*.66)],
+              fill=(255,255,255))
+    d.rounded_rectangle((N*.29,N*.66,N*.71,N*.77),radius=N*.035,fill=(255,255,255))
+    finish(mask, paint, "chess.png")
+
+
 ICONS = {
     "gemini": gemini,
     "chatgpt": chatgpt,
@@ -574,6 +625,10 @@ ICONS = {
     "youtube": youtube,
     "gmail": gmail,
     "outlook": outlook,
+    "x": x,
+    "instagram": instagram,
+    "facebook": facebook,
+    "chess": chess,
     "incognito": incognito,
     "live": live,
     "pomodoro": pomodoro,

@@ -37,6 +37,7 @@ pub(in crate::windows_app) enum PanelMessage {
     /// A seccao Downloads (`downloads_ui.rs`): so o numero de uma linha ou
     /// o estado do interruptor, nunca um caminho.
     Downloads(DownloadsPanelRequest),
+    Audio(AudioPanelRequest),
     /// Grafo do Obsidian: correlacao automatica de notas, sites e historico.
     ObsidianGraph,
     /// Pedido de verificacao de atualizacao a partir da secao Sobre.
@@ -85,6 +86,11 @@ pub(in crate::windows_app) const PANEL_SECTIONS: &[PanelSection] = &[
         prefixes: &["downloads"],
         max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
         parse: parse_downloads_action,
+    },
+    PanelSection {
+        prefixes: &["audio"],
+        max_bytes: |_| PANEL_MESSAGE_MAX_BYTES,
+        parse: parse_audio_action,
     },
     PanelSection {
         prefixes: &["obsidian"],
@@ -436,6 +442,7 @@ impl<W: PanelView, N: DraftRescue> SidePanel<W, N> {
             | PanelMessage::NoteDelete(_)
             | PanelMessage::Bookmarks(_)
             | PanelMessage::Downloads(_)
+            | PanelMessage::Audio(_)
             | PanelMessage::ObsidianGraph
             | PanelMessage::CheckUpdate => None,
         };
@@ -713,6 +720,10 @@ pub(in crate::windows_app) fn panel_theme_vars(theme: &Theme) -> serde_json::Val
 pub(in crate::windows_app) fn panel_html(theme: &Theme) -> String {
     PANEL_HTML
         .replace("__THEME__", &panel_theme_vars(theme).to_string())
+        .replace(
+            "__SHORTCUT_ROWS__",
+            &serde_json::to_string(&shortcut_map_rows()).unwrap_or_else(|_| "[]".into()),
+        )
         .replace("__NEURALIA_VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
@@ -735,13 +746,14 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
 "#,
     include_str!("../../../../assets/panel/panel.css"),
     r#"</style></head><body>
-<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Zettelkasten</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button><button class="tab" id="tab-shortcuts" role="tab" aria-selected="false">Teclas de atalho</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
+<header><nav class="tabs" role="tablist"><button class="tab" id="tab-history" role="tab" aria-selected="true">Histórico</button><button class="tab" id="tab-notes" role="tab" aria-selected="false">Zettelkasten</button><button class="tab" id="tab-obsidian" role="tab" aria-selected="false">Obsidian</button><button class="tab" id="tab-bookmarks" role="tab" aria-selected="false">Favoritos</button><button class="tab" id="tab-downloads" role="tab" aria-selected="false">Downloads</button><button class="tab" id="tab-audio" role="tab" aria-selected="false">Áudio</button><button class="tab" id="tab-about" role="tab" aria-selected="false">Sobre</button><button class="tab" id="tab-shortcuts" role="tab" aria-selected="false">Teclas de atalho</button></nav><button id="close" title="Fechar (Esc)">✕</button></header>
 "#,
     include_str!("../../../../assets/panel/history.html"),
     include_str!("../../../../assets/panel/notes.html"),
     include_str!("../../../../assets/panel/obsidian.html"),
     include_str!("../../../../assets/panel/bookmarks.html"),
     include_str!("../../../../assets/panel/downloads.html"),
+    include_str!("../../../../assets/panel/audio.html"),
     include_str!("../../../../assets/panel/about.html"),
     r#"<div class="view" id="view-shortcuts" hidden><main><h2>Teclas de atalho</h2><p>Atalhos do NeuralIA. No painel, pressione F2, digite o número do hint do botão e Enter. Esc cancela. Os números acompanham os botões desta sessão; ações ocultas ou desativadas não são executadas.</p><table><thead><tr><th>Ação</th><th>Atalho</th></tr></thead><tbody id="shortcut-rows"></tbody></table></main></div>"#,
     "<script>\n",
@@ -751,6 +763,7 @@ pub(in crate::windows_app) const PANEL_HTML: &str = concat!(
     include_str!("../../../../assets/panel/obsidian.js"),
     include_str!("../../../../assets/panel/bookmarks.js"),
     include_str!("../../../../assets/panel/downloads.js"),
+    include_str!("../../../../assets/panel/audio.js"),
     include_str!("../../../../assets/panel/about.js"),
     include_str!("../../../../assets/panel/key-hints.js"),
     include_str!("../../../../assets/panel/tabs.js"),

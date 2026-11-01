@@ -1175,8 +1175,8 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
 #[derive(Debug, Clone, Copy)]
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
-    /// Meet, Teams, Outlook, WhatsApp, YouTube e Gmail, a esquerda do Privado.
-    pub(in crate::windows_app) services: [UiRect; 6],
+    /// Servicos de conta e redes sociais, a esquerda do Privado.
+    pub(in crate::windows_app) services: [UiRect; 10],
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
     pub(in crate::windows_app) live: UiRect,
     /// Pomodoro, Respiracao e Sobre (ordem de `Tool::ALL`) na linha de CIMA,
@@ -1251,15 +1251,30 @@ pub(in crate::windows_app) fn title_address_rect(
 ) -> UiRect {
     let scale = scale.max(1.0);
     let right = title_tools_left(client_width, scale, pomodoro_label) - 8.0 * scale;
-    // Reserva espaco para as abas para que nenhuma fonte fique sem acesso.
-    let available = (right - (90.0 + 500.0) * scale).clamp(0.0, 240.0 * scale);
+    // As abas conservam acesso pela faixa/overflow. Centraliza na janela
+    // quando couber; numa janela menor desloca so o necessario para respeitar
+    // os botoes da direita, e desaparece antes de sobrepor outro controle.
+    let left = (90.0 + 160.0) * scale;
+    let center = client_width / 2.0;
+    let centered_room = (2.0 * (right - center).min(center - left)).max(0.0);
+    let available = if centered_room >= 80.0 * scale {
+        centered_room.min(240.0 * scale)
+    } else {
+        (right - left).clamp(0.0, 240.0 * scale)
+    };
     let width = if available >= 80.0 * scale {
         available
     } else {
         0.0
     };
+    let centered = (client_width - width) / 2.0;
+    let x = if width > 0.0 {
+        centered.max(left).min((right - width).max(left))
+    } else {
+        right
+    };
     UiRect {
-        x: right - width,
+        x,
         y: 3.0 * scale,
         width,
         height: (TITLE_TAB_HEIGHT - 6.0) * scale,
@@ -1361,10 +1376,16 @@ pub(in crate::windows_app) fn right_controls(
     // Os atalhos na barra de titulo (Row 1), imediatamente a esquerda do
     // Pomodoro (`tools[0]`), com folga uniforme de 4 px:
     // [Live] [Meet] [Teams] [Outlook] [WhatsApp] [YouTube] [Gmail] [Privado]
-    let title_y = 3.0 * scale;
-    let title_size = (TITLE_TAB_HEIGHT - 6.0) * scale;
     let icon_gap = 4.0 * scale;
     let cluster_right = tools[0].x - icon_gap;
+    // Todos os servicos continuam acessiveis em janelas menores. O grupo
+    // encolhe uniformemente antes de invadir a marca/abas da esquerda.
+    let tabs_reserve =
+        (90.0 + COMPARATOR_COLUMNS as f64 * (TAB_OVERFLOW_WIDTH + 3.0) + 8.0) * scale;
+    let title_size = ((cluster_right - tabs_reserve - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
+        / RIGHT_CLUSTER.len() as f64)
+        .clamp(18.0 * scale, (TITLE_TAB_HEIGHT - 6.0) * scale);
+    let title_y = (TITLE_TAB_HEIGHT * scale - title_size) / 2.0;
 
     let private = UiRect {
         x: cluster_right - title_size,
@@ -1372,8 +1393,8 @@ pub(in crate::windows_app) fn right_controls(
         width: title_size,
         height: title_size,
     };
-    let services: [UiRect; 6] = std::array::from_fn(|index| UiRect {
-        x: private.x - (6 - index) as f64 * (title_size + icon_gap),
+    let services: [UiRect; 10] = std::array::from_fn(|index| UiRect {
+        x: private.x - (10 - index) as f64 * (title_size + icon_gap),
         y: title_y,
         width: title_size,
         height: title_size,
@@ -1486,9 +1507,9 @@ pub(in crate::windows_app) struct ClusterSlot {
 }
 
 /// O grupo dos atalhos da barra de titulo, da esquerda para a direita:
-/// o Gemini Live, os servicos (Meet, Teams, Outlook, WhatsApp, YouTube,
-/// Gmail) e o Privado. Downloads nao tem botao aqui: Ctrl+J e a aba do painel.
-pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 8] = [
+/// o Gemini Live, os servicos de conta/redes sociais e o Privado.
+/// Downloads nao tem botao aqui: Ctrl+J e a aba do painel.
+pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 12] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
         icon: ICON_SLOT_LIVE,
@@ -1516,6 +1537,22 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 8] = [
     ClusterSlot {
         hit: BarHit::GmailToggle,
         icon: ICON_SLOT_MAIL,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::X),
+        icon: ICON_SLOT_X,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::Instagram),
+        icon: ICON_SLOT_INSTAGRAM,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::Facebook),
+        icon: ICON_SLOT_FACEBOOK,
+    },
+    ClusterSlot {
+        hit: BarHit::Service(Service::Chess),
+        icon: ICON_SLOT_CHESS,
     },
     ClusterSlot {
         hit: BarHit::Private,
@@ -1551,6 +1588,10 @@ impl RightControls {
             self.services[3],
             self.services[4],
             self.services[5],
+            self.services[6],
+            self.services[7],
+            self.services[8],
+            self.services[9],
             self.private,
         ]
     }
@@ -1636,4 +1677,68 @@ pub(in crate::windows_app) fn bar_hit_at(
         return Some(hit);
     }
     layout.and_then(|layout| layout.hit(x, y))
+}
+
+#[cfg(test)]
+mod sidebar_layout_gates {
+    use super::*;
+
+    #[test]
+    fn social_services_open_the_right_destination_and_hit_their_own_button() {
+        let controls = right_controls(1600.0, 1.0, false, None);
+        for (service, url) in [
+            (Service::X, "https://x.com/"),
+            (Service::Instagram, "https://www.instagram.com/"),
+            (Service::Facebook, "https://www.facebook.com/"),
+            (Service::Chess, "https://www.chess.com/"),
+        ] {
+            assert_eq!(service.url(), url);
+            let rect = service_icon_rect(controls, service).expect("service button");
+            assert_eq!(
+                right_controls_hit(
+                    controls,
+                    rect.x + rect.width / 2.0,
+                    rect.y + rect.height / 2.0
+                ),
+                Some(BarHit::Service(service)),
+            );
+            assert!(service.keeps_running_in_background());
+            let icon = RIGHT_CLUSTER
+                .iter()
+                .find(|slot| slot.hit == BarHit::Service(service))
+                .unwrap();
+            assert!(extra_icon(icon.icon).width() > 0);
+        }
+    }
+
+    #[test]
+    fn resting_address_tracks_window_center_and_keeps_controls_accessible() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for width in [1440.0, 1600.0, 1920.0, 2560.0] {
+                for label in [None, BarLabel::new("24:59"), BarLabel::new("⏸ 24:59")] {
+                    let client = width * scale;
+                    let rect = title_address_rect(client, scale, label);
+                    assert!(rect.width >= 80.0 * scale);
+                    assert!((rect.x + rect.width / 2.0 - client / 2.0).abs() < 0.001);
+                    assert!(
+                        rect.x + rect.width
+                            <= title_tools_left(client, scale, label) - 8.0 * scale + 0.001
+                    );
+                }
+            }
+            for width in (720..=2560).step_by(20) {
+                let client = width as f64 * scale;
+                let controls = right_controls(client, scale, false, BarLabel::new("⏸ 24:59"));
+                let address = title_address_rect(client, scale, BarLabel::new("⏸ 24:59"));
+                let mut right = 90.0 * scale;
+                for (slot, rect) in RIGHT_CLUSTER.iter().zip(controls.cluster()) {
+                    assert!(rect.x + 0.001 >= right, "{width}@{scale}: {:?}", slot.hit);
+                    assert!(rect.width >= 18.0 * scale);
+                    assert!(address.width == 0.0 || address.x + address.width <= rect.x);
+                    right = rect.x + rect.width;
+                }
+                assert!(right <= controls.tools[0].x);
+            }
+        }
+    }
 }

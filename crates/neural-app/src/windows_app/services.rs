@@ -15,6 +15,10 @@ pub(in crate::windows_app) enum Service {
     WhatsApp,
     YouTube,
     Gmail,
+    X,
+    Instagram,
+    Facebook,
+    Chess,
     /// Respiracao guiada (metodo Wim Hof), pedida pelo dono "em modo
     /// anonimo": o video no painel InPrivate, sem camera nem microfone.
     Breath,
@@ -33,6 +37,10 @@ impl Service {
             Self::WhatsApp => "https://web.whatsapp.com/",
             Self::YouTube => "https://www.youtube.com/",
             Self::Gmail => "https://mail.google.com/mail/u/0/#inbox",
+            Self::X => "https://x.com/",
+            Self::Instagram => "https://www.instagram.com/",
+            Self::Facebook => "https://www.facebook.com/",
+            Self::Chess => "https://www.chess.com/",
             Self::Breath => BREATH_VIDEO_URL,
         }
     }
@@ -45,6 +53,10 @@ impl Service {
             Self::WhatsApp => "WhatsApp",
             Self::YouTube => "YouTube",
             Self::Gmail => "Gmail",
+            Self::X => "X (Twitter)",
+            Self::Instagram => "Instagram",
+            Self::Facebook => "Facebook",
+            Self::Chess => "Chess.com",
             Self::Breath => "Respiração guiada (método Wim Hof)",
         }
     }
@@ -61,7 +73,11 @@ impl Service {
             | Self::Outlook
             | Self::WhatsApp
             | Self::YouTube
-            | Self::Gmail => false,
+            | Self::Gmail
+            | Self::X
+            | Self::Instagram
+            | Self::Facebook
+            | Self::Chess => false,
         }
     }
 
@@ -71,7 +87,15 @@ impl Service {
     pub(in crate::windows_app) fn keeps_running_in_background(self) -> bool {
         matches!(
             self,
-            Self::Teams | Self::Outlook | Self::WhatsApp | Self::YouTube | Self::Gmail
+            Self::Teams
+                | Self::Outlook
+                | Self::WhatsApp
+                | Self::YouTube
+                | Self::Gmail
+                | Self::X
+                | Self::Instagram
+                | Self::Facebook
+                | Self::Chess
         )
     }
 }
@@ -390,7 +414,11 @@ pub(in crate::windows_app) fn service_panel_navigation(service: Service, target:
         | Service::Outlook
         | Service::WhatsApp
         | Service::YouTube
-        | Service::Gmail => service_panel_allows_navigation(target),
+        | Service::Gmail
+        | Service::X
+        | Service::Instagram
+        | Service::Facebook
+        | Service::Chess => service_panel_allows_navigation(target),
     }
 }
 
