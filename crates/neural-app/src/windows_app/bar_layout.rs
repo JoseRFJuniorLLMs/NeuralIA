@@ -1717,7 +1717,10 @@ mod sidebar_layout_gates {
             for width in [1024.0, 1440.0, 1920.0] {
                 let layout = BarLayout::new(width * scale, scale, true, 3);
                 let plus = layout.title_new_tab;
-                assert!(plus.width > 0.0, "new tab must be visible at {width}@{scale}");
+                assert!(
+                    plus.width > 0.0,
+                    "new tab must be visible at {width}@{scale}"
+                );
                 assert!(plus.x >= 90.0 * scale);
                 assert!(plus.x + plus.width <= layout.address.x || layout.address.width == 0.0);
                 assert_eq!(
