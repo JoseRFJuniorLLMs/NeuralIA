@@ -866,11 +866,8 @@ impl BarLayout {
             return Some(BarHit::AddressBar);
         }
         if self.title_new_tab.contains(x, y) {
-            // A nova aba usa a primeira coluna visivel, nunca uma minimizada.
-            let source = (0..self.columns_len)
-                .find(|&index| !self.minimized[index])
-                .unwrap_or(0);
-            return Some(BarHit::AddTab(source));
+            // Nova aba Web, não paleta de uma coluna de IA.
+            return Some(BarHit::TitleNewTab);
         }
         for index in 0..self.columns_len {
             if self.tab_overflow[index].contains(x, y) {
@@ -1216,7 +1213,7 @@ pub(in crate::windows_app) unsafe fn apply_omnibox_interactivity(edit: HWND, sur
 pub(in crate::windows_app) struct RightControls {
     pub(in crate::windows_app) private: UiRect,
     /// Servicos de conta e redes sociais, a esquerda do Privado.
-    pub(in crate::windows_app) services: [UiRect; 10],
+    pub(in crate::windows_app) services: [UiRect; 11],
     /// Gemini Live, logo a esquerda dos servicos: o inicio do canto na barra de titulo.
     pub(in crate::windows_app) live: UiRect,
     /// Pomodoro, Respiracao e Sobre (ordem de `Tool::ALL`) na linha de CIMA,
@@ -1433,8 +1430,8 @@ pub(in crate::windows_app) fn right_controls(
         width: title_size,
         height: title_size,
     };
-    let services: [UiRect; 10] = std::array::from_fn(|index| UiRect {
-        x: private.x - (10 - index) as f64 * (title_size + icon_gap),
+    let services: [UiRect; 11] = std::array::from_fn(|index| UiRect {
+        x: private.x - (11 - index) as f64 * (title_size + icon_gap),
         y: title_y,
         width: title_size,
         height: title_size,
@@ -1549,7 +1546,7 @@ pub(in crate::windows_app) struct ClusterSlot {
 /// O grupo dos atalhos da barra de titulo, da esquerda para a direita:
 /// o Gemini Live, os servicos de conta/redes sociais e o Privado.
 /// Downloads nao tem botao aqui: Ctrl+J e a aba do painel.
-pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 12] = [
+pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 13] = [
     ClusterSlot {
         hit: BarHit::GeminiLive,
         icon: ICON_SLOT_LIVE,
@@ -1595,6 +1592,10 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 12] = [
         icon: ICON_SLOT_CHESS,
     },
     ClusterSlot {
+        hit: BarHit::Service(Service::GitHub),
+        icon: ICON_SLOT_ABOUT,
+    },
+    ClusterSlot {
         hit: BarHit::Private,
         icon: ICON_SLOT_INCOGNITO,
     },
@@ -1632,6 +1633,7 @@ impl RightControls {
             self.services[7],
             self.services[8],
             self.services[9],
+            self.services[10],
             self.private,
         ]
     }
@@ -1724,7 +1726,7 @@ mod sidebar_layout_gates {
     use super::*;
 
     #[test]
-    fn title_plus_opens_url_palette_without_covering_tabs_or_address() {
+    fn title_plus_opens_browser_tab_without_covering_tabs_or_address() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             for width in [1024.0, 1440.0, 1920.0] {
                 let layout = BarLayout::new(width * scale, scale, true, 3);
@@ -1737,7 +1739,7 @@ mod sidebar_layout_gates {
                 assert!(plus.x + plus.width <= layout.address.x || layout.address.width == 0.0);
                 assert_eq!(
                     layout.hit(plus.x + plus.width / 2.0, plus.y + plus.height / 2.0),
-                    Some(BarHit::AddTab(0)),
+                    Some(BarHit::TitleNewTab),
                 );
             }
         }
@@ -1751,6 +1753,7 @@ mod sidebar_layout_gates {
             (Service::Instagram, "https://www.instagram.com/"),
             (Service::Facebook, "https://www.facebook.com/"),
             (Service::Chess, "https://www.chess.com/"),
+            (Service::GitHub, "https://github.com/"),
         ] {
             assert_eq!(service.url(), url);
             let rect = service_icon_rect(controls, service).expect("service button");

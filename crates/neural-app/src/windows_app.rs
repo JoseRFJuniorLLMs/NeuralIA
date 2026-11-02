@@ -535,6 +535,8 @@ pub(in crate::windows_app) enum BarHit {
     SplitBookmark,
     Column(usize),
     AddTab(usize),
+    /// + superior, independente das novas perguntas das IAs.
+    TitleNewTab,
     ContextTab {
         source_index: usize,
         context_index: usize,
@@ -1137,7 +1139,8 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         }
         BarHit::SplitBookmark => bookmark_star_tooltip(state.split_bookmarked).to_string(),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
-        BarHit::AddTab(_) => format!("Nova aba: digite uma URL ou pergunte ao {provider}"),
+        BarHit::AddTab(_) => format!("Nova pergunta para {provider}"),
+        BarHit::TitleNewTab => "Nova aba do navegador".to_string(),
         BarHit::ContextTab { .. } => {
             format!(
                 "{}\nClique: abrir ao lado · Arraste: mover · Botão direito: fechar e grupos",
@@ -1225,6 +1228,7 @@ fn bar_hit_shortcut(hit: BarHit, maximized: bool) -> Option<&'static str> {
         BarHit::SplitMinimize => Some("Ctrl+Shift+M"),
         BarHit::Column(_) | BarHit::SplitExpand => Some("F11"),
         BarHit::AddTab(_) => Some("Ctrl+T"),
+        BarHit::TitleNewTab => None,
         BarHit::ColumnBookmark(_) | BarHit::SplitBookmark => Some("Ctrl+D"),
         BarHit::WindowMinimize => Some("F9"),
         BarHit::WindowMaximize if maximized => Some("F10"),
@@ -7561,13 +7565,12 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
         );
     }
 
-    // "+" do topo: abre a palette nativa, que aceita URL e cria uma aba
-    // de contexto persistida, sem criar outro motor de navegacao.
+    // "+" superior abre a aba Web; os "+" inferiores mantêm as IAs.
     draw_button(
         target,
         layout.title_new_tab,
         "+",
-        matches!(hover, Some(BarHit::AddTab(_))),
+        hover == Some(BarHit::TitleNewTab),
         scale,
         font,
         theme,
@@ -7637,6 +7640,10 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
                 draw_live_button(target, rect, live.indicator(), hovered, scale, theme);
             }
             hit => {
+                if hit == BarHit::Service(Service::GitHub) {
+                    draw_button(target, rect, "GH", hovered, scale, font, theme);
+                    continue;
+                }
                 let tint = match hit {
                     BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
                     _ => None,

@@ -19,6 +19,7 @@ pub(in crate::windows_app) enum Service {
     Instagram,
     Facebook,
     Chess,
+    GitHub,
     /// Respiracao guiada (metodo Wim Hof), pedida pelo dono "em modo
     /// anonimo": o video no painel InPrivate, sem camera nem microfone.
     Breath,
@@ -41,6 +42,7 @@ impl Service {
             Self::Instagram => "https://www.instagram.com/",
             Self::Facebook => "https://www.facebook.com/",
             Self::Chess => "https://www.chess.com/",
+            Self::GitHub => "https://github.com/",
             Self::Breath => BREATH_VIDEO_URL,
         }
     }
@@ -57,6 +59,7 @@ impl Service {
             Self::Instagram => "Instagram",
             Self::Facebook => "Facebook",
             Self::Chess => "Chess.com",
+            Self::GitHub => "GitHub",
             Self::Breath => "Respiração guiada (método Wim Hof)",
         }
     }
@@ -77,7 +80,8 @@ impl Service {
             | Self::X
             | Self::Instagram
             | Self::Facebook
-            | Self::Chess => false,
+            | Self::Chess
+            | Self::GitHub => false,
         }
     }
 
@@ -96,6 +100,7 @@ impl Service {
                 | Self::Instagram
                 | Self::Facebook
                 | Self::Chess
+                | Self::GitHub
         )
     }
 }
@@ -418,7 +423,8 @@ pub(in crate::windows_app) fn service_panel_navigation(service: Service, target:
         | Service::X
         | Service::Instagram
         | Service::Facebook
-        | Service::Chess => service_panel_allows_navigation(target),
+        | Service::Chess
+        | Service::GitHub => service_panel_allows_navigation(target),
     }
 }
 
