@@ -11684,6 +11684,7 @@ fn bar_hit_command_is_exhaustive() {
         (BarHit::SplitMinimize, None),
         (BarHit::Column(2), None),
         (BarHit::AddTab(0), None),
+        (BarHit::TitleNewTab, None),
         (
             BarHit::ContextTab {
                 source_index: 0,

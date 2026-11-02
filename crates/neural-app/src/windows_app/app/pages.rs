@@ -1107,19 +1107,6 @@ pub(in crate::windows_app) fn is_pdf_internal_target(target: &str) -> bool {
     })
 }
 
-#[cfg(test)]
-mod pdf_text_tests {
-    use super::*;
-
-    #[test]
-    fn pdf_text_bridge_is_specific_and_bounded() {
-        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("action:'pdf-page-text'"));
-        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("page > 24"));
-        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("text.length > 1500"));
-        assert!(!PDF_TEXT_BRIDGE_SCRIPT.contains("__neuralia_act"));
-    }
-}
-
 /// Página inicial da aba Web (o domínio remoto não recebe a busca até Enter).
 pub(in crate::windows_app) fn browser_new_tab_html() -> &'static str {
     r##"<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1152,4 +1139,17 @@ if(!v){e.preventDefault();return}
 if(/^https?:\/\//i.test(v)){e.preventDefault();location.href=v;return}
 if(/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/[^\s]*)?$/i.test(v)){e.preventDefault();location.href='https://'+v}
 });</script></body></html>"##
+}
+
+#[cfg(test)]
+mod pdf_text_tests {
+    use super::*;
+
+    #[test]
+    fn pdf_text_bridge_is_specific_and_bounded() {
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("action:'pdf-page-text'"));
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("page > 24"));
+        assert!(PDF_TEXT_BRIDGE_SCRIPT.contains("text.length > 1500"));
+        assert!(!PDF_TEXT_BRIDGE_SCRIPT.contains("__neuralia_act"));
+    }
 }

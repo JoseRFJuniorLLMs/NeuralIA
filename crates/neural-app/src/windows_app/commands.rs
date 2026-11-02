@@ -1115,6 +1115,7 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::SplitMinimize
         | BarHit::Column(_)
         | BarHit::AddTab(_)
+        | BarHit::TitleNewTab
         | BarHit::ContextTab { .. }
         | BarHit::CloseTab { .. }
         | BarHit::ContextGroup { .. }

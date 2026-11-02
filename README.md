@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/neuralia-home.png" width="480" height="347" alt="NeuralIA"></p>
+<p align="center"><img src="assets/github.png" width="480" height="347" alt="NeuralIA"></p>
 
 <h1 align="center">NeuralIA</h1>
 <p align="center"><strong>The browser without the browser.</strong></p>
@@ -6,7 +6,7 @@
 
 ## What NeuralIA is
 
-NeuralIA **v3.2.0** is an AI-first, reader-first, system-WebView information client written in Rust.
+NeuralIA **v3.2.1** is an AI-first, reader-first, system-WebView information client written in Rust.
 
 It deliberately refuses the usual browser arms race. It does not ship Chromium, does not implement its own JavaScript engine, does not carry a local LLM, and does not recreate a full browser tab strip just to prove that rectangles can multiply.
 

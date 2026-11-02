@@ -136,7 +136,7 @@ impl Chord {
     /// escreve "/"), e prende-lo tirava caracteres a quem escreve.
     pub(in crate::windows_app) fn bindable(self) -> bool {
         let function_key = (u32::from(VK_F1)..u32::from(VK_F1) + 24).contains(&self.vk);
-        if self.ctrl && self.alt {
+        if self.ctrl && self.alt && !(0x30..=0x39).contains(&self.vk) {
             return false;
         }
         function_key || self.ctrl || self.alt
