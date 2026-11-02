@@ -1413,15 +1413,32 @@ pub(in crate::windows_app) fn right_controls(
     // Os atalhos na barra de titulo (Row 1), imediatamente a esquerda do
     // Pomodoro (`tools[0]`), com folga uniforme de 4 px:
     // [Live] [Meet] [Teams] [Outlook] [WhatsApp] [YouTube] [Gmail] [Privado]
-    let icon_gap = 4.0 * scale;
+    // Ate 700 px os 13 atalhos partilham uma folga menor, para o
+    // overflow das tres colunas continuar acessivel e nenhum icone
+    // sair pela margem esquerda quando o Pomodoro mostra o tempo.
+    let logical_width = client_width / scale;
+    let compact = ((logical_width - 700.0) / 20.0).clamp(0.0, 1.0);
+    let icon_gap = (2.0 + 2.0 * compact) * scale;
     let cluster_right = tools[0].x - icon_gap;
     // Todos os servicos continuam acessiveis em janelas menores. O grupo
     // encolhe uniformemente antes de invadir a marca/abas da esquerda.
     let tabs_reserve =
         (90.0 + COMPARATOR_COLUMNS as f64 * (TAB_OVERFLOW_WIDTH + 3.0) + 8.0) * scale;
-    let title_size = ((cluster_right - tabs_reserve - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
-        / RIGHT_CLUSTER.len() as f64)
-        .clamp(18.0 * scale, (TITLE_TAB_HEIGHT - 6.0) * scale);
+    let mut title_size =
+        ((cluster_right - tabs_reserve - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
+            / RIGHT_CLUSTER.len() as f64)
+            .clamp(18.0 * scale, (TITLE_TAB_HEIGHT - 6.0) * scale);
+    // Em telas largas, a omnibox em repouso precisa de pelo menos 80 px
+    // realmente centrados. Os atalhos cedem alguns pixeis antes de
+    // empurrar o endereco para a esquerda; nao movemos a barra antiga.
+    if logical_width >= 1440.0 {
+        let centered_address_right = client_width / 2.0 + 48.0 * scale;
+        let max_icon_size = (cluster_right
+            - centered_address_right
+            - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
+            / RIGHT_CLUSTER.len() as f64;
+        title_size = title_size.min(max_icon_size.max(18.0 * scale));
+    }
     let title_y = (TITLE_TAB_HEIGHT * scale - title_size) / 2.0;
 
     let private = UiRect {
