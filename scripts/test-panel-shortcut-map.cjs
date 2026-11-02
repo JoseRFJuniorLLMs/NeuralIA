@@ -61,7 +61,9 @@ function exerciseAudio(page) {
   const input = {html: page, steps: [String.raw`
 window.neuraliaShowSection('audio');
 __out.audioVisible = __visible($('view-audio'));
+__out.initialAudioEnabled = $('audio-enabled').getAttribute('checked') !== null || !!$('audio-enabled').checked;
 window.__neuraliaAudio.render({enabled:true,status:'Pronto',items:[{id:17,title:'<img src=x onerror=evil()>',detail:'Voz original',busy:false}]});
+__out.audioEnabled = $('audio-enabled').checked;
 __out.audioTitle = $('audio-list').children[0].children[0].textContent;
 __click($('audio-list').children[0].children[2]);
 __click($('audio-refresh'));
@@ -78,6 +80,8 @@ __out.busy = $('audio-list').children[0].children[2].disabled;
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.html, [], 'audio data renders as text');
   assert.equal(result.out.audioVisible, true);
+  assert.equal(result.out.initialAudioEnabled, false, 'audio capture requires session opt-in');
+  assert.equal(result.out.audioEnabled, true);
   assert.equal(result.out.audioTitle, '<img src=x onerror=evil()>');
   assert.equal(result.out.busy, true);
   for (const expected of [
@@ -93,6 +97,9 @@ if (process.argv.includes('--mutation-check')) {
   const withoutRefresh = html.replace('      panelKeyHints.refresh();', '');
   assert.notEqual(withoutRefresh, html);
   assert.throws(() => exercise(withoutRefresh), /opening shortcuts refreshes dynamic buttons/);
+  const autoCapture = html.replace('id="audio-enabled" type="checkbox"', 'id="audio-enabled" type="checkbox" checked');
+  assert.notEqual(autoCapture, html);
+  assert.throws(() => exerciseAudio(autoCapture), /audio capture requires session opt-in/);
   const withoutExport = html.replace("post('audio-export', {id:item.id})", "post('audio-list')");
   assert.notEqual(withoutExport, html);
   assert.throws(() => exerciseAudio(withoutExport), /panel dispatch audio-export/);

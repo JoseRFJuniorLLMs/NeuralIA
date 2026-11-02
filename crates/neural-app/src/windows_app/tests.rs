@@ -907,7 +907,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     };
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
-        Some("Nova pergunta ao ChatGPT (Ctrl+T)")
+        Some("Nova aba: digite uma URL ou pergunte ao ChatGPT (Ctrl+T)")
     );
     // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
     assert_eq!(

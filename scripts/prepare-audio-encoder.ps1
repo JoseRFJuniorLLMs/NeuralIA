@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$OutputDir,
-    [string]$ArchivePath = ""
+    [string]$ArchivePath = "",
+    [switch]$IncludeProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +49,11 @@ try {
     Copy-Item -LiteralPath (Join-Path $root "bin/ffmpeg.exe") -Destination (Join-Path $prepared "ffmpeg.exe") -Force
     Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination (Join-Path $prepared "LICENSE.txt") -Force
     Copy-Item -LiteralPath (Join-Path $root "README.txt") -Destination (Join-Path $prepared "README.txt") -Force
+    # CI verifies the encoded stream with ffprobe from the same pinned ZIP.
+    # The installer retains its closed payload list and never ships ffprobe.
+    if ($IncludeProbe) {
+        Copy-Item -LiteralPath (Join-Path $root "bin/ffprobe.exe") -Destination (Join-Path $prepared "ffprobe.exe") -Force
+    }
     $provenance = [ordered]@{
         name = "FFmpeg"
         version = $encoderVersion

@@ -90,7 +90,7 @@ pub(in crate::windows_app) struct AudioLibrary {
 impl AudioLibrary {
     pub(in crate::windows_app) fn new() -> Self {
         Self {
-            enabled: Arc::new(AtomicBool::new(true)),
+            enabled: Arc::new(AtomicBool::new(false)),
             entries: VecDeque::new(),
             bytes: 0,
             next_id: 1,
@@ -321,8 +321,22 @@ mod tests {
     }
 
     #[test]
+    fn audio_capture_requires_session_opt_in() {
+        let mut library = AudioLibrary::new();
+        assert!(!library.enabled.load(Ordering::Acquire));
+        assert!(!library.insert(clip(1)));
+        assert!(library.entries.is_empty());
+        library.enabled.store(true, Ordering::Release);
+        assert!(library.insert(clip(1)));
+        library.enabled.store(false, Ordering::Release);
+        assert!(!library.insert(clip(2)));
+        assert_eq!(library.entries.len(), 1);
+    }
+
+    #[test]
     fn audio_library_bounds_deduplicates_and_never_reuses_ids() {
         let mut library = AudioLibrary::new();
+        library.enabled.store(true, Ordering::Release);
         assert!(library.insert(clip(1)));
         assert!(!library.insert(clip(1)));
         for n in 2..=40 {

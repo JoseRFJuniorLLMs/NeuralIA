@@ -676,14 +676,26 @@ impl BarLayout {
         // Reservar o "+" mesmo quando muitas abas ocupam a faixa.
         let title_plus_w = 26.0 * scale;
         let title_plus_gap = 6.0 * scale;
-        let show_title_plus = tabs_right - tabs_left >= title_plus_w + title_plus_gap + 8.0 * scale;
+        let visible_rows = &rows[..columns_len];
+        // Preserve at least the overflow button of every populated column.
+        // The extra + yields before a column loses access to all its tabs.
+        let populated = visible_rows
+            .iter()
+            .filter(|row| row.len > 0 || row.total_tabs > 0)
+            .count();
+        let minimum_tabs_room = if populated > 0 {
+            ((TAB_OVERFLOW_WIDTH + 3.0) * populated as f64 - 3.0) * scale
+        } else {
+            8.0 * scale
+        };
+        let show_title_plus =
+            tabs_right - tabs_left >= title_plus_w + title_plus_gap + minimum_tabs_room;
         let title_tabs_right = if show_title_plus {
             tabs_right - title_plus_w - title_plus_gap
         } else {
             tabs_right
         };
         let mut title_plus_x = tabs_left;
-        let visible_rows = &rows[..columns_len];
         let total_slots: usize = visible_rows.iter().map(|row| row.len).sum();
         let mut overflow = [empty; COMPARATOR_COLUMNS];
         let mut overflow_counts = [0usize; COMPARATOR_COLUMNS];
