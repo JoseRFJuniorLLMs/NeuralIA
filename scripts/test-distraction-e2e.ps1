@@ -46,7 +46,7 @@ try {
     $process = Start-Process -FilePath $exe -PassThru
 
     function Get-Seen {
-        $raw = Invoke-WebRequest -Uri "$localOrigin/__log" -UseBasicParsing -TimeoutSec 5
+        $raw = Invoke-WebRequest -Uri "$localOrigin/__log" -UseBasicParsing -NoProxy -TimeoutSec 5
         return @($raw.Content | ConvertFrom-Json)
     }
 
@@ -55,7 +55,17 @@ try {
     $watch.Restart()
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
         if ($process.HasExited) { throw "NeuralIA saiu antes do E2E da SPEC-0114 (codigo $($process.ExitCode))." }
-        $rows = Get-Seen
+        # A fixture pode atrasar o polling em runners Windows ocupados.
+        # Um timeout isolado nao invalida o E2E: o prazo global continua fixo.
+        try {
+            $rows = Get-Seen
+        } catch {
+            $message = $_.Exception.Message
+            if ($message -notmatch '(?i)timeout|timed out|canceled due to') { throw }
+            Write-Warning "SPEC-0114: timeout transitorio ao consultar a fixture local: $message"
+            Start-Sleep -Milliseconds 150
+            continue
+        }
         $sawSecond = @($rows | Where-Object { $_.host -like "$hostName*" -and $_.path -eq "/page.html" -and $_.query -eq "pass=2" }).Count -gt 0
         if (@($rows | Where-Object { $_.path -eq "/report" -and $_.query -eq "what=hidden" }).Count -gt 0) { $result = "hidden"; break }
         if (@($rows | Where-Object { $_.path -eq "/report" -and $_.query -eq "what=visible" }).Count -gt 0) { $result = "visible"; break }

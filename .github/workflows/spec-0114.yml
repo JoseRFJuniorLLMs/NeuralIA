@@ -14,9 +14,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e
-        with:
-          toolchain: 1.98.1
+      - uses: dtolnay/rust-toolchain@ce678459e9fc7500d337468f904b95f1b5c10b5e # pinned Rust 1.98.1
       - name: Build shipped feature set
         shell: pwsh
         run: cargo build --locked -p neural-app --bin NeuralIA --release
