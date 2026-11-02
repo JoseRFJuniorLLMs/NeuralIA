@@ -43,6 +43,11 @@ pub(in crate::windows_app) enum CommandId {
     WhatsAppPanel,
     YoutubePanel,
     GmailPanel,
+    XPanel,
+    InstagramPanel,
+    FacebookPanel,
+    ChessPanel,
+    GitHubPanel,
     PanelMinimize,
     PanelFullscreen,
     PanelClose,
@@ -101,7 +106,7 @@ pub(in crate::windows_app) enum CommandId {
 impl CommandId {
     /// Cada comando, uma vez: o que os gates percorrem.
     #[cfg(test)]
-    pub(in crate::windows_app) const ALL: [CommandId; 51] = [
+    pub(in crate::windows_app) const ALL: [CommandId; 56] = [
         CommandId::AutoScroll,
         CommandId::FocusAddress,
         CommandId::NavBack,
@@ -119,6 +124,11 @@ impl CommandId {
         CommandId::WhatsAppPanel,
         CommandId::YoutubePanel,
         CommandId::GmailPanel,
+        CommandId::XPanel,
+        CommandId::InstagramPanel,
+        CommandId::FacebookPanel,
+        CommandId::ChessPanel,
+        CommandId::GitHubPanel,
         CommandId::PanelMinimize,
         CommandId::PanelFullscreen,
         CommandId::PanelClose,
@@ -486,6 +496,51 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         alias: None,
     },
     CommandRow {
+        id: CommandId::XPanel,
+        key: "abrir-x",
+        label: "X - abrir painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["x", "social", "atalho"],
+        chords: &[ChordSpec::global(Chord { vk: b'1' as u32, ctrl: true, shift: false, alt: true })],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::InstagramPanel,
+        key: "abrir-instagram",
+        label: "Instagram - abrir painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["instagram", "social", "atalho"],
+        chords: &[ChordSpec::global(Chord { vk: b'2' as u32, ctrl: true, shift: false, alt: true })],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::FacebookPanel,
+        key: "abrir-facebook",
+        label: "Facebook - abrir painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["facebook", "social", "atalho"],
+        chords: &[ChordSpec::global(Chord { vk: b'3' as u32, ctrl: true, shift: false, alt: true })],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::ChessPanel,
+        key: "abrir-chess",
+        label: "Chess - abrir painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["chess", "social", "atalho"],
+        chords: &[ChordSpec::global(Chord { vk: b'4' as u32, ctrl: true, shift: false, alt: true })],
+        alias: None,
+    },
+    CommandRow {
+        id: CommandId::GitHubPanel,
+        key: "abrir-github",
+        label: "GitHub - abrir painel",
+        category: CommandCategory::Ferramentas,
+        keywords: &["github", "social", "atalho"],
+        chords: &[ChordSpec::global(Chord { vk: b'5' as u32, ctrl: true, shift: false, alt: true })],
+        alias: None,
+    },
+    CommandRow {
         id: CommandId::PanelMinimize,
         key: "minimizar-painel",
         label: "Minimizar ou restaurar painel",
@@ -787,6 +842,11 @@ fn chrome_event(id: CommandId) -> UserEvent {
         CommandId::WhatsAppPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::YoutubePanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::GmailPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::XPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::InstagramPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::FacebookPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::ChessPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
+        CommandId::GitHubPanel => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::PanelMinimize => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::PanelFullscreen => UserEvent::NativeShortcut(id, CommandOrigin::Window),
         CommandId::PanelClose => UserEvent::NativeShortcut(id, CommandOrigin::Window),
@@ -858,6 +918,11 @@ fn page_action(id: CommandId, column: Option<usize>) -> Option<IpcAction> {
         CommandId::WhatsAppPanel |
         CommandId::YoutubePanel |
         CommandId::GmailPanel |
+        CommandId::XPanel |
+        CommandId::InstagramPanel |
+        CommandId::FacebookPanel |
+        CommandId::ChessPanel |
+        CommandId::GitHubPanel |
         CommandId::PanelMinimize |
         CommandId::PanelFullscreen |
         CommandId::PanelClose |
@@ -1078,6 +1143,11 @@ pub(in crate::windows_app) fn is_native_shortcut(id: CommandId) -> bool {
             | CommandId::WhatsAppPanel
             | CommandId::YoutubePanel
             | CommandId::GmailPanel
+            | CommandId::XPanel
+            | CommandId::InstagramPanel
+            | CommandId::FacebookPanel
+            | CommandId::ChessPanel
+            | CommandId::GitHubPanel
             | CommandId::PanelMinimize
             | CommandId::PanelFullscreen
             | CommandId::PanelClose
@@ -1205,6 +1275,11 @@ impl App {
             CommandId::GmailPanel => {
                 self.open_service_panel(Service::Gmail);
             }
+            CommandId::XPanel => self.open_service_panel(Service::X),
+            CommandId::InstagramPanel => self.open_service_panel(Service::Instagram),
+            CommandId::FacebookPanel => self.open_service_panel(Service::Facebook),
+            CommandId::ChessPanel => self.open_service_panel(Service::Chess),
+            CommandId::GitHubPanel => self.open_service_panel(Service::GitHub),
             CommandId::PanelMinimize | CommandId::PanelFullscreen | CommandId::PanelClose => {
                 let target = panel_shortcut_target(
                     origin,
