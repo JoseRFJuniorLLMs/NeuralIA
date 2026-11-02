@@ -1092,6 +1092,8 @@
     // no mesmo canto: com ela aberta o botao desce para debaixo dela.
     ':root:has(#neuralia-find) #neuralia-ra-toggle{top:60px}',
     '#neuralia-ra-toggle[aria-pressed="true"]{background:var(--neuralia-ra-accent);color:var(--neuralia-ra-on-accent);border-color:transparent}',
+    '#neuralia-ra-toggle.neuralia-ra-pdf-toggle{width:auto;min-width:108px;padding:0 12px;gap:7px;display:inline-flex;justify-content:center;align-items:center;font:600 13px "Segoe UI",system-ui,sans-serif;white-space:nowrap}',
+    '#neuralia-ra-toggle.neuralia-ra-pdf-toggle .neuralia-ra-pdf-label{display:inline-block}',
     '#neuralia-ra-bar{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:2147483000;display:flex;align-items:center;gap:4px;padding:6px 8px;max-width:calc(100vw - 32px);border:1px solid var(--neuralia-ra-line);border-radius:999px;background:var(--neuralia-ra-surface);color:var(--neuralia-ra-fg);box-shadow:0 10px 32px rgba(0,0,0,.35);font:600 13px "Segoe UI",system-ui,sans-serif}',
     '#neuralia-ra-bar[hidden],#neuralia-ra-hint[hidden]{display:none}',
     '.neuralia-ra-btn{width:34px;height:34px;flex:none;display:inline-grid;place-items:center;padding:0;border:0;border-radius:999px;background:transparent;color:inherit;cursor:pointer}',
@@ -1111,7 +1113,7 @@
     return String(rate).replace('.', ',') + '×';
   }
 
-  function createUi(doc) {
+  function createUi(doc, isPdf) {
     const handlers = {};
     let hintTimer = 0;
     let noticeTimer = 0;
@@ -1180,6 +1182,14 @@
     const toggle = button('neuralia-ra-toggle', ICONS.speaker, 'Ler em voz alta (Ctrl+Shift+U)', 'toggle');
     toggle.className = '';
     toggle.setAttribute('aria-pressed', 'false');
+    let pdfToggleLabel = null;
+    if (isPdf) {
+      toggle.classList.add('neuralia-ra-pdf-toggle');
+      pdfToggleLabel = make('span');
+      pdfToggleLabel.className = 'neuralia-ra-pdf-label';
+      pdfToggleLabel.textContent = 'Ler PDF';
+      toggle.appendChild(pdfToggleLabel);
+    }
 
     const bar = make('div', 'neuralia-ra-bar');
     bar.setAttribute('role', 'toolbar');
@@ -1275,6 +1285,10 @@
       const speaking = snap.state === 'speaking' || snap.state === 'loading';
       bar.setAttribute('data-state', snap.state);
       toggle.setAttribute('aria-pressed', busy ? 'true' : 'false');
+      if (pdfToggleLabel) {
+        pdfToggleLabel.textContent = busy ? 'Parar PDF' : 'Ler PDF';
+        toggle.setAttribute('aria-label', busy ? 'Parar leitura do PDF (Ctrl+Shift+U)' : 'Ler PDF em voz alta (Ctrl+Shift+U)');
+      }
       play.innerHTML = speaking ? ICONS.pause : ICONS.play;
       play.setAttribute('aria-label', speaking ? 'Pausar' : snap.state === 'paused' ? 'Continuar' : 'Ler');
       prev.disabled = !busy;
@@ -1316,7 +1330,7 @@
     // do NeuralIA (pt), nao o do artigo nem o do PDF: sem declaracao, o
     // motor ouve o texto (`guessLang`).
     const lang = (options && options.lang) || '';
-    const ui = createUi(doc);
+    const ui = createUi(doc, !!(options && options.pdf));
     const speech = win.speechSynthesis;
     const Utterance = win.SpeechSynthesisUtterance;
     const engine =
@@ -1390,7 +1404,7 @@
   }
 
   function attachPdf(hooks) {
-    return attach(createPdfSource(hooks), { lang: hooks.lang });
+    return attach(createPdfSource(hooks), { lang: hooks.lang, pdf: true });
   }
 
   // Um campo de texto que nao e da leitura (a barra de procura do Ctrl+F, por

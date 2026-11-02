@@ -141,6 +141,41 @@ const ONLINE_BR = __voice('Microsoft Francisca Online (Natural) - Portuguese (Br
 "#;
 
     #[test]
+    fn pdf_read_aloud_has_visible_button_reuses_controller_and_updates_label() {
+        let outcome = pdf(&format!(
+            r#"{VOICES}
+__contentLoaded();
+__speech.setVoices([LOCAL_BR]);
+__pdf([[{{ str: 'Primeira frase. Segunda frase.', eol: false }}]]);
+__renderPage(0);
+const toggle = __byId('neuralia-ra-toggle');
+const out = {{
+  initial: toggle.textContent,
+  aria: toggle.getAttribute('aria-label'),
+  buttons: __byId('neuralia-ra-bar') !== null
+}};
+__click(toggle);
+await __settle();
+out.playing = toggle.textContent;
+out.said = __said().slice();
+__click(toggle);
+await __settle();
+out.stopped = toggle.textContent;
+out.state = __byId('neuralia-ra-bar').getAttribute('data-state');
+return out;
+"#
+        ));
+        let result = clean_result(&outcome);
+        assert_eq!(result["initial"], json!("Ler PDF"));
+        assert_eq!(result["aria"], json!("Ler PDF em voz alta (Ctrl+Shift+U)"));
+        assert_eq!(result["buttons"], json!(true));
+        assert_eq!(result["playing"], json!("Parar PDF"));
+        assert_eq!(strings(&result["said"]), ["Primeira frase."]);
+        assert_eq!(result["stopped"], json!("Ler PDF"));
+        assert_eq!(result["state"], json!("idle"));
+    }
+
+    #[test]
     fn read_aloud_sentences_keep_abbreviations_and_numbers_whole() {
         let outcome = pdf(r#"
 const cases = [
