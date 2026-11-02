@@ -501,7 +501,8 @@ impl App {
         let Some(window) = &self.window else {
             return;
         };
-        let builder = self.external_webview_builder(None, false)
+        let builder = self
+            .external_webview_builder(None, false)
             .with_html(browser_new_tab_html());
         let hooked = self.hooked_builder(builder, WebViewHost::External, None);
         match hooked.build_hooked(window) {
@@ -1118,7 +1119,6 @@ mod pdf_text_tests {
         assert!(!PDF_TEXT_BRIDGE_SCRIPT.contains("__neuralia_act"));
     }
 }
-
 
 /// Página inicial da aba Web (o domínio remoto não recebe a busca até Enter).
 pub(in crate::windows_app) fn browser_new_tab_html() -> &'static str {

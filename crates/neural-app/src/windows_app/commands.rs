@@ -501,7 +501,12 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "X - abrir painel",
         category: CommandCategory::Ferramentas,
         keywords: &["x", "social", "atalho"],
-        chords: &[ChordSpec::global(Chord { vk: b'1' as u32, ctrl: true, shift: false, alt: true })],
+        chords: &[ChordSpec::global(Chord {
+            vk: b'1' as u32,
+            ctrl: true,
+            shift: false,
+            alt: true,
+        })],
         alias: None,
     },
     CommandRow {
@@ -510,7 +515,12 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Instagram - abrir painel",
         category: CommandCategory::Ferramentas,
         keywords: &["instagram", "social", "atalho"],
-        chords: &[ChordSpec::global(Chord { vk: b'2' as u32, ctrl: true, shift: false, alt: true })],
+        chords: &[ChordSpec::global(Chord {
+            vk: b'2' as u32,
+            ctrl: true,
+            shift: false,
+            alt: true,
+        })],
         alias: None,
     },
     CommandRow {
@@ -519,7 +529,12 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Facebook - abrir painel",
         category: CommandCategory::Ferramentas,
         keywords: &["facebook", "social", "atalho"],
-        chords: &[ChordSpec::global(Chord { vk: b'3' as u32, ctrl: true, shift: false, alt: true })],
+        chords: &[ChordSpec::global(Chord {
+            vk: b'3' as u32,
+            ctrl: true,
+            shift: false,
+            alt: true,
+        })],
         alias: None,
     },
     CommandRow {
@@ -528,7 +543,12 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "Chess - abrir painel",
         category: CommandCategory::Ferramentas,
         keywords: &["chess", "social", "atalho"],
-        chords: &[ChordSpec::global(Chord { vk: b'4' as u32, ctrl: true, shift: false, alt: true })],
+        chords: &[ChordSpec::global(Chord {
+            vk: b'4' as u32,
+            ctrl: true,
+            shift: false,
+            alt: true,
+        })],
         alias: None,
     },
     CommandRow {
@@ -537,7 +557,12 @@ pub(in crate::windows_app) const COMMANDS: &[CommandRow] = &[
         label: "GitHub - abrir painel",
         category: CommandCategory::Ferramentas,
         keywords: &["github", "social", "atalho"],
-        chords: &[ChordSpec::global(Chord { vk: b'5' as u32, ctrl: true, shift: false, alt: true })],
+        chords: &[ChordSpec::global(Chord {
+            vk: b'5' as u32,
+            ctrl: true,
+            shift: false,
+            alt: true,
+        })],
         alias: None,
     },
     CommandRow {

@@ -2,6 +2,15 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.1] - 2026-11-02
+
+### Added
+- **Atalho GitHub na barra superior** ([fabb56b7](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/fabb56b79e1d5c5d994e2399671b40013fe0e27b)): botão GH abre o painel do GitHub, junto aos serviços sociais já existentes.
+- **Atalhos sociais** ([753c5a80](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/753c5a80eab539f9caedaa432ee2afc55b14a915)): Ctrl+Alt+1..5 abre X, Instagram, Facebook, Chess.com e GitHub.
+
+### Fixed
+- **Botões + com funções separadas** ([fabb56b7](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/fabb56b79e1d5c5d994e2399671b40013fe0e27b)): o + na faixa do título abre a nova página Web com campo de endereço/pesquisa e atalhos; os + das colunas de IA mantêm a paleta de cada provedor. A página Web atual não implementa ainda abas Web simultâneas e persistentes.
+
 ## [3.2.0] - 2026-11-01
 
 ### Added
