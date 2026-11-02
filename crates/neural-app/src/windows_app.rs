@@ -1350,7 +1350,7 @@ fn home_tool_buttons(
     let caption_left = client_width - 3.0 * 46.0 * scale;
     let size = (TITLE_TAB_HEIGHT - 6.0) * scale;
     let label_width = pomodoro_label.map_or(0.0, |label| label.width());
-    let label_fits = client_width / scale >= 504.0 + label_width;
+    let label_fits = client_width / scale >= 526.0 + label_width;
     let effective_label = if label_fits { label_width } else { 0.0 };
     tool_button_row(
         caption_left - 8.0 * scale,

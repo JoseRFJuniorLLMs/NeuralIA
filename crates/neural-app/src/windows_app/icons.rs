@@ -27,8 +27,9 @@ pub(in crate::windows_app) const ICON_SLOT_X: usize = COMPARATOR_COLUMNS + 15;
 pub(in crate::windows_app) const ICON_SLOT_INSTAGRAM: usize = COMPARATOR_COLUMNS + 16;
 pub(in crate::windows_app) const ICON_SLOT_FACEBOOK: usize = COMPARATOR_COLUMNS + 17;
 pub(in crate::windows_app) const ICON_SLOT_CHESS: usize = COMPARATOR_COLUMNS + 18;
-pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 18] =
-    [const { OnceLock::new() }; 18];
+pub(in crate::windows_app) const ICON_SLOT_GITHUB: usize = COMPARATOR_COLUMNS + 19;
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 19] =
+    [const { OnceLock::new() }; 19];
 
 pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];

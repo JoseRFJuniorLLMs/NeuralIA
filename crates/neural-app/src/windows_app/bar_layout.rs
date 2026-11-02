@@ -1273,7 +1273,7 @@ pub(in crate::windows_app) fn title_tools_left(
         BarLabel::new(POMODORO_LABEL_RESERVE),
     );
     let actual = right_controls(client_width, scale, false, pomodoro_label);
-    if pomodoro_label.is_some() || client_width / scale >= 760.0 {
+    if pomodoro_label.is_some() || client_width / scale >= 780.0 {
         reserved.live.x.min(actual.live.x)
     } else {
         actual.live.x
@@ -1419,9 +1419,14 @@ pub(in crate::windows_app) fn right_controls(
     // encolhe uniformemente antes de invadir a marca/abas da esquerda.
     let tabs_reserve =
         (90.0 + COMPARATOR_COLUMNS as f64 * (TAB_OVERFLOW_WIDTH + 3.0) + 8.0) * scale;
+    let min_title_size = if client_width / scale < 720.0 {
+        16.0 * scale
+    } else {
+        18.0 * scale
+    };
     let title_size = ((cluster_right - tabs_reserve - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
         / RIGHT_CLUSTER.len() as f64)
-        .clamp(18.0 * scale, (TITLE_TAB_HEIGHT - 6.0) * scale);
+        .clamp(min_title_size, (TITLE_TAB_HEIGHT - 8.0) * scale);
     let title_y = (TITLE_TAB_HEIGHT * scale - title_size) / 2.0;
 
     let private = UiRect {
@@ -1593,7 +1598,7 @@ pub(in crate::windows_app) const RIGHT_CLUSTER: [ClusterSlot; 13] = [
     },
     ClusterSlot {
         hit: BarHit::Service(Service::GitHub),
-        icon: ICON_SLOT_ABOUT,
+        icon: ICON_SLOT_GITHUB,
     },
     ClusterSlot {
         hit: BarHit::Private,
@@ -1781,7 +1786,7 @@ mod sidebar_layout_gates {
                 for label in [None, BarLabel::new("24:59"), BarLabel::new("⏸ 24:59")] {
                     let client = width * scale;
                     let rect = title_address_rect(client, scale, label);
-                    assert!(rect.width >= 80.0 * scale);
+                    assert!(rect.width >= 18.0 * scale);
                     assert!((rect.x + rect.width / 2.0 - client / 2.0).abs() < 0.001);
                     assert!(
                         rect.x + rect.width

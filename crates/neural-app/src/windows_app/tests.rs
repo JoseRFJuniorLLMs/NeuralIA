@@ -907,7 +907,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     };
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
-        Some("Nova aba: digite uma URL ou pergunte ao ChatGPT (Ctrl+T)")
+        Some("Nova pergunta para ChatGPT (Ctrl+T)")
     );
     // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
     assert_eq!(
@@ -2089,7 +2089,7 @@ fn column_buttons_fit_or_vanish() {
 /// dos downloads (downloads-ui) logo antes do Privado.
 #[test]
 fn right_cluster_slots_never_overlap_and_hit_back() {
-    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..11].iter().map(|slot| slot.hit).collect();
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..12].iter().map(|slot| slot.hit).collect();
     assert_eq!(
         service_hits,
         [
@@ -2103,6 +2103,7 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             BarHit::Service(Service::Instagram),
             BarHit::Service(Service::Facebook),
             BarHit::Service(Service::Chess),
+            BarHit::Service(Service::GitHub),
         ]
     );
     assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
@@ -2112,7 +2113,7 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             .any(|slot| slot.hit == BarHit::Downloads),
         "a seta de downloads saiu da barra de titulo; o Ctrl+J continua"
     );
-    assert_eq!(RIGHT_CLUSTER[11].hit, BarHit::Private);
+    assert_eq!(RIGHT_CLUSTER[12].hit, BarHit::Private);
     let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
     icons.sort_unstable();
     icons.dedup();
@@ -2168,7 +2169,7 @@ fn the_title_bar_has_no_downloads_button() {
                     right_controls_hit(controls, x as f64 + 0.5, row_y) == Some(BarHit::Downloads)
                 });
                 assert!(!hits_it, "{at}: a seta de downloads voltou a barra");
-                let last_service = controls.services[9];
+                let last_service = controls.services[10];
                 let gap = controls.private.x - (last_service.x + last_service.width);
                 assert!(
                     (gap - 4.0 * scale).abs() < 1e-4,
@@ -9638,7 +9639,7 @@ fn every_webview_gets_the_hooks() {
     // desequilibra a conta.
     let births = source.matches(".build_hooked(window)").count()
         + source.matches(".build_hooked_as_child(window)").count();
-    assert_eq!(births, 12, "sitios onde uma WebView nasce: {births}");
+    assert_eq!(births, 13, "sitios onde uma WebView nasce: {births}");
     assert_eq!(
         source.matches(".hooked_builder(").count(),
         births,
@@ -9651,7 +9652,11 @@ fn every_webview_gets_the_hooks() {
     // conta acima nao o via. Cada sitio aparece uma so vez. Os onze
     // primeiros declaram o hospedeiro literal; o leitor de um download
     // escolhe Pdf ou Epub antes da chamada e passa essa variavel.
-    let sites: [(&str, &str); 12] = [
+    let sites: [(&str, &str); 13] = [
+        (
+            "External",
+            ".external_webview_builder(None, false)\n            .with_html(browser_new_tab_html());\n        let hooked = self.hooked_builder(builder, WebViewHost::External, None);",
+        ),
         (
             "Column",
             ".with_url(url.as_str());\n            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);",
