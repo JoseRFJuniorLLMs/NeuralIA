@@ -1300,7 +1300,7 @@ pub(in crate::windows_app) fn shortcut_text(chord: Chord) -> String {
     )
 }
 
-pub(in crate::windows_app) fn shortcut_map_script() -> String {
+pub(in crate::windows_app) fn shortcut_map_rows() -> Vec<serde_json::Value> {
     let mut rows: Vec<_> = COMMANDS.iter().map(|row| serde_json::json!({
         "label": row.label, "keys": row.chords.iter().map(|spec| shortcut_text(spec.chord)).collect::<Vec<_>>().join(" / ")
     })).collect();
@@ -1308,9 +1308,13 @@ pub(in crate::windows_app) fn shortcut_map_script() -> String {
         rows.extend(live_rows.iter().filter(|row| row["native"] != true).map(|row|
             serde_json::json!({"label":format!("Gemini Live: {}",row["label"].as_str().unwrap_or("")),"keys":row["keys"]})));
     }
+    rows
+}
+
+pub(in crate::windows_app) fn shortcut_map_script() -> String {
     format!(
         "window.neuraliaSetShortcuts && window.neuraliaSetShortcuts({});",
-        serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+        serde_json::to_string(&shortcut_map_rows()).unwrap_or_else(|_| "[]".into())
     )
 }
 

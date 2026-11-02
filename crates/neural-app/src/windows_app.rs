@@ -134,6 +134,8 @@ pub(in crate::windows_app) enum UserEvent {
     /// O gestor de downloads (`downloads.rs`): o que o WebView2 avisa de cada
     /// download e o fim de cada um, com o evento do `neural_core::downloads`.
     Download(neural_core::downloads::DownloadEvent),
+    /// Captura da voz original e resultado da exportação MP3.
+    Audio(AudioEvent),
     /// Traduzir pagina (`translation.rs`): o 文A ou o menu, as leituras do
     /// `page_eval`, a thread `neural-translate` e o cartao.
     Translate(TranslateEvent),
@@ -1135,7 +1137,7 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         }
         BarHit::SplitBookmark => bookmark_star_tooltip(state.split_bookmarked).to_string(),
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
-        BarHit::AddTab(_) => format!("Nova pergunta ao {provider}"),
+        BarHit::AddTab(_) => format!("Nova aba: digite uma URL ou pergunte ao {provider}"),
         BarHit::ContextTab { .. } => {
             format!(
                 "{}\nClique: abrir ao lado · Arraste: mover · Botão direito: fechar e grupos",
@@ -3742,6 +3744,7 @@ pub(in crate::windows_app) struct App {
     /// O gestor de downloads (`downloads.rs`): o `DownloadManager`, as
     /// operacoes vivas do WebView2 e o `downloads.json`.
     pub(in crate::windows_app) downloads: DownloadsState,
+    pub(in crate::windows_app) audio_library: AudioLibrary,
     /// Traduzir pagina (`translation.rs`): as leituras, os runs e o cartao.
     /// Nasce sem thread, sem cofre e sem disco; a thread `neural-translate`
     /// so no primeiro clique.
@@ -3925,6 +3928,7 @@ impl App {
             adblock,
             egress: None,
             downloads,
+            audio_library: AudioLibrary::new(),
             translation,
             // Sem thread: a `neural-consensus` so no primeiro relatorio.
             consensus: ConsensusState::new(),
@@ -7557,6 +7561,18 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
         );
     }
 
+    // "+" do topo: abre a palette nativa, que aceita URL e cria uma aba
+    // de contexto persistida, sem criar outro motor de navegacao.
+    draw_button(
+        target,
+        layout.title_new_tab,
+        "+",
+        matches!(hover, Some(BarHit::AddTab(_))),
+        scale,
+        font,
+        theme,
+    );
+
     // ‹ e › da fonte aberta ao lado (so existem com a gaveta) e de cada IA.
     let mut pairs = vec![
         (layout.back, "‹", BarHit::Back),
@@ -8016,6 +8032,14 @@ fn render_brand_pixels(width: i32, height: i32) -> Vec<u8> {
 /// testes. `all_sources_lists_every_module` compara a lista com o disco.
 #[cfg(test)]
 pub(super) const ALL_MODULES: &[(&str, &str)] = &[
+    (
+        "audio_capture.rs",
+        include_str!("windows_app/audio_capture.rs"),
+    ),
+    (
+        "audio_library.rs",
+        include_str!("windows_app/audio_library.rs"),
+    ),
     ("app/mod.rs", include_str!("windows_app/app/mod.rs")),
     (
         "app/navigation.rs",
@@ -8182,6 +8206,10 @@ pub(in crate::windows_app) mod downloads;
 pub(in crate::windows_app) use downloads::*;
 pub(in crate::windows_app) mod downloads_ui;
 pub(in crate::windows_app) use downloads_ui::*;
+pub(in crate::windows_app) mod audio_capture;
+pub(in crate::windows_app) use audio_capture::*;
+pub(in crate::windows_app) mod audio_library;
+pub(in crate::windows_app) use audio_library::*;
 pub(in crate::windows_app) mod commands;
 pub(in crate::windows_app) use commands::*;
 pub(in crate::windows_app) mod keymap;

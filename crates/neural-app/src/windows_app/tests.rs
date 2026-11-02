@@ -907,7 +907,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     };
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
-        Some("Nova pergunta ao ChatGPT (Ctrl+T)")
+        Some("Nova aba: digite uma URL ou pergunte ao ChatGPT (Ctrl+T)")
     );
     // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
     assert_eq!(
@@ -2089,7 +2089,7 @@ fn column_buttons_fit_or_vanish() {
 /// dos downloads (downloads-ui) logo antes do Privado.
 #[test]
 fn right_cluster_slots_never_overlap_and_hit_back() {
-    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..7].iter().map(|slot| slot.hit).collect();
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..11].iter().map(|slot| slot.hit).collect();
     assert_eq!(
         service_hits,
         [
@@ -2099,6 +2099,10 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             BarHit::Service(Service::WhatsApp),
             BarHit::Service(Service::YouTube),
             BarHit::GmailToggle,
+            BarHit::Service(Service::X),
+            BarHit::Service(Service::Instagram),
+            BarHit::Service(Service::Facebook),
+            BarHit::Service(Service::Chess),
         ]
     );
     assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
@@ -2108,7 +2112,7 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             .any(|slot| slot.hit == BarHit::Downloads),
         "a seta de downloads saiu da barra de titulo; o Ctrl+J continua"
     );
-    assert_eq!(RIGHT_CLUSTER[7].hit, BarHit::Private);
+    assert_eq!(RIGHT_CLUSTER[11].hit, BarHit::Private);
     let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
     icons.sort_unstable();
     icons.dedup();
@@ -2164,11 +2168,11 @@ fn the_title_bar_has_no_downloads_button() {
                     right_controls_hit(controls, x as f64 + 0.5, row_y) == Some(BarHit::Downloads)
                 });
                 assert!(!hits_it, "{at}: a seta de downloads voltou a barra");
-                let gmail = controls.services[5];
-                let gap = controls.private.x - (gmail.x + gmail.width);
+                let last_service = controls.services[9];
+                let gap = controls.private.x - (last_service.x + last_service.width);
                 assert!(
                     (gap - 4.0 * scale).abs() < 1e-4,
-                    "{at}: o Gmail nao encosta ao Privado ({gap})"
+                    "{at}: o ultimo servico nao encosta ao Privado ({gap})"
                 );
             }
         }
@@ -9628,11 +9632,7 @@ fn every_webview_gets_the_hooks() {
         3,
         "a metade do COM e chamada pelos dois build_hooked e definida uma vez, privada"
     );
-    assert!(
-        module.contains(
-            "    fn install_webview_hooks(&self, webview: &WebView, host: WebViewHost) {"
-        )
-    );
+    assert!(module.contains("    fn install_webview_hooks("));
 
     // Uma WebView a mais, ou um sitio que constroi sem os ganchos,
     // desequilibra a conta.
@@ -22107,7 +22107,7 @@ function __build(html) {
       else el.setAttribute(name, value);
     }
     stack[stack.length - 1].appendChild(el);
-    if (!VOID[m[2].toLowerCase()]) stack.push(el);
+    if (!VOID[m[2].toLowerCase()] && !/\/\s*$/.test(m[3])) stack.push(el);
   }
   return html.slice(scriptAt + '<script>'.length, html.indexOf('</script>'));
 }
@@ -22143,6 +22143,11 @@ process.stdout.write(JSON.stringify({
     #[test]
     fn panel_button_shortcuts_use_the_shipped_click_and_preserve_hidden_confirmations() {
         let result = run_panel(&[r#"
+__out.initialNative = $('shortcut-rows').textContent.includes('Ctrl+T');
+window.neuraliaShowSection('shortcuts');
+__out.shortcutsVisible = __visible($('view-shortcuts'));
+__out.focusVisible = __visible(document.activeElement);
+__out.focusTag = document.activeElement.tagName;
 window.neuraliaSetShortcuts([{label:'Comando nativo', keys:'Ctrl+T'}]);
 const shortcut = el => {
   __key(document, 'F2');
@@ -22162,6 +22167,10 @@ __out.last = __posted[__posted.length - 1];
 "#
         .into()]);
         assert_eq!(result["errors"], serde_json::json!([]));
+        assert_eq!(result["out"]["initialNative"], true);
+        assert_eq!(result["out"]["shortcutsVisible"], true);
+        assert_eq!(result["out"]["focusVisible"], true);
+        assert_eq!(result["out"]["focusTag"], "MAIN");
         assert!(result["out"]["rows"].as_u64().unwrap() > 20);
         assert!(result["out"]["title"].as_str().unwrap().contains("F2, "));
         assert_eq!(result["out"]["notesVisible"], true);
@@ -26575,6 +26584,11 @@ fn no_raw_data_dir_write_outside_a_grant() {
             "neural-app/src/windows_app/bookmarks.rs",
             1,
             "exportar favoritos para um caminho que o utilizador escolheu no dialogo, fora da pasta de dados",
+        ),
+        (
+            "neural-app/src/windows_app/audio_capture.rs",
+            2,
+            "exportar MP3 para o caminho escolhido em Salvar como: staging e rename atomico; nenhuma persistencia automatica do audio",
         ),
         (
             "neural-app/src/windows_app/search_card.rs",

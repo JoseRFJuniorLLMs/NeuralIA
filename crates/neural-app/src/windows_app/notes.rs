@@ -124,6 +124,7 @@ pub(super) fn track_note_draft(draft: &mut Option<NoteEdit>, message: &PanelMess
         | PanelMessage::NoteSaveRefused
         | PanelMessage::NoteDelete(_)
         | PanelMessage::Downloads(_)
+        | PanelMessage::Audio(_)
         | PanelMessage::Bookmarks(_)
         | PanelMessage::CheckUpdate => {}
     }
@@ -352,6 +353,7 @@ pub(super) fn notes_command_for(message: PanelMessage) -> Option<NotesCommand> {
         | PanelMessage::Open(_)
         | PanelMessage::Close
         | PanelMessage::Downloads(_)
+        | PanelMessage::Audio(_)
         | PanelMessage::Bookmarks(_)
         | PanelMessage::ObsidianGraph
         | PanelMessage::CheckUpdate => {

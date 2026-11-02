@@ -358,6 +358,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Adblock(event) => self.adblock_event(event),
             UserEvent::Distraction(event) => self.distraction_event(event),
             UserEvent::Download(event) => self.download_event(event),
+            UserEvent::Audio(event) => self.audio_event(event),
             UserEvent::Translate(event) => self.translation_event(event),
             UserEvent::Consensus(event) => self.consensus_event(event),
             UserEvent::Bookmarks(event) => self.bookmarks_event(event),

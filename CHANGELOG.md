@@ -2,6 +2,21 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.0] - 2026-11-01
+
+### Added
+- **Nova aba na barra superior** ([276d136](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/276d136ceb9df0aa7eca17fce514effa9ea0e571)): o botão + abre um campo nativo para URL ou pergunta, e a URL abre uma nova aba persistida na coluna do comparador.
+- **Barra de endereço integrada** ([276d136](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/276d136ceb9df0aa7eca17fce514effa9ea0e571)): digitar uma URL na omnibox do comparador agora abre uma aba de contexto sem trocar para a janela Web isolada.
+- **Áudio das IAs** ([b12b02e](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/b12b02e2cd16e0bfc5ad2f08382f4cdbec49bd36)): capturas de reprodução de ChatGPT, Gemini e Claude habilitadas pelo usuário, lista temporária e exportação MP3 pela interface. Não captura painéis privados.
+- **Serviços sociais** ([b12b02e](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/b12b02e2cd16e0bfc5ad2f08382f4cdbec49bd36)): ícones e acesso aos painéis de X, Instagram, Facebook e Chess.
+
+
+### Fixed
+- O botão de nova aba preserva o acesso ao overflow de todas as colunas em janelas estreitas, com a dica atualizada para URL ou pergunta ([PR #251](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/251)).
+- A captura de áudio começa desativada e exige habilitação a cada sessão; a exportação MP3 real é validada no CI com o encoder pinado ([PR #251](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/251)).
+- Atualizadas as dependências TLS `rustls-webpki`, `webpki-roots` e `webpki-root-certs` para as versões corrigidas apontadas pela auditoria de dependências ([PR #251](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/251)).
+
+
 ## [3.1.1] - 2026-10-15
 
 ### Fixed

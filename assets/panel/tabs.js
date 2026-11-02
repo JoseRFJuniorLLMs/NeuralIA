@@ -3,12 +3,14 @@
     history: byId('tab-history'), notes: byId('tab-notes'),
     obsidian: byId('tab-obsidian'),
     bookmarks: byId('tab-bookmarks'), downloads: byId('tab-downloads'),
+    audio: byId('tab-audio'),
     about: byId('tab-about'), shortcuts: byId('tab-shortcuts')
   };
   const views = {
     history: byId('view-history'), notes: byId('view-notes'),
     obsidian: byId('view-obsidian'),
     bookmarks: byId('view-bookmarks'), downloads: byId('view-downloads'),
+    audio: byId('view-audio'),
     about: byId('view-about'), shortcuts: byId('view-shortcuts')
   };
   function showSection(name) {
@@ -17,6 +19,7 @@
       : name === 'history' || name === 'historico' ? 'history'
       : name === 'bookmarks' || name === 'favoritos' ? 'bookmarks'
       : name === 'downloads' ? 'downloads'
+      : name === 'audio' ? 'audio'
       : name === 'shortcuts' ? 'shortcuts'
       : name === 'about' || name === 'sobre' ? 'about' : '';
     if (!key) return false;
@@ -30,6 +33,14 @@
     else if (key === 'obsidian') { obsidian.refresh(); }
     else if (key === 'bookmarks') { bookmarks.refresh(); bookmarks.focus(); }
     else if (key === 'downloads') { downloads.refresh(); }
+    else if (key === 'audio') { audio.refresh(); }
+    else if (key === 'shortcuts') {
+      panelKeyHints.refresh();
+      renderShortcutMap();
+      const content = views.shortcuts.querySelector('main');
+      content.tabIndex = -1;
+      content.focus();
+    }
     else if (key === 'about') { /* Sobre não precisa focar */ }
     else { q.focus(); }
     return true;
@@ -56,6 +67,7 @@
     // (como o X), noutra seccao mostra os Downloads.
     button() { if (views.downloads.hidden) showSection('downloads'); else close(); }
   };
+  window.__neuraliaAudio = {render: audio.render};
   window.__neuraliaAbout = {
     show() { showSection('about'); },
     button() { if (views.about.hidden) showSection('about'); else close(); }
@@ -65,6 +77,7 @@
   tabs.obsidian.addEventListener('click', () => showSection('obsidian'));
   tabs.bookmarks.addEventListener('click', () => showSection('bookmarks'));
   tabs.downloads.addEventListener('click', () => showSection('downloads'));
+  tabs.audio.addEventListener('click', () => showSection('audio'));
   tabs.shortcuts.addEventListener('click', () => showSection('shortcuts'));
   tabs.about.addEventListener('click', () => showSection('about'));
   byId('close').addEventListener('click', close);
@@ -72,7 +85,8 @@
     if (e.key === 'Escape') { e.preventDefault(); close(); }
   });
 
-  let nativeShortcutRows = [], panelShortcutRows = [];
+  // O catálogo nativo já vem no documento local, antes do canal enviar ready.
+  let nativeShortcutRows = __SHORTCUT_ROWS__, panelShortcutRows = [];
   function renderShortcutMap() {
     const rows = nativeShortcutRows.concat(panelShortcutRows);
     const body = byId('shortcut-rows'); body.replaceChildren();
@@ -83,7 +97,7 @@
     }
   }
   window.neuraliaSetShortcuts = rows => { nativeShortcutRows = rows; renderShortcutMap(); };
-  installPanelKeyHints(document, rows => { panelShortcutRows = rows; renderShortcutMap(); });
+  const panelKeyHints = installPanelKeyHints(document, rows => { panelShortcutRows = rows; renderShortcutMap(); });
   theme(__THEME__);
   q.focus();
   post('ready');

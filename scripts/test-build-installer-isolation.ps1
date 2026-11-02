@@ -82,9 +82,11 @@ $ErrorActionPreference = "Stop"
 $payload = $env:NEURALIA_PAYLOAD_DIR
 $files = @()
 $hash = $null
+$hashes = [ordered]@{}
 if ($payload -and (Test-Path -LiteralPath $payload)) {
     $root = (Resolve-Path -LiteralPath $payload).Path
     $files = @(Get-ChildItem -LiteralPath $root -Recurse -File | ForEach-Object { $_.FullName.Substring($root.Length).TrimStart('\') })
+    foreach ($relative in $files) { $hashes[$relative] = (Get-FileHash -LiteralPath (Join-Path $root $relative) -Algorithm SHA256).Hash }
     $exe = Join-Path $root "NeuralIA.exe"
     if (Test-Path -LiteralPath $exe) {
         $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
@@ -95,6 +97,7 @@ $record = [ordered]@{
     secretVisible = -not ([string]::IsNullOrEmpty($env:NEURALIA_AUTHENTICODE_PFX_B64) -and [string]::IsNullOrEmpty($env:NEURALIA_AUTHENTICODE_PFX_PASSWORD))
     payloadFiles = $files
     payloadHash = $hash
+    payloadHashes = $hashes
 }
 Add-Content -LiteralPath $env:FAKE_CARGO_LOG -Value ($record | ConvertTo-Json -Compress)
 switch ($args[0]) {
@@ -153,6 +156,68 @@ switch ($args[0]) {
         throw "The build did not produce $installer."
     }
 
+    # --- Optional encoder: only the closed set enters the installer, with
+    # identical bytes. Secrets remain isolated with the extended payload too.
+    Remove-Item -LiteralPath $log -Force
+    $encoder = Join-Path $work "encoder"
+    New-Item -ItemType Directory -Force -Path $encoder | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $encoder "ffmpeg.exe"), [byte[]](0x4d, 0x5a, 1, 2))
+    [IO.File]::WriteAllText((Join-Path $encoder "LICENSE.txt"), "GPL v3 license fixture")
+    [IO.File]::WriteAllText((Join-Path $encoder "README.txt"), "FFmpeg build fixture")
+    [IO.File]::WriteAllText((Join-Path $encoder "SOURCE_CODE.txt"), "source revision fixture")
+    [IO.File]::WriteAllText((Join-Path $encoder "unrelated-secret.key"), "must never enter payload")
+    [IO.File]::WriteAllText((Join-Path $encoder "ffprobe.exe"), "not required for MP3 export")
+    $provenancePath = Join-Path $encoder "PROVENANCE.json"
+    $provenance = [ordered]@{
+        name = "FFmpeg"; version = "9.0.2"
+        archive_sha256 = "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba"
+        ffmpeg_sha256 = (Get-FileHash -LiteralPath (Join-Path $encoder "ffmpeg.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
+    } | ConvertTo-Json
+    [IO.File]::WriteAllText($provenancePath, $provenance)
+    $env:NEURALIA_AUTHENTICODE_PFX_B64 = "secret-encoder-marker"
+    $env:NEURALIA_AUTHENTICODE_PFX_PASSWORD = "secret-password-marker"
+    & $buildScript -ExePath $fakeExe -Version $version -OutputDir (Join-Path $work "audio-out") -AudioEncoderDir $encoder | Out-Null
+    $calls = @(Get-CargoCalls)
+    Assert-NoSecretSeen $calls
+    $expectedFiles = @("NeuralIA.exe", "ffmpeg.exe", "third_party\ffmpeg\LICENSE.txt", "third_party\ffmpeg\README.txt", "third_party\ffmpeg\PROVENANCE.json", "third_party\ffmpeg\SOURCE_CODE.txt")
+    $audioBuilds = @($calls | Where-Object { $_.args -like "build *" })
+    if ($audioBuilds.Count -ne 1) { throw "Encoder payload was not built exactly once." }
+    foreach ($call in $audioBuilds) {
+        $files = @($call.payloadFiles)
+        if (@(Compare-Object ($files | Sort-Object) ($expectedFiles | Sort-Object)).Count -ne 0) {
+            throw "Encoder payload is missing a required file or contains an unrelated file: $($files -join ', ')."
+        }
+        foreach ($relative in $expectedFiles) {
+            $input = if ($relative -eq "NeuralIA.exe") { $fakeExe } else { Join-Path $encoder ([IO.Path]::GetFileName($relative)) }
+            $wantedHash = (Get-FileHash -LiteralPath $input -Algorithm SHA256).Hash
+            if ($call.payloadHashes.$relative -ne $wantedHash) { throw "Encoder payload file differs from source: $relative." }
+        }
+    }
+    # Corrupted encoder bytes must be refused before cargo can pack them.
+    Remove-Item -LiteralPath $log -Force
+    [IO.File]::WriteAllBytes((Join-Path $encoder "ffmpeg.exe"), [byte[]](0x4d, 0x5a, 9, 9))
+    $refusedEncoder = $false
+    try { & $buildScript -ExePath $fakeExe -Version $version -OutputDir (Join-Path $work "bad-audio") -AudioEncoderDir $encoder | Out-Null }
+    catch { $refusedEncoder = $_.Exception.Message -match "identity/checksum" }
+    if (-not $refusedEncoder) { throw "A corrupted audio encoder was not refused." }
+    if (@(Get-CargoCalls | Where-Object { $_.args -like "build *" }).Count -ne 0) { throw "cargo packed a corrupted encoder." }
+
+    # A local archive override is verified before extraction. This exercises
+    # the real helper without network or a large binary download.
+    $fakePackage = Join-Path $work "fake-package/ffmpeg-9.0.2-essentials_build"
+    New-Item -ItemType Directory -Force -Path (Join-Path $fakePackage "bin") | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $fakePackage "bin/ffmpeg.exe"), [byte[]](0x4d, 0x5a, 1))
+    [IO.File]::WriteAllText((Join-Path $fakePackage "LICENSE"), "GPL v3")
+    [IO.File]::WriteAllText((Join-Path $fakePackage "README.txt"), "Version: 9.0.2-essentials_build`nLicense: GPL v3")
+    $fakeArchive = Join-Path $work "fake-ffmpeg.zip"
+    Compress-Archive -LiteralPath $fakePackage -DestinationPath $fakeArchive
+    $pinRejected = $false
+    $pinOutput = Join-Path $work "pin-rejected"
+    try { & (Join-Path $PSScriptRoot "prepare-audio-encoder.ps1") -OutputDir $pinOutput -ArchivePath $fakeArchive | Out-Null }
+    catch { $pinRejected = $_.Exception.Message -match "archive SHA256 mismatch" }
+    if (-not $pinRejected) { throw "An unpinned audio encoder archive was not refused." }
+    if (@(Get-ChildItem -LiteralPath $pinOutput -Recurse -File -ErrorAction SilentlyContinue).Count -ne 0) { throw "Unverified FFmpeg archive was extracted." }
+
     # --- 3: -Sign still gets the secrets (read before cargo ran). The fake
     # PFX is not a PFX, so the import fails -- and nothing else may.
     Remove-Item -LiteralPath $log -Force
@@ -173,7 +238,7 @@ switch ($args[0]) {
         throw "The signing step lost the secrets: $signError"
     }
 
-    Write-Host "Installer build isolation passed: cargo never saw the signing secrets, the payload is exactly the -ExePath bytes, -Sign still reads the secrets (fake PFX refused: $signError)."
+    Write-Host "Installer build isolation passed: cargo never saw signing secrets; default payload is exactly -ExePath; optional encoder is complete and byte-identical; corruption/unpinned archives are refused; -Sign still reads secrets (fake PFX refused: $signError)."
 }
 finally {
     foreach ($name in $saved.Keys) {

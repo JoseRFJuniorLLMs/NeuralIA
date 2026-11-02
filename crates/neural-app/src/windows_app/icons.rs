@@ -23,8 +23,12 @@ pub(in crate::windows_app) const ICON_SLOT_LIVE: usize = COMPARATOR_COLUMNS + 11
 pub(in crate::windows_app) const ICON_SLOT_DOWNLOADS: usize = COMPARATOR_COLUMNS + 12;
 /// Informacoes sobre o navegador e atualizacoes.
 pub(in crate::windows_app) const ICON_SLOT_ABOUT: usize = COMPARATOR_COLUMNS + 13;
-pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 14] =
-    [const { OnceLock::new() }; 14];
+pub(in crate::windows_app) const ICON_SLOT_X: usize = COMPARATOR_COLUMNS + 15;
+pub(in crate::windows_app) const ICON_SLOT_INSTAGRAM: usize = COMPARATOR_COLUMNS + 16;
+pub(in crate::windows_app) const ICON_SLOT_FACEBOOK: usize = COMPARATOR_COLUMNS + 17;
+pub(in crate::windows_app) const ICON_SLOT_CHESS: usize = COMPARATOR_COLUMNS + 18;
+pub(in crate::windows_app) static EXTRA_ICON_IMAGES: [OnceLock<RgbaImage>; 18] =
+    [const { OnceLock::new() }; 18];
 
 pub(in crate::windows_app) static AI_ICON_IMAGES: [OnceLock<RgbaImage>; COMPARATOR_COLUMNS] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new()];
@@ -126,6 +130,10 @@ pub(in crate::windows_app) fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_LIVE => include_bytes!("../../../../assets/ai/live.png"),
             ICON_SLOT_DOWNLOADS => include_bytes!("../../../../assets/ai/downloads.png"),
             ICON_SLOT_ABOUT => include_bytes!("../../../../assets/ai/about.png"),
+            ICON_SLOT_X => include_bytes!("../../../../assets/ai/x.png"),
+            ICON_SLOT_INSTAGRAM => include_bytes!("../../../../assets/ai/instagram.png"),
+            ICON_SLOT_FACEBOOK => include_bytes!("../../../../assets/ai/facebook.png"),
+            ICON_SLOT_CHESS => include_bytes!("../../../../assets/ai/chess.png"),
             _ => include_bytes!("../../../../assets/ai/incognito.png"),
         };
         image::load_from_memory(raw)

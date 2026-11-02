@@ -9,6 +9,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDir,
 
+    [string]$AudioEncoderDir = "",
+
     [switch]$Sign,
 
     [switch]$SkipTimestamp,
@@ -212,11 +214,9 @@ Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
 $targetDirectory = Get-CargoTargetDirectory -RepoRoot $repoRoot
 $builtSetup = Join-Path $targetDirectory "release\NeuralIA-Setup.exe"
 
-# The payload is staged in a fresh directory that holds exactly one file: the
-# -ExePath bytes, named NeuralIA.exe. NeuralIA.exe is self-contained (the
-# WebView2 loader is linked statically; PDF.js, Live and the Home art are
-# embedded), so nothing else is needed at runtime besides the system WebView2
-# runtime -- the same single file the Inno installer shipped.
+# The default payload contains only the exact -ExePath bytes. Release builds
+# explicitly add the verified, separately executed MP3 encoder and its notices.
+# No unrelated files from either input directory enter the payload.
 $payloadDir = Join-Path ([IO.Path]::GetTempPath()) ("neuralia-payload-" + [Guid]::NewGuid().ToString("N"))
 $previousPayloadDir = $env:NEURALIA_PAYLOAD_DIR
 New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
@@ -229,6 +229,35 @@ try {
         throw "Staged NeuralIA.exe ($stagedHash) differs from -ExePath ($sourceHash)."
     }
     Write-Host "Installer payload: NeuralIA.exe SHA256 $sourceHash"
+
+    if (-not [string]::IsNullOrWhiteSpace($AudioEncoderDir)) {
+        $encoderRoot = (Resolve-Path -LiteralPath $AudioEncoderDir).Path
+        $encoderFiles = @("ffmpeg.exe", "LICENSE.txt", "README.txt", "PROVENANCE.json", "SOURCE_CODE.txt")
+        foreach ($name in $encoderFiles) {
+            if (-not (Test-Path -LiteralPath (Join-Path $encoderRoot $name) -PathType Leaf)) {
+                throw "Audio encoder package is missing required file $name."
+            }
+        }
+        $manifest = Get-Content -LiteralPath (Join-Path $encoderRoot "PROVENANCE.json") -Raw | ConvertFrom-Json
+        $encoderSource = Join-Path $encoderRoot "ffmpeg.exe"
+        $encoderHash = (Get-FileHash -LiteralPath $encoderSource -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($manifest.name -ne "FFmpeg" -or $manifest.version -ne "9.0.2" -or
+            $manifest.archive_sha256 -ne "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba" -or
+            $manifest.ffmpeg_sha256 -ne $encoderHash) {
+            throw "Audio encoder identity/checksum does not match its pinned provenance."
+        }
+        $notices = Join-Path $payloadDir "third_party/ffmpeg"
+        New-Item -ItemType Directory -Force -Path $notices | Out-Null
+        foreach ($name in $encoderFiles) {
+            $destination = if ($name -eq "ffmpeg.exe") { Join-Path $payloadDir $name } else { Join-Path $notices $name }
+            [IO.File]::Copy((Join-Path $encoderRoot $name), $destination, $true)
+            if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ne
+                (Get-FileHash -LiteralPath (Join-Path $encoderRoot $name) -Algorithm SHA256).Hash) {
+                throw "Staged audio encoder file differs from source: $name."
+            }
+        }
+        Write-Host "Installer audio encoder: FFmpeg $($manifest.version) SHA256 $encoderHash"
+    }
 
     # Deleting the previous output makes a silent no-op build impossible to
     # mistake for a fresh one: cargo either writes it again or the check below

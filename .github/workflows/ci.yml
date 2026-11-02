@@ -71,6 +71,18 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Validate real MP3 export with the pinned audio encoder
+        shell: pwsh
+        run: |
+          $encoder = ./scripts/prepare-audio-encoder.ps1 -OutputDir (Join-Path $env:RUNNER_TEMP "neuralia-audio-validation") -IncludeProbe
+          $env:PATH = "$encoder;$env:PATH"
+          $gate = "windows_app::audio_capture::tests::audio_export_encodes_real_mp3_and_preserves_destination_on_failure"
+          $result = cargo test --locked -p neural-app --bin NeuralIA $gate -- --ignored --exact 2>&1
+          $testExit = $LASTEXITCODE
+          $result | Write-Output
+          if ($testExit -ne 0 -or ($result -join "`n") -notmatch ([regex]::Escape("test $gate ... ok"))) {
+            throw "Real MP3 export gate did not run and pass."
+          }
       - run: cargo check --locked --workspace
       - run: cargo test --locked -p neural-core
       - run: cargo test --locked -p neural-app
