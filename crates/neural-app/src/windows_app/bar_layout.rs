@@ -1259,6 +1259,10 @@ pub(in crate::windows_app) fn split_label_width(room: f64, split_active: bool) -
 /// pausar um Pomodoro nao mexe em nenhuma aba.
 pub(in crate::windows_app) const POMODORO_LABEL_RESERVE: &str = "⏸ 00:00";
 
+/// Marca, acesso ao overflow das tres colunas e folga antes dos atalhos.
+const TITLE_TABS_MIN_RIGHT: f64 =
+    90.0 + COMPARATOR_COLUMNS as f64 * (TAB_OVERFLOW_WIDTH + 3.0) + 8.0;
+
 /// Onde comecam as ferramentas e atalhos na barra de titulo, com a etiqueta
 /// do Pomodoro ja reservada: as abas e a omnibox acabam antes disto.
 pub(in crate::windows_app) fn title_tools_left(
@@ -1273,7 +1277,7 @@ pub(in crate::windows_app) fn title_tools_left(
         BarLabel::new(POMODORO_LABEL_RESERVE),
     );
     let actual = right_controls(client_width, scale, false, pomodoro_label);
-    if pomodoro_label.is_some() || client_width / scale >= 760.0 {
+    if pomodoro_label.is_some() || reserved.live.x + 1e-6 * scale >= TITLE_TABS_MIN_RIGHT * scale {
         reserved.live.x.min(actual.live.x)
     } else {
         actual.live.x
@@ -1294,8 +1298,8 @@ pub(in crate::windows_app) fn title_address_rect(
     let left = (90.0 + 160.0) * scale;
     let center = client_width / 2.0;
     let centered_room = (2.0 * (right - center).min(center - left)).max(0.0);
-    let available = if centered_room >= 80.0 * scale {
-        centered_room.min(240.0 * scale)
+    let available = if centered_room + 1e-6 * scale >= 80.0 * scale {
+        centered_room.max(80.0 * scale).min(240.0 * scale)
     } else {
         (right - left).clamp(0.0, 240.0 * scale)
     };
@@ -1410,18 +1414,32 @@ pub(in crate::windows_app) fn right_controls(
     // Ferramentas na barra de titulo (Row 1): Pomodoro, Notas, Respiracao.
     let tools = home_tool_buttons(client_width, scale, pomodoro_label);
 
-    // Os atalhos na barra de titulo (Row 1), imediatamente a esquerda do
-    // Pomodoro (`tools[0]`), com folga uniforme de 4 px:
-    // [Live] [Meet] [Teams] [Outlook] [WhatsApp] [YouTube] [Gmail] [Privado]
-    let icon_gap = 4.0 * scale;
+    // Os 13 atalhos cedem primeiro a folga, preservando o acesso ao
+    // overflow das tres colunas mesmo com o Pomodoro ativo ou pausado.
+    // Os alvos mantem 18 px a partir de 720 px logicos; abaixo disso,
+    // aceitam 16 px antes de ocupar a faixa das abas.
+    let logical_width = client_width / scale;
+    let tabs_reserve = TITLE_TABS_MIN_RIGHT * scale;
+    let min_title_size = if logical_width < 720.0 { 16.0 } else { 18.0 } * scale;
+    let icon_count = RIGHT_CLUSTER.len() as f64;
+    let gap_for_tools = |left: f64| {
+        ((left - tabs_reserve - icon_count * min_title_size) / icon_count).clamp(0.0, 4.0 * scale)
+    };
+    let icon_gap = gap_for_tools(tools[0].x);
     let cluster_right = tools[0].x - icon_gap;
-    // Todos os servicos continuam acessiveis em janelas menores. O grupo
-    // encolhe uniformemente antes de invadir a marca/abas da esquerda.
-    let tabs_reserve =
-        (90.0 + COMPARATOR_COLUMNS as f64 * (TAB_OVERFLOW_WIDTH + 3.0) + 8.0) * scale;
-    let title_size = ((cluster_right - tabs_reserve - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
-        / RIGHT_CLUSTER.len() as f64)
-        .clamp(18.0 * scale, (TITLE_TAB_HEIGHT - 6.0) * scale);
+    let mut title_size =
+        ((cluster_right - tabs_reserve - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap) / icon_count)
+            .clamp(min_title_size, (TITLE_TAB_HEIGHT - 6.0) * scale);
+    // Em telas largas, a omnibox em repouso precisa de pelo menos 80 px
+    // realmente centrados. Os atalhos cedem alguns pixeis antes de
+    // empurrar o endereco para a esquerda; nao movemos a barra antiga.
+    if logical_width >= 1440.0 {
+        let centered_address_right = client_width / 2.0 + 48.0 * scale;
+        let max_icon_size =
+            (cluster_right - centered_address_right - (RIGHT_CLUSTER.len() - 1) as f64 * icon_gap)
+                / RIGHT_CLUSTER.len() as f64;
+        title_size = title_size.min(max_icon_size.max(18.0 * scale));
+    }
     let title_y = (TITLE_TAB_HEIGHT * scale - title_size) / 2.0;
 
     let private = UiRect {
@@ -1475,12 +1493,8 @@ pub(in crate::windows_app) fn right_controls(
         // O chao e o Privado sem o Pomodoro. Com o timer, o botao anda para
         // a esquerda; se o rotulo o seguisse, as colunas da segunda linha
         // mudavam ao arrancar a sessao.
-        let floor = if pomodoro_label.is_none() {
-            private.x + private.width
-        } else {
-            let parked = home_tool_buttons(client_width, scale, None);
-            parked[0].x - icon_gap
-        };
+        let parked = home_tool_buttons(client_width, scale, None);
+        let floor = parked[0].x - gap_for_tools(parked[0].x);
         if label_x < floor {
             label_x = floor;
         }

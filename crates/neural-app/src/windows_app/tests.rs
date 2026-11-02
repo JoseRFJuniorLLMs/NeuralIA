@@ -907,7 +907,7 @@ fn every_bar_target_has_a_tooltip_that_says_what_the_click_does() {
     };
     assert_eq!(
         label(BarHit::AddTab(1), false).as_deref(),
-        Some("Nova aba: digite uma URL ou pergunte ao ChatGPT (Ctrl+T)")
+        Some("Nova pergunta para ChatGPT (Ctrl+T)")
     );
     // O 文A diz «Traduzir página» -- nao o «Traduzir» da barra de selecao.
     assert_eq!(
@@ -2089,7 +2089,7 @@ fn column_buttons_fit_or_vanish() {
 /// dos downloads (downloads-ui) logo antes do Privado.
 #[test]
 fn right_cluster_slots_never_overlap_and_hit_back() {
-    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..11].iter().map(|slot| slot.hit).collect();
+    let service_hits: Vec<BarHit> = RIGHT_CLUSTER[1..12].iter().map(|slot| slot.hit).collect();
     assert_eq!(
         service_hits,
         [
@@ -2103,6 +2103,7 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             BarHit::Service(Service::Instagram),
             BarHit::Service(Service::Facebook),
             BarHit::Service(Service::Chess),
+            BarHit::Service(Service::GitHub),
         ]
     );
     assert_eq!(RIGHT_CLUSTER[0].hit, BarHit::GeminiLive);
@@ -2112,7 +2113,8 @@ fn right_cluster_slots_never_overlap_and_hit_back() {
             .any(|slot| slot.hit == BarHit::Downloads),
         "a seta de downloads saiu da barra de titulo; o Ctrl+J continua"
     );
-    assert_eq!(RIGHT_CLUSTER[11].hit, BarHit::Private);
+    assert_eq!(RIGHT_CLUSTER[11].hit, BarHit::Service(Service::GitHub));
+    assert_eq!(RIGHT_CLUSTER[12].hit, BarHit::Private);
     let mut icons: Vec<usize> = RIGHT_CLUSTER.iter().map(|slot| slot.icon).collect();
     icons.sort_unstable();
     icons.dedup();
@@ -2168,12 +2170,20 @@ fn the_title_bar_has_no_downloads_button() {
                     right_controls_hit(controls, x as f64 + 0.5, row_y) == Some(BarHit::Downloads)
                 });
                 assert!(!hits_it, "{at}: a seta de downloads voltou a barra");
-                let last_service = controls.services[9];
+                let last_service = controls.services[10];
                 let gap = controls.private.x - (last_service.x + last_service.width);
                 assert!(
-                    (gap - 4.0 * scale).abs() < 1e-4,
-                    "{at}: o ultimo servico nao encosta ao Privado ({gap})"
+                    gap >= -1e-4 && gap <= 4.0 * scale + 1e-4,
+                    "{at}: folga entre GitHub e Privado fora de 0..4 px ({gap})"
                 );
+                let cluster = controls.cluster();
+                for pair in cluster.windows(2) {
+                    let between = pair[1].x - (pair[0].x + pair[0].width);
+                    assert!(
+                        (between - gap).abs() < 1e-4,
+                        "{at}: folgas diferentes entre os atalhos ({between} != {gap})"
+                    );
+                }
             }
         }
     }
@@ -9638,7 +9648,7 @@ fn every_webview_gets_the_hooks() {
     // desequilibra a conta.
     let births = source.matches(".build_hooked(window)").count()
         + source.matches(".build_hooked_as_child(window)").count();
-    assert_eq!(births, 12, "sitios onde uma WebView nasce: {births}");
+    assert_eq!(births, 13, "sitios onde uma WebView nasce: {births}");
     assert_eq!(
         source.matches(".hooked_builder(").count(),
         births,
@@ -9651,7 +9661,11 @@ fn every_webview_gets_the_hooks() {
     // conta acima nao o via. Cada sitio aparece uma so vez. Os onze
     // primeiros declaram o hospedeiro literal; o leitor de um download
     // escolhe Pdf ou Epub antes da chamada e passa essa variavel.
-    let sites: [(&str, &str); 12] = [
+    let sites: [(&str, &str); 13] = [
+        (
+            "External",
+            "let builder = self\n            .external_webview_builder(None, false)\n            .with_html(browser_new_tab_html());\n        let hooked = self.hooked_builder(builder, WebViewHost::External, None);",
+        ),
         (
             "Column",
             ".with_url(url.as_str());\n            let hooked = self.hooked_builder(builder, WebViewHost::Column(i), None);",
@@ -17333,52 +17347,58 @@ fn a_narrow_bar_never_shows_an_open_group_chip_without_its_tabs() {
     let contexts: [Vec<ContextTab>; COMPARATOR_COLUMNS] = std::array::from_fn(|_| column.clone());
     let all_groups: [Vec<ContextGroup>; COMPARATOR_COLUMNS] =
         std::array::from_fn(|_| vec![group(1, false)]);
-    for logical in [700.0, 760.0, 800.0, 900.0, 1000.0, 1280.0, 1600.0, 1920.0] {
-        for scale in [1.0, 1.25, 1.5, 2.0] {
-            let layout = BarLayout::with_rows(
-                logical * scale,
-                scale,
-                true,
-                BarColumns::even(3),
-                tab_rows(&contexts, &all_groups, None),
-            );
-            let limit = layout.window_minimize.x;
-            for col in 0..COMPARATOR_COLUMNS {
-                let at = format!("coluna {col} a {logical}px @{scale}x");
-                assert!(
-                    layout.context_tab_counts[col] > 0 || layout.tab_overflow_counts[col] > 0,
-                    "{at}: sem abas nem acesso via overflow"
+    let (running, paused) = shipped_pomodoro_labels();
+    for pomodoro_label in [None, running, paused] {
+        for logical in [700.0, 760.0, 800.0, 900.0, 1000.0, 1280.0, 1600.0, 1920.0] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let layout = BarLayout::with_rows(
+                    logical * scale,
+                    scale,
+                    true,
+                    BarColumns {
+                        pomodoro_label,
+                        ..BarColumns::even(3)
+                    },
+                    tab_rows(&contexts, &all_groups, None),
                 );
-                for visual in 0..layout.group_pill_counts[col] {
-                    assert!(
-                        layout.group_lines[col][visual].width > 0.0,
-                        "{at}: pilula aberta sem nenhuma das suas abas"
-                    );
-                    let chip = layout.group_pills[col][visual];
-                    assert!(chip.x + chip.width <= limit + 0.5, "{at}: pilula por cima");
-                }
-                for visual in 0..layout.context_tab_counts[col] {
-                    let tab = layout.context_tabs[col][visual];
-                    assert!(tab.x + tab.width <= limit + 0.5, "{at}: aba por cima");
-                    assert!(tab.width >= TAB_MIN_WIDTH * scale - 1e-9, "{at}: espremida");
-                }
-                let hidden = column.len() - layout.context_tab_counts[col];
-                assert_eq!(layout.tab_overflow_counts[col], hidden, "{at}: ‹N");
-                if hidden > 0 {
-                    let (x, y) = center_of(layout.tab_overflow[col]);
-                    assert_eq!(layout.hit(x, y), Some(BarHit::TabOverflow(col)), "{at}");
-                }
-            }
-            // A linha do titulo tambem leva as ferramentas (Pomodoro, com a
-            // etiqueta reservada, Notas e Respiracao) e os atalhos antes dos
-            // botoes da janela: tudo cabe a partir de 1600 px logicos (abaixo
-            // sobra o "‹N"; so as abas que nao cabem saem).
-            if logical >= 1600.0 {
+                let limit = layout.window_minimize.x;
                 for col in 0..COMPARATOR_COLUMNS {
-                    assert_eq!(
-                        layout.context_tab_counts[col], 3,
-                        "a {logical}px @{scale}x tudo cabe, encolhido"
+                    let at = format!("coluna {col} a {logical}px @{scale}x {pomodoro_label:?}");
+                    assert!(
+                        layout.context_tab_counts[col] > 0 || layout.tab_overflow_counts[col] > 0,
+                        "{at}: sem abas nem acesso via overflow"
                     );
+                    for visual in 0..layout.group_pill_counts[col] {
+                        assert!(
+                            layout.group_lines[col][visual].width > 0.0,
+                            "{at}: pilula aberta sem nenhuma das suas abas"
+                        );
+                        let chip = layout.group_pills[col][visual];
+                        assert!(chip.x + chip.width <= limit + 0.5, "{at}: pilula por cima");
+                    }
+                    for visual in 0..layout.context_tab_counts[col] {
+                        let tab = layout.context_tabs[col][visual];
+                        assert!(tab.x + tab.width <= limit + 0.5, "{at}: aba por cima");
+                        assert!(tab.width >= TAB_MIN_WIDTH * scale - 1e-9, "{at}: espremida");
+                    }
+                    let hidden = column.len() - layout.context_tab_counts[col];
+                    assert_eq!(layout.tab_overflow_counts[col], hidden, "{at}: ‹N");
+                    if hidden > 0 {
+                        let (x, y) = center_of(layout.tab_overflow[col]);
+                        assert_eq!(layout.hit(x, y), Some(BarHit::TabOverflow(col)), "{at}");
+                    }
+                }
+                // A linha do titulo tambem leva as ferramentas (Pomodoro, com a
+                // etiqueta reservada, Notas e Respiracao) e os atalhos antes dos
+                // botoes da janela: tudo cabe a partir de 1600 px logicos (abaixo
+                // sobra o "‹N"; so as abas que nao cabem saem).
+                if logical >= 1600.0 {
+                    for col in 0..COMPARATOR_COLUMNS {
+                        assert_eq!(
+                            layout.context_tab_counts[col], 3,
+                            "a {logical}px @{scale}x tudo cabe, encolhido"
+                        );
+                    }
                 }
             }
         }
