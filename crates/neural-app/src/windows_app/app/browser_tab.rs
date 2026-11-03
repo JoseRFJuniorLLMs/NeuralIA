@@ -1,6 +1,7 @@
 //! Aba Web independente no lado esquerdo do comparador.
- //! Usa um EDIT Win32 persistente: navegar nunca entrega texto às IAs.
+//! Usa um EDIT Win32 persistente: navegar nunca entrega texto às IAs.
 use crate::windows_app::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
 
 pub(in crate::windows_app) const LEFT_BROWSER_BAR_HEIGHT: f64 = 48.0;
 const LEFT_BROWSER_SUBCLASS_ID: usize = 0x4E91;
@@ -56,21 +57,26 @@ impl App {
             return;
         }
         let Some(window) = &self.window else { return };
-        let Some(owner) = window_hwnd(window) else { return };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
         let logical_width = size.width as f64 / scale;
         let logical_height = size.height as f64 / scale;
         let left_width = (comparator_logical_width(
             logical_width,
-            self.comparator.as_ref().map_or(0.0, |c| c.panel_width)
-        ) / 3.0).max(1.0);
+            self.comparator.as_ref().map_or(0.0, |c| c.panel_width),
+        ) / 3.0)
+            .max(1.0);
         let bounds = wry::Rect {
-            position: LogicalPosition::new(0.0, COMPARATOR_CHROME_HEIGHT + LEFT_BROWSER_BAR_HEIGHT).into(),
+            position: LogicalPosition::new(0.0, COMPARATOR_CHROME_HEIGHT + LEFT_BROWSER_BAR_HEIGHT)
+                .into(),
             size: LogicalSize::new(
                 left_width,
                 (logical_height - COMPARATOR_CHROME_HEIGHT - LEFT_BROWSER_BAR_HEIGHT).max(1.0),
-            ).into(),
+            )
+            .into(),
         };
         let builder = self
             .external_webview_builder(None, false)
@@ -88,11 +94,22 @@ impl App {
         };
         let address = unsafe {
             CreateWindowExW(
-                0, windows_sys::w!("EDIT"), windows_sys::w!(""),
-                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32 |
-                    windows_sys::Win32::UI::WindowsAndMessaging::WS_BORDER,
-                0, 0, 100, 34, owner,
-                std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+                0,
+                windows_sys::w!("EDIT"),
+                windows_sys::w!(""),
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | ES_AUTOHSCROLL as u32
+                    | windows_sys::Win32::UI::WindowsAndMessaging::WS_BORDER,
+                0,
+                0,
+                100,
+                34,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
         if address.is_null() {
@@ -101,7 +118,15 @@ impl App {
             return;
         }
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
-        if unsafe { SetWindowSubclass(address, Some(left_browser_edit_subclass), LEFT_BROWSER_SUBCLASS_ID, proxy_ptr) } == 0 {
+        if unsafe {
+            SetWindowSubclass(
+                address,
+                Some(left_browser_edit_subclass),
+                LEFT_BROWSER_SUBCLASS_ID,
+                proxy_ptr,
+            )
+        } == 0
+        {
             unsafe { DestroyWindow(address) };
             drop(view);
             self.show_native_error("Não foi possível inicializar o endereço Web.".to_string());
@@ -129,7 +154,9 @@ impl App {
             return;
         }
         let input = input.trim();
-        if input.is_empty() { return; }
+        if input.is_empty() {
+            return;
+        }
         let Some(target) = detect_web_target(input).or_else(|| google_search_url(input)) else {
             return;
         };
@@ -138,7 +165,10 @@ impl App {
             return;
         };
         if is_local_network_target(&url) {
-            self.show_splash("Endereço de rede local não permitido nesta aba.".to_string(), 4);
+            self.show_splash(
+                "Endereço de rede local não permitido nesta aba.".to_string(),
+                4,
+            );
             return;
         }
         if let Some(browser) = &self.webview {
@@ -150,7 +180,9 @@ impl App {
 
     /// Ao voltar a focar a barra, mostra o URL atual, sem ler dados da IA.
     pub(in crate::windows_app) fn sync_left_browser_address(&self) {
-        if self.surface != Surface::Comparator { return }
+        if self.surface != Surface::Comparator {
+            return;
+        }
         let (Some(address), Some(browser)) = (self.left_browser_address, &self.webview) else {
             return;
         };
