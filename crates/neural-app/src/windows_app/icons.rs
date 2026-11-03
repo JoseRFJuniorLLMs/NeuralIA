@@ -135,6 +135,7 @@ pub(in crate::windows_app) fn extra_icon(slot: usize) -> &'static RgbaImage {
             ICON_SLOT_INSTAGRAM => include_bytes!("../../../../assets/ai/instagram.png"),
             ICON_SLOT_FACEBOOK => include_bytes!("../../../../assets/ai/facebook.png"),
             ICON_SLOT_CHESS => include_bytes!("../../../../assets/ai/chess.png"),
+            ICON_SLOT_GITHUB => include_bytes!("../../../../assets/ai/github.png"),
             _ => include_bytes!("../../../../assets/ai/incognito.png"),
         };
         image::load_from_memory(raw)
@@ -382,4 +383,26 @@ pub(in crate::windows_app) const fn rgb(r: u8, g: u8, b: u8) -> u32 {
 
 pub(in crate::windows_app) const fn rgb3(color: Rgb) -> u32 {
     rgb(color.0, color.1, color.2)
+}
+
+// O simbolo GitHub da barra tem de ser o logo real, nao a imagem de
+// navegação privada usada anteriormente como fallback do mesmo slot.
+#[cfg(test)]
+mod github_icon_tests {
+    use super::*;
+
+    #[test]
+    fn github_toolbar_slot_has_distinct_bundled_icon() {
+        let github = extra_icon(ICON_SLOT_GITHUB);
+        assert_eq!((github.width(), github.height()), (64, 64));
+        assert!(github.pixels().any(|pixel| pixel[3] > 0));
+        assert!(github.pixels().any(|pixel| pixel[3] == 0));
+        assert_ne!(github.as_raw(), extra_icon(ICON_SLOT_INCOGNITO).as_raw());
+
+        let button = RIGHT_CLUSTER
+            .iter()
+            .find(|slot| slot.hit == BarHit::Service(Service::GitHub))
+            .expect("GitHub deve estar no cluster da barra de titulo");
+        assert_eq!(button.icon, ICON_SLOT_GITHUB);
+    }
 }

@@ -7647,12 +7647,10 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
                 draw_live_button(target, rect, live.indicator(), hovered, scale, theme);
             }
             hit => {
-                if hit == BarHit::Service(Service::GitHub) {
-                    draw_button(target, rect, "GH", hovered, scale, font, theme);
-                    continue;
-                }
                 let tint = match hit {
-                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
+                    BarHit::Service(Service::Meet)
+                    | BarHit::Service(Service::GitHub)
+                    | BarHit::Private => Some(theme.fg),
                     _ => None,
                 };
                 draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
