@@ -247,6 +247,8 @@ impl App {
     }
 
     fn open_comparator(&mut self, query: &str) {
+        // Uma pesquisa nova restaura a IA esquerda sem destruir as outras duas.
+        self.close_left_browser_tab();
         self.close_side_panel(PanelExit::NewSearch);
         self.service_panel_for_transition();
         self.minimize_live_panel();
@@ -839,6 +841,61 @@ impl App {
 
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
         let content_y = COMPARATOR_CHROME_HEIGHT;
+
+        // Aba Web independente: ocupa somente a faixa esquerda; a omnibox
+        // das IAs e os outros dois controllers continuam vivos.
+        let show_left_browser = left_browser_visible(
+            self.surface,
+            comp.expanded,
+            comp.split.as_ref().is_some_and(|split| split.fullscreen),
+        );
+        if !show_left_browser
+            && let (Some(browser), Some(address)) = (&self.webview, self.left_browser_address)
+        {
+            let _ = browser.set_visible(false);
+            unsafe { ShowWindow(address, SW_HIDE) };
+        }
+        if show_left_browser
+            && let (Some(browser), Some(address)) = (&self.webview, self.left_browser_address)
+        {
+            let left_width = (logical_w / 3.0).max(1.0);
+            for (index, view) in comp.views.iter().enumerate() {
+                if index == 0 || comp.minimized[index] {
+                    let _ = view.webview.set_visible(false);
+                } else {
+                    let width = ((logical_w - left_width) / 2.0).max(1.0);
+                    let x = left_width + (index - 1) as f64 * width;
+                    let _ = view.webview.set_bounds(wry::Rect {
+                        position: LogicalPosition::new(x, content_y).into(),
+                        size: LogicalSize::new(width, content_h).into(),
+                    });
+                    let _ = view.webview.set_visible(true);
+                }
+            }
+            if let Some(split) = &comp.split {
+                let _ = split.webview.set_visible(false);
+            }
+            let _ = browser.set_bounds(wry::Rect {
+                position: LogicalPosition::new(0.0, content_y + LEFT_BROWSER_BAR_HEIGHT).into(),
+                size: LogicalSize::new(left_width, (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0))
+                    .into(),
+            });
+            let _ = browser.set_visible(true);
+            let scale = window.scale_factor().max(1.0);
+            unsafe {
+                SetWindowPos(
+                    address,
+                    std::ptr::null_mut(),
+                    (8.0 * scale).round() as i32,
+                    ((content_y + 7.0) * scale).round() as i32,
+                    ((left_width - 16.0).max(1.0) * scale).round() as i32,
+                    (34.0 * scale).round() as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                ShowWindow(address, SW_SHOW);
+            }
+            return;
+        }
 
         // Fonte lateral: a IA que originou o link continua visível, as demais
         // ficam vivas e preservam estado para reaparecer ao fechar a gaveta.

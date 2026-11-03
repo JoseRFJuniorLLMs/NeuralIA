@@ -303,6 +303,10 @@ pub(in crate::windows_app) enum UserEvent {
     AgentObservation(ObservedPage),
     SubmitText(String),
     OpenExternal(String),
+    /// Enter na barra da aba Web esquerda (nunca passa pela busca das IAs).
+    LeftBrowserSubmit(String),
+    /// Ao focar a barra Web, sincronizar o URL real da WebView.
+    LeftBrowserFocus,
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
     OpenInColumn(usize, String),
     /// Clique simples num link: a mesma pagina nas TRES colunas, para se
@@ -3590,6 +3594,8 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) webview: Option<WebView>,
     pub(in crate::windows_app) comparator: Option<ComparatorState>,
     pub(in crate::windows_app) omnibox: Option<HWND>,
+    /// Campo EDIT exclusivo da aba Web na coluna esquerda.
+    pub(in crate::windows_app) left_browser_address: Option<HWND>,
     pub(in crate::windows_app) bar_hover: Option<BarHit>,
     /// Botao esquerdo em baixo sobre uma aba, o x dela ou a pilula de um
     /// grupo: o que acontece so se decide ao largar (ou ao arrastar).
@@ -3856,6 +3862,7 @@ impl App {
             webview: None,
             comparator: None,
             omnibox: None,
+            left_browser_address: None,
             bar_hover: None,
             tab_press: None,
             tab_gesture_count: 0,
@@ -7640,12 +7647,10 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
                 draw_live_button(target, rect, live.indicator(), hovered, scale, theme);
             }
             hit => {
-                if hit == BarHit::Service(Service::GitHub) {
-                    draw_button(target, rect, "GH", hovered, scale, font, theme);
-                    continue;
-                }
                 let tint = match hit {
-                    BarHit::Service(Service::Meet) | BarHit::Private => Some(theme.fg),
+                    BarHit::Service(Service::Meet)
+                    | BarHit::Service(Service::GitHub)
+                    | BarHit::Private => Some(theme.fg),
                     _ => None,
                 };
                 draw_icon_button(target, rect, slot.icon, tint, hovered, scale, theme);
@@ -8067,6 +8072,10 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("app/pages.rs", include_str!("windows_app/app/pages.rs")),
     ("app/chrome.rs", include_str!("windows_app/app/chrome.rs")),
     ("app/compare.rs", include_str!("windows_app/app/compare.rs")),
+    (
+        "app/browser_tab.rs",
+        include_str!("windows_app/app/browser_tab.rs"),
+    ),
     ("app/tabs.rs", include_str!("windows_app/app/tabs.rs")),
     (
         "app/event_loop.rs",

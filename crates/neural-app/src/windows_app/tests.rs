@@ -9655,7 +9655,7 @@ fn every_webview_gets_the_hooks() {
     let sites: [(&str, &str); 13] = [
         (
             "External",
-            ".external_webview_builder(None, false)\n            .with_html(browser_new_tab_html());\n        let hooked = self.hooked_builder(builder, WebViewHost::External, None);",
+            "let hooked = self.hooked_builder(builder, WebViewHost::External, None);\n        let result = hooked.build_hooked_as_child(window);",
         ),
         (
             "Column",
@@ -16199,6 +16199,58 @@ fn a_private_split_request_after_leaving_the_comparator_is_dropped() {
         assert_eq!(
             App::split_request_fallback(Surface::Comparator, private),
             SplitFallback::OpenSplit
+        );
+    }
+}
+
+#[test]
+fn left_browser_popups_stay_in_the_browser_and_reject_unsafe_targets() {
+    for target in ["https://example.com/", "http://example.com/path?q=one"] {
+        assert!(matches!(
+            left_browser_new_window_event(target.to_string()),
+            Some(UserEvent::LeftBrowserSubmit(url)) if url == target
+        ));
+    }
+    for target in [
+        "about:blank",
+        "ABOUT:BLANK",
+        "javascript:alert(1)",
+        "file:///C:/Windows/win.ini",
+        "http://127.0.0.1/",
+        "http://192.168.0.1/",
+    ] {
+        assert!(
+            left_browser_new_window_event(target.to_string()).is_none(),
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn left_browser_yields_to_fullscreen_and_other_surfaces() {
+    assert!(left_browser_visible(Surface::Comparator, None, false));
+    for column in 0..COMPARATOR_COLUMNS {
+        assert!(!left_browser_visible(
+            Surface::Comparator,
+            Some(column),
+            false
+        ));
+    }
+    assert!(!left_browser_visible(Surface::Comparator, None, true));
+    assert!(!left_browser_visible(Surface::Home, None, false));
+}
+
+#[test]
+fn left_browser_has_no_destructive_navigation_or_error_route() {
+    let source = include_str!("app/browser_tab.rs");
+    for forbidden in [
+        "show_native_error(",
+        "destroy_web_surfaces(",
+        "UserEvent::OpenExternal(",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "destructive route in left browser: {forbidden}"
         );
     }
 }

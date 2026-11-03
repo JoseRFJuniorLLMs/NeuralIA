@@ -462,6 +462,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::OpenExternal(url) => self.web(url),
+            UserEvent::LeftBrowserSubmit(text) => self.submit_left_browser_address(&text),
+            UserEvent::LeftBrowserFocus => self.sync_left_browser_address(),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {

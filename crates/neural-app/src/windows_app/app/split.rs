@@ -391,6 +391,8 @@ impl App {
 
         match committed {
             Ok((webview, previous)) => {
+                // A aba Web so fecha quando a nova fonte foi criada com sucesso.
+                self.close_left_browser_tab();
                 if let Some(previous) = previous {
                     let _ = previous.webview.set_visible(false);
                     let _ = previous.webview.focus_parent();
@@ -632,6 +634,7 @@ impl App {
             // divisores (popups, acima das WebViews) ficavam a flutuar sobre
             // o video.
             let show = self.surface == Surface::Comparator
+                && self.left_browser_address.is_none()
                 && comp.split.as_ref().is_none_or(|split| split.minimized)
                 && comp.expanded.is_none()
                 && !self.service_covers_window();
