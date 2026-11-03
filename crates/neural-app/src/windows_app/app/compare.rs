@@ -866,7 +866,8 @@ impl App {
             }
             let _ = browser.set_bounds(wry::Rect {
                 position: LogicalPosition::new(0.0, content_y + LEFT_BROWSER_BAR_HEIGHT).into(),
-                size: LogicalSize::new(left_width, (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0)).into(),
+                size: LogicalSize::new(left_width, (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0))
+                    .into(),
             });
             let _ = browser.set_visible(true);
             let scale = window.scale_factor().max(1.0);
