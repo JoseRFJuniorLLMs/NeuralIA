@@ -25,6 +25,8 @@ $settingsPath = Join-Path $dataDir "adblock-settings.json"
 [IO.File]::WriteAllText($settingsPath, '{"version":1,"data":{"enabled":false,"allow_sites":[],"distraction":{}}}', $utf8)
 
 $fixture = $null
+$fixtureStdout = $null
+$fixtureStderr = $null
 $process = $null
 $failure = $null
 $http = $null
@@ -34,10 +36,22 @@ $previousEnvironment = @{}
 foreach ($name in $environmentNames) { $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process") }
 try {
     $fixtureScript = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "distraction-e2e-fixture.mjs")).Path
-    $fixture = Start-Process -FilePath "node" -ArgumentList @(('"' + $fixtureScript + '"'), ('"' + $portFile + '"')) -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $work "fixture.stdout.log") -RedirectStandardError (Join-Path $work "fixture.stderr.log")
+    # The runner has no interactive console: launch Node directly rather
+    # than asking ShellExecute/console-window handling to hide a new window.
+    $fixtureStart = [Diagnostics.ProcessStartInfo]::new()
+    $fixtureStart.FileName = (Get-Command node -CommandType Application | Select-Object -First 1).Source
+    $fixtureStart.UseShellExecute = $false
+    $fixtureStart.CreateNoWindow = $true
+    $fixtureStart.RedirectStandardOutput = $true
+    $fixtureStart.RedirectStandardError = $true
+    $fixtureStart.ArgumentList.Add($fixtureScript)
+    $fixtureStart.ArgumentList.Add($portFile)
+    $fixture = [Diagnostics.Process]::Start($fixtureStart)
+    $fixtureStdout = $fixture.StandardOutput.ReadToEndAsync()
+    $fixtureStderr = $fixture.StandardError.ReadToEndAsync()
     $watch = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path -LiteralPath $portFile)) {
-        if ($watch.ElapsedMilliseconds -gt 10000 -or $fixture.HasExited) { throw "A fixture da SPEC-0114 nao arrancou." }
+        if ($watch.ElapsedMilliseconds -gt 45000 -or $fixture.HasExited) { throw "A fixture da SPEC-0114 nao arrancou (pid $($fixture.Id); exited=$($fixture.HasExited); node=$($fixtureStart.FileName))." }
         Start-Sleep -Milliseconds 50
     }
     $port = ([IO.File]::ReadAllText($portFile, $utf8)).Trim()
@@ -101,9 +115,8 @@ catch {
     $failure = $_.Exception.Message
     Write-Warning "SPEC-0114 failed: $failure"
     Write-Host "Last fixture requests: $(@($rows | Where-Object { $_.path -ne '/__log' } | Select-Object -Last 20) | ConvertTo-Json -Compress)"
-    foreach ($log in "fixture.stdout.log", "fixture.stderr.log") {
-        $logPath = Join-Path $work $log
-        if (Test-Path -LiteralPath $logPath) { Get-Content -LiteralPath $logPath -Tail 20 }
+    foreach ($output in @($fixtureStdout, $fixtureStderr)) {
+        if ($output -and $output.IsCompleted) { Write-Host $output.GetAwaiter().GetResult() }
     }
 }
 finally {
@@ -111,6 +124,15 @@ finally {
     foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], "Process") }
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
     if ($fixture -and -not $fixture.HasExited) { Stop-Process -Id $fixture.Id -Force -ErrorAction SilentlyContinue }
+    if ($fixture) {
+        $exited = $fixture.WaitForExit(5000)
+        if ($failure -and $exited) {
+            foreach ($output in @($fixtureStdout, $fixtureStderr)) {
+                if ($output) { Write-Host $output.GetAwaiter().GetResult() }
+            }
+        }
+        $fixture.Dispose()
+    }
     Start-Sleep -Milliseconds 300
     $resolvedWork = [IO.Path]::GetFullPath($work)
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'

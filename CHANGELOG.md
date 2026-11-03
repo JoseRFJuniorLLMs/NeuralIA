@@ -7,7 +7,7 @@ All notable changes to NeuralIA are documented here.
 ### Fixed
 - **Compilação e gates da nova aba Web** ([90632b4](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/90632b4)): corrigida a formatação que bloqueava o CI e atualizado o teste de registro dos hooks para a WebView filha introduzida no [PR #256](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/256).
 - **Navegação da aba Web esquerda** ([90632b4](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/90632b4)): popups HTTP(S) são encaminhados à própria aba, com recusa de alvos locais; erros usam aviso não destrutivo. A apresentação cede à IA expandida ou ao Split em tela cheia, e a aba só é fechada após a criação bem-sucedida da fonte lateral. Três testes de regressão foram comprovados com sabotagem e restauração.
-- **Fixture WebView2 da SPEC-0114** ([90632b4](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/90632b4)): preflight HTTP, cliente loopback reutilizado sem proxy, perfil isolado e diagnóstico em falhas; o prazo de arranque a frio passa a 180 segundos. A segunda navegação e o veredicto DOM de injeção COM continuam obrigatórios.
+- **Fixture WebView2 da SPEC-0114** ([90632b4](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/90632b4)): preflight HTTP, cliente loopback reutilizado sem proxy, perfil isolado e diagnóstico em falhas; o prazo de arranque a frio passa a 180 segundos. A segunda navegação e o veredicto DOM de injeção COM continuam obrigatórios. O servidor da fixture inicia diretamente sem console e drena as saídas de forma assíncrona para os runners Windows ([PR #257](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/257)).
 
 ## [3.2.1] - 2026-11-02
 
