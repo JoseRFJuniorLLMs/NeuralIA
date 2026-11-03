@@ -78,13 +78,13 @@ impl App {
             )
             .into(),
         };
+        // O nascimento deve manter o gancho de segurança External do produto.
+        // Criamos como child e aplicamos o retângulo ANTES de publicar o view.
         let builder = self
             .external_webview_builder(None, false)
-            .with_bounds(bounds)
             .with_html(browser_new_tab_html());
-        let result = self
-            .hooked_builder(builder, WebViewHost::External, None)
-            .build_hooked_as_child(window);
+        let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+        let result = hooked.build_hooked_as_child(window);
         let view = match result {
             Ok(view) => view,
             Err(error) => {
@@ -92,6 +92,13 @@ impl App {
                 return;
             }
         };
+        // Ao contrario do build top-level anterior, a WebView vive somente
+        // dentro da area esquerda, preservando as superficies das IAs.
+        if let Err(error) = view.set_bounds(bounds) {
+            drop(view);
+            self.show_native_error(format!("Não foi possível posicionar a aba Web: {error}"));
+            return;
+        }
         let address = unsafe {
             CreateWindowExW(
                 0,
