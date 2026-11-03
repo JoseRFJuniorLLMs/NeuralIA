@@ -8074,6 +8074,7 @@ pub(super) const ALL_MODULES: &[(&str, &str)] = &[
     ("app/pages.rs", include_str!("windows_app/app/pages.rs")),
     ("app/chrome.rs", include_str!("windows_app/app/chrome.rs")),
     ("app/compare.rs", include_str!("windows_app/app/compare.rs")),
+    ("app/browser_tab.rs", include_str!("windows_app/app/browser_tab.rs")),
     ("app/tabs.rs", include_str!("windows_app/app/tabs.rs")),
     (
         "app/event_loop.rs",
