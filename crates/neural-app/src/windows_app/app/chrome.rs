@@ -160,7 +160,9 @@ impl App {
             // A troca de decorations pode substituir/reparentar o HWND nativo.
             // A omnibox e o Home sao filhos Win32 reais: se continuarem ligados
             // ao HWND antigo, ficam invisiveis ou deixam de receber teclado/rato.
-            for child in [self.omnibox, self.home_button].into_iter().flatten() {
+            for child in [self.omnibox, self.home_button, self.left_browser_address]
+                .into_iter()
+                .flatten() {
                 if GetParent(child) != parent {
                     SetParent(child, parent);
                     if GetParent(child) != parent {
@@ -408,6 +410,9 @@ impl App {
                 let _ = split.webview.focus_parent();
             }
             drop(comparator);
+        }
+        if let Some(address) = self.left_browser_address.take() {
+            unsafe { DestroyWindow(address) };
         }
         if let Some(webview) = self.webview.take() {
             let _ = webview.set_visible(false);
