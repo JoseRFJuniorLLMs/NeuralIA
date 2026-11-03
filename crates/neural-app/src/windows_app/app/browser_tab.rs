@@ -41,12 +41,12 @@ impl App {
         if let Some(address) = self.left_browser_address.take() {
             unsafe { DestroyWindow(address) };
         }
-        if self.surface == Surface::Comparator {
-            if let Some(view) = self.webview.take() {
-                let _ = view.set_visible(false);
-                let _ = view.focus_parent();
-                drop(view);
-            }
+        if self.surface == Surface::Comparator
+            && let Some(view) = self.webview.take()
+        {
+            let _ = view.set_visible(false);
+            let _ = view.focus_parent();
+            drop(view);
         }
     }
 
@@ -171,10 +171,10 @@ impl App {
             );
             return;
         }
-        if let Some(browser) = &self.webview {
-            if let Err(error) = browser.load_url(url.as_str()) {
-                self.show_native_error(format!("Não foi possível navegar: {error}"));
-            }
+        if let Some(browser) = &self.webview
+            && let Err(error) = browser.load_url(url.as_str())
+        {
+            self.show_native_error(format!("Não foi possível navegar: {error}"));
         }
     }
 
@@ -186,12 +186,12 @@ impl App {
         let (Some(address), Some(browser)) = (self.left_browser_address, &self.webview) else {
             return;
         };
-        if let Ok(url) = browser.url() {
-            if url.starts_with("http://") || url.starts_with("https://") {
-                unsafe {
-                    SetWindowTextW(address, wide_null(&url).as_ptr());
-                    SendMessageW(address, EM_SETSEL, 0, -1);
-                }
+        if let Ok(url) = browser.url()
+            && (url.starts_with("http://") || url.starts_with("https://"))
+        {
+            unsafe {
+                SetWindowTextW(address, wide_null(&url).as_ptr());
+                SendMessageW(address, EM_SETSEL, 0, -1);
             }
         }
     }
