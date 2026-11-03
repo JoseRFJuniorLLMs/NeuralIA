@@ -30,6 +30,10 @@ pub(super) mod compare;
 #[allow(unused_imports)]
 pub(super) use compare::*;
 
+pub(super) mod browser_tab;
+#[allow(unused_imports)]
+pub(super) use browser_tab::*;
+
 pub(super) mod tabs;
 #[allow(unused_imports)]
 pub(super) use tabs::*;

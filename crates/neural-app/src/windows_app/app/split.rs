@@ -311,6 +311,8 @@ impl App {
         existing_context_id: Option<u64>,
         opener: Option<u64>,
     ) -> bool {
+        // O split devolve a coluna ao comparador e fecha apenas a aba Web.
+        self.close_left_browser_tab();
         let column_name = self
             .comparator
             .as_ref()

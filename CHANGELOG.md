@@ -2,6 +2,13 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.2] - 2026-11-03
+
+### Fixed
+- **Nova aba Web à esquerda:** o botão `+` da barra de título abre uma WebView2 isolada com página inicial branca e campo de endereço próprio, sem apagar os painéis de IA ([PR #256](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/256)).
+- **Ícone GitHub:** o atalho da barra de título mostra o símbolo gráfico do GitHub no lugar das letras `GH`, respeitando o tema ([PR #256](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/256)).
+- **Correções CI:** importação Win32, formatação Rust, lint e registro do novo módulo nos testes de integração ([PR #256](https://github.com/JoseRFJuniorLLMs/NeuralIA/pull/256)).
+
 ## [3.2.1] - 2026-11-02
 
 ### Added

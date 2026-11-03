@@ -494,26 +494,9 @@ impl App {
             .with_focused(true)
     }
 
-    /// A nova aba Web tem endereço próprio; a omnibox do comparador não muda.
+    /// O + superior abre navegador normal na coluna esquerda; nenhuma IA e descartada.
     pub(in crate::windows_app) fn open_browser_new_tab(&mut self) {
-        self.destroy_web_surfaces();
-        self.show_omnibox(false);
-        let Some(window) = &self.window else {
-            return;
-        };
-        let builder = self
-            .external_webview_builder(None, false)
-            .with_html(browser_new_tab_html());
-        let hooked = self.hooked_builder(builder, WebViewHost::External, None);
-        match hooked.build_hooked(window) {
-            Ok(view) => {
-                self.webview = Some(view);
-                self.surface = Surface::External;
-                self.sync_page_controls();
-                self.request_redraw();
-            }
-            Err(error) => self.show_native_error(format!("Nova aba indisponível: {error}")),
-        }
+        self.open_left_browser_tab();
     }
 
     pub(in crate::windows_app) fn open_external(&mut self, url: &str) {
@@ -1109,36 +1092,7 @@ pub(in crate::windows_app) fn is_pdf_internal_target(target: &str) -> bool {
 
 /// Página inicial da aba Web (o domínio remoto não recebe a busca até Enter).
 pub(in crate::windows_app) fn browser_new_tab_html() -> &'static str {
-    r##"<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Nova aba — NeuralIA</title><style>
-:root{color-scheme:dark;font-family:Segoe UI,Arial,sans-serif;color:#f8f5fd;background:#201e26}*{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:#201e26}header{height:54px;background:#292532;display:flex;align-items:flex-end;padding:0 15px}
-.tab{border-radius:15px 15px 0 0;background:#393345;padding:13px 22px;width:255px;font-size:14px}
-nav{height:76px;background:#292532;display:flex;gap:18px;align-items:center;padding:12px 20px}
-nav a{color:#eee;text-decoration:none;font-size:20px}form{flex:1;display:flex;justify-content:center}
-input{width:min(70vw,800px);height:49px;border:2px solid #b6a0e2;border-radius:26px;padding:0 24px;background:#413a4c;color:white;font-size:17px;outline:none;transition:width .2s,box-shadow .2s}
-input:focus{width:min(100%,1180px);box-shadow:0 0 0 3px #a57df044;border-color:#dac5ff}
-main{padding:9vh 25px 25px;text-align:center}h1{font-size:38px;font-weight:500;margin-bottom:12px}
-p{color:#d3c9df}.links{display:flex;flex-wrap:wrap;gap:15px;justify-content:center;margin-top:42px}
-.links a{width:130px;background:#34303d;border:1px solid #534960;border-radius:16px;padding:22px 12px;color:white;text-decoration:none}
-.links a:hover{background:#474052}.links strong{display:block;font-size:24px;margin-bottom:10px}.links span{font-size:14px}
-@media(max-width:600px){.tab{width:145px}h1{font-size:28px}input{width:100%}}
-</style></head><body><header><div class="tab">◉ &nbsp; Nova aba</div></header>
-<nav><a aria-label="Home" href="https://www.google.com/">⌂</a>
-<form id="search" method="get" action="https://www.google.com/search">
-<input id="address" type="text" name="q" placeholder="Pesquisar ou digitar um endereço" autofocus autocomplete="off" aria-label="Endereço e pesquisa"></form></nav>
-<main><h1>Nova aba</h1><p>Pesquise na Web ou escolha um atalho abaixo.</p>
-<div class="links"><a href="https://x.com/"><strong>𝕏</strong><span>X</span></a>
-<a href="https://www.instagram.com/"><strong>◎</strong><span>Instagram</span></a>
-<a href="https://www.facebook.com/"><strong>f</strong><span>Facebook</span></a>
-<a href="https://www.chess.com/"><strong>♞</strong><span>Chess.com</span></a>
-<a href="https://github.com/"><strong>GH</strong><span>GitHub</span></a></div></main>
-<script>document.getElementById('search').addEventListener('submit',function(e){
-var v=document.getElementById('address').value.trim();
-if(!v){e.preventDefault();return}
-if(/^https?:\/\//i.test(v)){e.preventDefault();location.href=v;return}
-if(/^[a-z0-9-]+(\.[a-z0-9-]+)+(\/[^\s]*)?$/i.test(v)){e.preventDefault();location.href='https://'+v}
-});</script></body></html>"##
+    r#"<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><title>Nova aba — NeuralIA</title><style>html,body{margin:0;width:100%;min-height:100%;background:#fff;color:#222;font-family:Segoe UI,Arial,sans-serif}</style></head><body></body></html>"#
 }
 
 #[cfg(test)]

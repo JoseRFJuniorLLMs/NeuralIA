@@ -114,6 +114,8 @@ const ALL_SOURCES: &str = concat!(
     "\n",
     include_str!("../src/windows_app/app/compare.rs"),
     "\n",
+    include_str!("../src/windows_app/app/browser_tab.rs"),
+    "\n",
     include_str!("../src/windows_app/app/tabs.rs"),
     "\n",
     include_str!("../src/windows_app/app/event_loop.rs"),
