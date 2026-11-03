@@ -844,7 +844,18 @@ impl App {
 
         // Aba Web independente: ocupa somente a faixa esquerda; a omnibox
         // das IAs e os outros dois controllers continuam vivos.
-        if self.surface == Surface::Comparator
+        let show_left_browser = left_browser_visible(
+            self.surface,
+            comp.expanded,
+            comp.split.as_ref().is_some_and(|split| split.fullscreen),
+        );
+        if !show_left_browser
+            && let (Some(browser), Some(address)) = (&self.webview, self.left_browser_address)
+        {
+            let _ = browser.set_visible(false);
+            unsafe { ShowWindow(address, SW_HIDE) };
+        }
+        if show_left_browser
             && let (Some(browser), Some(address)) = (&self.webview, self.left_browser_address)
         {
             let left_width = (logical_w / 3.0).max(1.0);

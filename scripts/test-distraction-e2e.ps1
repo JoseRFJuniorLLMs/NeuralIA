@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ExePath,
     [switch]$ExpectVisible,
-    [int]$TimeoutSec = 45
+    [int]$TimeoutSec = 180
 )
 
 # SPEC-0114 E2E of the real WebView2 COM injection boundary.
@@ -27,9 +27,14 @@ $settingsPath = Join-Path $dataDir "adblock-settings.json"
 $fixture = $null
 $process = $null
 $failure = $null
+$http = $null
+$rows = @()
+$environmentNames = @("NEURALIA_DATA_DIR", "NEURALIA_NO_GMAIL", "NEURALIA_REDUCE_MOTION", "NEURALIA_STARTUP_INPUT", "WEBVIEW2_USER_DATA_FOLDER")
+$previousEnvironment = @{}
+foreach ($name in $environmentNames) { $previousEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process") }
 try {
     $fixtureScript = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "distraction-e2e-fixture.mjs")).Path
-    $fixture = Start-Process -FilePath "node" -ArgumentList @(('"' + $fixtureScript + '"'), ('"' + $portFile + '"')) -PassThru -NoNewWindow
+    $fixture = Start-Process -FilePath "node" -ArgumentList @(('"' + $fixtureScript + '"'), ('"' + $portFile + '"')) -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $work "fixture.stdout.log") -RedirectStandardError (Join-Path $work "fixture.stderr.log")
     $watch = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path -LiteralPath $portFile)) {
         if ($watch.ElapsedMilliseconds -gt 10000 -or $fixture.HasExited) { throw "A fixture da SPEC-0114 nao arrancou." }
@@ -39,21 +44,31 @@ try {
     $localOrigin = "http://127.0.0.1:$port"
     $pageUrl = "http://${hostName}:$port/page.html"
 
+    # Reuse one direct loopback client; readiness is checked before WebView2
+    # starts, so a dead fixture cannot be mistaken for failed COM injection.
+    $handler = [Net.Http.HttpClientHandler]::new()
+    $handler.UseProxy = $false
+    $http = [Net.Http.HttpClient]::new($handler)
+    $http.Timeout = [TimeSpan]::FromSeconds(5)
+    function Get-Seen {
+        $raw = $http.GetStringAsync("$localOrigin/__log").GetAwaiter().GetResult()
+        return @($raw | ConvertFrom-Json)
+    }
+    $rows = Get-Seen
+    Write-Host "SPEC-0114 fixture ready at $localOrigin; cold-start deadline ${TimeoutSec}s."
+
     $env:NEURALIA_DATA_DIR = $dataDir
+    $env:WEBVIEW2_USER_DATA_FOLDER = Join-Path $dataDir "WebView2"
     $env:NEURALIA_NO_GMAIL = "1"
     $env:NEURALIA_REDUCE_MOTION = "1"
     $env:NEURALIA_STARTUP_INPUT = "web:$pageUrl"
     $process = Start-Process -FilePath $exe -PassThru
 
-    function Get-Seen {
-        $raw = Invoke-WebRequest -Uri "$localOrigin/__log" -UseBasicParsing -NoProxy -TimeoutSec 5
-        return @($raw.Content | ConvertFrom-Json)
-    }
-
     $result = $null
     $sawSecond = $false
     $watch.Restart()
     while ($watch.Elapsed.TotalSeconds -lt $TimeoutSec) {
+        if ($fixture.HasExited) { throw "A fixture da SPEC-0114 saiu (codigo $($fixture.ExitCode))." }
         if ($process.HasExited) { throw "NeuralIA saiu antes do E2E da SPEC-0114 (codigo $($process.ExitCode))." }
         # A fixture pode atrasar o polling em runners Windows ocupados.
         # Um timeout isolado nao invalida o E2E: o prazo global continua fixo.
@@ -82,12 +97,24 @@ try {
         Write-Host "SPEC-0114 WebView2 E2E: a segunda navegacao recebeu o script COM e ocultou o cookie banner real."
     }
 }
-catch { $failure = $_.Exception.Message }
+catch {
+    $failure = $_.Exception.Message
+    Write-Warning "SPEC-0114 failed: $failure"
+    Write-Host "Last fixture requests: $(@($rows | Where-Object { $_.path -ne '/__log' } | Select-Object -Last 20) | ConvertTo-Json -Compress)"
+    foreach ($log in "fixture.stdout.log", "fixture.stderr.log") {
+        $logPath = Join-Path $work $log
+        if (Test-Path -LiteralPath $logPath) { Get-Content -LiteralPath $logPath -Tail 20 }
+    }
+}
 finally {
-    foreach ($name in "NEURALIA_DATA_DIR", "NEURALIA_NO_GMAIL", "NEURALIA_REDUCE_MOTION", "NEURALIA_STARTUP_INPUT") { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+    if ($http) { $http.Dispose() }
+    foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $previousEnvironment[$name], "Process") }
     if ($process -and -not $process.HasExited) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
     if ($fixture -and -not $fixture.HasExited) { Stop-Process -Id $fixture.Id -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 300
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    $resolvedWork = [IO.Path]::GetFullPath($work)
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+    if (-not $resolvedWork.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) { throw "E2E cleanup escaped temp root: $resolvedWork" }
+    Remove-Item -LiteralPath $resolvedWork -Recurse -Force -ErrorAction SilentlyContinue
 }
 if ($failure) { throw $failure }

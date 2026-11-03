@@ -6,6 +6,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW;
 pub(in crate::windows_app) const LEFT_BROWSER_BAR_HEIGHT: f64 = 48.0;
 const LEFT_BROWSER_SUBCLASS_ID: usize = 0x4E91;
 
+pub(in crate::windows_app) fn left_browser_new_window_event(target: String) -> Option<UserEvent> {
+    (!target.eq_ignore_ascii_case("about:blank") && remote_web_target(&target, None))
+        .then_some(UserEvent::LeftBrowserSubmit(target))
+}
+
+pub(in crate::windows_app) fn left_browser_visible(
+    surface: Surface,
+    expanded: Option<usize>,
+    split_fullscreen: bool,
+) -> bool {
+    surface == Surface::Comparator && expanded.is_none() && !split_fullscreen
+}
+
 pub(in crate::windows_app) unsafe extern "system" fn left_browser_edit_subclass(
     hwnd: HWND,
     message: u32,
@@ -78,17 +91,23 @@ impl App {
             )
             .into(),
         };
+        let new_window_proxy = self.proxy.clone();
         let builder = self
             .external_webview_builder(None, false)
             .with_bounds(bounds)
-            .with_html(browser_new_tab_html());
-        let result = self
-            .hooked_builder(builder, WebViewHost::External, None)
-            .build_hooked_as_child(window);
+            .with_html(browser_new_tab_html())
+            .with_new_window_req_handler(move |target, _features| {
+                if let Some(event) = left_browser_new_window_event(target) {
+                    let _ = new_window_proxy.send_event(event);
+                }
+                wry::NewWindowResponse::Deny
+            });
+        let hooked = self.hooked_builder(builder, WebViewHost::External, None);
+        let result = hooked.build_hooked_as_child(window);
         let view = match result {
             Ok(view) => view,
             Err(error) => {
-                self.show_native_error(format!("Não foi possível criar a aba Web: {error}"));
+                self.show_splash(format!("Não foi possível criar a aba Web: {error}"), 4);
                 return;
             }
         };
@@ -114,7 +133,10 @@ impl App {
         };
         if address.is_null() {
             drop(view);
-            self.show_native_error("Não foi possível criar a barra de endereço Web.".to_string());
+            self.show_splash(
+                "Não foi possível criar a barra de endereço Web.".to_string(),
+                4,
+            );
             return;
         }
         let proxy_ptr = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
@@ -129,7 +151,10 @@ impl App {
         {
             unsafe { DestroyWindow(address) };
             drop(view);
-            self.show_native_error("Não foi possível inicializar o endereço Web.".to_string());
+            self.show_splash(
+                "Não foi possível inicializar o endereço Web.".to_string(),
+                4,
+            );
             return;
         }
         let cue = wide_null("Digite um endereço ou pesquise na Web (sem IA)");
@@ -174,7 +199,7 @@ impl App {
         if let Some(browser) = &self.webview
             && let Err(error) = browser.load_url(url.as_str())
         {
-            self.show_native_error(format!("Não foi possível navegar: {error}"));
+            self.show_splash(format!("Não foi possível navegar: {error}"), 4);
         }
     }
 
