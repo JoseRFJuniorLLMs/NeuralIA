@@ -162,7 +162,8 @@ impl App {
             // ao HWND antigo, ficam invisiveis ou deixam de receber teclado/rato.
             for child in [self.omnibox, self.home_button, self.left_browser_address]
                 .into_iter()
-                .flatten() {
+                .flatten()
+            {
                 if GetParent(child) != parent {
                     SetParent(child, parent);
                     if GetParent(child) != parent {
