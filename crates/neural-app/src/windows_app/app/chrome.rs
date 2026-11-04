@@ -902,19 +902,18 @@ impl App {
         };
         let client_width = window.inner_size().width as f64;
         let scale = window.scale_factor();
-        let mut columns = bar_columns(comp, self.pomodoro_bar_label());
-        columns.browser_tabs = self.left_browser_tabs.len();
-        let mut layout = BarLayout::with_rows(
+        let mut layout = BarLayout::with_rows_browser(
             client_width,
             scale,
             self.bar_visible(),
-            columns,
+            bar_columns(comp, self.pomodoro_bar_label()),
             tab_rows_focused(
                 &comp.contexts,
                 &comp.groups,
                 active_context(comp),
                 comp.bar_focus,
             ),
+            self.left_browser_tabs.len(),
         )
         .with_browser_tabs(
             self.left_browser_tabs.len(),
