@@ -173,7 +173,6 @@ pub(in crate::windows_app) struct BarColumns {
     pub(in crate::windows_app) restore_strip: f64,
     /// Tempo que falta no Pomodoro, ao lado do icone dele; alarga o botao.
     pub(in crate::windows_app) pomodoro_label: Option<BarLabel>,
-    pub(in crate::windows_app) browser_tabs: usize,
 }
 
 impl BarColumns {
@@ -188,7 +187,6 @@ impl BarColumns {
             panel_width: 0.0,
             restore_strip: 0.0,
             pomodoro_label: None,
-            browser_tabs: 0,
         }
     }
 }
@@ -435,6 +433,19 @@ impl BarLayout {
         visible: bool,
         columns: BarColumns,
         rows: [TabRow; COMPARATOR_COLUMNS],
+    ) -> Self {
+        Self::with_rows_browser(client_width, scale, visible, columns, rows, 0)
+    }
+
+    /// Reserva espaço na faixa superior sem aumentar a largura da
+    /// estrutura BarColumns (mantém compatibilidade com os gates antigos).
+    pub(in crate::windows_app) fn with_rows_browser(
+        client_width: f64,
+        scale: f64,
+        visible: bool,
+        columns: BarColumns,
+        rows: [TabRow; COMPARATOR_COLUMNS],
+        browser_tabs: usize,
     ) -> Self {
         let scale = scale.max(1.0);
         let empty = UiRect {
@@ -712,10 +723,10 @@ impl BarLayout {
         // As abas Web têm reserva própria; antes o '+' colava-se às abas
         // das IAs e não sobrava lugar para a aba que acabava de nascer.
         let remaining = (tabs_right - tabs_left - title_plus_w - title_plus_gap).max(0.0);
-        let browser_reserve = if columns.browser_tabs == 0 {
+        let browser_reserve = if browser_tabs == 0 {
             0.0
         } else {
-            (columns.browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.52)
+            (browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.52)
         };
         let title_tabs_right = if show_title_plus {
             tabs_right - title_plus_w - title_plus_gap - browser_reserve
@@ -813,7 +824,7 @@ impl BarLayout {
             }
             title_plus_x = x;
         }
-        if columns.browser_tabs > 0 && show_title_plus {
+        if browser_tabs > 0 && show_title_plus {
             title_plus_x = title_tabs_right.max(title_plus_x);
         }
         let title_new_tab = UiRect {
