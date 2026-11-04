@@ -319,7 +319,12 @@ pub(in crate::windows_app) struct BarState {
     pub(in crate::windows_app) downloads: DownloadsBadge,
     /// Se a omnibox / barra de endereço está focada no momento.
     pub(in crate::windows_app) omnibox_focused: bool,
+    /// Abas Web independentes visíveis na linha superior.
+    pub(in crate::windows_app) browser_tab_count: usize,
+    pub(in crate::windows_app) browser_active: Option<usize>,
 }
+
+pub(in crate::windows_app) const MAX_VISIBLE_BROWSER_TABS: usize = 8;
 
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
 /// numa segunda linha, sem disputar espaco com as abas.
@@ -344,6 +349,12 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) add_tabs: [UiRect; COMPARATOR_COLUMNS],
     /// Novo separador ao lado das abas na faixa superior (URL ou pergunta).
     pub(in crate::windows_app) title_new_tab: UiRect,
+    pub(in crate::windows_app) browser_tabs: [UiRect; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_tab_closes: [UiRect; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_tab_indices: [usize; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_tab_count: usize,
+    pub(in crate::windows_app) browser_tab_overflow: UiRect,
+    pub(in crate::windows_app) browser_tab_overflow_count: usize,
     pub(in crate::windows_app) context_tabs:
         [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) context_indices:
@@ -804,6 +815,12 @@ impl BarLayout {
             minimized: columns.minimized,
             add_tabs: plus_rect,
             title_new_tab,
+            browser_tabs: [empty; MAX_VISIBLE_BROWSER_TABS],
+            browser_tab_closes: [empty; MAX_VISIBLE_BROWSER_TABS],
+            browser_tab_indices: [0; MAX_VISIBLE_BROWSER_TABS],
+            browser_tab_count: 0,
+            browser_tab_overflow: empty,
+            browser_tab_overflow_count: 0,
             context_tabs: tabs,
             context_indices: tab_indices,
             context_tab_counts: tab_counts,
@@ -843,6 +860,79 @@ impl BarLayout {
         self.address_go = go;
     }
 
+    /// Reserva espaço para as abas Web antes do '+' superior, sem interferir
+    /// nas abas de contexto das três IAs. As mais recentes continuam acessíveis
+    /// e o indicador de excesso permite selecionar as antigas.
+    pub(in crate::windows_app) fn with_browser_tabs(
+        mut self,
+        total: usize,
+        scale: f64,
+    ) -> Self {
+        if !self.visible || total == 0 || self.title_new_tab.width <= 0.0 {
+            return self;
+        }
+        let scale = scale.max(1.0);
+        let right = if self.address.width > 0.0 {
+            self.address.x - 8.0 * scale
+        } else {
+            self.window_minimize.x - 8.0 * scale
+        };
+        let start = self.title_new_tab.x;
+        let gap = 4.0 * scale;
+        let min_tab = 68.0 * scale;
+        let plus_w = self.title_new_tab.width;
+        let space = (right - start - plus_w - 6.0 * scale).max(0.0);
+        let mut shown = total.min(MAX_VISIBLE_BROWSER_TABS)
+            .min((space / (min_tab + gap)).floor() as usize);
+        if shown == 0 {
+            return self;
+        }
+        let mut cursor = start;
+        let mut hidden = total - shown;
+        if hidden > 0 && shown > 1 {
+            // Mantém o acesso às abas antigas sem sacrificar a recém-aberta.
+            let overflow_width = 34.0 * scale;
+            if space >= overflow_width + gap + shown as f64 * (min_tab + gap) {
+                self.browser_tab_overflow = UiRect {
+                    x: cursor, y: self.title_new_tab.y,
+                    width: overflow_width, height: self.title_new_tab.height,
+                };
+                cursor += overflow_width + gap;
+            } else {
+                shown -= 1;
+                hidden += 1;
+                self.browser_tab_overflow = UiRect {
+                    x: cursor, y: self.title_new_tab.y,
+                    width: overflow_width, height: self.title_new_tab.height,
+                };
+                cursor += overflow_width + gap;
+            }
+            self.browser_tab_overflow_count = hidden;
+        }
+        if shown == 0 {
+            return self;
+        }
+        let available = (right - cursor - plus_w - 6.0 * scale
+            - shown.saturating_sub(1) as f64 * gap).max(0.0);
+        let width = (available / shown as f64).min(125.0 * scale);
+        for visual in 0..shown {
+            let index = total - shown + visual;
+            let rect = UiRect {
+                x: cursor, y: self.title_new_tab.y, width,
+                height: self.title_new_tab.height,
+            };
+            self.browser_tabs[visual] = rect;
+            self.browser_tab_indices[visual] = index;
+            self.browser_tab_closes[visual] = tab_close_rect(
+                rect, scale, TAB_CLOSE_SIZE * scale,
+            );
+            self.browser_tab_count += 1;
+            cursor += width + gap;
+        }
+        self.title_new_tab.x = cursor;
+        self
+    }
+
     pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
         if !self.visible || y > self.height {
             return None;
@@ -864,6 +954,18 @@ impl BarLayout {
         }
         if self.address.contains(x, y) {
             return Some(BarHit::AddressBar);
+        }
+        if self.browser_tab_overflow.contains(x, y) {
+            return Some(BarHit::BrowserTabOverflow);
+        }
+        for visual in 0..self.browser_tab_count {
+            let index = self.browser_tab_indices[visual];
+            if self.browser_tab_closes[visual].contains(x, y) {
+                return Some(BarHit::BrowserTabClose(index));
+            }
+            if self.browser_tabs[visual].contains(x, y) {
+                return Some(BarHit::BrowserTab(index));
+            }
         }
         if self.title_new_tab.contains(x, y) {
             // Nova aba Web, não paleta de uma coluna de IA.
