@@ -842,29 +842,34 @@ impl App {
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
         let content_y = COMPARATOR_CHROME_HEIGHT;
 
-        // Aba Web independente: ocupa somente a faixa esquerda; a omnibox
-        // das IAs e os outros dois controllers continuam vivos.
-        let show_left_browser = left_browser_visible(
-            self.surface,
-            comp.expanded,
-            comp.split.as_ref().is_some_and(|split| split.fullscreen),
-        );
-        if !show_left_browser
-            && let (Some(browser), Some(address)) = (&self.webview, self.left_browser_address)
-        {
-            let _ = browser.set_visible(false);
-            unsafe { ShowWindow(address, SW_HIDE) };
+        // A aba Web ativa divide o conteúdo apenas com as colunas de IA
+        // efetivamente visíveis. Não se reserva um terço fantasma no meio.
+        let show_left_browser = !self.left_browser_tabs.is_empty()
+            && left_browser_visible(
+                self.surface,
+                comp.expanded,
+                comp.split.as_ref().is_some_and(|split| split.fullscreen),
+            );
+        if !show_left_browser {
+            for tab in &self.left_browser_tabs {
+                let _ = tab.view.set_visible(false);
+            }
+            if let Some(toolbar) = self.left_browser_toolbar {
+                unsafe { ShowWindow(toolbar, SW_HIDE) };
+            }
         }
-        if show_left_browser
-            && let (Some(browser), Some(address)) = (&self.webview, self.left_browser_address)
-        {
-            let left_width = (logical_w / 3.0).max(1.0);
-            for (index, view) in comp.views.iter().enumerate() {
-                if index == 0 || comp.minimized[index] {
-                    let _ = view.webview.set_visible(false);
-                } else {
-                    let width = ((logical_w - left_width) / 2.0).max(1.0);
-                    let x = left_width + (index - 1) as f64 * width;
+        if show_left_browser {
+            let (browser_width, spans) = left_browser_content_spans(
+                logical_w,
+                &comp.minimized[..comp.views.len().min(COMPARATOR_COLUMNS)],
+                self.left_browser_minimized,
+                self.left_browser_expanded,
+            );
+            for view in &comp.views {
+                let _ = view.webview.set_visible(false);
+            }
+            for (index, x, width) in spans {
+                if let Some(view) = comp.views.get(index) {
                     let _ = view.webview.set_bounds(wry::Rect {
                         position: LogicalPosition::new(x, content_y).into(),
                         size: LogicalSize::new(width, content_h).into(),
@@ -875,24 +880,29 @@ impl App {
             if let Some(split) = &comp.split {
                 let _ = split.webview.set_visible(false);
             }
-            let _ = browser.set_bounds(wry::Rect {
-                position: LogicalPosition::new(0.0, content_y + LEFT_BROWSER_BAR_HEIGHT).into(),
-                size: LogicalSize::new(left_width, (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0))
-                    .into(),
-            });
-            let _ = browser.set_visible(true);
-            let scale = window.scale_factor().max(1.0);
-            unsafe {
-                SetWindowPos(
-                    address,
-                    std::ptr::null_mut(),
-                    (8.0 * scale).round() as i32,
-                    ((content_y + 7.0) * scale).round() as i32,
-                    ((left_width - 16.0).max(1.0) * scale).round() as i32,
-                    (34.0 * scale).round() as i32,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                ShowWindow(address, SW_SHOW);
+            let active = self.left_browser_active;
+            for (index, tab) in self.left_browser_tabs.iter().enumerate() {
+                if !self.left_browser_minimized && Some(index) == active {
+                    let _ = tab.view.set_bounds(wry::Rect {
+                        position: LogicalPosition::new(0.0, content_y + LEFT_BROWSER_BAR_HEIGHT)
+                            .into(),
+                        size: LogicalSize::new(
+                            browser_width.max(1.0),
+                            (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0),
+                        )
+                        .into(),
+                    });
+                    let _ = tab.view.set_visible(true);
+                } else {
+                    let _ = tab.view.set_visible(false);
+                }
+            }
+            if self.left_browser_minimized {
+                if let Some(toolbar) = self.left_browser_toolbar {
+                    unsafe { ShowWindow(toolbar, SW_HIDE) };
+                }
+            } else {
+                self.position_left_browser_toolbar(browser_width, content_y, scale);
             }
             return;
         }

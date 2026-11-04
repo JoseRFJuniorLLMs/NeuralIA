@@ -464,6 +464,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::OpenExternal(url) => self.web(url),
             UserEvent::LeftBrowserSubmit(text) => self.submit_left_browser_address(&text),
             UserEvent::LeftBrowserFocus => self.sync_left_browser_address(),
+            UserEvent::LeftBrowserMinimize => self.toggle_left_browser_minimized(),
+            UserEvent::LeftBrowserExpand => self.toggle_left_browser_expanded(),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {
@@ -729,7 +731,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 draw_comparator_neural_background(window);
                             }
                             if show_bar {
-                                draw_comparator_bar(window, comp, state, &self.live_panel);
+                                draw_comparator_bar(
+                                    window,
+                                    comp,
+                                    state,
+                                    &self.live_panel,
+                                    &self.left_browser_tabs,
+                                );
                             }
                             for panel in &self.background_services {
                                 draw_service_chrome(

@@ -319,7 +319,12 @@ pub(in crate::windows_app) struct BarState {
     pub(in crate::windows_app) downloads: DownloadsBadge,
     /// Se a omnibox / barra de endereço está focada no momento.
     pub(in crate::windows_app) omnibox_focused: bool,
+    /// Abas Web independentes visíveis na linha superior.
+    pub(in crate::windows_app) browser_tab_count: usize,
+    pub(in crate::windows_app) browser_active: Option<usize>,
 }
+
+pub(in crate::windows_app) const MAX_VISIBLE_BROWSER_TABS: usize = 8;
 
 /// Geometria em duas linhas. As fontes ficam na title bar; os provedores ficam
 /// numa segunda linha, sem disputar espaco com as abas.
@@ -344,6 +349,12 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) add_tabs: [UiRect; COMPARATOR_COLUMNS],
     /// Novo separador ao lado das abas na faixa superior (URL ou pergunta).
     pub(in crate::windows_app) title_new_tab: UiRect,
+    pub(in crate::windows_app) browser_tabs: [UiRect; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_tab_closes: [UiRect; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_tab_indices: [usize; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_tab_count: usize,
+    pub(in crate::windows_app) browser_tab_overflow: UiRect,
+    pub(in crate::windows_app) browser_tab_overflow_count: usize,
     pub(in crate::windows_app) context_tabs:
         [[UiRect; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
     pub(in crate::windows_app) context_indices:
@@ -423,6 +434,19 @@ impl BarLayout {
         columns: BarColumns,
         rows: [TabRow; COMPARATOR_COLUMNS],
     ) -> Self {
+        Self::with_rows_browser(client_width, scale, visible, columns, rows, 0)
+    }
+
+    /// Reserva espaço na faixa superior sem aumentar a largura da
+    /// estrutura BarColumns (mantém compatibilidade com os gates antigos).
+    pub(in crate::windows_app) fn with_rows_browser(
+        client_width: f64,
+        scale: f64,
+        visible: bool,
+        columns: BarColumns,
+        rows: [TabRow; COMPARATOR_COLUMNS],
+        browser_tabs: usize,
+    ) -> Self {
         let scale = scale.max(1.0);
         let empty = UiRect {
             x: 0.0,
@@ -442,6 +466,12 @@ impl BarLayout {
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
                 title_new_tab: empty,
+                browser_tabs: [empty; MAX_VISIBLE_BROWSER_TABS],
+                browser_tab_closes: [empty; MAX_VISIBLE_BROWSER_TABS],
+                browser_tab_indices: [0; MAX_VISIBLE_BROWSER_TABS],
+                browser_tab_count: 0,
+                browser_tab_overflow: empty,
+                browser_tab_overflow_count: 0,
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_tab_counts: [0; COMPARATOR_COLUMNS],
@@ -688,10 +718,24 @@ impl BarLayout {
         } else {
             8.0 * scale
         };
-        let show_title_plus =
-            tabs_right - tabs_left >= title_plus_w + title_plus_gap + minimum_tabs_room;
+        let show_title_plus = tabs_right - tabs_left
+            >= title_plus_w
+                + title_plus_gap
+                + if browser_tabs > 0 {
+                    0.0
+                } else {
+                    minimum_tabs_room
+                };
+        // As abas Web têm reserva própria; antes o '+' colava-se às abas
+        // das IAs e não sobrava lugar para a aba que acabava de nascer.
+        let remaining = (tabs_right - tabs_left - title_plus_w - title_plus_gap).max(0.0);
+        let browser_reserve = if browser_tabs == 0 {
+            0.0
+        } else {
+            (browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.85)
+        };
         let title_tabs_right = if show_title_plus {
-            tabs_right - title_plus_w - title_plus_gap
+            tabs_right - title_plus_w - title_plus_gap - browser_reserve
         } else {
             tabs_right
         };
@@ -786,6 +830,9 @@ impl BarLayout {
             }
             title_plus_x = x;
         }
+        if browser_tabs > 0 && show_title_plus {
+            title_plus_x = title_tabs_right.max(title_plus_x);
+        }
         let title_new_tab = UiRect {
             x: title_plus_x.min(title_tabs_right),
             y: 3.0 * scale,
@@ -804,6 +851,12 @@ impl BarLayout {
             minimized: columns.minimized,
             add_tabs: plus_rect,
             title_new_tab,
+            browser_tabs: [empty; MAX_VISIBLE_BROWSER_TABS],
+            browser_tab_closes: [empty; MAX_VISIBLE_BROWSER_TABS],
+            browser_tab_indices: [0; MAX_VISIBLE_BROWSER_TABS],
+            browser_tab_count: 0,
+            browser_tab_overflow: empty,
+            browser_tab_overflow_count: 0,
             context_tabs: tabs,
             context_indices: tab_indices,
             context_tab_counts: tab_counts,
@@ -843,6 +896,110 @@ impl BarLayout {
         self.address_go = go;
     }
 
+    /// Reserva espaço para as abas Web antes do '+' superior, sem interferir
+    /// nas abas de contexto das três IAs. As mais recentes continuam acessíveis
+    /// e o indicador de excesso permite selecionar as antigas.
+    pub(in crate::windows_app) fn with_browser_tabs(
+        mut self,
+        total: usize,
+        active: usize,
+        scale: f64,
+    ) -> Self {
+        if !self.visible || total == 0 || self.title_new_tab.width <= 0.0 {
+            return self;
+        }
+        let scale = scale.max(1.0);
+        let right = if self.address.width > 0.0 {
+            self.address.x - 8.0 * scale
+        } else {
+            self.window_minimize.x - 8.0 * scale
+        };
+        let start = self.title_new_tab.x;
+        let gap = 4.0 * scale;
+        let min_tab = 48.0 * scale;
+        let plus_w = self.title_new_tab.width;
+        let space = (right - start - plus_w - 6.0 * scale).max(0.0);
+        let mut shown = total
+            .min(MAX_VISIBLE_BROWSER_TABS)
+            .min((space / (min_tab + gap)).floor() as usize);
+        if shown == 0 {
+            // Na largura mínima, o menu "N" mantém todas as abas
+            // acessíveis mesmo quando nenhum título cabe.
+            let overflow_width = space.min(34.0 * scale);
+            if overflow_width >= 18.0 * scale {
+                self.browser_tab_overflow = UiRect {
+                    x: start,
+                    y: self.title_new_tab.y,
+                    width: overflow_width,
+                    height: self.title_new_tab.height,
+                };
+                self.browser_tab_overflow_count = total;
+                self.title_new_tab.x = start + overflow_width + gap;
+            }
+            return self;
+        }
+        let mut cursor = start;
+        let mut hidden = total - shown;
+        if hidden > 0 && shown == 1 && space < min_tab + 34.0 * scale + 2.0 * gap {
+            self.browser_tab_overflow = UiRect {
+                x: cursor,
+                y: self.title_new_tab.y,
+                width: space.min(34.0 * scale),
+                height: self.title_new_tab.height,
+            };
+            self.browser_tab_overflow_count = total;
+            self.title_new_tab.x = cursor + self.browser_tab_overflow.width + gap;
+            return self;
+        }
+        if hidden > 0 && shown >= 1 {
+            // Mantém o acesso às abas antigas sem sacrificar a recém-aberta.
+            let overflow_width = 34.0 * scale;
+            if space >= overflow_width + gap + shown as f64 * (min_tab + gap) {
+                self.browser_tab_overflow = UiRect {
+                    x: cursor,
+                    y: self.title_new_tab.y,
+                    width: overflow_width,
+                    height: self.title_new_tab.height,
+                };
+                cursor += overflow_width + gap;
+            } else {
+                shown -= 1;
+                hidden += 1;
+                self.browser_tab_overflow = UiRect {
+                    x: cursor,
+                    y: self.title_new_tab.y,
+                    width: overflow_width,
+                    height: self.title_new_tab.height,
+                };
+                cursor += overflow_width + gap;
+            }
+            self.browser_tab_overflow_count = hidden;
+        }
+        if shown == 0 {
+            return self;
+        }
+        let available =
+            (right - cursor - plus_w - 6.0 * scale - shown.saturating_sub(1) as f64 * gap).max(0.0);
+        let width = (available / shown as f64).min(125.0 * scale);
+        for visual in 0..shown {
+            let first = active.saturating_sub(shown - 1).min(total - shown);
+            let index = first + visual;
+            let rect = UiRect {
+                x: cursor,
+                y: self.title_new_tab.y,
+                width,
+                height: self.title_new_tab.height,
+            };
+            self.browser_tabs[visual] = rect;
+            self.browser_tab_indices[visual] = index;
+            self.browser_tab_closes[visual] = tab_close_rect(rect, scale, TAB_CLOSE_SIZE * scale);
+            self.browser_tab_count += 1;
+            cursor += width + gap;
+        }
+        self.title_new_tab.x = cursor;
+        self
+    }
+
     pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
         if !self.visible || y > self.height {
             return None;
@@ -864,6 +1021,18 @@ impl BarLayout {
         }
         if self.address.contains(x, y) {
             return Some(BarHit::AddressBar);
+        }
+        if self.browser_tab_overflow.contains(x, y) {
+            return Some(BarHit::BrowserTabOverflow);
+        }
+        for visual in 0..self.browser_tab_count {
+            let index = self.browser_tab_indices[visual];
+            if self.browser_tab_closes[visual].contains(x, y) {
+                return Some(BarHit::BrowserTabClose(index));
+            }
+            if self.browser_tabs[visual].contains(x, y) {
+                return Some(BarHit::BrowserTab(index));
+            }
         }
         if self.title_new_tab.contains(x, y) {
             // Nova aba Web, não paleta de uma coluna de IA.
@@ -1745,6 +1914,47 @@ mod sidebar_layout_gates {
                 assert_eq!(
                     layout.hit(plus.x + plus.width / 2.0, plus.y + plus.height / 2.0),
                     Some(BarHit::TitleNewTab),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_web_tab_and_close_button_is_visible_in_title_row() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for width in [1024.0, 1440.0, 1920.0] {
+                let rows = std::array::from_fn(|_| TabRow::plain(1));
+                let layout = BarLayout::with_rows_browser(
+                    width * scale,
+                    scale,
+                    true,
+                    BarColumns::even(3),
+                    rows,
+                    4,
+                )
+                .with_browser_tabs(4, 3, scale);
+                assert!(
+                    layout.browser_tab_count > 0 || layout.browser_tab_overflow_count == 4,
+                    "browser tabs inaccessible at {width}"
+                );
+                for visual in 0..layout.browser_tab_count {
+                    let rect = layout.browser_tabs[visual];
+                    let close = layout.browser_tab_closes[visual];
+                    let index = layout.browser_tab_indices[visual];
+                    assert!(rect.width > 0.0 && close.width > 0.0);
+                    assert_eq!(
+                        layout.hit(rect.x + rect.width * 0.25, rect.y + rect.height * 0.5),
+                        Some(BarHit::BrowserTab(index))
+                    );
+                    assert_eq!(
+                        layout.hit(close.x + close.width * 0.5, close.y + close.height * 0.5),
+                        Some(BarHit::BrowserTabClose(index))
+                    );
+                }
+                let plus = layout.title_new_tab;
+                assert_eq!(
+                    layout.hit(plus.x + plus.width * 0.5, plus.y + plus.height * 0.5),
+                    Some(BarHit::TitleNewTab)
                 );
             }
         }

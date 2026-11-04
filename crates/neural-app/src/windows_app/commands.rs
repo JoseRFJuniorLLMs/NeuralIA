@@ -1116,6 +1116,9 @@ pub(in crate::windows_app) fn bar_hit_command(hit: BarHit) -> Option<CommandId> 
         | BarHit::Column(_)
         | BarHit::AddTab(_)
         | BarHit::TitleNewTab
+        | BarHit::BrowserTab(_)
+        | BarHit::BrowserTabClose(_)
+        | BarHit::BrowserTabOverflow
         | BarHit::ContextTab { .. }
         | BarHit::CloseTab { .. }
         | BarHit::ContextGroup { .. }
