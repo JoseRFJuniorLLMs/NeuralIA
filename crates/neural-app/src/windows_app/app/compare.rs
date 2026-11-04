@@ -844,11 +844,12 @@ impl App {
 
         // A aba Web ativa divide o conteúdo apenas com as colunas de IA
         // efetivamente visíveis. Não se reserva um terço fantasma no meio.
-        let show_left_browser = !self.left_browser_tabs.is_empty() && left_browser_visible(
-            self.surface,
-            comp.expanded,
-            comp.split.as_ref().is_some_and(|split| split.fullscreen),
-        );
+        let show_left_browser = !self.left_browser_tabs.is_empty()
+            && left_browser_visible(
+                self.surface,
+                comp.expanded,
+                comp.split.as_ref().is_some_and(|split| split.fullscreen),
+            );
         if !show_left_browser {
             for tab in &self.left_browser_tabs {
                 let _ = tab.view.set_visible(false);
@@ -883,13 +884,13 @@ impl App {
             for (index, tab) in self.left_browser_tabs.iter().enumerate() {
                 if !self.left_browser_minimized && Some(index) == active {
                     let _ = tab.view.set_bounds(wry::Rect {
-                        position: LogicalPosition::new(
-                            0.0, content_y + LEFT_BROWSER_BAR_HEIGHT,
-                        ).into(),
+                        position: LogicalPosition::new(0.0, content_y + LEFT_BROWSER_BAR_HEIGHT)
+                            .into(),
                         size: LogicalSize::new(
                             browser_width.max(1.0),
                             (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0),
-                        ).into(),
+                        )
+                        .into(),
                     });
                     let _ = tab.view.set_visible(true);
                 } else {
