@@ -613,8 +613,8 @@ mod left_browser_tests {
     fn layout_never_reserves_an_invisible_middle_column() {
         for count in 0..=3 {
             let mut minimized = [false; 3];
-            for index in count..3 {
-                minimized[index] = true;
+            for item in minimized.iter_mut().skip(count) {
+                *item = true;
             }
             let (browser_width, spans) =
                 left_browser_content_spans(1200.0, &minimized, false, false);
