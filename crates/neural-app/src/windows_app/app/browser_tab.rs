@@ -35,14 +35,20 @@ pub(in crate::windows_app) fn left_browser_content_spans(
     if browser_expanded && !browser_minimized {
         return (width, Vec::new());
     }
-    let visible: Vec<usize> = minimized.iter().enumerate()
+    let visible: Vec<usize> = minimized
+        .iter()
+        .enumerate()
         .filter_map(|(index, &min)| (!min).then_some(index))
         .collect();
     let slots = visible.len() + usize::from(!browser_minimized);
     if slots == 0 {
         return (0.0, Vec::new());
     }
-    let browser_width = if browser_minimized { 0.0 } else { width / slots as f64 };
+    let browser_width = if browser_minimized {
+        0.0
+    } else {
+        width / slots as f64
+    };
     let ai_width = (width - browser_width) / visible.len().max(1) as f64;
     let mut spans = Vec::with_capacity(visible.len());
     for (position, index) in visible.into_iter().enumerate() {
@@ -122,7 +128,8 @@ pub(in crate::windows_app) unsafe extern "system" fn left_browser_toolbar_subcla
                     fill_pill(
                         hdc,
                         UiRect {
-                            x: 8.0 * scale, y: 6.0 * scale,
+                            x: 8.0 * scale,
+                            y: 6.0 * scale,
                             width: (width - 100.0 * scale).max(1.0),
                             height: 36.0 * scale,
                         },
@@ -132,7 +139,8 @@ pub(in crate::windows_app) unsafe extern "system" fn left_browser_toolbar_subcla
                         theme.bar_bg,
                     );
                     // Lupa desenhada vetorialmente (não depende de emoji/fonte).
-                    let pen = CreatePen(PS_SOLID, (2.0 * scale).round() as i32, rgb3(theme.fg_muted));
+                    let pen =
+                        CreatePen(PS_SOLID, (2.0 * scale).round() as i32, rgb3(theme.fg_muted));
                     let old_pen = SelectObject(hdc, pen as _);
                     let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
                     let cx = (23.0 * scale).round() as i32;
@@ -140,8 +148,11 @@ pub(in crate::windows_app) unsafe extern "system" fn left_browser_toolbar_subcla
                     let radius = (6.0 * scale).round() as i32;
                     Ellipse(hdc, cx - radius, cy - radius, cx + radius, cy + radius);
                     MoveToEx(hdc, cx + radius - 1, cy + radius - 1, std::ptr::null_mut());
-                    LineTo(hdc, cx + radius + (4.0 * scale).round() as i32,
-                        cy + radius + (4.0 * scale).round() as i32);
+                    LineTo(
+                        hdc,
+                        cx + radius + (4.0 * scale).round() as i32,
+                        cy + radius + (4.0 * scale).round() as i32,
+                    );
                     SelectObject(hdc, old_brush);
                     SelectObject(hdc, old_pen);
                     DeleteObject(pen as _);
@@ -151,7 +162,8 @@ pub(in crate::windows_app) unsafe extern "system" fn left_browser_toolbar_subcla
                             hdc,
                             UiRect {
                                 x: width - (84.0 - index as f64 * 40.0) * scale,
-                                y: 6.0 * scale, width: 36.0 * scale,
+                                y: 6.0 * scale,
+                                width: 36.0 * scale,
                                 height: 36.0 * scale,
                             },
                             label,
@@ -173,7 +185,8 @@ pub(in crate::windows_app) unsafe extern "system" fn left_browser_toolbar_subcla
                 if GetClientRect(hwnd, &mut area) != 0 {
                     let x = (lparam as u32 & 0xffff) as u16 as i16 as i32;
                     let width = area.right - area.left;
-                    let scale = ((area.bottom - area.top) as f64 / LEFT_BROWSER_BAR_HEIGHT).max(1.0);
+                    let scale =
+                        ((area.bottom - area.top) as f64 / LEFT_BROWSER_BAR_HEIGHT).max(1.0);
                     let event = if x >= width - (44.0 * scale).round() as i32 {
                         Some(UserEvent::LeftBrowserExpand)
                     } else if x >= width - (84.0 * scale).round() as i32 {
@@ -220,7 +233,9 @@ impl App {
             return;
         }
         let Some(window) = &self.window else { return };
-        let Some(owner) = window_hwnd(window) else { return };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
         let scale = window.scale_factor().max(1.0);
         let size = window.inner_size();
         let logical_width = size.width as f64 / scale;
@@ -228,16 +243,20 @@ impl App {
         let left_width = (comparator_logical_width(
             logical_width,
             self.comparator.as_ref().map_or(0.0, |c| c.panel_width),
-        ) / 3.0).max(1.0);
+        ) / 3.0)
+            .max(1.0);
         let bounds = wry::Rect {
-            position: LogicalPosition::new(0.0, COMPARATOR_CHROME_HEIGHT + LEFT_BROWSER_BAR_HEIGHT).into(),
+            position: LogicalPosition::new(0.0, COMPARATOR_CHROME_HEIGHT + LEFT_BROWSER_BAR_HEIGHT)
+                .into(),
             size: LogicalSize::new(
                 left_width,
-                (logical_height - COMPARATOR_CHROME_HEIGHT - LEFT_BROWSER_BAR_HEIGHT).max(1.0)
-            ).into(),
+                (logical_height - COMPARATOR_CHROME_HEIGHT - LEFT_BROWSER_BAR_HEIGHT).max(1.0),
+            )
+            .into(),
         };
         let new_window_proxy = self.proxy.clone();
-        let builder = self.external_webview_builder(None, false)
+        let builder = self
+            .external_webview_builder(None, false)
             .with_bounds(bounds)
             .with_html(browser_new_tab_html())
             .with_new_window_req_handler(move |target, _features| {
@@ -260,7 +279,10 @@ impl App {
             return;
         }
 
-        if let Some(old) = self.left_browser_active.and_then(|index| self.left_browser_tabs.get(index)) {
+        if let Some(old) = self
+            .left_browser_active
+            .and_then(|index| self.left_browser_tabs.get(index))
+        {
             let _ = old.view.set_visible(false);
         }
         let index = self.left_browser_tabs.len();
@@ -285,10 +307,18 @@ impl App {
     fn create_left_browser_toolbar(&mut self, owner: HWND, scale: f64) -> bool {
         let toolbar = unsafe {
             CreateWindowExW(
-                0, windows_sys::w!("STATIC"), windows_sys::w!("NeuralIA.WebToolbar"),
+                0,
+                windows_sys::w!("STATIC"),
+                windows_sys::w!("NeuralIA.WebToolbar"),
                 WS_CHILD | WS_VISIBLE,
-                0, 0, 300, (LEFT_BROWSER_BAR_HEIGHT * scale).round() as i32,
-                owner, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+                0,
+                0,
+                300,
+                (LEFT_BROWSER_BAR_HEIGHT * scale).round() as i32,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
         if toolbar.is_null() {
@@ -296,24 +326,45 @@ impl App {
             return false;
         }
         let reference = (&*self.omnibox_proxy as *const EventLoopProxy<UserEvent>) as usize;
-        if unsafe { SetWindowSubclass(
-            toolbar, Some(left_browser_toolbar_subclass), LEFT_BROWSER_TOOLBAR_ID, reference,
-        ) } == 0 {
+        if unsafe {
+            SetWindowSubclass(
+                toolbar,
+                Some(left_browser_toolbar_subclass),
+                LEFT_BROWSER_TOOLBAR_ID,
+                reference,
+            )
+        } == 0
+        {
             unsafe { DestroyWindow(toolbar) };
             self.show_splash("Não foi possível inicializar a barra Web.".to_owned(), 4);
             return false;
         }
         let address = unsafe {
             CreateWindowExW(
-                0, windows_sys::w!("EDIT"), windows_sys::w!(""),
+                0,
+                windows_sys::w!("EDIT"),
+                windows_sys::w!(""),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-                38, 10, 160, (28.0 * scale).round() as i32,
-                toolbar, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+                38,
+                10,
+                160,
+                (28.0 * scale).round() as i32,
+                toolbar,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
-        if address.is_null() || unsafe { SetWindowSubclass(
-            address, Some(left_browser_edit_subclass), LEFT_BROWSER_SUBCLASS_ID, reference,
-        ) } == 0 {
+        if address.is_null()
+            || unsafe {
+                SetWindowSubclass(
+                    address,
+                    Some(left_browser_edit_subclass),
+                    LEFT_BROWSER_SUBCLASS_ID,
+                    reference,
+                )
+            } == 0
+        {
             unsafe { DestroyWindow(toolbar) };
             self.show_splash("Não foi possível inicializar o campo Web.".to_owned(), 4);
             return false;
@@ -337,7 +388,10 @@ impl App {
         if index >= self.left_browser_tabs.len() {
             return;
         }
-        if let Some(old) = self.left_browser_active.and_then(|i| self.left_browser_tabs.get(i)) {
+        if let Some(old) = self
+            .left_browser_active
+            .and_then(|i| self.left_browser_tabs.get(i))
+        {
             let _ = old.view.set_visible(false);
         }
         self.left_browser_active = Some(index);
@@ -372,7 +426,9 @@ impl App {
     }
 
     pub(in crate::windows_app) fn toggle_left_browser_minimized(&mut self) {
-        if self.left_browser_tabs.is_empty() { return; }
+        if self.left_browser_tabs.is_empty() {
+            return;
+        }
         self.left_browser_minimized = !self.left_browser_minimized;
         if self.left_browser_minimized {
             self.left_browser_expanded = false;
@@ -382,7 +438,9 @@ impl App {
     }
 
     pub(in crate::windows_app) fn toggle_left_browser_expanded(&mut self) {
-        if self.left_browser_tabs.is_empty() { return; }
+        if self.left_browser_tabs.is_empty() {
+            return;
+        }
         self.left_browser_minimized = false;
         self.left_browser_expanded = !self.left_browser_expanded;
         self.update_comparator_layout();
@@ -393,33 +451,55 @@ impl App {
     pub(in crate::windows_app) fn show_left_browser_tab_list(&mut self) {
         // As abas antigas continuam acessíveis com a alternância cíclica
         // e via indicador de excesso na faixa superior.
-        let next = self.left_browser_active.map_or(0, |i| (i + 1) % self.left_browser_tabs.len().max(1));
+        let next = self
+            .left_browser_active
+            .map_or(0, |i| (i + 1) % self.left_browser_tabs.len().max(1));
         self.switch_left_browser_tab(next);
     }
 
     pub(in crate::windows_app) fn position_left_browser_toolbar(
-        &self, width: f64, content_y: f64, scale: f64,
+        &self,
+        width: f64,
+        content_y: f64,
+        scale: f64,
     ) {
         let (Some(toolbar), Some(address)) = (self.left_browser_toolbar, self.left_browser_address)
-        else { return };
+        else {
+            return;
+        };
         let w = (width.max(1.0) * scale).round() as i32;
         let h = (LEFT_BROWSER_BAR_HEIGHT * scale).round() as i32;
         let edit_width = (w - (144.0 * scale).round() as i32).max(1);
         unsafe {
             SetWindowPos(
-                toolbar, std::ptr::null_mut(), 0, (content_y * scale).round() as i32,
-                w, h, SWP_NOZORDER | SWP_NOACTIVATE,
+                toolbar,
+                std::ptr::null_mut(),
+                0,
+                (content_y * scale).round() as i32,
+                w,
+                h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
             );
             SetWindowPos(
-                address, std::ptr::null_mut(), (38.0 * scale).round() as i32,
-                (10.0 * scale).round() as i32, edit_width,
-                (28.0 * scale).round() as i32, SWP_NOZORDER | SWP_NOACTIVATE,
+                address,
+                std::ptr::null_mut(),
+                (38.0 * scale).round() as i32,
+                (10.0 * scale).round() as i32,
+                edit_width,
+                (28.0 * scale).round() as i32,
+                SWP_NOZORDER | SWP_NOACTIVATE,
             );
             let region = CreateRoundRectRgn(
-                0, 0, edit_width + 1, (28.0 * scale).round() as i32 + 1,
-                (9.0 * scale).round() as i32, (9.0 * scale).round() as i32,
+                0,
+                0,
+                edit_width + 1,
+                (28.0 * scale).round() as i32 + 1,
+                (9.0 * scale).round() as i32,
+                (9.0 * scale).round() as i32,
             );
-            if !region.is_null() { SetWindowRgn(address, region, 1); }
+            if !region.is_null() {
+                SetWindowRgn(address, region, 1);
+            }
             ShowWindow(toolbar, SW_SHOW);
             ShowWindow(address, SW_SHOW);
             InvalidateRect(toolbar, std::ptr::null(), 0);
@@ -427,9 +507,13 @@ impl App {
     }
 
     pub(in crate::windows_app) fn submit_left_browser_address(&mut self, input: &str) {
-        if self.surface != Surface::Comparator { return; }
+        if self.surface != Surface::Comparator {
+            return;
+        }
         let input = input.trim();
-        if input.is_empty() { return; }
+        if input.is_empty() {
+            return;
+        }
         let Some(target) = detect_web_target(input).or_else(|| google_search_url(input)) else {
             return;
         };
@@ -438,10 +522,16 @@ impl App {
             return;
         };
         if is_local_network_target(&url) {
-            self.show_splash("Endereço de rede local não permitido nesta aba.".to_string(), 4);
+            self.show_splash(
+                "Endereço de rede local não permitido nesta aba.".to_string(),
+                4,
+            );
             return;
         }
-        if let Some(tab) = self.left_browser_active.and_then(|index| self.left_browser_tabs.get_mut(index)) {
+        if let Some(tab) = self
+            .left_browser_active
+            .and_then(|index| self.left_browser_tabs.get_mut(index))
+        {
             if let Err(error) = tab.view.load_url(url.as_str()) {
                 self.show_splash(format!("Não foi possível navegar: {error}"), 4);
             } else {
@@ -454,8 +544,11 @@ impl App {
     pub(in crate::windows_app) fn sync_left_browser_address(&self) {
         let (Some(address), Some(tab)) = (
             self.left_browser_address,
-            self.left_browser_active.and_then(|index| self.left_browser_tabs.get(index)),
-        ) else { return };
+            self.left_browser_active
+                .and_then(|index| self.left_browser_tabs.get(index)),
+        ) else {
+            return;
+        };
         if let Ok(url) = tab.view.url() {
             unsafe {
                 let value = if url.starts_with("http://") || url.starts_with("https://") {
@@ -478,8 +571,11 @@ mod left_browser_tests {
     fn layout_never_reserves_an_invisible_middle_column() {
         for count in 0..=3 {
             let mut minimized = [false; 3];
-            for index in count..3 { minimized[index] = true; }
-            let (browser_width, spans) = left_browser_content_spans(1200.0, &minimized, false, false);
+            for index in count..3 {
+                minimized[index] = true;
+            }
+            let (browser_width, spans) =
+                left_browser_content_spans(1200.0, &minimized, false, false);
             assert_eq!(spans.len(), count);
             let sum: f64 = spans.iter().map(|(_, _, w)| *w).sum();
             assert!((browser_width + sum - 1200.0).abs() < 0.01);
@@ -488,7 +584,8 @@ mod left_browser_tests {
         let (full, spans) = left_browser_content_spans(1200.0, &[false; 3], false, true);
         assert_eq!(full, 1200.0);
         assert!(spans.is_empty());
-        let (hidden, spans) = left_browser_content_spans(1200.0, &[false, true, false], true, false);
+        let (hidden, spans) =
+            left_browser_content_spans(1200.0, &[false, true, false], true, false);
         assert_eq!(hidden, 0.0);
         assert_eq!(spans.len(), 2);
     }
