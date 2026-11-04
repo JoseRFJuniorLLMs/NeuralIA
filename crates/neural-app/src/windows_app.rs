@@ -1152,6 +1152,9 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta para {provider}"),
         BarHit::TitleNewTab => "Nova aba do navegador".to_string(),
+        BarHit::BrowserTab(_) => "Alternar para esta aba Web".to_string(),
+        BarHit::BrowserTabClose(_) => "Fechar esta aba Web".to_string(),
+        BarHit::BrowserTabOverflow => "Selecionar abas Web ocultas".to_string(),
         BarHit::ContextTab { .. } => {
             format!(
                 "{}\nClique: abrir ao lado · Arraste: mover · Botão direito: fechar e grupos",
