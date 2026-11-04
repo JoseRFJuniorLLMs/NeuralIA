@@ -173,6 +173,7 @@ pub(in crate::windows_app) struct BarColumns {
     pub(in crate::windows_app) restore_strip: f64,
     /// Tempo que falta no Pomodoro, ao lado do icone dele; alarga o botao.
     pub(in crate::windows_app) pomodoro_label: Option<BarLabel>,
+    pub(in crate::windows_app) browser_tabs: usize,
 }
 
 impl BarColumns {
@@ -187,6 +188,7 @@ impl BarColumns {
             panel_width: 0.0,
             restore_strip: 0.0,
             pomodoro_label: None,
+            browser_tabs: 0,
         }
     }
 }
@@ -453,6 +455,12 @@ impl BarLayout {
                 minimized: [false; COMPARATOR_COLUMNS],
                 add_tabs: [empty; COMPARATOR_COLUMNS],
                 title_new_tab: empty,
+                browser_tabs: [empty; MAX_VISIBLE_BROWSER_TABS],
+                browser_tab_closes: [empty; MAX_VISIBLE_BROWSER_TABS],
+                browser_tab_indices: [0; MAX_VISIBLE_BROWSER_TABS],
+                browser_tab_count: 0,
+                browser_tab_overflow: empty,
+                browser_tab_overflow_count: 0,
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_indices: [[0; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
                 context_tab_counts: [0; COMPARATOR_COLUMNS],
@@ -701,8 +709,17 @@ impl BarLayout {
         };
         let show_title_plus =
             tabs_right - tabs_left >= title_plus_w + title_plus_gap + minimum_tabs_room;
+        // As abas Web têm reserva própria; antes o '+' colava-se às abas
+        // das IAs e não sobrava lugar para a aba que acabava de nascer.
+        let remaining = (tabs_right - tabs_left - title_plus_w - title_plus_gap).max(0.0);
+        let browser_reserve = if columns.browser_tabs == 0 {
+            0.0
+        } else {
+            (columns.browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale)
+                .min(remaining * 0.52)
+        };
         let title_tabs_right = if show_title_plus {
-            tabs_right - title_plus_w - title_plus_gap
+            tabs_right - title_plus_w - title_plus_gap - browser_reserve
         } else {
             tabs_right
         };
@@ -797,6 +814,9 @@ impl BarLayout {
             }
             title_plus_x = x;
         }
+        if columns.browser_tabs > 0 && show_title_plus {
+            title_plus_x = title_tabs_right.max(title_plus_x);
+        }
         let title_new_tab = UiRect {
             x: title_plus_x.min(title_tabs_right),
             y: 3.0 * scale,
@@ -866,6 +886,7 @@ impl BarLayout {
     pub(in crate::windows_app) fn with_browser_tabs(
         mut self,
         total: usize,
+        active: usize,
         scale: f64,
     ) -> Self {
         if !self.visible || total == 0 || self.title_new_tab.width <= 0.0 {
@@ -916,7 +937,8 @@ impl BarLayout {
             - shown.saturating_sub(1) as f64 * gap).max(0.0);
         let width = (available / shown as f64).min(125.0 * scale);
         for visual in 0..shown {
-            let index = total - shown + visual;
+            let first = active.saturating_sub(shown - 1).min(total - shown);
+            let index = first + visual;
             let rect = UiRect {
                 x: cursor, y: self.title_new_tab.y, width,
                 height: self.title_new_tab.height,
