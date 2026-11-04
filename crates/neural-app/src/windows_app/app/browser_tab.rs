@@ -38,7 +38,9 @@ pub(in crate::windows_app) fn left_browser_content_spans(
     let visible: Vec<usize> = minimized
         .iter()
         .enumerate()
-        .filter_map(|(index, &min)| (!min).then_some(index))
+        // A Web ocupa o espaço da primeira IA, sem destruir a sessão
+        // dela. Ao minimizar a Web, a primeira IA volta a aparecer.
+        .filter_map(|(index, &min)| (!min && (browser_minimized || index != 0)).then_some(index))
         .collect();
     let slots = visible.len() + usize::from(!browser_minimized);
     if slots == 0 {
@@ -600,7 +602,7 @@ mod left_browser_tests {
             }
             let (browser_width, spans) =
                 left_browser_content_spans(1200.0, &minimized, false, false);
-            assert_eq!(spans.len(), count);
+            assert_eq!(spans.len(), count.saturating_sub(1));
             let sum: f64 = spans.iter().map(|(_, _, w)| *w).sum();
             assert!((browser_width + sum - 1200.0).abs() < 0.01);
             assert!(spans.iter().all(|(_, _, w)| *w > 0.0));
