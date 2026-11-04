@@ -7201,7 +7201,8 @@ fn draw_comparator_bar<W>(
                     active_context(comp),
                     comp.bar_focus,
                 ),
-            ).with_browser_tabs(
+            )
+            .with_browser_tabs(
                 browser_tabs.len(),
                 state.browser_active.unwrap_or(browser_tabs.len() - 1),
                 scale,
@@ -7213,12 +7214,26 @@ fn draw_comparator_bar<W>(
                 let index = layout.browser_tab_indices[visual];
                 let hovered = matches!(state.hover, Some(BarHit::BrowserTab(i) | BarHit::BrowserTabClose(i)) if i == index);
                 let selected = active == index;
-                let fill = mix(theme.bar_bg, theme.accent, if selected { 0.28 } else if hovered { 0.18 } else { 0.08 });
+                let fill = mix(
+                    theme.bar_bg,
+                    theme.accent,
+                    if selected {
+                        0.28
+                    } else if hovered {
+                        0.18
+                    } else {
+                        0.08
+                    },
+                );
                 draw_pill(
                     target,
                     layout.browser_tabs[visual],
                     &browser_tabs[index].title,
-                    PillStyle::new(fill, theme.surface_line, if selected { theme.fg } else { theme.fg_muted }),
+                    PillStyle::new(
+                        fill,
+                        theme.surface_line,
+                        if selected { theme.fg } else { theme.fg_muted },
+                    ),
                     scale,
                     font,
                     theme.bar_bg,
@@ -7226,18 +7241,25 @@ fn draw_comparator_bar<W>(
                 let close = layout.browser_tab_closes[visual];
                 if close.width > 0.0 {
                     draw_pill(
-                        target, close, "×",
+                        target,
+                        close,
+                        "×",
                         PillStyle::new(fill, fill, theme.fg),
-                        scale, font, fill,
+                        scale,
+                        font,
+                        fill,
                     );
                 }
             }
             if layout.browser_tab_overflow_count > 0 {
                 draw_pill(
-                    target, layout.browser_tab_overflow,
+                    target,
+                    layout.browser_tab_overflow,
                     &format!("+{}", layout.browser_tab_overflow_count),
                     PillStyle::new(theme.surface, theme.surface_line, theme.fg),
-                    scale, font, theme.bar_bg,
+                    scale,
+                    font,
+                    theme.bar_bg,
                 );
             }
             DeleteObject(font as _);
@@ -7332,7 +7354,8 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
             active_context.map(|(source, id, _, _)| (source, id)),
             focus,
         ),
-    ).with_browser_tabs(
+    )
+    .with_browser_tabs(
         state.browser_tab_count,
         state.browser_active.unwrap_or(0),
         scale,
