@@ -731,7 +731,13 @@ impl ApplicationHandler<UserEvent> for App {
                                 draw_comparator_neural_background(window);
                             }
                             if show_bar {
-                                draw_comparator_bar(window, comp, state, &self.live_panel, &self.left_browser_tabs);
+                                draw_comparator_bar(
+                                    window,
+                                    comp,
+                                    state,
+                                    &self.live_panel,
+                                    &self.left_browser_tabs,
+                                );
                             }
                             for panel in &self.background_services {
                                 draw_service_chrome(
