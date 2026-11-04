@@ -307,6 +307,9 @@ pub(in crate::windows_app) enum UserEvent {
     LeftBrowserSubmit(String),
     /// Ao focar a barra Web, sincronizar o URL real da WebView.
     LeftBrowserFocus,
+    /// Controles da faixa de endereço Web, independentes do sistema de IA.
+    LeftBrowserMinimize,
+    LeftBrowserExpand,
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
     OpenInColumn(usize, String),
     /// Clique simples num link: a mesma pagina nas TRES colunas, para se
@@ -541,6 +544,9 @@ pub(in crate::windows_app) enum BarHit {
     AddTab(usize),
     /// + superior, independente das novas perguntas das IAs.
     TitleNewTab,
+    BrowserTab(usize),
+    BrowserTabClose(usize),
+    BrowserTabOverflow,
     ContextTab {
         source_index: usize,
         context_index: usize,
@@ -727,6 +733,7 @@ fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarC
         panel_width: comp.panel_width,
         restore_strip: comp.restore_strip,
         pomodoro_label,
+        browser_tabs: 0,
     }
 }
 
@@ -3596,6 +3603,12 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) omnibox: Option<HWND>,
     /// Campo EDIT exclusivo da aba Web na coluna esquerda.
     pub(in crate::windows_app) left_browser_address: Option<HWND>,
+    pub(in crate::windows_app) left_browser_toolbar: Option<HWND>,
+    pub(in crate::windows_app) left_browser_font: Option<*mut core::ffi::c_void>,
+    pub(in crate::windows_app) left_browser_tabs: Vec<LeftBrowserTab>,
+    pub(in crate::windows_app) left_browser_active: Option<usize>,
+    pub(in crate::windows_app) left_browser_minimized: bool,
+    pub(in crate::windows_app) left_browser_expanded: bool,
     pub(in crate::windows_app) bar_hover: Option<BarHit>,
     /// Botao esquerdo em baixo sobre uma aba, o x dela ou a pilula de um
     /// grupo: o que acontece so se decide ao largar (ou ao arrastar).
@@ -3863,6 +3876,12 @@ impl App {
             comparator: None,
             omnibox: None,
             left_browser_address: None,
+            left_browser_toolbar: None,
+            left_browser_font: None,
+            left_browser_tabs: Vec::new(),
+            left_browser_active: None,
+            left_browser_minimized: false,
+            left_browser_expanded: false,
             bar_hover: None,
             tab_press: None,
             tab_gesture_count: 0,
@@ -7098,6 +7117,7 @@ fn draw_comparator_bar<W>(
     comp: &ComparatorState,
     state: BarState,
     live: &LivePanel<W>,
+    browser_tabs: &[LeftBrowserTab],
 ) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -7146,12 +7166,14 @@ fn draw_comparator_bar<W>(
             std::ptr::null_mut()
         };
 
+        let mut columns = bar_columns(comp, state.pomodoro_label);
+        columns.browser_tabs = browser_tabs.len();
         paint_comparator_bar_with_contexts(
             target,
             width,
             scale,
             names,
-            bar_columns(comp, state.pomodoro_label),
+            columns,
             &comp.contexts,
             &comp.groups,
             comp.split.as_ref().map(|split| {
@@ -7167,6 +7189,59 @@ fn draw_comparator_bar<W>(
             live,
             &Theme::system(),
         );
+        if !browser_tabs.is_empty() {
+            let layout = BarLayout::with_rows(
+                width as f64,
+                scale,
+                state.visible,
+                columns,
+                tab_rows_focused(
+                    &comp.contexts,
+                    &comp.groups,
+                    active_context(comp),
+                    comp.bar_focus,
+                ),
+            ).with_browser_tabs(
+                browser_tabs.len(),
+                state.browser_active.unwrap_or(browser_tabs.len() - 1),
+                scale,
+            );
+            let theme = Theme::system();
+            let font = create_font((-11.0 * scale) as i32, FW_NORMAL as i32);
+            let active = state.browser_active.unwrap_or(browser_tabs.len() - 1);
+            for visual in 0..layout.browser_tab_count {
+                let index = layout.browser_tab_indices[visual];
+                let hovered = matches!(state.hover, Some(BarHit::BrowserTab(i) | BarHit::BrowserTabClose(i)) if i == index);
+                let selected = active == index;
+                let fill = mix(theme.bar_bg, theme.accent, if selected { 0.28 } else if hovered { 0.18 } else { 0.08 });
+                draw_pill(
+                    target,
+                    layout.browser_tabs[visual],
+                    &browser_tabs[index].title,
+                    PillStyle::new(fill, theme.surface_line, if selected { theme.fg } else { theme.fg_muted }),
+                    scale,
+                    font,
+                    theme.bar_bg,
+                );
+                let close = layout.browser_tab_closes[visual];
+                if close.width > 0.0 {
+                    draw_pill(
+                        target, close, "×",
+                        PillStyle::new(fill, fill, theme.fg),
+                        scale, font, fill,
+                    );
+                }
+            }
+            if layout.browser_tab_overflow_count > 0 {
+                draw_pill(
+                    target, layout.browser_tab_overflow,
+                    &format!("+{}", layout.browser_tab_overflow_count),
+                    PillStyle::new(theme.surface, theme.surface_line, theme.fg),
+                    scale, font, theme.bar_bg,
+                );
+            }
+            DeleteObject(font as _);
+        }
 
         if buffered {
             BitBlt(hdc, 0, 0, width, bar_h, mem_dc, 0, 0, SRCCOPY);
@@ -7257,6 +7332,10 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
             active_context.map(|(source, id, _, _)| (source, id)),
             focus,
         ),
+    ).with_browser_tabs(
+        state.browser_tab_count,
+        state.browser_active.unwrap_or(0),
+        scale,
     );
     if state.omnibox_focused {
         layout.apply_omnibox_focus(width as f64, scale);
