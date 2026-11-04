@@ -715,8 +715,7 @@ impl BarLayout {
         let browser_reserve = if columns.browser_tabs == 0 {
             0.0
         } else {
-            (columns.browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale)
-                .min(remaining * 0.52)
+            (columns.browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.52)
         };
         let title_tabs_right = if show_title_plus {
             tabs_right - title_plus_w - title_plus_gap - browser_reserve
@@ -903,7 +902,8 @@ impl BarLayout {
         let min_tab = 68.0 * scale;
         let plus_w = self.title_new_tab.width;
         let space = (right - start - plus_w - 6.0 * scale).max(0.0);
-        let mut shown = total.min(MAX_VISIBLE_BROWSER_TABS)
+        let mut shown = total
+            .min(MAX_VISIBLE_BROWSER_TABS)
             .min((space / (min_tab + gap)).floor() as usize);
         if shown == 0 {
             return self;
@@ -915,16 +915,20 @@ impl BarLayout {
             let overflow_width = 34.0 * scale;
             if space >= overflow_width + gap + shown as f64 * (min_tab + gap) {
                 self.browser_tab_overflow = UiRect {
-                    x: cursor, y: self.title_new_tab.y,
-                    width: overflow_width, height: self.title_new_tab.height,
+                    x: cursor,
+                    y: self.title_new_tab.y,
+                    width: overflow_width,
+                    height: self.title_new_tab.height,
                 };
                 cursor += overflow_width + gap;
             } else {
                 shown -= 1;
                 hidden += 1;
                 self.browser_tab_overflow = UiRect {
-                    x: cursor, y: self.title_new_tab.y,
-                    width: overflow_width, height: self.title_new_tab.height,
+                    x: cursor,
+                    y: self.title_new_tab.y,
+                    width: overflow_width,
+                    height: self.title_new_tab.height,
                 };
                 cursor += overflow_width + gap;
             }
@@ -933,21 +937,21 @@ impl BarLayout {
         if shown == 0 {
             return self;
         }
-        let available = (right - cursor - plus_w - 6.0 * scale
-            - shown.saturating_sub(1) as f64 * gap).max(0.0);
+        let available =
+            (right - cursor - plus_w - 6.0 * scale - shown.saturating_sub(1) as f64 * gap).max(0.0);
         let width = (available / shown as f64).min(125.0 * scale);
         for visual in 0..shown {
             let first = active.saturating_sub(shown - 1).min(total - shown);
             let index = first + visual;
             let rect = UiRect {
-                x: cursor, y: self.title_new_tab.y, width,
+                x: cursor,
+                y: self.title_new_tab.y,
+                width,
                 height: self.title_new_tab.height,
             };
             self.browser_tabs[visual] = rect;
             self.browser_tab_indices[visual] = index;
-            self.browser_tab_closes[visual] = tab_close_rect(
-                rect, scale, TAB_CLOSE_SIZE * scale,
-            );
+            self.browser_tab_closes[visual] = tab_close_rect(rect, scale, TAB_CLOSE_SIZE * scale);
             self.browser_tab_count += 1;
             cursor += width + gap;
         }
