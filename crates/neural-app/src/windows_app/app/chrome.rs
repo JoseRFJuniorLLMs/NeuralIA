@@ -160,7 +160,7 @@ impl App {
             // A troca de decorations pode substituir/reparentar o HWND nativo.
             // A omnibox e o Home sao filhos Win32 reais: se continuarem ligados
             // ao HWND antigo, ficam invisiveis ou deixam de receber teclado/rato.
-            for child in [self.omnibox, self.home_button, self.left_browser_address]
+            for child in [self.omnibox, self.home_button, self.left_browser_toolbar]
                 .into_iter()
                 .flatten()
             {
@@ -401,6 +401,7 @@ impl App {
         // As abas e os grupos morrem com o comparador: gravam-se antes, para
         // a proxima pesquisa (ou o proximo arranque) os trazer de volta.
         let _ = self.save_tab_session();
+        self.close_left_browser_tab();
         if let Some(comparator) = self.comparator.take() {
             for view in &comparator.views {
                 let _ = view.webview.set_visible(false);
@@ -411,9 +412,6 @@ impl App {
                 let _ = split.webview.focus_parent();
             }
             drop(comparator);
-        }
-        if let Some(address) = self.left_browser_address.take() {
-            unsafe { DestroyWindow(address) };
         }
         if let Some(webview) = self.webview.take() {
             let _ = webview.set_visible(false);
@@ -904,17 +902,23 @@ impl App {
         };
         let client_width = window.inner_size().width as f64;
         let scale = window.scale_factor();
+        let mut columns = bar_columns(comp, self.pomodoro_bar_label());
+        columns.browser_tabs = self.left_browser_tabs.len();
         let mut layout = BarLayout::with_rows(
             client_width,
             scale,
             self.bar_visible(),
-            bar_columns(comp, self.pomodoro_bar_label()),
+            columns,
             tab_rows_focused(
                 &comp.contexts,
                 &comp.groups,
                 active_context(comp),
                 comp.bar_focus,
             ),
+        ).with_browser_tabs(
+            self.left_browser_tabs.len(),
+            self.left_browser_active.unwrap_or(0),
+            scale,
         );
         let omnibox_focused = self
             .omnibox
@@ -1605,6 +1609,8 @@ impl App {
             omnibox_focused: self
                 .omnibox
                 .is_some_and(|edit| unsafe { GetFocus() == edit }),
+            browser_tab_count: self.left_browser_tabs.len(),
+            browser_active: self.left_browser_active,
         }
     }
 }
