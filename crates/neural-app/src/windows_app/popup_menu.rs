@@ -390,6 +390,10 @@ impl App {
         if let Some(webview) = &self.webview {
             hosts.push(webview);
         }
+        // As abas Web independentes também devolvem o foco ao fecho do menu.
+        for tab in &self.left_browser_tabs {
+            hosts.push(&tab.view);
+        }
         if let Some(panel) = self.side_panel.view() {
             hosts.push(panel);
         }
