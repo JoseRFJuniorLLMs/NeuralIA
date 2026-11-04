@@ -733,7 +733,6 @@ fn bar_columns(comp: &ComparatorState, pomodoro_label: Option<BarLabel>) -> BarC
         panel_width: comp.panel_width,
         restore_strip: comp.restore_strip,
         pomodoro_label,
-        browser_tabs: 0,
     }
 }
 
@@ -7169,8 +7168,7 @@ fn draw_comparator_bar<W>(
             std::ptr::null_mut()
         };
 
-        let mut columns = bar_columns(comp, state.pomodoro_label);
-        columns.browser_tabs = browser_tabs.len();
+        let columns = bar_columns(comp, state.pomodoro_label);
         paint_comparator_bar_with_contexts(
             target,
             width,
@@ -7193,7 +7191,7 @@ fn draw_comparator_bar<W>(
             &Theme::system(),
         );
         if !browser_tabs.is_empty() {
-            let layout = BarLayout::with_rows(
+            let layout = BarLayout::with_rows_browser(
                 width as f64,
                 scale,
                 state.visible,
@@ -7204,6 +7202,7 @@ fn draw_comparator_bar<W>(
                     active_context(comp),
                     comp.bar_focus,
                 ),
+                browser_tabs.len(),
             )
             .with_browser_tabs(
                 browser_tabs.len(),
@@ -7346,7 +7345,7 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
         Some((tabs, column_groups, focus)) => (tabs, column_groups, *focus),
         None => (contexts, groups, focus),
     };
-    let mut layout = BarLayout::with_rows(
+    let mut layout = BarLayout::with_rows_browser(
         width as f64,
         scale,
         visible,
@@ -7357,6 +7356,7 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
             active_context.map(|(source, id, _, _)| (source, id)),
             focus,
         ),
+        state.browser_tab_count,
     )
     .with_browser_tabs(
         state.browser_tab_count,
