@@ -1903,7 +1903,10 @@ mod sidebar_layout_gates {
                     4,
                 )
                 .with_browser_tabs(4, 3, scale);
-                assert!(layout.browser_tab_count > 0, "browser tabs disappeared at {width}");
+                assert!(
+                    layout.browser_tab_count > 0,
+                    "browser tabs disappeared at {width}"
+                );
                 for visual in 0..layout.browser_tab_count {
                     let rect = layout.browser_tabs[visual];
                     let close = layout.browser_tab_closes[visual];
