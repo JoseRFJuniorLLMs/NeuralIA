@@ -1890,6 +1890,44 @@ mod sidebar_layout_gates {
     }
 
     #[test]
+    fn each_web_tab_and_close_button_is_visible_in_title_row() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for width in [1024.0, 1440.0, 1920.0] {
+                let rows = std::array::from_fn(|_| TabRow::plain(1));
+                let layout = BarLayout::with_rows_browser(
+                    width * scale,
+                    scale,
+                    true,
+                    BarColumns::even(3),
+                    rows,
+                    4,
+                )
+                .with_browser_tabs(4, 3, scale);
+                assert!(layout.browser_tab_count > 0, "browser tabs disappeared at {width}");
+                for visual in 0..layout.browser_tab_count {
+                    let rect = layout.browser_tabs[visual];
+                    let close = layout.browser_tab_closes[visual];
+                    let index = layout.browser_tab_indices[visual];
+                    assert!(rect.width > 0.0 && close.width > 0.0);
+                    assert_eq!(
+                        layout.hit(rect.x + rect.width * 0.25, rect.y + rect.height * 0.5),
+                        Some(BarHit::BrowserTab(index))
+                    );
+                    assert_eq!(
+                        layout.hit(close.x + close.width * 0.5, close.y + close.height * 0.5),
+                        Some(BarHit::BrowserTabClose(index))
+                    );
+                }
+                let plus = layout.title_new_tab;
+                assert_eq!(
+                    layout.hit(plus.x + plus.width * 0.5, plus.y + plus.height * 0.5),
+                    Some(BarHit::TitleNewTab)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn social_services_open_the_right_destination_and_hit_their_own_button() {
         let controls = right_controls(1600.0, 1.0, false, None);
         for (service, url) in [
