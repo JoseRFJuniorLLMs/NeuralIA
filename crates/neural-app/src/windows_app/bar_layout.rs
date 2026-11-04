@@ -718,15 +718,17 @@ impl BarLayout {
         } else {
             8.0 * scale
         };
-        let show_title_plus =
-            tabs_right - tabs_left >= title_plus_w + title_plus_gap + minimum_tabs_room;
+        let show_title_plus = tabs_right - tabs_left
+            >= title_plus_w
+                + title_plus_gap
+                + if browser_tabs > 0 { 0.0 } else { minimum_tabs_room };
         // As abas Web têm reserva própria; antes o '+' colava-se às abas
         // das IAs e não sobrava lugar para a aba que acabava de nascer.
         let remaining = (tabs_right - tabs_left - title_plus_w - title_plus_gap).max(0.0);
         let browser_reserve = if browser_tabs == 0 {
             0.0
         } else {
-            (browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.52)
+            (browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.85)
         };
         let title_tabs_right = if show_title_plus {
             tabs_right - title_plus_w - title_plus_gap - browser_reserve
@@ -910,18 +912,42 @@ impl BarLayout {
         };
         let start = self.title_new_tab.x;
         let gap = 4.0 * scale;
-        let min_tab = 68.0 * scale;
+        let min_tab = 48.0 * scale;
         let plus_w = self.title_new_tab.width;
         let space = (right - start - plus_w - 6.0 * scale).max(0.0);
         let mut shown = total
             .min(MAX_VISIBLE_BROWSER_TABS)
             .min((space / (min_tab + gap)).floor() as usize);
         if shown == 0 {
+            // Na largura mínima, o menu "N" mantém todas as abas
+            // acessíveis mesmo quando nenhum título cabe.
+            let overflow_width = space.min(34.0 * scale);
+            if overflow_width >= 18.0 * scale {
+                self.browser_tab_overflow = UiRect {
+                    x: start,
+                    y: self.title_new_tab.y,
+                    width: overflow_width,
+                    height: self.title_new_tab.height,
+                };
+                self.browser_tab_overflow_count = total;
+                self.title_new_tab.x = start + overflow_width + gap;
+            }
             return self;
         }
         let mut cursor = start;
         let mut hidden = total - shown;
-        if hidden > 0 && shown > 1 {
+        if hidden > 0 && shown == 1 && space < min_tab + 34.0 * scale + 2.0 * gap {
+            self.browser_tab_overflow = UiRect {
+                x: cursor,
+                y: self.title_new_tab.y,
+                width: space.min(34.0 * scale),
+                height: self.title_new_tab.height,
+            };
+            self.browser_tab_overflow_count = total;
+            self.title_new_tab.x = cursor + self.browser_tab_overflow.width + gap;
+            return self;
+        }
+        if hidden > 0 && shown >= 1 {
             // Mantém o acesso às abas antigas sem sacrificar a recém-aberta.
             let overflow_width = 34.0 * scale;
             if space >= overflow_width + gap + shown as f64 * (min_tab + gap) {
@@ -1904,8 +1930,8 @@ mod sidebar_layout_gates {
                 )
                 .with_browser_tabs(4, 3, scale);
                 assert!(
-                    layout.browser_tab_count > 0,
-                    "browser tabs disappeared at {width}"
+                    layout.browser_tab_count > 0 || layout.browser_tab_overflow_count == 4,
+                    "browser tabs inaccessible at {width}"
                 );
                 for visual in 0..layout.browser_tab_count {
                     let rect = layout.browser_tabs[visual];
