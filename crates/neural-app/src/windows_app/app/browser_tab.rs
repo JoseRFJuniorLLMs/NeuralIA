@@ -40,7 +40,9 @@ pub(in crate::windows_app) fn left_browser_content_spans(
         .enumerate()
         // A Web ocupa o espaço da primeira IA, sem destruir a sessão
         // dela. Ao minimizar a Web, a primeira IA volta a aparecer.
-        .filter_map(|(index, &min)| (!min && (browser_minimized || index != 0)).then_some(index))
+        .filter_map(|(index, &min)| {
+            (!min && (browser_minimized || index != 0)).then_some(index)
+        })
         .collect();
     let slots = visible.len() + usize::from(!browser_minimized);
     if slots == 0 {
@@ -456,7 +458,9 @@ impl App {
         let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
             return;
         };
-        let Some(owner) = window_hwnd(window) else { return };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
         let scale = window.scale_factor().max(1.0);
         let anchor = layout.browser_tab_overflow;
         let mut position = POINT {
@@ -465,16 +469,25 @@ impl App {
         };
         unsafe { ClientToScreen(owner, &mut position) };
         let menu = unsafe { CreatePopupMenu() };
-        if menu.is_null() { return; }
+        if menu.is_null() {
+            return;
+        }
         const FIRST_BROWSER_MENU_ID: usize = 1000;
         for (index, tab) in self.left_browser_tabs.iter().enumerate() {
             let label = wide_null(&format!("{} — {}", index + 1, tab.title));
-            unsafe { AppendMenuW(menu, MF_STRING, FIRST_BROWSER_MENU_ID + index, label.as_ptr()); }
+            unsafe {
+                AppendMenuW(menu, MF_STRING, FIRST_BROWSER_MENU_ID + index, label.as_ptr());
+            }
         }
         let chosen = unsafe {
             TrackPopupMenu(
-                menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                position.x, position.y, 0, owner, std::ptr::null(),
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                position.x,
+                position.y,
+                0,
+                owner,
+                std::ptr::null(),
             )
         } as usize;
         unsafe { DestroyMenu(menu) };
