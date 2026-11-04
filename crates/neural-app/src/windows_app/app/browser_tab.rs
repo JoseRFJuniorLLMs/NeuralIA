@@ -411,6 +411,7 @@ impl App {
         drop(tab);
         if self.left_browser_tabs.is_empty() {
             self.close_left_browser_tab();
+            self.update_comparator_layout();
         } else {
             let next = match self.left_browser_active {
                 Some(active) if active > index => active - 1,
@@ -447,14 +448,37 @@ impl App {
         self.request_redraw();
     }
 
-    /// Menu com todas as abas Web, incluindo as que não cabem na barra.
+    /// Menu nativo de abas excedentes: seleção explícita, não um ciclo
+    /// que muda de aba sem dizer qual será aberta.
     pub(in crate::windows_app) fn show_left_browser_tab_list(&mut self) {
-        // As abas antigas continuam acessíveis com a alternância cíclica
-        // e via indicador de excesso na faixa superior.
-        let next = self
-            .left_browser_active
-            .map_or(0, |i| (i + 1) % self.left_browser_tabs.len().max(1));
-        self.switch_left_browser_tab(next);
+        let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else { return };
+        let scale = window.scale_factor().max(1.0);
+        let anchor = layout.browser_tab_overflow;
+        let mut position = POINT {
+            x: (anchor.x * scale).round() as i32,
+            y: ((anchor.y + anchor.height) * scale).round() as i32,
+        };
+        unsafe { ClientToScreen(owner, &mut position) };
+        let menu = unsafe { CreatePopupMenu() };
+        if menu.is_null() { return; }
+        const FIRST_BROWSER_MENU_ID: usize = 1000;
+        for (index, tab) in self.left_browser_tabs.iter().enumerate() {
+            let label = wide_null(&format!("{} — {}", index + 1, tab.title));
+            unsafe { AppendMenuW(menu, MF_STRING, FIRST_BROWSER_MENU_ID + index, label.as_ptr()); }
+        }
+        let chosen = unsafe {
+            TrackPopupMenu(
+                menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                position.x, position.y, 0, owner, std::ptr::null(),
+            )
+        } as usize;
+        unsafe { DestroyMenu(menu) };
+        if chosen >= FIRST_BROWSER_MENU_ID {
+            self.switch_left_browser_tab(chosen - FIRST_BROWSER_MENU_ID);
+        }
     }
 
     pub(in crate::windows_app) fn position_left_browser_toolbar(
