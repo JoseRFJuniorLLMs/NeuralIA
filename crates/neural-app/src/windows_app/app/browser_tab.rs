@@ -268,7 +268,8 @@ impl App {
                 wry::NewWindowResponse::Deny
             });
         let hooked = self.hooked_builder(builder, WebViewHost::External, None);
-        let view = match hooked.build_hooked_as_child(window) {
+        let result = hooked.build_hooked_as_child(window);
+        let view = match result {
             Ok(view) => view,
             Err(error) => {
                 self.show_splash(format!("Não foi possível criar a aba Web: {error}"), 4);
@@ -466,34 +467,19 @@ impl App {
             y: ((anchor.y + anchor.height) * scale).round() as i32,
         };
         unsafe { ClientToScreen(owner, &mut position) };
-        let menu = unsafe { CreatePopupMenu() };
-        if menu.is_null() {
-            return;
-        }
+        let mut menu = PopupMenu::default();
         const FIRST_BROWSER_MENU_ID: usize = 1000;
         for (index, tab) in self.left_browser_tabs.iter().enumerate() {
-            let label = wide_null(&format!("{} — {}", index + 1, tab.title));
-            unsafe {
-                AppendMenuW(
-                    menu,
-                    MF_STRING,
+            menu.push(
+                MenuCommand::new(
                     FIRST_BROWSER_MENU_ID + index,
-                    label.as_ptr(),
-                );
-            }
+                    format!("{} — {}", index + 1, tab.title),
+                )
+                .checked(self.left_browser_active == Some(index))
+                .moves_focus(),
+            );
         }
-        let chosen = unsafe {
-            TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                position.x,
-                position.y,
-                0,
-                owner,
-                std::ptr::null(),
-            )
-        } as usize;
-        unsafe { DestroyMenu(menu) };
+        let chosen = self.track_menu(&menu, position, MenuButton::Left);
         if chosen >= FIRST_BROWSER_MENU_ID {
             self.switch_left_browser_tab(chosen - FIRST_BROWSER_MENU_ID);
         }
