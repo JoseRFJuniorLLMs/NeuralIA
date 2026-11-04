@@ -721,7 +721,11 @@ impl BarLayout {
         let show_title_plus = tabs_right - tabs_left
             >= title_plus_w
                 + title_plus_gap
-                + if browser_tabs > 0 { 0.0 } else { minimum_tabs_room };
+                + if browser_tabs > 0 {
+                    0.0
+                } else {
+                    minimum_tabs_room
+                };
         // As abas Web têm reserva própria; antes o '+' colava-se às abas
         // das IAs e não sobrava lugar para a aba que acabava de nascer.
         let remaining = (tabs_right - tabs_left - title_plus_w - title_plus_gap).max(0.0);
