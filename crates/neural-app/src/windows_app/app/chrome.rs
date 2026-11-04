@@ -915,7 +915,8 @@ impl App {
                 active_context(comp),
                 comp.bar_focus,
             ),
-        ).with_browser_tabs(
+        )
+        .with_browser_tabs(
             self.left_browser_tabs.len(),
             self.left_browser_active.unwrap_or(0),
             scale,
