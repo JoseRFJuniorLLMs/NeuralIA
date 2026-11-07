@@ -310,6 +310,8 @@ pub(in crate::windows_app) enum UserEvent {
     /// Controles da faixa de endereço Web, independentes do sistema de IA.
     LeftBrowserMinimize,
     LeftBrowserExpand,
+    /// O x da barra Web: fecha só a aba Web ativa.
+    LeftBrowserClose,
     /// Popup pedido por uma coluna do comparador: carrega nessa coluna.
     OpenInColumn(usize, String),
     /// Clique simples num link: a mesma pagina nas TRES colunas, para se
@@ -3611,6 +3613,8 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) left_browser_active: Option<usize>,
     pub(in crate::windows_app) left_browser_minimized: bool,
     pub(in crate::windows_app) left_browser_expanded: bool,
+    /// Peso da aba Web na geometria das colunas: o divisor ao lado dela muda-o.
+    pub(in crate::windows_app) left_browser_weight: f64,
     pub(in crate::windows_app) bar_hover: Option<BarHit>,
     /// Botao esquerdo em baixo sobre uma aba, o x dela ou a pilula de um
     /// grupo: o que acontece so se decide ao largar (ou ao arrastar).
@@ -3884,6 +3888,7 @@ impl App {
             left_browser_active: None,
             left_browser_minimized: false,
             left_browser_expanded: false,
+            left_browser_weight: LEFT_BROWSER_DEFAULT_WEIGHT,
             bar_hover: None,
             tab_press: None,
             tab_gesture_count: 0,

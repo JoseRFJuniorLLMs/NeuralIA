@@ -859,11 +859,18 @@ impl App {
             }
         }
         if show_left_browser {
+            // A Web reparte a largura pela conta das colunas, com o peso que
+            // o divisor ao lado dela lhe deu.
             let (browser_width, spans) = left_browser_content_spans(
                 logical_w,
-                &comp.minimized[..comp.views.len().min(COMPARATOR_COLUMNS)],
-                self.left_browser_minimized,
-                self.left_browser_expanded,
+                comp.views.len(),
+                &comp.weights,
+                &comp.minimized,
+                (
+                    self.left_browser_weight,
+                    self.left_browser_minimized,
+                    self.left_browser_expanded,
+                ),
             );
             for view in &comp.views {
                 let _ = view.webview.set_visible(false);

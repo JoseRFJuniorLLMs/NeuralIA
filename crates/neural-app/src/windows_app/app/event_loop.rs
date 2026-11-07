@@ -466,6 +466,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::LeftBrowserFocus => self.sync_left_browser_address(),
             UserEvent::LeftBrowserMinimize => self.toggle_left_browser_minimized(),
             UserEvent::LeftBrowserExpand => self.toggle_left_browser_expanded(),
+            UserEvent::LeftBrowserClose => self.close_active_left_browser_tab(),
             UserEvent::OpenInColumn(index, url) => self.open_in_column(index, url),
             UserEvent::OpenEverywhere(url) => self.open_everywhere(url),
             UserEvent::OpenSplit { source_index, url } => {
