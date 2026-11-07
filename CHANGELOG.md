@@ -2,6 +2,11 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.3] - 2026-11-07
+
+### Fixed
+- Integradas as correções de abas Web múltiplas e barra de navegação padrão, incluindo redimensionamento do painel (PR #259).
+
 ## [3.2.2] - 2026-11-03
 
 ### Fixed
