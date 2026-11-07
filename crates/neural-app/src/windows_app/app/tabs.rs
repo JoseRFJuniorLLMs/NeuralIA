@@ -1198,6 +1198,9 @@ impl App {
             Some(BarHit::Column(index)) => self.expand_comparator(index),
             Some(BarHit::AddTab(index)) => self.open_ai_palette(index),
             Some(BarHit::TitleNewTab) => self.open_browser_new_tab(),
+            Some(BarHit::BrowserTab(index)) => self.switch_left_browser_tab(index),
+            Some(BarHit::BrowserTabClose(index)) => self.close_one_left_browser_tab(index),
+            Some(BarHit::BrowserTabOverflow) => self.show_left_browser_tab_list(),
             Some(BarHit::ContextTab {
                 source_index,
                 context_index,

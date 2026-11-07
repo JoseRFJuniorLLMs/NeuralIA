@@ -633,15 +633,39 @@ impl App {
             // Com o painel de servicos em tela cheia por cima de tudo, os
             // divisores (popups, acima das WebViews) ficavam a flutuar sobre
             // o video.
+            // Com a aba Web aberta, o Split fica escondido atras dela e a Web
+            // entra na geometria das colunas: os divisores ficam, e o da
+            // fronteira Web|IA redimensiona a Web. So a Web maximizada
+            // (sozinha no conteudo) nao tem divisores.
+            let browser = self.left_browser_owns_layout();
+            let browser_maximized = self.left_browser_expanded && !self.left_browser_minimized;
             let show = self.surface == Surface::Comparator
-                && self.left_browser_address.is_none()
-                && comp.split.as_ref().is_none_or(|split| split.minimized)
+                && if browser {
+                    !browser_maximized
+                } else {
+                    comp.split.as_ref().is_none_or(|split| split.minimized)
+                }
                 && comp.expanded.is_none()
                 && !self.service_covers_window();
             // Um divisor por fronteira entre colunas visiveis: o fim de cada
             // faixa menos a ultima, na mesma geometria que as WebViews usam.
-            let spans =
-                visible_column_spans(logical_w, comp.views.len(), &comp.weights, &comp.minimized);
+            let (weights, minimized, columns) = if browser {
+                let (weights, minimized) = left_browser_column_model(
+                    &comp.weights,
+                    &comp.minimized,
+                    self.left_browser_weight,
+                    self.left_browser_minimized,
+                );
+                let columns = if self.left_browser_minimized {
+                    comp.views.len()
+                } else {
+                    comp.views.len().max(1)
+                };
+                (weights, minimized, columns)
+            } else {
+                (comp.weights, comp.minimized, comp.views.len())
+            };
+            let spans = visible_column_spans(logical_w, columns, &weights, &minimized);
             let boundaries: Vec<f64> = spans
                 .iter()
                 .take(spans.len().saturating_sub(1))
@@ -747,6 +771,10 @@ impl App {
     }
 
     pub(in crate::windows_app) fn resize_comparator(&mut self, divider: usize, screen_x: i32) {
+        if self.left_browser_owns_layout() {
+            self.resize_left_browser_columns(divider, screen_x);
+            return;
+        }
         let (Some(window), Some(comp)) = (&self.window, &mut self.comparator) else {
             return;
         };
