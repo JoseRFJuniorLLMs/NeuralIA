@@ -384,6 +384,10 @@ pub(in crate::windows_app) enum UserEvent {
     },
     /// Esc no painel de servicos (AcceleratorKeyPressed do WebView2).
     ServiceEscape(u64),
+    WhatsAppOpenLink {
+        generation: u64,
+        target: Url,
+    },
     /// O rato entrou (ou saiu) do "−" ou do "⛶ <IA>" injetados na coluna:
     /// a dica centrada do app, com o texto escolhido aqui.
     ColumnHint {

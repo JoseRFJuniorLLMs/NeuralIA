@@ -383,6 +383,10 @@ impl App {
     }
 
     pub(in crate::windows_app) fn destroy_web_surfaces(&mut self) {
+        self.destroy_web_surfaces_with_panels(false);
+    }
+
+    pub(super) fn destroy_web_surfaces_with_panels(&mut self, keep_panels: bool) {
         if lifecycle_probe_enabled() {
             LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
             LIFECYCLE_HOME_READY.store(false, Ordering::Release);
@@ -418,15 +422,12 @@ impl App {
             let _ = webview.focus_parent();
             drop(webview);
         }
-        // O Live ativado acompanha toda a sessao, inclusive na Home.
-        self.minimize_live_panel();
-        self.service_panel_for_transition();
-        // O do Ctrl+H pela saida unica: o texto de uma nota a meio vai para
-        // o disco antes de a pagina sair (gate
-        // `every_way_out_of_the_side_panel_saves_the_note_being_typed_once`).
-        // `SurfaceChange` nao mexe no teclado: esta troca trata dele.
-        self.close_side_panel(PanelExit::SurfaceChange);
-        // Sem painel: a pega some e o gancho da roda sai.
+        if !keep_panels {
+            // A saída pelo Ctrl+H grava o rascunho antes de descartar a página.
+            self.minimize_live_panel();
+            self.service_panel_for_transition();
+            self.close_side_panel(PanelExit::SurfaceChange);
+        }
         self.after_panel_change();
 
         if let Some(button) = self.exit_button.take() {

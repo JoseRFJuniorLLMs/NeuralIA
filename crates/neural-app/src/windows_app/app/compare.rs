@@ -424,7 +424,15 @@ impl App {
             }
         }
 
-        self.comparator = Some(ComparatorState {
+        self.comparator = Some(Self::new_comparator_state(views, restored));
+        self.activate_comparator(true);
+        if let Some(notice) = tabs_notice {
+            self.show_splash(notice, 5);
+        }
+    }
+
+    fn new_comparator_state(views: Vec<ComparatorView>, restored: RestoredTabs) -> ComparatorState {
+        ComparatorState {
             views,
             expanded: None,
             minimized: [false; COMPARATOR_COLUMNS],
@@ -437,9 +445,32 @@ impl App {
             bar_focus: [None; COMPARATOR_COLUMNS],
             panel_width: 0.0,
             restore_strip: 0.0,
-        });
-        self.activate_comparator(true);
-        if let Some(notice) = tabs_notice {
+        }
+    }
+
+    /// Uma aba pode ser aberta a partir de um painel sem iniciar pesquisa nas IAs.
+    pub(super) fn prepare_browser_link_workspace(&mut self) {
+        if self.surface == Surface::Comparator {
+            if self.comparator.as_ref().is_some_and(|comp| {
+                comp.expanded.is_some() || comp.split.as_ref().is_some_and(|split| split.fullscreen)
+            }) {
+                self.leave_column_fullscreen();
+            }
+            return;
+        }
+
+        if self.surface != Surface::Home {
+            self.next_generation();
+            self.destroy_web_surfaces_with_panels(true);
+        }
+        if let Some(window) = &self.window {
+            window.set_decorations(false);
+        }
+        let (restored, notice) = self.privacy.restore_tabs();
+        self.comparator = Some(Self::new_comparator_state(Vec::new(), restored));
+        self.activate_comparator(false);
+        self.apply_panel_layout();
+        if let Some(notice) = notice {
             self.show_splash(notice, 5);
         }
     }

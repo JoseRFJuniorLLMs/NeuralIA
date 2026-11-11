@@ -520,6 +520,15 @@ impl App {
     }
 
     pub(in crate::windows_app) fn open_left_browser_tab(&mut self) {
+        self.create_left_browser_tab(None);
+    }
+
+    pub(in crate::windows_app) fn open_left_browser_link(&mut self, target: Url) {
+        self.prepare_browser_link_workspace();
+        self.create_left_browser_tab(Some(target));
+    }
+
+    fn create_left_browser_tab(&mut self, target: Option<Url>) {
         if self.surface != Surface::Comparator {
             return;
         }
@@ -549,13 +558,16 @@ impl App {
         let builder = self
             .external_webview_builder(None, false)
             .with_bounds(bounds)
-            .with_html(browser_new_tab_html())
             .with_new_window_req_handler(move |target, _features| {
                 if let Some(event) = left_browser_new_window_event(target) {
                     let _ = new_window_proxy.send_event(event);
                 }
                 wry::NewWindowResponse::Deny
             });
+        let builder = match &target {
+            Some(url) => builder.with_url(url.as_str()),
+            None => builder.with_html(browser_new_tab_html()),
+        };
         let hooked = self.hooked_builder(builder, WebViewHost::External, None);
         let result = hooked.build_hooked_as_child(window);
         let view = match result {
@@ -578,18 +590,22 @@ impl App {
             let _ = old.view.set_visible(false);
         }
         let index = self.left_browser_tabs.len();
-        self.left_browser_tabs.push(LeftBrowserTab {
-            view,
-            title: format!("Nova aba {}", index + 1),
-        });
+        let title = target.as_ref().map_or_else(
+            || format!("Nova aba {}", index + 1),
+            |url| url.host_str().unwrap_or("Web").to_owned(),
+        );
+        self.left_browser_tabs.push(LeftBrowserTab { view, title });
         self.left_browser_active = Some(index);
         self.left_browser_minimized = false;
         self.left_browser_expanded = false;
         if let Some(address) = self.left_browser_address {
-            unsafe { SetWindowTextW(address, wide_null("").as_ptr()) };
+            let text = target.as_ref().map_or("", Url::as_str);
+            unsafe { SetWindowTextW(address, wide_null(text).as_ptr()) };
         }
         self.refresh_left_browser_layout();
-        if let Some(address) = self.left_browser_address {
+        if target.is_some() {
+            let _ = self.left_browser_tabs[index].view.focus();
+        } else if let Some(address) = self.left_browser_address {
             unsafe { SetFocus(address) };
         }
     }

@@ -40,8 +40,8 @@ use crate::windows_app::{
     },
     services::{
         Service, ServicePanel, logical_rect, raise_webview_host, register_service_panel_events,
-        service_event_is_current, service_panel_permission, service_should_pause,
-        start_whatsapp_with_notifications,
+        register_whatsapp_link_events, service_event_is_current, service_panel_permission,
+        service_should_pause, start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
@@ -345,10 +345,15 @@ impl App {
                 {
                     debug_log(format_args!("service panel: sem avisos ({error})"));
                 }
-                if service == Service::WhatsApp
-                    && let Err(error) = start_whatsapp_with_notifications(&panel)
-                {
-                    debug_log(format_args!("service panel: {error}"));
+                if service == Service::WhatsApp {
+                    if let Err(error) =
+                        register_whatsapp_link_events(&panel, generation, self.proxy.clone())
+                    {
+                        debug_log(format_args!("service panel: {error}"));
+                    }
+                    if let Err(error) = start_whatsapp_with_notifications(&panel) {
+                        debug_log(format_args!("service panel: {error}"));
+                    }
                 }
                 debug_log(format_args!("service panel: {service:?}"));
                 self.install_service_panel(ServicePanel {
