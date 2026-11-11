@@ -628,7 +628,9 @@ impl App {
         let (show, boundaries, content_height, scale) = if let Some(comp) = &self.comparator {
             let scale = window.scale_factor().max(1.0);
             let size = window.inner_size();
-            let logical_w = comparator_logical_width(size.width as f64 / scale, comp.panel_width);
+            let content_x = self.left_panel_width();
+            let logical_w =
+                comparator_logical_width(size.width as f64 / scale, comp.panel_width + content_x);
             let logical_h = size.height as f64 / scale;
             // Com o painel de servicos em tela cheia por cima de tudo, os
             // divisores (popups, acima das WebViews) ficavam a flutuar sobre
@@ -669,7 +671,7 @@ impl App {
             let boundaries: Vec<f64> = spans
                 .iter()
                 .take(spans.len().saturating_sub(1))
-                .map(|span| span.x + span.width)
+                .map(|span| content_x + span.x + span.width)
                 .collect();
             (
                 show,
@@ -775,6 +777,7 @@ impl App {
             self.resize_left_browser_columns(divider, screen_x);
             return;
         }
+        let content_x = self.left_panel_width();
         let (Some(window), Some(comp)) = (&self.window, &mut self.comparator) else {
             return;
         };
@@ -800,9 +803,11 @@ impl App {
             ScreenToClient(owner, &mut point);
         }
         let scale = window.scale_factor().max(1.0);
-        let logical_w =
-            comparator_logical_width(window.inner_size().width as f64 / scale, comp.panel_width);
-        let mouse_x = (point.x as f64 / scale).clamp(0.0, logical_w);
+        let logical_w = comparator_logical_width(
+            window.inner_size().width as f64 / scale,
+            comp.panel_width + content_x,
+        );
+        let mouse_x = (point.x as f64 / scale - content_x).clamp(0.0, logical_w);
 
         comp.weights = resized_weights(&comp.weights, &visible, divider, mouse_x, logical_w);
 

@@ -283,9 +283,7 @@ impl App {
     /// Abre a respiracao guiada (Wim Hof) no painel de servico.
     /// Se ja estiver aberto e nao-minimizado, mantem aberto sem fechar.
     pub(in crate::windows_app) fn open_breath(&mut self) {
-        if let Some(panel) = &mut self.service_panel
-            && panel.service == Service::Breath
-        {
+        if let Some(panel) = self.service_by_name(Service::Breath) {
             if panel.state.minimized() {
                 self.open_service_panel(Service::Breath);
             }

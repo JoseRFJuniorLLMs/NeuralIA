@@ -1315,7 +1315,7 @@ impl App {
                     self.live_panel.is_open(),
                     self.live_panel.is_docked(),
                     self.side_panel.is_open(),
-                    self.service_panel.is_some(),
+                    self.service_panel.is_some() || self.left_service_panel.is_some(),
                 );
                 match panel_shortcut_action(id, target, self.live_panel.is_minimized()) {
                     PanelShortcutAction::MinimizeLive => self.minimize_live_panel(),
@@ -1324,12 +1324,14 @@ impl App {
                         self.close_side_panel(PanelExit::CloseButton)
                     }
                     PanelShortcutAction::MinimizeService => {
-                        self.service_input(ServiceInput::Minimize)
+                        self.service_input_from(origin, ServiceInput::Minimize)
                     }
                     PanelShortcutAction::FullscreenService => {
-                        self.service_input(ServiceInput::ToggleFullscreen)
+                        self.service_input_from(origin, ServiceInput::ToggleFullscreen)
                     }
-                    PanelShortcutAction::CloseService => self.service_input(ServiceInput::Close),
+                    PanelShortcutAction::CloseService => {
+                        self.service_input_from(origin, ServiceInput::Close)
+                    }
                     PanelShortcutAction::Nothing => {}
                 }
             }

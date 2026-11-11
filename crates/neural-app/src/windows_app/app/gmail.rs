@@ -89,10 +89,9 @@ impl App {
         if self.notify.current_kind() == Some(NoticeKind::Gmail) {
             self.hide_toast_window();
         }
-        let gmail_visible = self.service_panel.as_ref().is_some_and(|panel| {
-            panel.service == crate::windows_app::services::Service::Gmail
-                && !panel.state.minimized()
-        });
+        let gmail_visible = self
+            .service_by_name(crate::windows_app::services::Service::Gmail)
+            .is_some_and(|panel| !panel.state.minimized());
         if !gmail_visible {
             self.open_service_panel(crate::windows_app::services::Service::Gmail);
         }
@@ -105,9 +104,13 @@ impl App {
             .and_then(|comp| comp.views.first().map(|view| &view.webview))
             .or(self.webview.as_ref())
             .or_else(|| {
-                self.service_panel
-                    .as_ref()
-                    .filter(|panel| panel.service == crate::windows_app::services::Service::Gmail)
+                let gmail = crate::windows_app::services::Service::Gmail;
+                self.service_by_name(gmail)
+                    .or_else(|| {
+                        self.background_services
+                            .iter()
+                            .find(|panel| panel.service == gmail)
+                    })
                     .map(|panel| &panel.webview)
             });
         let Some(source) = source else {

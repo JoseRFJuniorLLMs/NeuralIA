@@ -1159,7 +1159,7 @@ impl App {
                     .window
                     .as_ref()
                     .is_some_and(|window| window.fullscreen().is_some()))
-            || self.service_frame().is_some_and(|frame| frame.exit_button);
+            || self.service_covers_window();
 
         if !wanted {
             EXIT_BUTTON_REVEAL_ACTIVE.store(false, Ordering::Release);
@@ -1315,7 +1315,14 @@ impl App {
 
     /// A faixa do painel de servicos, em pixels do cliente (os do rato).
     pub(in crate::windows_app) fn service_strip_physical(&self) -> Option<Area> {
-        let strip = self.service_frame()?.strip?;
+        self.service_strip_physical_at(PanelDock::Right)
+    }
+
+    pub(in crate::windows_app) fn service_strip_physical_at(
+        &self,
+        dock: PanelDock,
+    ) -> Option<Area> {
+        let strip = self.service_frame_at(dock)?.strip?;
         let scale = self.window.as_ref()?.scale_factor().max(1.0);
         Some(Area {
             x: strip.x * scale,
@@ -1496,7 +1503,11 @@ impl App {
         {
             return Some(with_shortcut(hint, bar_hit_shortcut(hit, false)));
         }
-        for panel in &self.background_services {
+        for panel in self
+            .left_service_panel
+            .iter()
+            .chain(&self.background_services)
+        {
             if let Some(hint) =
                 service_panel_hint(hit, panel.service, panel.state.badge(panel.audio))
             {

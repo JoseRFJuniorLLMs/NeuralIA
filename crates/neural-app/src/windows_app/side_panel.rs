@@ -547,6 +547,7 @@ pub(in crate::windows_app) fn side_panel_bounds(
 /// Um painel da direita com a largura `chosen` (arrastada pela borda e
 /// gravada) ou, sem escolha, a de sempre -- presa sempre a [300 px, 60% da
 /// janela] (`panel_chrome::panel_width`).
+#[cfg(test)]
 pub(in crate::windows_app) fn panel_bounds(
     kind: PanelKind,
     chosen: Option<f64>,

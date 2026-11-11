@@ -397,7 +397,7 @@ impl App {
         if let Some(panel) = self.side_panel.view() {
             hosts.push(panel);
         }
-        if let Some(panel) = &self.service_panel {
+        for panel in self.service_panel.iter().chain(&self.left_service_panel) {
             hosts.push(&panel.webview);
         }
         hosts

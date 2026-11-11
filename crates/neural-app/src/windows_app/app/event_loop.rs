@@ -300,8 +300,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::ResizePanel => self.resize_panel(),
             UserEvent::PanelResizeDone => self.save_panel_widths(),
             UserEvent::ServiceFullscreen { generation, on } => {
-                if self.service_event_is_current(generation) {
-                    self.service_input(ServiceInput::PageFullscreen(on));
+                if let Some(dock) = self.service_dock_for_generation(generation) {
+                    self.service_input_at(dock, ServiceInput::PageFullscreen(on));
                 }
             }
             UserEvent::ServiceAudio {
@@ -310,8 +310,9 @@ impl ApplicationHandler<UserEvent> for App {
             } => {
                 if let Some(panel) = self
                     .service_panel
-                    .as_mut()
-                    .filter(|panel| panel.generation == generation)
+                    .iter_mut()
+                    .chain(self.left_service_panel.iter_mut())
+                    .find(|panel| panel.generation == generation)
                 {
                     panel.audio = playing;
                     self.request_redraw();
@@ -325,8 +326,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::ServiceEscape(generation) => {
-                if self.service_event_is_current(generation) {
-                    self.service_input(ServiceInput::Escape);
+                if let Some(dock) = self.service_dock_for_generation(generation) {
+                    self.service_input_at(dock, ServiceInput::Escape);
                 }
             }
             UserEvent::GmailProbe(token) => {
@@ -335,10 +336,7 @@ impl ApplicationHandler<UserEvent> for App {
                     if self.gmail_monitor.is_none()
                         && (self.webview.is_some()
                             || self.comparator.is_some()
-                            || self
-                                .service_panel
-                                .as_ref()
-                                .is_some_and(|panel| panel.service == Service::Gmail))
+                            || self.service_by_name(Service::Gmail).is_some())
                     {
                         self.schedule_gmail_probe(60);
                     }
@@ -590,7 +588,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::RestoreComparator => {
-                if self.service_frame().is_some_and(|frame| frame.exit_button) {
+                if self.service_covers_window() {
                     self.service_input(ServiceInput::ToggleFullscreen);
                 } else {
                     self.leave_column_fullscreen();
@@ -713,6 +711,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 self.home_tool_hover,
                                 self.pomodoro_bar_label(),
                             );
+                            self.draw_docked_panels(window, false, false);
                         }
                     }
                     Surface::Comparator => {
@@ -721,13 +720,6 @@ impl ApplicationHandler<UserEvent> for App {
                         if let Some(window) = &self.window
                             && let Some(comp) = &self.comparator
                         {
-                            let service = self.service_panel.as_ref().map(|panel| {
-                                (
-                                    panel.service,
-                                    panel.state.badge(panel.audio),
-                                    self.service_strip_physical(),
-                                )
-                            });
                             if self.comparator_has_no_panels() && home_animation_enabled() {
                                 draw_comparator_neural_background(window);
                             }
@@ -750,16 +742,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     self.bar_hover,
                                 );
                             }
-                            if let Some((service, badge, strip)) = service {
-                                draw_service_chrome(
-                                    window,
-                                    comp.split.is_some(),
-                                    service,
-                                    badge,
-                                    strip,
-                                    self.bar_hover,
-                                );
-                            }
+                            self.draw_docked_panels(window, comp.split.is_some(), show_bar);
                         }
                     }
                     _ => {}
@@ -898,16 +881,24 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } => match self.surface {
-                Surface::Home => self.click_home(),
-                Surface::Comparator => self.press_comparator(),
-                _ => {}
-            },
+            } => {
+                if !self.press_dock_strip() {
+                    match self.surface {
+                        Surface::Home => self.click_home(),
+                        Surface::Comparator => self.press_comparator(),
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
-            } => self.release_comparator(),
+            } => {
+                if !self.release_dock_strip() {
+                    self.release_comparator();
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Right,

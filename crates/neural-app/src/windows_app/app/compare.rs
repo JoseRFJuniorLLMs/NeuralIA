@@ -680,7 +680,7 @@ impl App {
     pub(in crate::windows_app) fn minimize_active_page(&mut self, origin: CommandOrigin) {
         match origin {
             CommandOrigin::Host(WebViewHost::Service(_)) => {
-                self.service_input(ServiceInput::Minimize);
+                self.service_input_from(origin, ServiceInput::Minimize);
                 return;
             }
             CommandOrigin::Host(WebViewHost::Live) => {
@@ -836,7 +836,8 @@ impl App {
         let size = window.inner_size();
         let scale = window.scale_factor().max(1.0);
         let window_w = size.width as f64 / scale;
-        let logical_w = comparator_logical_width(window_w, comp.panel_width);
+        let content_x = self.left_panel_width();
+        let logical_w = comparator_logical_width(window_w, comp.panel_width + content_x);
         let logical_h = size.height as f64 / scale;
 
         let content_h = (logical_h - COMPARATOR_CHROME_HEIGHT).max(100.0);
@@ -878,7 +879,7 @@ impl App {
             for (index, x, width) in spans {
                 if let Some(view) = comp.views.get(index) {
                     let _ = view.webview.set_bounds(wry::Rect {
-                        position: LogicalPosition::new(x, content_y).into(),
+                        position: LogicalPosition::new(content_x + x, content_y).into(),
                         size: LogicalSize::new(width, content_h).into(),
                     });
                     let _ = view.webview.set_visible(true);
@@ -891,8 +892,11 @@ impl App {
             for (index, tab) in self.left_browser_tabs.iter().enumerate() {
                 if !self.left_browser_minimized && Some(index) == active {
                     let _ = tab.view.set_bounds(wry::Rect {
-                        position: LogicalPosition::new(0.0, content_y + LEFT_BROWSER_BAR_HEIGHT)
-                            .into(),
+                        position: LogicalPosition::new(
+                            content_x,
+                            content_y + LEFT_BROWSER_BAR_HEIGHT,
+                        )
+                        .into(),
                         size: LogicalSize::new(
                             browser_width.max(1.0),
                             (content_h - LEFT_BROWSER_BAR_HEIGHT).max(1.0),
@@ -933,7 +937,7 @@ impl App {
                 let (x, y, width, height) = if presentation == SplitPresentation::Fullscreen {
                     fullscreen_page_bounds(window_w, logical_h)
                 } else {
-                    (0.0, content_y, logical_w, content_h)
+                    (content_x, content_y, logical_w, content_h)
                 };
                 let _ = split.webview.set_bounds(wry::Rect {
                     position: LogicalPosition::new(x, y).into(),
@@ -946,7 +950,7 @@ impl App {
                 for (index, view) in comp.views.iter().enumerate() {
                     if index == source_index {
                         let _ = view.webview.set_bounds(wry::Rect {
-                            position: LogicalPosition::new(0.0, content_y).into(),
+                            position: LogicalPosition::new(content_x, content_y).into(),
                             size: LogicalSize::new(ai_width, content_h).into(),
                         });
                         let _ = view.webview.set_visible(true);
@@ -955,7 +959,7 @@ impl App {
                     }
                 }
                 let _ = split.webview.set_bounds(wry::Rect {
-                    position: LogicalPosition::new(ai_width, content_y).into(),
+                    position: LogicalPosition::new(content_x + ai_width, content_y).into(),
                     size: LogicalSize::new((logical_w - ai_width).max(1.0), content_h).into(),
                 });
                 let _ = split.webview.set_visible(true);
@@ -993,7 +997,7 @@ impl App {
                 for span in &spans {
                     let v = &comp.views[span.index];
                     let _ = v.webview.set_bounds(wry::Rect {
-                        position: LogicalPosition::new(span.x, content_y).into(),
+                        position: LogicalPosition::new(content_x + span.x, content_y).into(),
                         size: LogicalSize::new(span.width.max(1.0), content_h).into(),
                     });
                     let _ = v.webview.set_visible(true);

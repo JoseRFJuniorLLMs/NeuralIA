@@ -21429,7 +21429,7 @@ fn service_panels_never_reach_history_or_memory() {
     let body = source
         .split("fn open_service_panel(&mut self")
         .nth(1)
-        .and_then(|part| part.split("fn close_service_panel").next())
+        .and_then(|part| part.split("fn panel_space").next())
         .expect("corpo de open_service_panel");
     for forbidden in [
         "self.record(",
