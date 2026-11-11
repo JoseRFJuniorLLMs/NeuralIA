@@ -2,6 +2,12 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.5] - 2026-11-11
+
+### Fixed
+- **Links do WhatsApp** ([d182f0b](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/d182f0bb21fda41b3d1b1444f7f2de2e9b96e5b8)): links Web clicados na conversa abrem em abas independentes do NeuralIA e preservam o painel do WhatsApp.
+- **SQLite embutido** ([492fb8a](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/492fb8a0ba2fa5e6c9531c0238fdf0d21af541a8)): atualizado para a versão corrigida indicada pelo RustSec no [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459.html).
+
 ## [3.2.4] - 2026-11-10
 
 ### Added

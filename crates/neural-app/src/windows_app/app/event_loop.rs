@@ -330,6 +330,21 @@ impl ApplicationHandler<UserEvent> for App {
                     self.service_input_at(dock, ServiceInput::Escape);
                 }
             }
+            UserEvent::WhatsAppOpenLink { generation, target } => {
+                if let Some(dock) = self.service_dock_for_generation(generation)
+                    && self
+                        .service_at(dock)
+                        .is_some_and(|panel| panel.service == Service::WhatsApp)
+                    && self
+                        .service_frame_at(dock)
+                        .is_some_and(|frame| frame.panel.is_some())
+                {
+                    if self.service_covers_window() {
+                        self.service_input_at(dock, ServiceInput::Escape);
+                    }
+                    self.open_left_browser_link(target);
+                }
+            }
             UserEvent::GmailProbe(token) => {
                 if token == self.gmail_probe_token && self.gmail_monitor.is_none() {
                     self.maybe_start_gmail_monitor();

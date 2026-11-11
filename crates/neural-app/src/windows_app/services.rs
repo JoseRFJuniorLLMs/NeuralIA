@@ -458,6 +458,96 @@ pub(in crate::windows_app) fn whatsapp_notification_origin_allows(uri: &str) -> 
     })
 }
 
+fn whatsapp_link_event(
+    generation: u64,
+    source: &str,
+    target: &str,
+    user_initiated: bool,
+) -> Option<UserEvent> {
+    if !user_initiated || !whatsapp_notification_origin_allows(source) {
+        return None;
+    }
+    let target = neural_core::validate_web_url(target).ok()?;
+    if is_local_network_target(&target) {
+        return None;
+    }
+    Some(UserEvent::WhatsAppOpenLink { generation, target })
+}
+
+/// Usa o gesto informado pelo WebView2. O callback do wry não expõe esse dado.
+pub(in crate::windows_app) fn register_whatsapp_link_events(
+    webview: &WebView,
+    generation: u64,
+    proxy: EventLoopProxy<UserEvent>,
+) -> Result<(), String> {
+    use webview2_com::{
+        Microsoft::Web::WebView2::Win32::ICoreWebView2, NavigationStartingEventHandler,
+        NewWindowRequestedEventHandler, take_pwstr,
+    };
+    use windows_core::{BOOL, PWSTR};
+    use wry::WebViewExtWindows;
+
+    fn source_url(sender: &ICoreWebView2) -> windows_core::Result<String> {
+        let mut uri = PWSTR::null();
+        unsafe { sender.Source(&mut uri)? };
+        Ok(take_pwstr(uri))
+    }
+
+    let core = webview.webview();
+    let popup_proxy = proxy.clone();
+    let popup = NewWindowRequestedEventHandler::create(Box::new(move |sender, args| {
+        let (Some(sender), Some(args)) = (sender, args) else {
+            return Ok(());
+        };
+        let mut user_initiated = BOOL::default();
+        let mut uri = PWSTR::null();
+        unsafe {
+            args.SetHandled(true)?;
+            args.IsUserInitiated(&mut user_initiated)?;
+            args.Uri(&mut uri)?;
+        }
+        let target = take_pwstr(uri);
+        let source = source_url(&sender)?;
+        if let Some(event) =
+            whatsapp_link_event(generation, &source, &target, user_initiated.as_bool())
+        {
+            let _ = popup_proxy.send_event(event);
+        }
+        Ok(())
+    }));
+    let mut token = 0;
+    unsafe { core.add_NewWindowRequested(&popup, &mut token) }
+        .map_err(|error| format!("WhatsApp NewWindowRequested: {error}"))?;
+
+    let navigation = NavigationStartingEventHandler::create(Box::new(move |sender, args| {
+        let (Some(sender), Some(args)) = (sender, args) else {
+            return Ok(());
+        };
+        let mut user_initiated = BOOL::default();
+        unsafe { args.IsUserInitiated(&mut user_initiated)? };
+        if !user_initiated.as_bool() {
+            return Ok(());
+        }
+        let source = source_url(&sender)?;
+        if !whatsapp_notification_origin_allows(&source) {
+            return Ok(());
+        }
+        let mut uri = PWSTR::null();
+        unsafe { args.Uri(&mut uri)? };
+        let target = take_pwstr(uri);
+        if !whatsapp_notification_origin_allows(&target) {
+            unsafe { args.SetCancel(true)? };
+            if let Some(event) = whatsapp_link_event(generation, &source, &target, true) {
+                let _ = proxy.send_event(event);
+            }
+        }
+        Ok(())
+    }));
+    let mut token = 0;
+    unsafe { core.add_NavigationStarting(&navigation, &mut token) }
+        .map_err(|error| format!("WhatsApp NavigationStarting: {error}"))
+}
+
 /// Regista a permissao de notificacao por origem antes de carregar o site.
 /// O perfil pode conter um Deny antigo, gravado pelas versoes anteriores:
 /// SetPermissionState substitui so a entrada desta origem, sem limpar o perfil.
@@ -969,4 +1059,39 @@ pub(in crate::windows_app) fn gmail_is_new_mail(
     unread > 0
         && !key.is_empty()
         && previous_key.is_some_and(|previous| !previous.is_empty() && previous != key)
+}
+
+#[cfg(test)]
+mod whatsapp_link_tests {
+    use super::*;
+
+    #[test]
+    fn whatsapp_click_routes_to_an_independent_web_tab() {
+        let source = "https://web.whatsapp.com/";
+        let target = "https://example.org/article?a=b#section";
+        assert!(matches!(
+            whatsapp_link_event(17, source, target, true),
+            Some(UserEvent::WhatsAppOpenLink { generation: 17, target: url })
+                if url.as_str() == target
+        ));
+        assert!(whatsapp_link_event(17, source, target, false).is_none());
+        assert!(
+            whatsapp_link_event(17, "https://web.whatsapp.com.example.org/", target, true)
+                .is_none()
+        );
+        for unsafe_target in [
+            "about:blank",
+            "file:///C:/Users/public",
+            "javascript:alert(1)",
+            "neuralia:home",
+            "https://user:password@example.org/",
+            "http://127.0.0.1:8080/",
+            "http://192.168.1.1/",
+        ] {
+            assert!(
+                whatsapp_link_event(17, source, unsafe_target, true).is_none(),
+                "{unsafe_target}"
+            );
+        }
+    }
 }
