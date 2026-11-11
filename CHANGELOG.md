@@ -2,6 +2,11 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [Unreleased]
+
+### Added
+- **Painéis laterais encaixáveis** ([5d1a135](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/5d1a1355f5a857e1e2fdbcc501c40eafc92ecd3a)): o novo painel abre à direita, o anterior passa para a esquerda e o cabeçalho permite trocar os lados. O encaixe vale para os serviços da barra, o Gemini Live e o painel Ferramentas.
+
 ## [3.2.3] - 2026-11-07
 
 ### Fixed
