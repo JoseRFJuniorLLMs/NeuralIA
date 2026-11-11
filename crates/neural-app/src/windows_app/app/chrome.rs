@@ -383,10 +383,10 @@ impl App {
     }
 
     pub(in crate::windows_app) fn destroy_web_surfaces(&mut self) {
-        self.destroy_web_surfaces_with_panels(false);
+        self.teardown_web_surfaces(false);
     }
 
-    pub(super) fn destroy_web_surfaces_with_panels(&mut self, keep_panels: bool) {
+    pub(super) fn teardown_web_surfaces(&mut self, keep_panels: bool) {
         if lifecycle_probe_enabled() {
             LIFECYCLE_COMPARATOR_READY.store(false, Ordering::Release);
             LIFECYCLE_HOME_READY.store(false, Ordering::Release);

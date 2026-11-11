@@ -524,12 +524,8 @@ pub(in crate::windows_app) fn register_whatsapp_link_events(
             return Ok(());
         };
         let mut user_initiated = BOOL::default();
-        let mut redirected = BOOL::default();
-        unsafe {
-            args.IsUserInitiated(&mut user_initiated)?;
-            args.IsRedirected(&mut redirected)?;
-        }
-        if !user_initiated.as_bool() || redirected.as_bool() {
+        unsafe { args.IsUserInitiated(&mut user_initiated)? };
+        if !user_initiated.as_bool() {
             return Ok(());
         }
         let source = source_url(&sender)?;
@@ -550,41 +546,6 @@ pub(in crate::windows_app) fn register_whatsapp_link_events(
     let mut token = 0;
     unsafe { core.add_NavigationStarting(&navigation, &mut token) }
         .map_err(|error| format!("WhatsApp NavigationStarting: {error}"))
-}
-
-#[cfg(test)]
-mod whatsapp_link_tests {
-    use super::*;
-
-    #[test]
-    fn whatsapp_click_routes_to_an_independent_web_tab() {
-        let source = "https://web.whatsapp.com/";
-        let target = "https://example.org/article?a=b#section";
-        assert!(matches!(
-            whatsapp_link_event(17, source, target, true),
-            Some(UserEvent::WhatsAppOpenLink { generation: 17, target: url })
-                if url.as_str() == target
-        ));
-        assert!(whatsapp_link_event(17, source, target, false).is_none());
-        assert!(
-            whatsapp_link_event(17, "https://web.whatsapp.com.example.org/", target, true)
-                .is_none()
-        );
-        for unsafe_target in [
-            "about:blank",
-            "file:///C:/Users/public",
-            "javascript:alert(1)",
-            "neuralia:home",
-            "https://user:password@example.org/",
-            "http://127.0.0.1:8080/",
-            "http://192.168.1.1/",
-        ] {
-            assert!(
-                whatsapp_link_event(17, source, unsafe_target, true).is_none(),
-                "{unsafe_target}"
-            );
-        }
-    }
 }
 
 /// Regista a permissao de notificacao por origem antes de carregar o site.
@@ -1098,4 +1059,39 @@ pub(in crate::windows_app) fn gmail_is_new_mail(
     unread > 0
         && !key.is_empty()
         && previous_key.is_some_and(|previous| !previous.is_empty() && previous != key)
+}
+
+#[cfg(test)]
+mod whatsapp_link_tests {
+    use super::*;
+
+    #[test]
+    fn whatsapp_click_routes_to_an_independent_web_tab() {
+        let source = "https://web.whatsapp.com/";
+        let target = "https://example.org/article?a=b#section";
+        assert!(matches!(
+            whatsapp_link_event(17, source, target, true),
+            Some(UserEvent::WhatsAppOpenLink { generation: 17, target: url })
+                if url.as_str() == target
+        ));
+        assert!(whatsapp_link_event(17, source, target, false).is_none());
+        assert!(
+            whatsapp_link_event(17, "https://web.whatsapp.com.example.org/", target, true)
+                .is_none()
+        );
+        for unsafe_target in [
+            "about:blank",
+            "file:///C:/Users/public",
+            "javascript:alert(1)",
+            "neuralia:home",
+            "https://user:password@example.org/",
+            "http://127.0.0.1:8080/",
+            "http://192.168.1.1/",
+        ] {
+            assert!(
+                whatsapp_link_event(17, source, unsafe_target, true).is_none(),
+                "{unsafe_target}"
+            );
+        }
+    }
 }
