@@ -2,7 +2,7 @@
 
 All notable changes to NeuralIA are documented here.
 
-## [Unreleased]
+## [3.2.5] - 2026-11-11
 
 ### Fixed
 - **Links do WhatsApp** ([d182f0b](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/d182f0bb21fda41b3d1b1444f7f2de2e9b96e5b8)): links Web clicados na conversa abrem em abas independentes do NeuralIA e preservam o painel do WhatsApp.
