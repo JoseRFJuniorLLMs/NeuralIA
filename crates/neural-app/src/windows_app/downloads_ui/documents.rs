@@ -488,9 +488,7 @@ impl App {
                 }
                 self.downloads_ui.document_view_generation = generation;
                 self.downloads_ui.document_ticket = Some(ticket);
-                self.fit_comparator_to_panel();
-                self.after_panel_change();
-                self.request_redraw();
+                self.apply_panel_layout();
             }
             Err(error) => self.show_splash(format!("Não foi possível abrir o leitor: {error}"), 5),
         }
@@ -643,7 +641,11 @@ impl App {
             self.downloads_ui.document_chrome = None;
             return;
         }
-        let (Some((_, area)), Some(window)) = (self.docked_right_panel(), &self.window) else {
+        if self.service_covers_window() {
+            self.downloads_ui.document_chrome = None;
+            return;
+        }
+        let (Some(area), Some(window)) = (self.side_panel_area(), &self.window) else {
             return;
         };
         let Some(owner) = window_hwnd(window) else {

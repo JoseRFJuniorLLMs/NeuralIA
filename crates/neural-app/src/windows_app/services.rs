@@ -238,6 +238,7 @@ pub(in crate::windows_app) fn service_key_event(
 /// A largura que as colunas cedem ao painel da direita aberto. Minimizado,
 /// as colunas recuperam a janela; se o historico ou o Gemini Live estiverem
 /// abertos, e esse painel que ocupa o lugar, sem faixa vazia no meio.
+#[cfg(test)]
 pub(in crate::windows_app) fn reserved_panel_width(
     service: Option<ServicePanelState>,
     live_open: bool,
@@ -542,6 +543,7 @@ pub(in crate::windows_app) fn start_whatsapp_with_notifications(
 /// largura dos servicos. As larguras sao as escolhidas pela borda
 /// (`panel-width.json`). Minimizado, nao cede largura: a faixa de restaurar
 /// fica na barra (`reserved_panel_width`).
+#[cfg(test)]
 pub(in crate::windows_app) fn open_panel_width_for(
     surface: Surface,
     service: Option<ServicePanelState>,
@@ -853,9 +855,14 @@ pub(in crate::windows_app) fn draw_service_chrome(
                 right: (buttons[0].x - 6.0 * scale).round() as i32,
                 ..area
             };
+            let title = if badge.is_some() {
+                service.label().to_string()
+            } else {
+                format!("⠿  {}", service.label())
+            };
             draw_text(
                 hdc,
-                service.label(),
+                &title,
                 &mut label,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
@@ -887,6 +894,48 @@ pub(in crate::windows_app) fn draw_service_chrome(
             SelectObject(hdc, old_font);
             DeleteObject(font as _);
         }
+        ReleaseDC(hwnd, hdc);
+    }
+}
+
+/// Faixa nativa para arrastar os painéis que têm controles próprios na página.
+pub(in crate::windows_app) fn draw_panel_grip(window: &Window, strip: Area, title: &str) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    let scale = window.scale_factor().max(1.0);
+    let theme = Theme::system();
+    unsafe {
+        let hdc = GetDC(hwnd);
+        if hdc.is_null() {
+            return;
+        }
+        let area = RECT {
+            left: strip.x.round() as i32,
+            top: strip.y.round() as i32,
+            right: (strip.x + strip.width).round() as i32,
+            bottom: (strip.y + strip.height).round() as i32,
+        };
+        let brush = CreateSolidBrush(rgb3(theme.bar_bg));
+        FillRect(hdc, &area, brush);
+        DeleteObject(brush as _);
+        let font = create_font((-12.5 * scale).round() as i32, FW_NORMAL as i32);
+        let old_font = SelectObject(hdc, font as _);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        SetTextColor(hdc, rgb3(theme.fg_muted));
+        let mut label = RECT {
+            left: area.left + (12.0 * scale).round() as i32,
+            right: area.right - (6.0 * scale).round() as i32,
+            ..area
+        };
+        draw_text(
+            hdc,
+            &format!("⠿  {title}"),
+            &mut label,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(hdc, old_font);
+        DeleteObject(font as _);
         ReleaseDC(hwnd, hdc);
     }
 }

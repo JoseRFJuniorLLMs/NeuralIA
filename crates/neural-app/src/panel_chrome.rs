@@ -670,7 +670,9 @@ pub fn strip_buttons(strip: Area, scale: f64) -> [Area; 2] {
     let gap = 6.0 * scale;
     let height = (strip.height - 2.0 * margin).max(1.0);
     let mut wanted = [120.0 * scale, 112.0 * scale];
-    let room = (strip.width - 2.0 * margin - gap).max(2.0);
+    // Deixa espaço para a pega e o título mesmo quando a janela é estreita.
+    let grip = (34.0 * scale).min(strip.width * 0.3);
+    let room = (strip.width - 2.0 * margin - gap - grip).max(2.0);
     let total: f64 = wanted.iter().sum();
     if total > room {
         let shrink = room / total;

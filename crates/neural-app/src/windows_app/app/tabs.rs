@@ -31,7 +31,7 @@ impl App {
                 return;
             }
             CommandOrigin::Host(WebViewHost::Service(_)) => {
-                self.service_input(ServiceInput::Close);
+                self.service_input_from(origin, ServiceInput::Close);
                 return;
             }
             _ => {}

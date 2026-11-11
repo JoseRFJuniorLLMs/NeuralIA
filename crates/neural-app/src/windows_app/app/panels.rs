@@ -8,11 +8,7 @@ use windows_sys::Win32::{
         SWP_SHOWWINDOW, SetWindowPos, ShowWindow, WS_CHILD,
     },
 };
-use winit::{
-    dpi::{LogicalPosition, LogicalSize},
-    event_loop::EventLoopProxy,
-    window::Fullscreen,
-};
+use winit::{event_loop::EventLoopProxy, window::Fullscreen};
 use wry::{NewWindowResponse, PermissionKind, PermissionResponse, WebViewExtWindows};
 
 use neural_core::{HistoryEntry, MemoryHit};
@@ -32,8 +28,7 @@ use crate::windows_app::{
     install_wheel_hook,
     native::{
         PANEL_HANDLE_SUBCLASS_ID, PANEL_RESIZE_PENDING, PANEL_RESIZE_X, SetWindowSubclass,
-        WHEEL_APP_HWND, WHEEL_PANEL_ACTIVE, WHEEL_PANEL_BOTTOM, WHEEL_PANEL_HOST, WHEEL_PANEL_LEFT,
-        WHEEL_PANEL_RIGHT, WHEEL_PANEL_TOP, panel_handle_subclass, uninstall_wheel_hook,
+        WHEEL_APP_HWND, WHEEL_PANELS, panel_handle_subclass, uninstall_wheel_hook,
     },
     notes::{
         NOTE_SAVE_REFUSED, NoteDraft, NotesCommand, NotesOrigin, NotesReply, notes_command_for,
@@ -44,14 +39,14 @@ use crate::windows_app::{
         PANEL_SHOW_OBSIDIAN_SCRIPT,
     },
     services::{
-        Service, ServicePanel, logical_rect, open_panel_width_for, raise_webview_host,
-        register_service_panel_events, service_event_is_current, service_panel_permission,
-        service_should_pause, start_whatsapp_with_notifications,
+        Service, ServicePanel, logical_rect, raise_webview_host, register_service_panel_events,
+        service_event_is_current, service_panel_permission, service_should_pause,
+        start_whatsapp_with_notifications,
     },
     side_panel::{
         self, PANEL_RECENT_LIMIT, PANEL_SUGGESTION_LIMIT, PanelExit, PanelMessage,
-        history_panel_items, memory_panel_items, panel_bounds, panel_html, panel_render_script,
-        panel_theme_vars, suggestion_panel_items,
+        history_panel_items, memory_panel_items, panel_html, panel_render_script, panel_theme_vars,
+        suggestion_panel_items,
     },
     theme::{Theme, themed_webview_builder},
     web_media_permission, window_hwnd,
@@ -161,27 +156,142 @@ pub(in crate::windows_app) fn service_transition_input(
     (!state.minimized()).then_some(ServiceInput::Minimize)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum PanelDock {
+    Left,
+    Right,
+}
+
+impl PanelDock {
+    pub(in crate::windows_app) const ALL: [Self; 2] = [Self::Left, Self::Right];
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
+fn paired_panel_width(width: f64, window_width: f64, paired: bool) -> f64 {
+    if paired {
+        width.min(window_width * 0.42)
+    } else {
+        width
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn docked_service_frame(
+    dock: PanelDock,
+    state: ServicePanelState,
+    width: f64,
+    window_width: f64,
+    window_height: f64,
+    top: f64,
+    strip: f64,
+    paired: bool,
+) -> ServiceFrame {
+    let width = paired_panel_width(width, window_width, paired);
+    let mut frame = state.frame(width, window_width, window_height, top, strip);
+    if dock == PanelDock::Left && state.docked() {
+        if let Some(panel) = &mut frame.panel {
+            panel.x = 0.0;
+        }
+        if let Some(strip) = &mut frame.strip {
+            strip.x = 0.0;
+        }
+    }
+    frame
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::windows_app) enum DockedPanel {
+    Service(u64),
+    Live,
+    Tools,
+}
+
+fn panels_displaced_by_opening(
+    left: Option<DockedPanel>,
+    right: Option<DockedPanel>,
+) -> (Option<DockedPanel>, Option<DockedPanel>) {
+    // O painel da esquerda só cede lugar se o da direita tiver de mudar de lado.
+    (right.and(left), right)
+}
+
+fn drop_dock(start_x: f64, x: f64, y: f64, width: f64, height: f64) -> Option<PanelDock> {
+    if (x - start_x).abs() < 8.0 || !(0.0..width).contains(&x) || !(0.0..height).contains(&y) {
+        return None;
+    }
+    Some(if x < width / 2.0 {
+        PanelDock::Left
+    } else {
+        PanelDock::Right
+    })
+}
+
 impl App {
+    pub(in crate::windows_app) fn service_at(&self, dock: PanelDock) -> Option<&ServicePanel> {
+        match dock {
+            PanelDock::Left => self.left_service_panel.as_ref(),
+            PanelDock::Right => self.service_panel.as_ref(),
+        }
+    }
+
+    fn service_slot(&mut self, dock: PanelDock) -> &mut Option<ServicePanel> {
+        match dock {
+            PanelDock::Left => &mut self.left_service_panel,
+            PanelDock::Right => &mut self.service_panel,
+        }
+    }
+
+    pub(in crate::windows_app) fn service_dock(&self, service: Service) -> Option<PanelDock> {
+        PanelDock::ALL.into_iter().find(|&dock| {
+            self.service_at(dock)
+                .is_some_and(|panel| panel.service == service)
+        })
+    }
+
+    pub(in crate::windows_app) fn service_by_name(
+        &self,
+        service: Service,
+    ) -> Option<&ServicePanel> {
+        self.service_at(self.service_dock(service)?)
+    }
+
+    fn fullscreen_service_dock(&self) -> Option<PanelDock> {
+        PanelDock::ALL.into_iter().find(|&dock| {
+            self.service_at(dock)
+                .is_some_and(|panel| panel.state.fullscreen())
+        })
+    }
+
+    fn default_service_dock(&self) -> PanelDock {
+        self.fullscreen_service_dock().unwrap_or_else(|| {
+            let left_is_docked = self
+                .left_service_panel
+                .as_ref()
+                .is_some_and(|panel| panel.state.docked());
+            let right_is_docked = self
+                .service_panel
+                .as_ref()
+                .is_some_and(|panel| panel.state.docked());
+            if self.service_panel.is_none() || (left_is_docked && !right_is_docked) {
+                PanelDock::Left
+            } else {
+                PanelDock::Right
+            }
+        })
+    }
+
     /// Os icones da barra: o servico abre no painel ao lado; de novo, minimiza
     /// -- ou, minimizado, volta (`ServicePanelState`).
     pub(in crate::windows_app) fn open_service_panel(&mut self, service: Service) {
-        if let Some(panel) = self
-            .service_panel
-            .as_ref()
-            .filter(|panel| panel.service == service)
-        {
-            // Voltar do minimizado ocupa o lugar do painel que estiver aberto.
-            if panel.state.minimized() {
-                self.close_side_panel(PanelExit::OtherPanel);
-                self.minimize_live_panel();
-            }
-            self.service_input(ServiceInput::IconClick);
+        if let Some(dock) = self.service_dock(service) {
+            self.service_input_at(dock, ServiceInput::IconClick);
             return;
         }
-        self.close_service_panel();
-        // Um painel de cada vez.
-        self.close_side_panel(PanelExit::OtherPanel);
-        self.minimize_live_panel();
         if let Some(index) = self
             .background_services
             .iter()
@@ -189,13 +299,11 @@ impl App {
         {
             let mut panel = self.background_services.remove(index);
             panel.state = ServicePanelState::default();
-            let _ = panel.webview.focus();
-            self.service_panel = Some(panel);
-            self.apply_service_frame();
+            self.install_service_panel(panel);
             return;
         }
         let Some(area) = self
-            .service_frame_for(ServicePanelState::default())
+            .service_frame_for(PanelDock::Right, ServicePanelState::default())
             .and_then(|frame| frame.panel)
         else {
             return;
@@ -243,14 +351,13 @@ impl App {
                     debug_log(format_args!("service panel: {error}"));
                 }
                 debug_log(format_args!("service panel: {service:?}"));
-                self.service_panel = Some(ServicePanel {
+                self.install_service_panel(ServicePanel {
                     service,
                     webview: panel,
                     state: ServicePanelState::default(),
                     audio: false,
                     generation,
                 });
-                self.apply_service_frame();
                 if service == Service::Gmail {
                     self.schedule_gmail_probe(4);
                 }
@@ -264,52 +371,90 @@ impl App {
         }
     }
 
-    /// Uma transicao interna (Ctrl+H, Home, nova pesquisa, EPUB) preserva o
-    /// WhatsApp e YouTube continuam vivos como abas de fundo minimizadas.
+    fn install_service_panel(&mut self, panel: ServicePanel) {
+        self.make_right_dock_available();
+        self.service_panel = Some(panel);
+        self.apply_panel_layout();
+        if let Some(panel) = &self.service_panel {
+            let _ = panel.webview.focus();
+        }
+    }
+
+    /// Transições internas minimizam os serviços mantendo as páginas vivas.
     pub(in crate::windows_app) fn service_panel_for_transition(&mut self) {
-        let Some(panel) = self.service_panel.as_ref() else {
-            return;
-        };
-        if let Some(input) = service_transition_input(panel.service, panel.state) {
-            self.service_input(input);
+        self.panel_drag = None;
+        for dock in PanelDock::ALL {
+            if let Some(panel) = self.service_at(dock)
+                && let Some(input) = service_transition_input(panel.service, panel.state)
+            {
+                self.service_input_at(dock, input);
+            }
         }
     }
 
-    /// Outro painel da direita precisa do espaco. Os servicos persistentes minimizam;
-    /// os demais servicos fecham como antes.
-    pub(in crate::windows_app) fn close_docked_service_panel(&mut self) {
-        if self
-            .service_panel
-            .as_ref()
-            .is_some_and(|panel| !panel.state.minimized())
+    fn auxiliary_panel_at(&self, dock: PanelDock) -> Option<DockedPanel> {
+        if self.live_panel_dock == dock && self.live_panel.is_docked() {
+            Some(DockedPanel::Live)
+        } else if self.side_panel_dock == dock && self.side_panel.is_open() {
+            Some(DockedPanel::Tools)
+        } else {
+            None
+        }
+    }
+
+    fn docked_panel_at(&self, dock: PanelDock) -> Option<DockedPanel> {
+        self.service_at(dock)
+            .filter(|panel| panel.state.docked())
+            .map(|panel| DockedPanel::Service(panel.generation))
+            .or_else(|| self.auxiliary_panel_at(dock))
+    }
+
+    fn make_right_dock_available(&mut self) {
+        self.panel_drag = None;
+        if let Some(dock) = self.fullscreen_service_dock() {
+            self.service_input_at(dock, ServiceInput::Close);
+        }
+        let (evicted, moved) = panels_displaced_by_opening(
+            self.docked_panel_at(PanelDock::Left),
+            self.docked_panel_at(PanelDock::Right),
+        );
+        match evicted {
+            Some(DockedPanel::Live) => self.minimize_live_panel(),
+            Some(DockedPanel::Tools) => self.close_side_panel(PanelExit::OtherPanel),
+            _ => {}
+        }
+        let right_service = self.service_panel.take();
+        if moved.is_some()
+            && let Some(left) = self.left_service_panel.take()
         {
-            self.service_panel_for_transition();
+            self.park_service_panel(left);
+        }
+        match moved {
+            Some(DockedPanel::Service(_)) => self.left_service_panel = right_service,
+            other => {
+                if let Some(right) = right_service {
+                    self.park_service_panel(right);
+                }
+                match other {
+                    Some(DockedPanel::Live) => self.live_panel_dock = PanelDock::Left,
+                    Some(DockedPanel::Tools) => self.side_panel_dock = PanelDock::Left,
+                    _ => {}
+                }
+            }
         }
     }
 
-    /// Descarte real do painel. A faixa, o ícone, o Alt+W e o Gemini Live
-    /// não passam por aqui: o painel lateral minimiza.
-    #[allow(dead_code)]
-    pub(in crate::windows_app) fn conceal_service_panel(&mut self) {
-        let service = self.service_panel.as_ref().map(|panel| panel.service);
-        self.close_service_panel();
-        if let Some(service) = service {
-            self.background_services
-                .retain(|panel| panel.service != service);
-        }
+    fn swap_panel_docks(&mut self) {
+        std::mem::swap(&mut self.left_service_panel, &mut self.service_panel);
+        self.live_panel_dock = self.live_panel_dock.opposite();
+        self.side_panel_dock = self.side_panel_dock.opposite();
+        self.apply_panel_layout();
     }
 
-    pub(in crate::windows_app) fn close_service_panel(&mut self) {
-        let Some(service) = self.service_panel.as_ref().map(|panel| panel.service) else {
-            return;
-        };
-        // O Gmail usa outro WebView para avisos. Antes de descartar o painel,
-        // aproveita a sessao que a pessoa acabou de abrir nele.
-        if service == Service::Gmail {
-            self.maybe_start_gmail_monitor();
-        }
-        // Trocar de serviço também minimiza: a conta e o som continuam ativos.
-        let mut panel = self.service_panel.take().expect("painel conferido acima");
+    /// Retira um painel do layout sem recarregar a página.
+    fn park_service_panel(&mut self, mut panel: ServicePanel) {
+        let service = panel.service;
+        // A conta e o som continuam ativos em segundo plano.
         let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
         let _ = panel.webview.set_bounds(logical_rect(Area {
             x: -9999.0,
@@ -318,32 +463,13 @@ impl App {
             height: 320.0,
         }));
         let _ = panel.webview.set_visible(true);
-        let _ = panel.webview.focus_parent();
-        if self.surface == Surface::Home
-            && let Some(edit) = self.omnibox
-        {
-            unsafe { SetFocus(edit) };
-        }
         panel.state = ServicePanelState::default();
         let _ = panel.state.step(ServiceInput::Minimize);
         self.background_services.push(panel);
-        debug_log(format_args!("service panel: {service:?} minimizado"));
-        let window_fullscreen = self
-            .window
-            .as_ref()
-            .is_some_and(|window| window.fullscreen().is_some());
-        if let Some(on) = self.panel_window_fullscreen.step(false, window_fullscreen)
-            && let Some(window) = &self.window
-        {
-            window.set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
+        if service == Service::Gmail {
+            self.maybe_start_gmail_monitor();
         }
-        self.fit_comparator_to_panel();
-        self.sync_comparator_splitters();
-        self.sync_exit_button();
-        self.sync_caption_buttons();
-        self.after_panel_change();
-        self.needs_clear = true;
-        self.request_redraw();
+        debug_log(format_args!("service panel: {service:?} minimizado"));
     }
 
     /// A janela em pixels logicos e o topo dos paineis da direita
@@ -370,60 +496,76 @@ impl App {
     }
 
     /// O que o painel de servicos, no modo `state`, pede a janela agora.
-    pub(in crate::windows_app) fn service_frame_for(
-        &self,
-        state: ServicePanelState,
-    ) -> Option<ServiceFrame> {
+    fn service_frame_for(&self, dock: PanelDock, state: ServicePanelState) -> Option<ServiceFrame> {
         let (logical_w, logical_h, top, _) = self.panel_space()?;
         // A faixa de controlos so existe no comparador, que e onde ha barra.
         // Minimizado, ela sobe para essa barra. Se outro painel ou a gaveta
         // ja ocupam o canto, a faixa sai: o icone do servico e que restaura.
-        let other_panel = self.live_panel.is_docked() || self.side_panel.is_open();
+        let other_panel = self.auxiliary_panel_at(dock).is_some();
         let split_open = self
             .comparator
             .as_ref()
             .is_some_and(|comp| comp.split.is_some());
-        let strip = if self.surface == Surface::Comparator
-            && !(state.minimized() && (other_panel || split_open))
+        let show_restore_strip = self.surface == Surface::Comparator
+            && dock == PanelDock::Right
+            && !other_panel
+            && !split_open;
+        let strip = if (state.docked()
+            && matches!(self.surface, Surface::Home | Surface::Comparator))
+            || (state.minimized() && show_restore_strip)
         {
             SERVICE_STRIP_HEIGHT
         } else {
             0.0
         };
-        Some(state.frame(
-            self.chosen_panel_width(PanelKind::Service, logical_w),
-            logical_w,
-            logical_h,
-            top,
-            strip,
+        let width = self.chosen_panel_width(PanelKind::Service, logical_w);
+        let paired = state.docked() && self.docked_panel_at(dock.opposite()).is_some();
+        Some(docked_service_frame(
+            dock, state, width, logical_w, logical_h, top, strip, paired,
         ))
     }
 
+    pub(in crate::windows_app) fn service_frame_at(&self, dock: PanelDock) -> Option<ServiceFrame> {
+        if self.fullscreen_service_dock() == Some(dock.opposite()) {
+            return None;
+        }
+        self.service_frame_for(dock, self.service_at(dock)?.state)
+    }
+
     pub(in crate::windows_app) fn service_frame(&self) -> Option<ServiceFrame> {
-        self.service_frame_for(self.service_panel.as_ref()?.state)
+        self.service_frame_at(PanelDock::Right)
     }
 
     pub(in crate::windows_app) fn service_covers_window(&self) -> bool {
-        self.service_frame()
-            .is_some_and(|frame| frame.window_fullscreen)
+        self.fullscreen_service_dock().is_some()
     }
 
-    pub(in crate::windows_app) fn service_event_is_current(&self, generation: u64) -> bool {
-        service_event_is_current(
-            self.service_panel.as_ref().map(|panel| panel.generation),
-            generation,
-        )
+    pub(in crate::windows_app) fn service_dock_for_generation(
+        &self,
+        generation: u64,
+    ) -> Option<PanelDock> {
+        PanelDock::ALL.into_iter().find(|&dock| {
+            service_event_is_current(
+                self.service_at(dock).map(|panel| panel.generation),
+                generation,
+            )
+        })
     }
 
     pub(in crate::windows_app) fn position_service_panel(&self) {
-        let (Some(panel), Some(frame)) = (&self.service_panel, self.service_frame()) else {
-            return;
-        };
-        match frame.panel {
+        for dock in PanelDock::ALL {
+            if let Some(panel) = self.service_at(dock) {
+                self.position_service_at(panel, self.service_frame_at(dock));
+            }
+        }
+    }
+
+    fn position_service_at(&self, panel: &ServicePanel, frame: Option<ServiceFrame>) {
+        match frame.and_then(|frame| frame.panel) {
             Some(area) => {
                 let _ = panel.webview.set_bounds(logical_rect(area));
                 let _ = panel.webview.set_visible(true);
-                if frame.window_fullscreen {
+                if panel.state.fullscreen() {
                     // Por cima das colunas e de todos os filhos da janela.
                     raise_webview_host(&panel.webview);
                 }
@@ -437,41 +579,59 @@ impl App {
                     height: 320.0,
                 }));
                 let _ = panel.webview.set_visible(true);
-                let _ = panel.webview.focus_parent();
             }
         }
     }
 
     /// Um passo do painel de servicos: faixa, icone, a propria pagina, Esc.
     pub(in crate::windows_app) fn service_input(&mut self, input: ServiceInput) {
-        let Some(was_minimized) = self
-            .service_panel
-            .as_ref()
-            .map(|panel| panel.state.minimized())
-        else {
+        self.service_input_at(self.default_service_dock(), input);
+    }
+
+    pub(in crate::windows_app) fn service_input_from(
+        &mut self,
+        origin: CommandOrigin,
+        input: ServiceInput,
+    ) {
+        if let CommandOrigin::Host(WebViewHost::Service(service)) = origin {
+            if let Some(dock) = self.service_dock(service) {
+                self.service_input_at(dock, input);
+            }
+        } else {
+            self.service_input(input);
+        }
+    }
+
+    pub(in crate::windows_app) fn service_input_at(
+        &mut self,
+        dock: PanelDock,
+        input: ServiceInput,
+    ) {
+        let other_fullscreen = self.fullscreen_service_dock() == Some(dock.opposite());
+        let Some(panel) = self.service_slot(dock).as_mut() else {
             return;
         };
-        let effect = self
-            .service_panel
-            .as_mut()
-            .expect("painel conferido")
-            .state
-            .step(input);
-        let now_minimized = self
-            .service_panel
-            .as_ref()
-            .is_some_and(|panel| panel.state.minimized());
-        if service_should_pause(was_minimized, now_minimized)
-            && let Some(panel) = &self.service_panel
+        if other_fullscreen
+            && matches!(
+                input,
+                ServiceInput::ToggleFullscreen | ServiceInput::PageFullscreen(true)
+            )
         {
+            if input == ServiceInput::PageFullscreen(true) {
+                let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
+            }
+            return;
+        }
+        let was_minimized = panel.state.minimized();
+        let effect = panel.state.step(input);
+        if service_should_pause(was_minimized, panel.state.minimized()) {
             let _ = panel.webview.evaluate_script(SERVICE_PAUSE_SCRIPT);
+            let _ = panel.webview.focus_parent();
         }
         match effect {
-            ServiceEffect::Relayout => self.apply_service_frame(),
+            ServiceEffect::Relayout => self.apply_panel_layout(),
             ServiceEffect::ExitPageFullscreen => {
-                if let Some(panel) = &self.service_panel {
-                    let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
-                }
+                let _ = panel.webview.evaluate_script(EXIT_PAGE_FULLSCREEN_SCRIPT);
             }
             ServiceEffect::Nothing => {}
         }
@@ -479,7 +639,7 @@ impl App {
 
     /// Aplica o modo do painel de servicos a janela inteira: tela cheia da
     /// janela, painel, colunas, divisores, "Sair", pega e roda.
-    pub(in crate::windows_app) fn apply_service_frame(&mut self) {
+    pub(in crate::windows_app) fn apply_panel_layout(&mut self) {
         let fullscreen = self.service_covers_window();
         let entering = fullscreen && !self.panel_window_fullscreen.active();
         let window_fullscreen = self
@@ -497,11 +657,18 @@ impl App {
         }
         // Em tela cheia o teclado vai para o painel: o Esc (e as teclas do
         // proprio video) chegam a ele e nao a uma coluna escondida.
-        if entering && let Some(panel) = &self.service_panel {
+        self.position_service_panel();
+        self.position_side_panel();
+        self.position_live_panel();
+        if entering
+            && let Some(panel) = self
+                .fullscreen_service_dock()
+                .and_then(|dock| self.service_at(dock))
+        {
             let _ = panel.webview.focus();
         }
-        self.position_service_panel();
         self.fit_comparator_to_panel();
+        self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_exit_button();
         // Os botoes da janela saem da frente do painel em tela cheia e voltam
@@ -515,49 +682,191 @@ impl App {
 
     /// O painel da direita a vista e encostado (o que tem pega), em pixels
     /// logicos, e o tipo de largura que ele usa.
-    pub(in crate::windows_app) fn docked_right_panel(&self) -> Option<(PanelKind, Area)> {
-        let (logical_w, logical_h, top, _) = self.panel_space()?;
-        // O de servicos minimizado nao esta a vista: conta o outro painel.
-        if let Some(frame) = self.service_frame().filter(|frame| frame.panel.is_some()) {
-            return frame
-                .resize_handle
-                .then_some(frame.panel)
-                .flatten()
-                .map(|area| (PanelKind::Service, area));
-        }
-        let kind = if self.live_panel.is_docked() {
-            PanelKind::Service
-        } else if self.side_panel.is_open() {
-            PanelKind::History
-        } else {
-            return None;
-        };
-        Some((
-            kind,
-            panel_area(
-                self.chosen_panel_width(kind, logical_w),
-                logical_w,
-                logical_h,
-                top,
-            ),
-        ))
+    fn docked_right_panel(&self) -> Option<(PanelKind, Area)> {
+        self.docked_panel_bounds(PanelDock::Right)
     }
 
-    /// O painel da direita a vista (encostado ou em tela cheia) e a janela
-    /// hospedeira dele, para a roda do rato.
-    pub(in crate::windows_app) fn visible_right_panel(&self) -> Option<(Area, HWND)> {
-        if let Some(panel) = &self.service_panel
-            && let Some(area) = self.service_frame().and_then(|frame| frame.panel)
-        {
-            return Some((area, panel.webview.hwnd().0 as HWND));
+    fn docked_panel_bounds(&self, dock: PanelDock) -> Option<(PanelKind, Area)> {
+        if self.service_covers_window() {
+            return None;
         }
-        let (_, area) = self.docked_right_panel()?;
-        let host = if self.live_panel.is_docked() {
-            self.live_panel.view()?.hwnd().0 as HWND
+        match self.docked_panel_at(dock)? {
+            DockedPanel::Service(_) => {
+                Some((PanelKind::Service, self.service_frame_at(dock)?.panel?))
+            }
+            DockedPanel::Live => Some((
+                PanelKind::Service,
+                self.auxiliary_panel_area(dock, PanelKind::Service, true)?,
+            )),
+            DockedPanel::Tools => Some((
+                PanelKind::History,
+                self.auxiliary_panel_area(dock, PanelKind::History, true)?,
+            )),
+        }
+    }
+
+    fn visible_panel_at(&self, dock: PanelDock) -> Option<(Area, HWND)> {
+        if let Some(fullscreen) = self.fullscreen_service_dock() {
+            if dock != fullscreen {
+                return None;
+            }
+            let panel = self.service_at(dock)?;
+            return Some((
+                self.service_frame_at(dock)?.panel?,
+                panel.webview.hwnd().0 as HWND,
+            ));
+        }
+        let (_, area) = self.docked_panel_bounds(dock)?;
+        let view = self.docked_panel_view(dock)?;
+        Some((area, view.hwnd().0 as HWND))
+    }
+
+    fn docked_panel_view(&self, dock: PanelDock) -> Option<&WebView> {
+        match self.docked_panel_at(dock)? {
+            DockedPanel::Service(_) => self.service_at(dock).map(|panel| &panel.webview),
+            DockedPanel::Live => self.live_panel.view(),
+            DockedPanel::Tools => self.side_panel.view(),
+        }
+    }
+
+    fn auxiliary_panel_area(
+        &self,
+        dock: PanelDock,
+        kind: PanelKind,
+        reserve_strip: bool,
+    ) -> Option<Area> {
+        let (w, h, top, _) = self.panel_space()?;
+        let width = self.chosen_panel_width(kind, w);
+        let width = paired_panel_width(width, w, self.docked_panel_at(dock.opposite()).is_some());
+        let strip = if reserve_strip && self.dock_strips_available() {
+            SERVICE_STRIP_HEIGHT
         } else {
-            self.side_panel.view()?.hwnd().0 as HWND
+            0.0
         };
-        Some((area, host))
+        let mut area = panel_area(width, w, h, top + strip);
+        if dock == PanelDock::Left {
+            area.x = 0.0;
+        }
+        Some(area)
+    }
+
+    fn dock_strips_available(&self) -> bool {
+        matches!(self.surface, Surface::Home | Surface::Comparator)
+    }
+
+    fn auxiliary_strip_physical(&self, dock: PanelDock) -> Option<Area> {
+        if self.service_covers_window() || !self.dock_strips_available() {
+            return None;
+        }
+        let kind = match self.auxiliary_panel_at(dock)? {
+            DockedPanel::Live => PanelKind::Service,
+            DockedPanel::Tools => PanelKind::History,
+            DockedPanel::Service(_) => return None,
+        };
+        let (_, _, _, scale) = self.panel_space()?;
+        let area = self.auxiliary_panel_area(dock, kind, false)?;
+        Some(Area {
+            x: area.x * scale,
+            y: area.y * scale,
+            width: area.width * scale,
+            height: SERVICE_STRIP_HEIGHT * scale,
+        })
+    }
+
+    pub(in crate::windows_app) fn draw_docked_panels(
+        &self,
+        window: &Window,
+        split: bool,
+        show_badges: bool,
+    ) {
+        for dock in PanelDock::ALL {
+            if let Some(strip) = self.auxiliary_strip_physical(dock) {
+                let title = if self.auxiliary_panel_at(dock) == Some(DockedPanel::Live) {
+                    "Gemini Live"
+                } else {
+                    "Ferramentas"
+                };
+                draw_panel_grip(window, strip, title);
+            }
+            if let Some(panel) = self.service_at(dock) {
+                let strip = self.service_strip_physical_at(dock);
+                let badge = panel.state.badge(panel.audio);
+                if strip.is_some() || show_badges {
+                    draw_service_chrome(
+                        window,
+                        split,
+                        panel.service,
+                        badge,
+                        strip,
+                        if dock == PanelDock::Right {
+                            self.bar_hover
+                        } else {
+                            None
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    pub(in crate::windows_app) fn press_dock_strip(&mut self) -> bool {
+        self.panel_drag = None;
+        let Some(window) = &self.window else {
+            return false;
+        };
+        let scale = window.scale_factor().max(1.0);
+        let (x, y) = self.cursor;
+        for dock in PanelDock::ALL {
+            if self
+                .auxiliary_strip_physical(dock)
+                .is_some_and(|strip| strip.contains(x, y))
+                && let Some(panel) = self.auxiliary_panel_at(dock)
+            {
+                self.panel_drag = Some((dock, panel, x));
+                return true;
+            }
+            let Some(strip) = self.service_strip_physical_at(dock) else {
+                continue;
+            };
+            if !strip.contains(x, y) {
+                continue;
+            }
+            if let Some(button) = strip_hit(strip, scale, x, y) {
+                self.service_input_at(dock, button.input());
+            } else if let Some(panel) = self.docked_panel_at(dock) {
+                self.panel_drag = Some((dock, panel, x));
+            }
+            return true;
+        }
+        false
+    }
+
+    pub(in crate::windows_app) fn release_dock_strip(&mut self) -> bool {
+        let Some((dock, panel, start_x)) = self.panel_drag.take() else {
+            return false;
+        };
+        if self.service_covers_window() || self.docked_panel_at(dock) != Some(panel) {
+            return true;
+        }
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let scale = window.scale_factor().max(1.0);
+            let (x, y) = self.cursor;
+            if drop_dock(
+                start_x / scale,
+                x / scale,
+                y / scale,
+                size.width as f64 / scale,
+                size.height as f64 / scale,
+            ) == Some(dock.opposite())
+            {
+                self.swap_panel_docks();
+                if let Some(panel) = self.docked_panel_view(dock.opposite()) {
+                    let _ = panel.focus();
+                }
+            }
+        }
+        true
     }
 
     /// Depois de qualquer mudanca nos paineis da direita: a pega e a roda.
@@ -567,39 +876,41 @@ impl App {
         self.sync_wheel_route();
     }
 
-    /// A roda sobre o painel da direita vai para o painel (`wheel_hook`).
+    /// A roda segue o painel sob o cursor, mesmo se o foco estiver em outra WebView.
     pub(in crate::windows_app) fn sync_wheel_route(&self) {
-        let target = self.visible_right_panel().and_then(|(area, host)| {
-            let window = self.window.as_ref()?;
-            let owner = window_hwnd(window)?;
-            let scale = window.scale_factor().max(1.0);
-            let mut origin = POINT { x: 0, y: 0 };
-            unsafe {
-                ClientToScreen(owner, &mut origin);
-            }
-            let rect = ScreenRect {
-                left: origin.x + (area.x * scale).round() as i32,
-                top: origin.y + (area.y * scale).round() as i32,
-                right: origin.x + ((area.x + area.width) * scale).round() as i32,
-                bottom: origin.y + ((area.y + area.height) * scale).round() as i32,
-            };
-            Some((rect, host, owner))
-        });
-        match target {
-            Some((rect, host, owner)) => {
-                WHEEL_PANEL_LEFT.store(rect.left, Ordering::Release);
-                WHEEL_PANEL_TOP.store(rect.top, Ordering::Release);
-                WHEEL_PANEL_RIGHT.store(rect.right, Ordering::Release);
-                WHEEL_PANEL_BOTTOM.store(rect.bottom, Ordering::Release);
-                WHEEL_PANEL_HOST.store(host as usize, Ordering::Release);
+        let targets = self
+            .window
+            .as_ref()
+            .and_then(|window| {
+                let owner = window_hwnd(window)?;
+                let scale = window.scale_factor().max(1.0);
+                let mut origin = POINT { x: 0, y: 0 };
+                if unsafe { ClientToScreen(owner, &mut origin) } == 0 {
+                    return None;
+                }
                 WHEEL_APP_HWND.store(owner as usize, Ordering::Release);
-                WHEEL_PANEL_ACTIVE.store(true, Ordering::Release);
-                install_wheel_hook();
-            }
-            None => {
-                WHEEL_PANEL_ACTIVE.store(false, Ordering::Release);
-                uninstall_wheel_hook();
-            }
+                Some(PanelDock::ALL.map(|dock| {
+                    let target = self.visible_panel_at(dock);
+                    target.map(|(area, host)| {
+                        let rect = ScreenRect {
+                            left: origin.x + (area.x * scale).round() as i32,
+                            top: origin.y + (area.y * scale).round() as i32,
+                            right: origin.x + ((area.x + area.width) * scale).round() as i32,
+                            bottom: origin.y + ((area.y + area.height) * scale).round() as i32,
+                        };
+                        (rect, host as usize)
+                    })
+                }))
+            })
+            .unwrap_or_default();
+
+        if let Ok(mut routes) = WHEEL_PANELS.lock() {
+            *routes = targets;
+        }
+        if targets.iter().any(Option::is_some) {
+            install_wheel_hook();
+        } else {
+            uninstall_wheel_hook();
         }
     }
 
@@ -716,50 +1027,28 @@ impl App {
             let _ = panel.focus_parent();
         }
         debug_log(format_args!("live panel: minimizado para segundo plano"));
-        self.fit_comparator_to_panel();
-        self.after_panel_change();
-        self.request_redraw();
+        self.apply_panel_layout();
     }
 
     pub(in crate::windows_app) fn restore_live_panel(&mut self) {
         if !self.live_panel.is_open() || !self.live_panel.is_minimized() {
             return;
         }
-        self.close_docked_service_panel();
-        self.close_side_panel(PanelExit::OtherPanel);
+        self.make_right_dock_available();
+        self.live_panel_dock = PanelDock::Right;
         self.live_panel.restore();
-        self.position_live_panel();
+        self.apply_panel_layout();
         if let Some(panel) = self.live_panel.view() {
-            let _ = panel.set_visible(true);
             let _ = panel.focus();
         }
         debug_log(format_args!("live panel: restaurado"));
-        self.fit_comparator_to_panel();
-        self.after_panel_change();
-        self.request_redraw();
-    }
-
-    pub(in crate::windows_app) fn live_panel_rect(&self) -> Option<wry::Rect> {
-        let (logical_w, logical_h, top, _) = self.panel_space()?;
-        let (x, y, width, height) = panel_bounds(
-            PanelKind::Service,
-            self.panel_widths.get(PanelKind::Service),
-            logical_w,
-            logical_h,
-            top,
-        );
-        Some(wry::Rect {
-            position: LogicalPosition::new(x, y).into(),
-            size: LogicalSize::new(width, height).into(),
-        })
     }
 
     pub(in crate::windows_app) fn open_live_panel(&mut self) {
-        // Um painel de cada vez. O de servicos minimizado ja parou o som e
-        // fica fora da vista, com a conta.
-        self.close_docked_service_panel();
-        self.close_side_panel(PanelExit::OtherPanel);
-        let Some(bounds) = self.live_panel_rect() else {
+        let Some(bounds) = self
+            .auxiliary_panel_area(PanelDock::Right, PanelKind::Service, true)
+            .map(logical_rect)
+        else {
             return;
         };
         let Some(window) = &self.window else {
@@ -785,12 +1074,12 @@ impl App {
         let built = hooked.build_hooked_as_child(window);
         match built {
             Ok(panel) => {
+                self.make_right_dock_available();
+                self.live_panel_dock = PanelDock::Right;
                 let _ = panel.focus();
                 debug_log(format_args!("live panel: ligado"));
                 self.live_panel.open(panel);
-                self.fit_comparator_to_panel();
-                self.after_panel_change();
-                self.request_redraw();
+                self.apply_panel_layout();
             }
             Err(error) => {
                 self.show_splash(format!("Não foi possível abrir o Gemini Live: {error}"), 3);
@@ -811,17 +1100,22 @@ impl App {
                 self.live_panel.indicator(),
             ));
         }
-        self.fit_comparator_to_panel();
-        self.after_panel_change();
-        self.request_redraw();
+        self.apply_panel_layout();
     }
 
     pub(in crate::windows_app) fn position_live_panel(&self) {
-        if self.live_panel.is_minimized() {
+        let Some(panel) = self
+            .live_panel
+            .view()
+            .filter(|_| self.live_panel.is_docked())
+        else {
             return;
-        }
-        if let (Some(panel), Some(bounds)) = (self.live_panel.view(), self.live_panel_rect()) {
-            let _ = panel.set_bounds(bounds);
+        };
+        if let Some(area) =
+            self.auxiliary_panel_area(self.live_panel_dock, PanelKind::Service, true)
+        {
+            let _ = panel.set_bounds(logical_rect(area));
+            let _ = panel.set_visible(!self.service_covers_window());
         }
     }
 
@@ -1724,19 +2018,17 @@ impl App {
     }
 
     /// Largura que o painel aberto ocupa a direita do comparador (0 sem painel).
-    pub(in crate::windows_app) fn open_panel_width(&self) -> f64 {
-        let Some(window) = &self.window else {
+    fn open_panel_width(&self) -> f64 {
+        if self.surface != Surface::Comparator {
             return 0.0;
-        };
-        let scale = window.scale_factor().max(1.0);
-        open_panel_width_for(
-            self.surface,
-            self.service_panel.as_ref().map(|panel| panel.state),
-            self.live_panel.is_docked(),
-            self.side_panel.is_open(),
-            window.inner_size().width as f64 / scale,
-            self.panel_widths,
-        )
+        }
+        self.docked_right_panel()
+            .map_or(0.0, |(_, area)| area.width)
+    }
+
+    pub(in crate::windows_app) fn left_panel_width(&self) -> f64 {
+        self.docked_panel_bounds(PanelDock::Left)
+            .map_or(0.0, |(_, area)| area.width)
     }
 
     /// O comparador encolhe para o lado do painel, como no Chrome. Antes o
@@ -1784,27 +2076,22 @@ impl App {
         }
     }
 
+    pub(in crate::windows_app) fn side_panel_area(&self) -> Option<Area> {
+        self.auxiliary_panel_area(self.side_panel_dock, PanelKind::History, true)
+    }
+
     pub(in crate::windows_app) fn side_panel_rect(&self) -> Option<wry::Rect> {
-        let (logical_w, logical_h, top, _) = self.panel_space()?;
-        let (x, y, width, height) = panel_bounds(
-            PanelKind::History,
-            self.panel_widths.get(PanelKind::History),
-            logical_w,
-            logical_h,
-            top,
-        );
-        Some(wry::Rect {
-            position: LogicalPosition::new(x, y).into(),
-            size: LogicalSize::new(width, height).into(),
-        })
+        self.side_panel_area().map(logical_rect)
     }
 
     pub(in crate::windows_app) fn open_side_panel(&mut self) {
-        // Um painel de cada vez. O de servicos minimizado ja parou o som e
-        // fica fora da vista, com a conta.
-        self.close_docked_service_panel();
-        self.minimize_live_panel();
-        let Some(bounds) = self.side_panel_rect() else {
+        if self.side_panel.is_open() {
+            return;
+        }
+        let Some(bounds) = self
+            .auxiliary_panel_area(PanelDock::Right, PanelKind::History, true)
+            .map(logical_rect)
+        else {
             return;
         };
         let Some(window) = &self.window else {
@@ -1835,12 +2122,13 @@ impl App {
                 self.accel_spike_hook(&panel, crate::accel_spike::SpikeHost::SidePanel);
                 // So com o painel fechado se chega aqui; um aberto nunca e
                 // largado sem `close_side_panel`.
+                self.make_right_dock_available();
+                self.side_panel_dock = PanelDock::Right;
                 if let Err(extra) = self.side_panel.open(ticket, panel) {
                     drop(extra);
                     return;
                 }
-                self.fit_comparator_to_panel();
-                self.after_panel_change();
+                self.apply_panel_layout();
                 debug_log(format_args!(
                     "side panel: aberto surface={:?}",
                     self.surface
@@ -1867,13 +2155,7 @@ impl App {
         if let Err(error) = closed.saved {
             self.show_splash(error, 6);
         }
-        self.fit_comparator_to_panel();
-        self.after_panel_change();
-        // Na Home, o sitio do painel volta a ser a Home.
-        if self.surface == Surface::Home {
-            self.needs_clear = true;
-            self.request_redraw();
-        }
+        self.apply_panel_layout();
     }
 
     pub(in crate::windows_app) fn position_side_panel(&self) {
@@ -1891,6 +2173,7 @@ impl App {
                 bounds
             };
             let _ = panel.set_bounds(bounds);
+            let _ = panel.set_visible(!self.service_covers_window());
         }
     }
 
@@ -2252,6 +2535,69 @@ impl App {
 #[cfg(test)]
 mod youtube_transition_tests {
     use super::*;
+
+    #[test]
+    fn opening_a_panel_keeps_the_previous_right_panel_on_the_left() {
+        let service = DockedPanel::Service(1);
+        let live = DockedPanel::Live;
+        let tools = DockedPanel::Tools;
+
+        assert_eq!(panels_displaced_by_opening(None, None), (None, None));
+        assert_eq!(
+            panels_displaced_by_opening(None, Some(service)),
+            (None, Some(service))
+        );
+        assert_eq!(
+            panels_displaced_by_opening(None, Some(live)),
+            (None, Some(live))
+        );
+        assert_eq!(
+            panels_displaced_by_opening(Some(live), Some(tools)),
+            (Some(live), Some(tools))
+        );
+        assert_eq!(panels_displaced_by_opening(Some(tools), None), (None, None));
+    }
+
+    #[test]
+    fn two_service_panels_leave_room_for_the_comparator() {
+        let state = ServicePanelState::default();
+        let left = docked_service_frame(
+            PanelDock::Left,
+            state,
+            800.0,
+            1000.0,
+            750.0,
+            100.0,
+            34.0,
+            true,
+        );
+        let right = docked_service_frame(
+            PanelDock::Right,
+            state,
+            800.0,
+            1000.0,
+            750.0,
+            100.0,
+            34.0,
+            true,
+        );
+        let left_area = left.panel.unwrap();
+        let right_area = right.panel.unwrap();
+        assert_eq!((left_area.x, left.strip.unwrap().x), (0.0, 0.0));
+        assert_eq!((right_area.x, right.strip.unwrap().x), (580.0, 580.0));
+        assert_eq!(right_area.x - left_area.width, 160.0);
+        assert_eq!(right_area.x + right_area.width, 1000.0);
+    }
+
+    #[test]
+    fn only_a_drag_released_inside_the_window_changes_docks() {
+        assert!(drop_dock(850.0, 200.0, 300.0, 1000.0, 750.0) == Some(PanelDock::Left));
+        assert!(drop_dock(100.0, 800.0, 300.0, 1000.0, 750.0) == Some(PanelDock::Right));
+        assert!(drop_dock(850.0, -1.0, 300.0, 1000.0, 750.0).is_none());
+        assert!(drop_dock(100.0, 800.0, 751.0, 1000.0, 750.0).is_none());
+        // A faixa de um painel largo pode atravessar o centro da janela.
+        assert!(drop_dock(420.0, 420.0, 80.0, 1000.0, 750.0).is_none());
+    }
 
     #[test]
     fn account_services_keep_their_webviews_when_hidden() {

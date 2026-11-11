@@ -132,27 +132,23 @@ pub(in crate::windows_app) static PANEL_HANDLE_HINT: AtomicBool = AtomicBool::ne
 // do cursor. Tudo o resto passa intocado.
 pub(in crate::windows_app) static WHEEL_HOOK: AtomicUsize = AtomicUsize::new(0);
 pub(in crate::windows_app) static WHEEL_APP_HWND: AtomicUsize = AtomicUsize::new(0);
-pub(in crate::windows_app) static WHEEL_PANEL_HOST: AtomicUsize = AtomicUsize::new(0);
-pub(in crate::windows_app) static WHEEL_PANEL_ACTIVE: AtomicBool = AtomicBool::new(false);
-pub(in crate::windows_app) static WHEEL_PANEL_LEFT: AtomicI32 = AtomicI32::new(0);
-pub(in crate::windows_app) static WHEEL_PANEL_TOP: AtomicI32 = AtomicI32::new(0);
-pub(in crate::windows_app) static WHEEL_PANEL_RIGHT: AtomicI32 = AtomicI32::new(0);
-pub(in crate::windows_app) static WHEEL_PANEL_BOTTOM: AtomicI32 = AtomicI32::new(0);
+type WheelPanel = Option<(ScreenRect, usize)>;
+pub(in crate::windows_app) static WHEEL_PANELS: std::sync::Mutex<[WheelPanel; 2]> =
+    std::sync::Mutex::new([None; 2]);
 pub(in crate::windows_app) static EXIT_BUTTON_REVEAL_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub(in crate::windows_app) static EXIT_BUTTON_HWND: AtomicUsize = AtomicUsize::new(0);
 pub(in crate::windows_app) static EXIT_REVEAL_INSIDE: AtomicBool = AtomicBool::new(false);
 pub(in crate::windows_app) static EXIT_REVEAL_SHOW_THRESHOLD: AtomicI32 = AtomicI32::new(60);
 pub(in crate::windows_app) static EXIT_REVEAL_HIDE_THRESHOLD: AtomicI32 = AtomicI32::new(120);
 
-pub(in crate::windows_app) fn wheel_panel_rect() -> Option<ScreenRect> {
-    WHEEL_PANEL_ACTIVE
-        .load(Ordering::Acquire)
-        .then(|| ScreenRect {
-            left: WHEEL_PANEL_LEFT.load(Ordering::Acquire),
-            top: WHEEL_PANEL_TOP.load(Ordering::Acquire),
-            right: WHEEL_PANEL_RIGHT.load(Ordering::Acquire),
-            bottom: WHEEL_PANEL_BOTTOM.load(Ordering::Acquire),
-        })
+fn wheel_panel_at(point: POINT) -> Option<(ScreenRect, usize)> {
+    WHEEL_PANELS
+        .try_lock()
+        .ok()?
+        .iter()
+        .flatten()
+        .copied()
+        .find(|(rect, _)| rect.contains(point.x, point.y))
 }
 
 /// Teclas e botoes em baixo, no formato MK_* da palavra baixa do wParam.
@@ -257,8 +253,13 @@ pub(in crate::windows_app) unsafe extern "system" fn wheel_hook(
             let info = &*(lparam as *const MSLLHOOKSTRUCT);
             let app = WHEEL_APP_HWND.load(Ordering::Acquire) as HWND;
             let foreground = !app.is_null() && GetForegroundWindow() == app;
-            let host = WHEEL_PANEL_HOST.load(Ordering::Acquire) as HWND;
-            let panel = wheel_panel_rect();
+            let route = if foreground {
+                wheel_panel_at(info.pt)
+            } else {
+                None
+            };
+            let host = route.map_or(std::ptr::null_mut(), |(_, host)| host as HWND);
+            let panel = route.map(|(rect, _)| rect);
             // So se pergunta ao Windows quem esta debaixo do cursor quando o
             // resto ja apontava para o painel: fora dele o gancho nao gasta nada.
             let hit_is_panel = foreground

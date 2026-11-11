@@ -24,11 +24,12 @@ use crate::ipc::{
     ColumnHint, IpcAction, NoteVia, SEARCH_MAX_CHARS, SearchIntent, parse_ipc_message,
 };
 use crate::panel_chrome::{
-    Area, CAPTION_HOT_MARGIN, CaptionReveal, PANEL_WIDTHS_FILE, PanelKind, PanelWidths,
-    PanelWindowFullscreen, RevealStep, ScreenRect, ServiceBadge, ServiceInput, ServicePanelState,
-    StripButton, WheelRoute, caption_hot_zone, is_escape_down, panel_area, panel_width,
-    strip_buttons, strip_hit, wheel_message_params, wheel_route,
+    Area, CAPTION_HOT_MARGIN, CaptionReveal, PANEL_WIDTHS_FILE, PanelWidths, PanelWindowFullscreen,
+    RevealStep, ScreenRect, ServiceBadge, ServiceInput, ServicePanelState, StripButton, WheelRoute,
+    caption_hot_zone, is_escape_down, strip_buttons, strip_hit, wheel_message_params, wheel_route,
 };
+#[cfg(test)]
+use crate::panel_chrome::{PanelKind, panel_area, panel_width};
 use crate::pomodoro_ui::{PomodoroController, TickSchedule, TickScheduler, phase_color};
 use crate::privacy::{PrivacyGuard, PrivacyMode};
 use crate::read_aloud::READ_ALOUD_SCRIPT;
@@ -3722,6 +3723,10 @@ pub(in crate::windows_app) struct App {
     /// Servico aberto no painel lateral (WhatsApp, Meet, YouTube, Gmail e o
     /// video da respiracao, este em InPrivate).
     pub(in crate::windows_app) service_panel: Option<ServicePanel>,
+    pub(in crate::windows_app) left_service_panel: Option<ServicePanel>,
+    pub(in crate::windows_app) panel_drag: Option<(PanelDock, DockedPanel, f64)>,
+    pub(in crate::windows_app) live_panel_dock: PanelDock,
+    pub(in crate::windows_app) side_panel_dock: PanelDock,
     /// WhatsApp e YouTube ocultos: WebViews vivas enquanto o processo existir.
     pub(in crate::windows_app) background_services: Vec<ServicePanel>,
     /// Numero do ultimo painel de servicos aberto: os avisos do WebView2 de
@@ -3948,6 +3953,10 @@ impl App {
             side_panel: side_panel::SidePanel::closed(notes.clone()),
             panel_suggestion_query: None,
             service_panel: None,
+            left_service_panel: None,
+            panel_drag: None,
+            live_panel_dock: PanelDock::Right,
+            side_panel_dock: PanelDock::Right,
             background_services: Vec::new(),
             service_generation: 0,
             panel_window_fullscreen: PanelWindowFullscreen::default(),

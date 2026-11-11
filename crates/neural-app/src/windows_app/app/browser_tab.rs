@@ -633,6 +633,7 @@ impl App {
         if self.left_browser_expanded && !self.left_browser_minimized {
             return;
         }
+        let content_x = self.left_panel_width();
         let (Some(window), Some(comp)) = (&self.window, &mut self.comparator) else {
             return;
         };
@@ -645,9 +646,11 @@ impl App {
         let mut point = POINT { x: screen_x, y: 0 };
         unsafe { ScreenToClient(owner, &mut point) };
         let scale = window.scale_factor().max(1.0);
-        let logical_w =
-            comparator_logical_width(window.inner_size().width as f64 / scale, comp.panel_width);
-        let mouse_x = (point.x as f64 / scale).clamp(0.0, logical_w);
+        let logical_w = comparator_logical_width(
+            window.inner_size().width as f64 / scale,
+            comp.panel_width + content_x,
+        );
+        let mouse_x = (point.x as f64 / scale - content_x).clamp(0.0, logical_w);
         let (browser_weight, weights) = left_browser_resized_weights(
             comp.views.len(),
             &comp.weights,
@@ -866,7 +869,7 @@ impl App {
             SetWindowPos(
                 toolbar,
                 std::ptr::null_mut(),
-                0,
+                (self.left_panel_width() * scale).round() as i32,
                 (content_y * scale).round() as i32,
                 w,
                 h,
