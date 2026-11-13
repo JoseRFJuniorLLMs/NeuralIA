@@ -920,6 +920,7 @@ impl App {
             self.left_browser_tabs.len(),
             self.left_browser_active.unwrap_or(0),
             scale,
+            self.left_browser_group_row(),
         );
         let omnibox_focused = self
             .omnibox
@@ -1560,6 +1561,10 @@ impl App {
         // clique): uma pilula sozinha, cujas abas ficaram fora do corte,
         // mostra-as -- nao diz "recolher".
         let group = match hit {
+            BarHit::BrowserGroup(index) => self
+                .left_browser_groups
+                .get(index)
+                .map(|group| (group.name.as_str(), group.collapsed)),
             BarHit::ContextGroup {
                 source_index,
                 group_index,
@@ -1623,6 +1628,7 @@ impl App {
                 .is_some_and(|edit| unsafe { GetFocus() == edit }),
             browser_tab_count: self.left_browser_tabs.len(),
             browser_active: self.left_browser_active,
+            browser_group_row: self.left_browser_group_row(),
         }
     }
 }

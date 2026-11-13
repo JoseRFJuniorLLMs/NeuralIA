@@ -55,11 +55,12 @@ use windows_sys::Win32::{
         CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen, CreateRoundRectRgn,
         CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CALCRECT, DT_CENTER,
         DT_EDITCONTROL, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-        DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FW_BOLD, FW_NORMAL,
-        FillRect, GetDC, GetStockObject, IntersectClipRect, InvalidateRect, LineTo, MoveToEx,
-        NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RestoreDC, RoundRect,
-        SRCCOPY, SaveDC, ScreenToClient, SelectClipRgn, SelectObject, SetBkColor, SetBkMode,
-        SetTextColor, SetViewportOrgEx, SetWindowRgn, StretchDIBits, TRANSPARENT,
+        DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, ExcludeClipRect,
+        FW_BOLD, FW_NORMAL, FillRect, GetDC, GetStockObject, IntersectClipRect, InvalidateRect,
+        LineTo, MoveToEx, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC,
+        RestoreDC, RoundRect, SRCCOPY, SaveDC, ScreenToClient, SelectClipRgn, SelectObject,
+        SetBkColor, SetBkMode, SetTextColor, SetViewportOrgEx, SetWindowRgn, StretchDIBits,
+        TRANSPARENT,
     },
     Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom},
     System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
@@ -355,8 +356,8 @@ pub(in crate::windows_app) enum UserEvent {
     ClosePalette(u64),
     /// Submissão do novo nome de um grupo de abas.
     GroupRenameSubmit {
-        source_index: usize,
-        group_id: u64,
+        target: GroupRenameTarget,
+        generation: u64,
         name: String,
     },
     /// Fecho do editor de renomear grupo.
@@ -553,6 +554,7 @@ pub(in crate::windows_app) enum BarHit {
     TitleNewTab,
     BrowserTab(usize),
     BrowserTabClose(usize),
+    BrowserGroup(usize),
     BrowserTabOverflow,
     ContextTab {
         source_index: usize,
@@ -610,6 +612,8 @@ enum BarMenu {
         source_index: usize,
         group_index: usize,
     },
+    BrowserTab(usize),
+    BrowserGroup(usize),
     /// A pilula de uma IA: o item da rolagem automatica (Ctrl+R).
     Column(usize),
 }
@@ -637,6 +641,10 @@ fn bar_menu_for(hit: Option<BarHit>) -> Option<BarMenu> {
             source_index,
             group_index,
         }),
+        BarHit::BrowserTab(index) | BarHit::BrowserTabClose(index) => {
+            Some(BarMenu::BrowserTab(index))
+        }
+        BarHit::BrowserGroup(index) => Some(BarMenu::BrowserGroup(index)),
         BarHit::Column(col_index) => Some(BarMenu::Column(col_index)),
         _ => None,
     }
@@ -706,9 +714,15 @@ pub(in crate::windows_app) struct GroupRenameWindow {
     pub(in crate::windows_app) font: *mut core::ffi::c_void,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::windows_app) enum GroupRenameTarget {
+    Context { source: usize, group_id: u64 },
+    Web(u64),
+}
+
 pub(in crate::windows_app) struct GroupRenameHost {
     pub(in crate::windows_app) proxy: EventLoopProxy<UserEvent>,
-    pub(in crate::windows_app) target: Cell<Option<(usize, u64)>>,
+    pub(in crate::windows_app) target: Cell<Option<GroupRenameTarget>>,
     pub(in crate::windows_app) generation: Cell<u64>,
 }
 
@@ -1158,7 +1172,8 @@ pub(in crate::windows_app) fn bar_tooltip_label(
         BarHit::Column(_) => format!("{provider}: expandir esta coluna"),
         BarHit::AddTab(_) => format!("Nova pergunta para {provider}"),
         BarHit::TitleNewTab => "Nova aba do navegador".to_string(),
-        BarHit::BrowserTab(_) => "Alternar para esta aba Web".to_string(),
+        BarHit::BrowserTab(_) => "Alternar aba Web · Botão direito: opções de grupo".to_string(),
+        BarHit::BrowserGroup(_) => format!("Grupo {} · Botão direito: nome e cor", group?.0),
         BarHit::BrowserTabClose(_) => "Fechar esta aba Web".to_string(),
         BarHit::BrowserTabOverflow => "Selecionar abas Web ocultas".to_string(),
         BarHit::ContextTab { .. } => {
@@ -3615,6 +3630,10 @@ pub(in crate::windows_app) struct App {
     pub(in crate::windows_app) left_browser_toolbar: Option<HWND>,
     pub(in crate::windows_app) left_browser_font: Option<*mut core::ffi::c_void>,
     pub(in crate::windows_app) left_browser_tabs: Vec<LeftBrowserTab>,
+    pub(in crate::windows_app) left_browser_groups: Vec<ContextGroup>,
+    pub(in crate::windows_app) left_browser_next_tab_id: u64,
+    pub(in crate::windows_app) left_browser_next_group_id: u64,
+    pub(in crate::windows_app) left_browser_group_focus: Option<u64>,
     pub(in crate::windows_app) left_browser_active: Option<usize>,
     pub(in crate::windows_app) left_browser_minimized: bool,
     pub(in crate::windows_app) left_browser_expanded: bool,
@@ -3894,6 +3913,10 @@ impl App {
             left_browser_toolbar: None,
             left_browser_font: None,
             left_browser_tabs: Vec::new(),
+            left_browser_groups: Vec::new(),
+            left_browser_next_tab_id: 1,
+            left_browser_next_group_id: 1,
+            left_browser_group_focus: None,
             left_browser_active: None,
             left_browser_minimized: false,
             left_browser_expanded: false,
@@ -7138,6 +7161,7 @@ fn draw_comparator_bar<W>(
     state: BarState,
     live: &LivePanel<W>,
     browser_tabs: &[LeftBrowserTab],
+    browser_groups: &[ContextGroup],
 ) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -7209,34 +7233,75 @@ fn draw_comparator_bar<W>(
             &Theme::system(),
         );
         if !browser_tabs.is_empty() {
-            let layout = BarLayout::with_rows_browser(
+            let preview = state.drag.and_then(|drag| {
+                drag_preview_model(&comp.contexts, &comp.groups, comp.bar_focus, drag)
+            });
+            let (contexts, groups, focus) = match &preview {
+                Some((tabs, groups, focus)) => (tabs, groups, *focus),
+                None => (&comp.contexts, &comp.groups, comp.bar_focus),
+            };
+            let mut layout = BarLayout::with_rows_browser(
                 width as f64,
                 scale,
                 state.visible,
                 columns,
-                tab_rows_focused(
-                    &comp.contexts,
-                    &comp.groups,
-                    active_context(comp),
-                    comp.bar_focus,
-                ),
+                tab_rows_focused(contexts, groups, active_context(comp), focus),
                 browser_tabs.len(),
             )
             .with_browser_tabs(
                 browser_tabs.len(),
                 state.browser_active.unwrap_or(browser_tabs.len() - 1),
                 scale,
+                state.browser_group_row,
             );
+            let saved = SaveDC(target);
+            if state.omnibox_focused {
+                layout.apply_omnibox_focus(width as f64, scale);
+                if saved != 0 {
+                    let rect = layout.address;
+                    ExcludeClipRect(
+                        target,
+                        rect.x.floor() as i32,
+                        rect.y.floor() as i32,
+                        (rect.x + rect.width).ceil() as i32,
+                        (rect.y + rect.height).ceil() as i32,
+                    );
+                }
+            }
             let theme = Theme::system();
             let font = create_font((-11.0 * scale) as i32, FW_NORMAL as i32);
             let active = state.browser_active.unwrap_or(browser_tabs.len() - 1);
+            for visual in 0..layout.browser_group_count {
+                let index = layout.browser_group_indices[visual];
+                let Some(group) = browser_groups.get(index) else {
+                    continue;
+                };
+                let color = group.color.rgb();
+                let fill = if state.hover == Some(BarHit::BrowserGroup(index)) {
+                    mix(color, theme.bar_bg, 0.18)
+                } else {
+                    color
+                };
+                draw_pill(
+                    target,
+                    layout.browser_group_pills[visual],
+                    &group.name,
+                    PillStyle::new(fill, fill, on_color(fill)),
+                    scale,
+                    font,
+                    theme.bar_bg,
+                );
+            }
             for visual in 0..layout.browser_tab_count {
                 let index = layout.browser_tab_indices[visual];
                 let hovered = matches!(state.hover, Some(BarHit::BrowserTab(i) | BarHit::BrowserTabClose(i)) if i == index);
                 let selected = active == index;
+                let group_color = layout.browser_tab_owners[visual]
+                    .and_then(|owner| browser_groups.get(owner))
+                    .map(|group| group.color.rgb());
                 let fill = mix(
                     theme.bar_bg,
-                    theme.accent,
+                    group_color.unwrap_or(theme.accent),
                     if selected {
                         0.28
                     } else if hovered {
@@ -7251,7 +7316,7 @@ fn draw_comparator_bar<W>(
                     &browser_tabs[index].title,
                     PillStyle::new(
                         fill,
-                        theme.surface_line,
+                        group_color.unwrap_or(theme.surface_line),
                         if selected { theme.fg } else { theme.fg_muted },
                     ),
                     scale,
@@ -7283,6 +7348,9 @@ fn draw_comparator_bar<W>(
                 );
             }
             DeleteObject(font as _);
+            if saved != 0 {
+                RestoreDC(target, saved);
+            }
         }
 
         if buffered {
@@ -7380,6 +7448,7 @@ pub(in crate::windows_app) unsafe fn paint_comparator_bar_with_contexts<W>(
         state.browser_tab_count,
         state.browser_active.unwrap_or(0),
         scale,
+        state.browser_group_row,
     );
     if state.omnibox_focused {
         layout.apply_omnibox_focus(width as f64, scale);

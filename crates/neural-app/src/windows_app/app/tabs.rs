@@ -4,6 +4,9 @@
 use crate::windows_app::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowTextW, WS_BORDER};
 
+const CONTEXT_GROUP_OPTIONS_BASE: usize = 1000;
+const CONTEXT_TAB_OPTIONS_BASE: usize = 2000;
+
 pub(in crate::windows_app) fn close_tab_origin_matches(
     origin: CommandOrigin,
     source: usize,
@@ -503,25 +506,59 @@ impl App {
                 .moves_focus()
         };
         let mut menu = PopupMenu::default();
+        let mut loose_options = Vec::new();
         for entry in &entries {
             match entry {
-                TabListEntry::Tab { index, label } => menu.push(tab_item(*index, label)),
+                TabListEntry::Tab { index, label } => {
+                    menu.push(tab_item(*index, label));
+                    loose_options.push(
+                        MenuCommand::new(CONTEXT_TAB_OPTIONS_BASE + index, label.as_str()).into(),
+                    );
+                }
                 TabListEntry::Group { group, name, tabs } => menu.push(MenuEntry::Submenu {
                     label: format!("{name} ({})", tabs.len()),
                     icon: Some(MenuIcon::Swatch(
                         colors.get(*group).copied().unwrap_or((0, 0, 0)),
                     )),
-                    entries: tabs
-                        .iter()
-                        .map(|(index, label)| tab_item(*index, label).into())
-                        .collect(),
+                    entries: std::iter::once(
+                        MenuCommand::new(CONTEXT_GROUP_OPTIONS_BASE + group, "Editar nome e cor")
+                            .into(),
+                    )
+                    .chain(
+                        tabs.iter()
+                            .map(|(index, label)| tab_item(*index, label).into()),
+                    )
+                    .chain(std::iter::once(MenuEntry::Submenu {
+                        label: "Opções das abas".into(),
+                        icon: None,
+                        entries: tabs
+                            .iter()
+                            .map(|(index, label)| {
+                                MenuCommand::new(CONTEXT_TAB_OPTIONS_BASE + index, label.as_str())
+                                    .into()
+                            })
+                            .collect(),
+                    }))
+                    .collect(),
                 }),
             }
+        }
+        if !loose_options.is_empty() {
+            menu.separator();
+            menu.push(MenuEntry::Submenu {
+                label: "Opções das abas sem grupo".into(),
+                icon: None,
+                entries: loose_options,
+            });
         }
         // Aberto pelo botao esquerdo: sem TPM_RIGHTBUTTON.
         let selected = self.track_menu(&menu, point, MenuButton::Left);
         if let Some(index) = tab_list_command(selected, count) {
             self.open_listed_tab(source_index, index);
+        } else if let Some(index) = selected.checked_sub(CONTEXT_TAB_OPTIONS_BASE) {
+            self.show_tab_menu(source_index, index);
+        } else if let Some(group) = selected.checked_sub(CONTEXT_GROUP_OPTIONS_BASE) {
+            self.show_group_menu(source_index, group, true);
         }
     }
 
@@ -554,13 +591,15 @@ impl App {
                 source_index,
                 group_index,
             }) => self.show_group_menu(source_index, group_index, false),
+            Some(BarMenu::BrowserTab(index)) => self.show_browser_tab_menu(index),
+            Some(BarMenu::BrowserGroup(index)) => self.show_browser_group_menu(index, false),
             Some(BarMenu::Column(col_index)) => self.column_pill_menu(col_index),
             None => {}
         }
     }
 
     /// Onde o menu do botao direito abre: no cursor, em coordenadas de ecra.
-    fn bar_menu_point(&self, hwnd: HWND) -> POINT {
+    pub(super) fn bar_menu_point(&self, hwnd: HWND) -> POINT {
         let mut point = POINT {
             x: self.cursor.0.round() as i32,
             y: self.cursor.1.round() as i32,
@@ -621,40 +660,13 @@ impl App {
             },
         ));
         menu.separator();
-        menu.push(MenuCommand::new(
-            TAB_MENU_NEW_GROUP,
-            "Adicionar a um novo grupo",
-        ));
-        // "Mover para o grupo ▸": um submenu com os outros grupos da coluna,
-        // cada um com a amostra da sua cor, como no Chrome.
-        if !joinable.is_empty() {
-            menu.push(MenuEntry::Submenu {
-                label: "Mover para o grupo".to_string(),
-                icon: None,
-                entries: joinable
-                    .iter()
-                    .enumerate()
-                    .map(|(offset, (_, name))| {
-                        MenuCommand::new(TAB_MENU_GROUP_BASE + offset, name.as_str())
-                            .icon(MenuIcon::Swatch(colors[offset]))
-                            .into()
-                    })
-                    .collect(),
-            });
-        }
-        if in_group {
-            menu.push(MenuCommand::new(TAB_MENU_UNGROUP, "Remover do grupo"));
-        }
-        // "Cor do grupo ▸" numa aba agrupada: a cor muda-se tambem onde
-        // estao as abas, nao so na pilula -- as mesmas amostras e ids do
-        // menu do grupo, com a atual marcada.
-        if let Some((_, current)) = own_group {
-            menu.push(MenuEntry::Submenu {
-                label: "Cor do grupo".to_string(),
-                icon: None,
-                entries: group_color_items(current),
-            });
-        }
+        tab_group_items(
+            &mut menu,
+            &joinable,
+            &colors,
+            own_group.map(|(_, color)| color),
+            TAB_MENU_GROUP_BASE,
+        );
 
         let selected = self.track_menu(&menu, point, MenuButton::Right);
 
@@ -730,25 +742,7 @@ impl App {
             .flatten()
             .unwrap_or_else(|| self.bar_menu_point(hwnd));
 
-        let mut menu = PopupMenu::default();
-        // O nome do grupo por cima, cinzento: um titulo, nao um comando.
-        menu.push(MenuCommand::new(0, format!("Grupo \u{201C}{name}\u{201D}")).disabled(""));
-        menu.separator();
-        menu.push(MenuCommand::new(GROUP_MENU_RENAME, "Renomear grupo"));
-        menu.separator();
-        menu.entries.extend(group_color_items(current));
-        menu.separator();
-        menu.push(MenuCommand::new(
-            GROUP_MENU_TOGGLE,
-            if collapsed {
-                "Expandir grupo"
-            } else {
-                "Recolher grupo"
-            },
-        ));
-        menu.push(MenuCommand::new(GROUP_MENU_UNGROUP, "Desagrupar"));
-        menu.push(MenuCommand::new(GROUP_MENU_CLOSE, "Fechar grupo"));
-
+        let menu = tab_group_menu(&name, current, collapsed);
         let selected = self.track_menu(&menu, point, MenuButton::Right);
 
         if selected == GROUP_MENU_RENAME {
@@ -793,13 +787,6 @@ impl App {
         group_index: usize,
         group_id: u64,
     ) {
-        self.close_group_rename();
-        let Some(window) = &self.window else {
-            return;
-        };
-        let Some(owner) = window_hwnd(window) else {
-            return;
-        };
         let Some(group_name) = self
             .comparator
             .as_ref()
@@ -809,10 +796,36 @@ impl App {
         else {
             return;
         };
-        let scale = window.scale_factor().max(1.0);
+        let Some(owner) = self.window.as_ref().and_then(window_hwnd) else {
+            return;
+        };
         let point = self
             .group_chip_point(owner, source_index, group_index)
             .unwrap_or_else(|| self.bar_menu_point(owner));
+        self.open_group_name_editor(
+            GroupRenameTarget::Context {
+                source: source_index,
+                group_id,
+            },
+            &group_name,
+            point,
+        );
+    }
+
+    pub(super) fn open_group_name_editor(
+        &mut self,
+        target: GroupRenameTarget,
+        group_name: &str,
+        point: POINT,
+    ) {
+        self.close_group_rename();
+        let Some(window) = &self.window else {
+            return;
+        };
+        let Some(owner) = window_hwnd(window) else {
+            return;
+        };
+        let scale = window.scale_factor().max(1.0);
 
         let width = (200.0 * scale).round() as i32;
         let height = (32.0 * scale).round() as i32;
@@ -864,7 +877,7 @@ impl App {
                 DestroyWindow(popup);
                 return;
             }
-            let text = wide_null(&group_name);
+            let text = wide_null(group_name);
             SetWindowTextW(edit, text.as_ptr());
             let cue = wide_null("Nome do grupo");
             SendMessageW(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
@@ -890,9 +903,7 @@ impl App {
 
         let (popup, edit) = (created.popup, created.edit);
         self.group_rename = Some(created);
-        self.group_rename_host
-            .target
-            .set(Some((source_index, group_id)));
+        self.group_rename_host.target.set(Some(target));
         self.group_rename_host
             .generation
             .set(self.group_rename_host.generation.get().wrapping_add(1));
@@ -1200,6 +1211,7 @@ impl App {
             Some(BarHit::TitleNewTab) => self.open_browser_new_tab(),
             Some(BarHit::BrowserTab(index)) => self.switch_left_browser_tab(index),
             Some(BarHit::BrowserTabClose(index)) => self.close_one_left_browser_tab(index),
+            Some(BarHit::BrowserGroup(index)) => self.toggle_browser_group(index),
             Some(BarHit::BrowserTabOverflow) => self.show_left_browser_tab_list(),
             Some(BarHit::ContextTab {
                 source_index,
@@ -1295,6 +1307,64 @@ impl App {
     }
 }
 
+pub(super) fn tab_group_items(
+    menu: &mut PopupMenu,
+    joinable: &[(usize, String)],
+    colors: &[Rgb],
+    current: Option<GroupColor>,
+    move_to_group_base: usize,
+) {
+    menu.push(MenuCommand::new(
+        TAB_MENU_NEW_GROUP,
+        "Adicionar a um novo grupo",
+    ));
+    if !joinable.is_empty() {
+        menu.push(MenuEntry::Submenu {
+            label: "Mover para o grupo".into(),
+            icon: None,
+            entries: joinable
+                .iter()
+                .zip(colors)
+                .enumerate()
+                .map(|(offset, ((_, name), color))| {
+                    MenuCommand::new(move_to_group_base + offset, name.as_str())
+                        .icon(MenuIcon::Swatch(*color))
+                        .into()
+                })
+                .collect(),
+        });
+    }
+    if let Some(color) = current {
+        menu.push(MenuCommand::new(TAB_MENU_UNGROUP, "Remover do grupo"));
+        menu.push(MenuEntry::Submenu {
+            label: "Cor do grupo".into(),
+            icon: None,
+            entries: group_color_items(color),
+        });
+    }
+}
+
+pub(super) fn tab_group_menu(name: &str, current: GroupColor, collapsed: bool) -> PopupMenu {
+    let mut menu = PopupMenu::default();
+    menu.push(MenuCommand::new(0, format!("Grupo “{name}”")).disabled(""));
+    menu.separator();
+    menu.push(MenuCommand::new(GROUP_MENU_RENAME, "Renomear grupo").moves_focus());
+    menu.separator();
+    menu.entries.extend(group_color_items(current));
+    menu.separator();
+    menu.push(MenuCommand::new(
+        GROUP_MENU_TOGGLE,
+        if collapsed {
+            "Expandir grupo"
+        } else {
+            "Recolher grupo"
+        },
+    ));
+    menu.push(MenuCommand::new(GROUP_MENU_UNGROUP, "Desagrupar"));
+    menu.push(MenuCommand::new(GROUP_MENU_CLOSE, "Fechar grupo"));
+    menu
+}
+
 /// As cores de um grupo como itens de menu, com a amostra de cada uma e a
 /// `current` marcada: o menu do grupo e o submenu "Cor do grupo" de uma aba
 /// agrupada usam os mesmos ids (`GROUP_MENU_COLOR_BASE`).
@@ -1356,10 +1426,10 @@ unsafe extern "system" fn group_rename_edit_subclass(
             match wparam as u16 {
                 VK_RETURN => {
                     let name = window_text(hwnd);
-                    if let Some((source_index, group_id)) = host.target.get() {
+                    if let Some(target) = host.target.get() {
                         let _ = host.proxy.send_event(UserEvent::GroupRenameSubmit {
-                            source_index,
-                            group_id,
+                            target,
+                            generation: host.generation.get(),
                             name,
                         });
                     }

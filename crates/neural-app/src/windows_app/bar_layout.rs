@@ -322,6 +322,7 @@ pub(in crate::windows_app) struct BarState {
     /// Abas Web independentes visíveis na linha superior.
     pub(in crate::windows_app) browser_tab_count: usize,
     pub(in crate::windows_app) browser_active: Option<usize>,
+    pub(in crate::windows_app) browser_group_row: Option<TabRow>,
 }
 
 pub(in crate::windows_app) const MAX_VISIBLE_BROWSER_TABS: usize = 8;
@@ -353,6 +354,11 @@ pub(in crate::windows_app) struct BarLayout {
     pub(in crate::windows_app) browser_tab_closes: [UiRect; MAX_VISIBLE_BROWSER_TABS],
     pub(in crate::windows_app) browser_tab_indices: [usize; MAX_VISIBLE_BROWSER_TABS],
     pub(in crate::windows_app) browser_tab_count: usize,
+    pub(in crate::windows_app) browser_tab_owners: [Option<usize>; MAX_VISIBLE_BROWSER_TABS],
+    pub(in crate::windows_app) browser_group_pills: [UiRect; MAX_VISIBLE_TAB_SLOTS],
+    pub(in crate::windows_app) browser_group_indices: [usize; MAX_VISIBLE_TAB_SLOTS],
+    pub(in crate::windows_app) browser_group_count: usize,
+    browser_tabs_right: f64,
     pub(in crate::windows_app) browser_tab_overflow: UiRect,
     pub(in crate::windows_app) browser_tab_overflow_count: usize,
     pub(in crate::windows_app) context_tabs:
@@ -470,6 +476,11 @@ impl BarLayout {
                 browser_tab_closes: [empty; MAX_VISIBLE_BROWSER_TABS],
                 browser_tab_indices: [0; MAX_VISIBLE_BROWSER_TABS],
                 browser_tab_count: 0,
+                browser_tab_owners: [None; MAX_VISIBLE_BROWSER_TABS],
+                browser_group_pills: [empty; MAX_VISIBLE_TAB_SLOTS],
+                browser_group_indices: [0; MAX_VISIBLE_TAB_SLOTS],
+                browser_group_count: 0,
+                browser_tabs_right: 0.0,
                 browser_tab_overflow: empty,
                 browser_tab_overflow_count: 0,
                 context_tabs: [[empty; MAX_VISIBLE_CONTEXT_TABS]; COMPARATOR_COLUMNS],
@@ -732,7 +743,18 @@ impl BarLayout {
         let browser_reserve = if browser_tabs == 0 {
             0.0
         } else {
-            (browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(remaining * 0.85)
+            let grouped = visible_rows
+                .iter()
+                .filter(|row| {
+                    row.visible()
+                        .iter()
+                        .any(|slot| matches!(slot, TabSlot::Group(_)))
+                })
+                .count();
+            let group_room = (GROUP_CHIP_MIN_WIDTH + TAB_MIN_WIDTH + 6.0) * scale;
+            let context_room = minimum_tabs_room + grouped as f64 * group_room;
+            let web_room = remaining - context_room.min((remaining - 24.0 * scale).max(0.0));
+            (browser_tabs.min(3) as f64 * 92.0 * scale + 38.0 * scale).min(web_room)
         };
         let title_tabs_right = if show_title_plus {
             tabs_right - title_plus_w - title_plus_gap - browser_reserve
@@ -746,7 +768,15 @@ impl BarLayout {
         if (total_slots > 0 || visible_rows.iter().any(|row| row.total_tabs > 0))
             && title_tabs_right > tabs_left
         {
-            let metrics = TitleRowMetrics::fit(visible_rows, title_tabs_right - tabs_left, scale);
+            let mut metrics =
+                TitleRowMetrics::fit(visible_rows, title_tabs_right - tabs_left, scale);
+            if browser_tabs > 0 && populated > 0 {
+                let room_per_column =
+                    (title_tabs_right - tabs_left + metrics.gap) / populated as f64;
+                metrics.overflow = metrics
+                    .overflow
+                    .min((room_per_column - metrics.gap).max(0.0));
+            }
             let gap = metrics.gap;
             let budgets = metrics.budgets(visible_rows, title_tabs_right - tabs_left);
             let mut x = tabs_left;
@@ -761,7 +791,10 @@ impl BarLayout {
                 // acabou de mexer, nunca uma pilula antes das suas abas. O
                 // que sai conta no "‹N" -- nada desaparece sem aviso.
                 let (kept, hidden) = metrics.fit_row(&rows[index], budgets[index]);
-                if hidden > 0 && x + metrics.overflow <= title_tabs_right {
+                if hidden > 0
+                    && metrics.overflow > 0.0
+                    && x + metrics.overflow <= title_tabs_right + 1e-6
+                {
                     overflow[index] = UiRect {
                         x,
                         y: tab_y,
@@ -830,9 +863,6 @@ impl BarLayout {
             }
             title_plus_x = x;
         }
-        if browser_tabs > 0 && show_title_plus {
-            title_plus_x = title_tabs_right.max(title_plus_x);
-        }
         let title_new_tab = UiRect {
             x: title_plus_x.min(title_tabs_right),
             y: 3.0 * scale,
@@ -855,6 +885,11 @@ impl BarLayout {
             browser_tab_closes: [empty; MAX_VISIBLE_BROWSER_TABS],
             browser_tab_indices: [0; MAX_VISIBLE_BROWSER_TABS],
             browser_tab_count: 0,
+            browser_tab_owners: [None; MAX_VISIBLE_BROWSER_TABS],
+            browser_group_pills: [empty; MAX_VISIBLE_TAB_SLOTS],
+            browser_group_indices: [0; MAX_VISIBLE_TAB_SLOTS],
+            browser_group_count: 0,
+            browser_tabs_right: tabs_right,
             browser_tab_overflow: empty,
             browser_tab_overflow_count: 0,
             context_tabs: tabs,
@@ -904,16 +939,16 @@ impl BarLayout {
         total: usize,
         active: usize,
         scale: f64,
+        grouped: Option<TabRow>,
     ) -> Self {
         if !self.visible || total == 0 || self.title_new_tab.width <= 0.0 {
             return self;
         }
         let scale = scale.max(1.0);
-        let right = if self.address.width > 0.0 {
-            self.address.x - 8.0 * scale
-        } else {
-            self.window_minimize.x - 8.0 * scale
-        };
+        let right = self.browser_tabs_right;
+        if let Some(row) = grouped {
+            return self.with_browser_group_row(row, scale);
+        }
         let start = self.title_new_tab.x;
         let gap = 4.0 * scale;
         let min_tab = 48.0 * scale;
@@ -925,7 +960,7 @@ impl BarLayout {
         if shown == 0 {
             // Na largura mínima, o menu "N" mantém todas as abas
             // acessíveis mesmo quando nenhum título cabe.
-            let overflow_width = space.min(34.0 * scale);
+            let overflow_width = (space - gap).min(34.0 * scale);
             if overflow_width >= 18.0 * scale {
                 self.browser_tab_overflow = UiRect {
                     x: start,
@@ -1000,6 +1035,55 @@ impl BarLayout {
         self
     }
 
+    fn with_browser_group_row(mut self, row: TabRow, scale: f64) -> Self {
+        let start = self.title_new_tab.x;
+        let space =
+            (self.browser_tabs_right - start - self.title_new_tab.width - 6.0 * scale).max(0.0);
+        let mut metrics = TitleRowMetrics::fit(&[row], space, scale);
+        metrics.overflow = metrics.overflow.min((space - metrics.gap).max(0.0));
+        let (kept, hidden) = metrics.fit_row(&row, space);
+        let mut x = start;
+        if hidden > 0 && metrics.overflow >= 18.0 * scale {
+            self.browser_tab_overflow = UiRect {
+                x,
+                width: metrics.overflow,
+                ..self.title_new_tab
+            };
+            self.browser_tab_overflow_count = hidden;
+            x += metrics.overflow + metrics.gap;
+        }
+        for (position, slot) in row.visible().iter().copied().enumerate() {
+            if !kept[position] {
+                continue;
+            }
+            let rect = UiRect {
+                x,
+                width: metrics.width(slot),
+                ..self.title_new_tab
+            };
+            match slot {
+                TabSlot::Group(index) => {
+                    let visual = self.browser_group_count;
+                    self.browser_group_pills[visual] = rect;
+                    self.browser_group_indices[visual] = index;
+                    self.browser_group_count += 1;
+                }
+                TabSlot::Tab(index) => {
+                    let visual = self.browser_tab_count;
+                    self.browser_tabs[visual] = rect;
+                    self.browser_tab_indices[visual] = index;
+                    self.browser_tab_owners[visual] = row.owner(position);
+                    self.browser_tab_closes[visual] =
+                        tab_close_rect(rect, scale, TAB_CLOSE_SIZE * scale);
+                    self.browser_tab_count += 1;
+                }
+            }
+            x += rect.width + metrics.gap;
+        }
+        self.title_new_tab.x = x;
+        self
+    }
+
     pub(in crate::windows_app) fn hit(&self, x: f64, y: f64) -> Option<BarHit> {
         if !self.visible || y > self.height {
             return None;
@@ -1024,6 +1108,11 @@ impl BarLayout {
         }
         if self.browser_tab_overflow.contains(x, y) {
             return Some(BarHit::BrowserTabOverflow);
+        }
+        for visual in 0..self.browser_group_count {
+            if self.browser_group_pills[visual].contains(x, y) {
+                return Some(BarHit::BrowserGroup(self.browser_group_indices[visual]));
+            }
         }
         for visual in 0..self.browser_tab_count {
             let index = self.browser_tab_indices[visual];
@@ -1932,7 +2021,7 @@ mod sidebar_layout_gates {
                     rows,
                     4,
                 )
-                .with_browser_tabs(4, 3, scale);
+                .with_browser_tabs(4, 3, scale, None);
                 assert!(
                     layout.browser_tab_count > 0 || layout.browser_tab_overflow_count == 4,
                     "browser tabs inaccessible at {width}"
@@ -1955,6 +2044,22 @@ mod sidebar_layout_gates {
                 assert_eq!(
                     layout.hit(plus.x + plus.width * 0.5, plus.y + plus.height * 0.5),
                     Some(BarHit::TitleNewTab)
+                );
+
+                let web_only = BarLayout::with_rows_browser(
+                    width * scale,
+                    scale,
+                    true,
+                    BarColumns::even(3),
+                    [TabRow::empty(); 3],
+                    1,
+                )
+                .with_browser_tabs(1, 0, scale, None);
+                assert_eq!(web_only.browser_tab_count, 1);
+                assert_eq!(web_only.browser_tabs[0].x, 90.0 * scale);
+                assert!(
+                    web_only.browser_tabs[0].x + web_only.browser_tabs[0].width
+                        <= web_only.title_new_tab.x
                 );
             }
         }

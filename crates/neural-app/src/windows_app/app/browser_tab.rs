@@ -1,5 +1,6 @@
 //! Abas Web independentes: cada clique no + superior cria um WebView2 próprio.
 //! A barra é nativa e não envia pesquisas às IAs do comparador.
+use super::tabs::{tab_group_items, tab_group_menu};
 use crate::windows_app::*;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
@@ -9,9 +10,40 @@ pub(in crate::windows_app) const LEFT_BROWSER_BAR_HEIGHT: f64 = 48.0;
 const LEFT_BROWSER_SUBCLASS_ID: usize = 0x4E91;
 const LEFT_BROWSER_TOOLBAR_ID: usize = 0x4E92;
 
-pub(in crate::windows_app) struct LeftBrowserTab {
-    pub(in crate::windows_app) view: WebView,
+pub(in crate::windows_app) struct LeftBrowserTab<V = WebView> {
+    pub(in crate::windows_app) view: V,
     pub(in crate::windows_app) title: String,
+    pub(in crate::windows_app) id: u64,
+    group: Option<u64>,
+}
+
+impl<V> GroupTab for LeftBrowserTab<V> {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn group(&self) -> Option<u64> {
+        self.group
+    }
+
+    fn set_group(&mut self, group: Option<u64>) {
+        self.group = group;
+    }
+}
+
+fn group_browser_tab<V>(
+    tabs: &mut Vec<LeftBrowserTab<V>>,
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    index: usize,
+) -> Option<usize> {
+    if index >= tabs.len() {
+        return None;
+    }
+    let index = detach_from_group(tabs, index);
+    prune_empty_groups(tabs, groups);
+    let name = tabs[index].title.clone();
+    Some(create_tab_group(&mut tabs[index], groups, next_id, name))
 }
 
 pub(in crate::windows_app) fn left_browser_new_window_event(target: String) -> Option<UserEvent> {
@@ -494,6 +526,70 @@ unsafe fn paint_left_browser_toolbar(
     }
 }
 
+fn browser_menu_point(owner: HWND, rect: UiRect) -> POINT {
+    let mut point = POINT {
+        x: rect.x.round() as i32,
+        y: (rect.y + rect.height).round() as i32,
+    };
+    unsafe { ClientToScreen(owner, &mut point) };
+    point
+}
+
+fn browser_tab_list_menu<V>(
+    tabs: &[LeftBrowserTab<V>],
+    groups: &[ContextGroup],
+    active: Option<usize>,
+) -> PopupMenu {
+    let open_tab = |index: usize| {
+        MenuCommand::new(index * 3 + 1, tabs[index].title.as_str())
+            .checked(active == Some(index))
+            .moves_focus()
+    };
+    let tab_options =
+        |index: usize| MenuCommand::new(index * 3 + 2, tabs[index].title.as_str()).into();
+    let mut menu = PopupMenu::default();
+    let mut loose = Vec::new();
+    let mut index = 0;
+    while index < tabs.len() {
+        let Some(group) = tabs[index]
+            .group
+            .and_then(|id| groups.iter().position(|group| group.id == id))
+        else {
+            menu.push(open_tab(index));
+            loose.push(tab_options(index));
+            index += 1;
+            continue;
+        };
+        let end = index
+            + tabs[index..]
+                .iter()
+                .take_while(|tab| tab.group == Some(groups[group].id))
+                .count();
+        let mut entries = vec![MenuCommand::new(group * 3 + 3, "Editar nome e cor").into()];
+        entries.extend((index..end).map(|index| open_tab(index).into()));
+        entries.push(MenuEntry::Submenu {
+            label: "Opções das abas".into(),
+            icon: None,
+            entries: (index..end).map(tab_options).collect(),
+        });
+        menu.push(MenuEntry::Submenu {
+            label: format!("{} ({})", groups[group].name, end - index),
+            icon: Some(MenuIcon::Swatch(groups[group].color.rgb())),
+            entries,
+        });
+        index = end;
+    }
+    if !loose.is_empty() {
+        menu.separator();
+        menu.push(MenuEntry::Submenu {
+            label: "Opções das abas sem grupo".into(),
+            icon: None,
+            entries: loose,
+        });
+    }
+    menu
+}
+
 impl App {
     /// Fecha todas as abas Web, sem alterar as sessões das três IAs.
     pub(in crate::windows_app) fn close_left_browser_tab(&mut self) {
@@ -502,6 +598,8 @@ impl App {
             let _ = tab.view.focus_parent();
         }
         self.left_browser_active = None;
+        self.left_browser_groups.clear();
+        self.left_browser_group_focus = None;
         self.left_browser_minimized = false;
         self.left_browser_expanded = false;
         LEFT_BROWSER_EXPANDED.store(false, Ordering::Release);
@@ -594,7 +692,14 @@ impl App {
             || format!("Nova aba {}", index + 1),
             |url| url.host_str().unwrap_or("Web").to_owned(),
         );
-        self.left_browser_tabs.push(LeftBrowserTab { view, title });
+        self.left_browser_tabs.push(LeftBrowserTab {
+            view,
+            title,
+            id: self.left_browser_next_tab_id,
+            group: None,
+        });
+        self.left_browser_next_tab_id += 1;
+        self.left_browser_group_focus = None;
         self.left_browser_active = Some(index);
         self.left_browser_minimized = false;
         self.left_browser_expanded = false;
@@ -780,6 +885,7 @@ impl App {
             let _ = old.view.set_visible(false);
         }
         self.left_browser_active = Some(index);
+        self.left_browser_group_focus = None;
         self.left_browser_minimized = false;
         self.sync_left_browser_address();
         self.refresh_left_browser_layout();
@@ -790,6 +896,7 @@ impl App {
             return;
         }
         let tab = self.left_browser_tabs.remove(index);
+        prune_empty_groups(&self.left_browser_tabs, &mut self.left_browser_groups);
         let _ = tab.view.set_visible(false);
         let _ = tab.view.focus_parent();
         drop(tab);
@@ -807,6 +914,13 @@ impl App {
             self.left_browser_active = Some(next);
             self.sync_left_browser_address();
             self.refresh_left_browser_layout();
+        }
+    }
+
+    fn open_listed_browser_tab(&mut self, index: usize) {
+        self.switch_left_browser_tab(index);
+        if let Some(tab) = self.left_browser_tabs.get(index) {
+            let _ = tab.view.focus();
         }
     }
 
@@ -830,8 +944,182 @@ impl App {
         self.refresh_left_browser_layout();
     }
 
-    /// Menu nativo de abas excedentes: seleção explícita, não um ciclo
-    /// que muda de aba sem dizer qual será aberta.
+    pub(in crate::windows_app) fn left_browser_group_row(&self) -> Option<TabRow> {
+        (!self.left_browser_groups.is_empty()).then(|| {
+            plan_tab_row_focused(
+                &self.left_browser_tabs,
+                &self.left_browser_groups,
+                self.active_browser_tab_id(),
+                self.left_browser_group_focus,
+            )
+        })
+    }
+
+    fn active_browser_tab_id(&self) -> Option<u64> {
+        self.left_browser_active
+            .and_then(|index| self.left_browser_tabs.get(index))
+            .map(GroupTab::id)
+    }
+
+    fn restore_browser_tab_index(&mut self, active: Option<u64>) {
+        self.left_browser_active =
+            active.and_then(|id| self.left_browser_tabs.iter().position(|tab| tab.id == id));
+    }
+
+    fn edit_browser_tab_group(&mut self, index: usize, command: TabMenuCommand) {
+        let Some(tab) = self.left_browser_tabs.get(index) else {
+            return;
+        };
+        let tab_id = tab.id;
+        let active = self.active_browser_tab_id();
+        let mut created = None;
+        match command {
+            TabMenuCommand::NewGroup => {
+                created = group_browser_tab(
+                    &mut self.left_browser_tabs,
+                    &mut self.left_browser_groups,
+                    &mut self.left_browser_next_group_id,
+                    index,
+                );
+            }
+            TabMenuCommand::MoveToGroup(group) => {
+                let Some(group) = self.left_browser_groups.get_mut(group) else {
+                    return;
+                };
+                group.collapsed = false;
+                join_context_group(&mut self.left_browser_tabs, group.id, index);
+                prune_empty_groups(&self.left_browser_tabs, &mut self.left_browser_groups);
+            }
+            TabMenuCommand::Ungroup => leave_context_group(
+                &mut self.left_browser_tabs,
+                &mut self.left_browser_groups,
+                index,
+            ),
+            TabMenuCommand::GroupColor(color) => {
+                if let Some(group) = tab.group {
+                    self.apply_browser_group_menu(group, GroupMenuCommand::Color(color));
+                }
+                return;
+            }
+            _ => return,
+        }
+        self.restore_browser_tab_index(active);
+        self.left_browser_group_focus = Some(tab_id);
+        self.request_redraw();
+        if let Some(group) = created {
+            self.show_browser_group_menu(group, true);
+        }
+    }
+
+    fn apply_browser_group_menu(&mut self, group: u64, command: GroupMenuCommand) {
+        if command == GroupMenuCommand::Close {
+            let members: Vec<_> = self
+                .left_browser_tabs
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, tab)| (tab.group == Some(group)).then_some(index))
+                .collect();
+            for index in members {
+                self.close_one_left_browser_tab(index);
+            }
+            return;
+        }
+        apply_group_command(
+            &mut self.left_browser_tabs,
+            &mut self.left_browser_groups,
+            group,
+            command,
+        );
+        self.request_redraw();
+    }
+
+    pub(in crate::windows_app) fn toggle_browser_group(&mut self, group: usize) {
+        let members_drawn = self.bar_layout().is_some_and(|layout| {
+            layout.browser_tab_owners[..layout.browser_tab_count].contains(&Some(group))
+        });
+        apply_chip_click(
+            &self.left_browser_tabs,
+            &mut self.left_browser_groups,
+            &mut self.left_browser_group_focus,
+            group,
+            members_drawn,
+        );
+        self.request_redraw();
+    }
+
+    pub(in crate::windows_app) fn show_browser_tab_menu(&mut self, index: usize) {
+        let (Some(owner), Some(tab)) = (
+            self.window.as_ref().and_then(window_hwnd),
+            self.left_browser_tabs.get(index),
+        ) else {
+            return;
+        };
+        let own_group = tab
+            .group
+            .and_then(|id| self.left_browser_groups.iter().find(|g| g.id == id));
+        let mut menu = PopupMenu::default();
+        menu.push(MenuCommand::new(TAB_MENU_OPEN, "Abrir").moves_focus());
+        menu.push(MenuCommand::new(TAB_MENU_CLOSE, "Fechar aba"));
+        menu.separator();
+        let joinable = Self::joinable_context_groups(&self.left_browser_groups, tab.group);
+        let colors: Vec<_> = joinable
+            .iter()
+            .map(|(index, _)| self.left_browser_groups[*index].color.rgb())
+            .collect();
+        const MOVE_TO_GROUP_BASE: usize = 1000;
+        tab_group_items(
+            &mut menu,
+            &joinable,
+            &colors,
+            own_group.map(|group| group.color),
+            MOVE_TO_GROUP_BASE,
+        );
+        let chosen = self.track_menu(&menu, self.bar_menu_point(owner), MenuButton::Right);
+        if let Some(offset) = chosen.checked_sub(MOVE_TO_GROUP_BASE) {
+            if let Some((group, _)) = joinable.get(offset) {
+                self.edit_browser_tab_group(index, TabMenuCommand::MoveToGroup(*group));
+            }
+            return;
+        }
+        match tab_menu_command(chosen, &[]) {
+            Some(TabMenuCommand::Open) => self.open_listed_browser_tab(index),
+            Some(TabMenuCommand::Close) => self.close_one_left_browser_tab(index),
+            Some(command) => self.edit_browser_tab_group(index, command),
+            None => {}
+        }
+    }
+
+    pub(in crate::windows_app) fn show_browser_group_menu(&mut self, index: usize, at_chip: bool) {
+        let (Some(owner), Some(group)) = (
+            self.window.as_ref().and_then(window_hwnd),
+            self.left_browser_groups.get(index),
+        ) else {
+            return;
+        };
+        let (id, name) = (group.id, group.name.clone());
+        let menu = tab_group_menu(&name, group.color, group.collapsed);
+        let point = at_chip
+            .then(|| self.bar_layout())
+            .flatten()
+            .and_then(|layout| {
+                (0..layout.browser_group_count)
+                    .find(|&visual| layout.browser_group_indices[visual] == index)
+                    .map(|visual| layout.browser_group_pills[visual])
+            })
+            .map(|rect| browser_menu_point(owner, rect))
+            .unwrap_or_else(|| self.bar_menu_point(owner));
+        let chosen = self.track_menu(&menu, point, MenuButton::Right);
+        if let Some(command) = group_menu_command(chosen) {
+            if command == GroupMenuCommand::Rename {
+                self.open_group_name_editor(GroupRenameTarget::Web(id), &name, point);
+            } else {
+                self.apply_browser_group_menu(id, command);
+            }
+        }
+    }
+
+    /// Menu nativo de abas excedentes: mantém acessíveis as abas e seus grupos.
     pub(in crate::windows_app) fn show_left_browser_tab_list(&mut self) {
         let (Some(window), Some(layout)) = (&self.window, self.bar_layout()) else {
             return;
@@ -839,28 +1127,19 @@ impl App {
         let Some(owner) = window_hwnd(window) else {
             return;
         };
-        let scale = window.scale_factor().max(1.0);
-        let anchor = layout.browser_tab_overflow;
-        let mut position = POINT {
-            x: (anchor.x * scale).round() as i32,
-            y: ((anchor.y + anchor.height) * scale).round() as i32,
-        };
-        unsafe { ClientToScreen(owner, &mut position) };
-        let mut menu = PopupMenu::default();
-        const FIRST_BROWSER_MENU_ID: usize = 1000;
-        for (index, tab) in self.left_browser_tabs.iter().enumerate() {
-            menu.push(
-                MenuCommand::new(
-                    FIRST_BROWSER_MENU_ID + index,
-                    format!("{} — {}", index + 1, tab.title),
-                )
-                .checked(self.left_browser_active == Some(index))
-                .moves_focus(),
-            );
-        }
+        let position = browser_menu_point(owner, layout.browser_tab_overflow);
+        let active = self.left_browser_active;
+        let tabs = &self.left_browser_tabs;
+        let groups = &self.left_browser_groups;
+        let menu = browser_tab_list_menu(tabs, groups, active);
         let chosen = self.track_menu(&menu, position, MenuButton::Left);
-        if chosen >= FIRST_BROWSER_MENU_ID {
-            self.switch_left_browser_tab(chosen - FIRST_BROWSER_MENU_ID);
+        let Some(offset) = chosen.checked_sub(1) else {
+            return;
+        };
+        match offset % 3 {
+            0 => self.open_listed_browser_tab(offset / 3),
+            1 => self.show_browser_tab_menu(offset / 3),
+            _ => self.show_browser_group_menu(offset / 3, true),
         }
     }
 
@@ -966,6 +1245,131 @@ impl App {
 #[cfg(test)]
 mod left_browser_tests {
     use super::*;
+
+    fn web_tab(id: u64, title: &str) -> LeftBrowserTab<()> {
+        LeftBrowserTab {
+            id,
+            title: title.into(),
+            group: None,
+            view: (),
+        }
+    }
+
+    #[test]
+    fn web_tab_groups_share_the_color_and_name_menu_and_keep_tab_identity() {
+        let mut tabs = vec![
+            web_tab(11, "Documentação"),
+            web_tab(22, "Referências"),
+            web_tab(33, "Leitura"),
+        ];
+        let mut groups = Vec::new();
+        let mut next_id = 1;
+        let group_index = group_browser_tab(&mut tabs, &mut groups, &mut next_id, 0).unwrap();
+        let group = groups[group_index].id;
+        assert_eq!(tabs[0].group(), Some(group));
+        assert_eq!(groups[group_index].name, "Documentação");
+
+        join_context_group(&mut tabs, group, 2);
+        assert_eq!(
+            tabs.iter().map(GroupTab::id).collect::<Vec<_>>(),
+            [11, 33, 22]
+        );
+        assert!(rename_context_group(&mut groups, group, "Pesquisa"));
+        let menu = tab_group_menu("Pesquisa", GroupColor::Blue, false);
+        assert!(menu.command(GROUP_MENU_RENAME).is_some());
+        let green = GROUP_MENU_COLOR_BASE
+            + GroupColor::ALL
+                .iter()
+                .position(|color| *color == GroupColor::Green)
+                .unwrap();
+        let command = group_menu_command(green).unwrap();
+        apply_group_command(&mut tabs, &mut groups, group, command);
+
+        let overflow = browser_tab_list_menu(&tabs, &groups, Some(1));
+        assert_eq!(overflow.command(3).unwrap().label, "Editar nome e cor");
+        assert!(matches!(
+            &overflow.entries[0],
+            MenuEntry::Submenu { label, icon: Some(MenuIcon::Swatch(color)), .. }
+            if label == "Pesquisa (2)" && *color == GroupColor::Green.rgb()
+        ));
+        assert!(overflow.command(4).unwrap().checked);
+        assert_eq!(overflow.command(8).unwrap().label, "Referências");
+
+        leave_context_group(&mut tabs, &mut groups, 1);
+        assert_eq!(tabs[1].id, 33);
+        assert_eq!(tabs[1].group(), None);
+        let closed = apply_group_command(&mut tabs, &mut groups, group, GroupMenuCommand::Close);
+        assert_eq!(closed, [11]);
+        assert_eq!(tabs.iter().map(GroupTab::id).collect::<Vec<_>>(), [33, 22]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn web_group_chip_and_tabs_remain_reachable_when_the_title_bar_is_crowded() {
+        let mut tabs = vec![web_tab(11, "Documentação"), web_tab(22, "Referências")];
+        let mut groups = Vec::new();
+        let mut next_id = 1;
+        group_browser_tab(&mut tabs, &mut groups, &mut next_id, 0).unwrap();
+        join_context_group(&mut tabs, groups[0].id, 1);
+        let contexts = [ContextTab {
+            id: 41,
+            url: "https://example.com/".into(),
+            group: Some(groups[0].id),
+        }];
+        let context_row = plan_tab_row(&contexts, &groups);
+
+        for width in [700.0, 880.0, 1024.0, 1440.0, 1920.0] {
+            for scale in [1.0, 1.25, 2.0] {
+                let row = plan_tab_row_focused(&tabs, &groups, Some(11), None);
+                let layout = BarLayout::with_rows_browser(
+                    width * scale,
+                    scale,
+                    true,
+                    BarColumns::even(3),
+                    [context_row; 3],
+                    tabs.len(),
+                )
+                .with_browser_tabs(tabs.len(), 0, scale, Some(row));
+                let at = |rect: UiRect| {
+                    layout.hit(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+                };
+                assert_eq!(at(layout.title_new_tab), Some(BarHit::TitleNewTab));
+                assert!(
+                    layout.title_new_tab.x + layout.title_new_tab.width
+                        <= title_tools_left(width * scale, scale, None),
+                    "tabs overlap the service icons at {width}@{scale}"
+                );
+                for column in 0..3 {
+                    assert!(
+                        layout.group_pill_counts[column] > 0
+                            || layout.tab_overflow_counts[column] == 1,
+                        "context group {column} is inaccessible at {width}@{scale}"
+                    );
+                }
+                if layout.browser_group_count == 0 {
+                    assert_eq!(layout.browser_tab_overflow_count, tabs.len());
+                    assert_eq!(
+                        at(layout.browser_tab_overflow),
+                        Some(BarHit::BrowserTabOverflow)
+                    );
+                } else {
+                    let chip = layout.browser_group_pills[0];
+                    assert_eq!(bar_menu_for(at(chip)), Some(BarMenu::BrowserGroup(0)));
+                    for visual in 0..layout.browser_tab_count {
+                        assert_eq!(layout.browser_tab_owners[visual], Some(0));
+                        assert_eq!(
+                            bar_menu_for(at(layout.browser_tabs[visual])),
+                            Some(BarMenu::BrowserTab(layout.browser_tab_indices[visual]))
+                        );
+                    }
+                }
+                if width >= 1440.0 {
+                    assert_eq!(layout.browser_group_count, 1);
+                    assert!(layout.browser_tab_count >= 1);
+                }
+            }
+        }
+    }
 
     #[test]
     fn layout_never_reserves_an_invisible_middle_column() {

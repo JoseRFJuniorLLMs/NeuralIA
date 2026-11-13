@@ -84,6 +84,26 @@ pub(crate) struct ContextTab {
     pub(in crate::windows_app) group: Option<u64>,
 }
 
+pub(in crate::windows_app) trait GroupTab {
+    fn id(&self) -> u64;
+    fn group(&self) -> Option<u64>;
+    fn set_group(&mut self, group: Option<u64>);
+}
+
+impl GroupTab for ContextTab {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn group(&self) -> Option<u64> {
+        self.group
+    }
+
+    fn set_group(&mut self, group: Option<u64>) {
+        self.group = group;
+    }
+}
+
 /// Um lugar na fila de abas de uma coluna: ou a pilula de um grupo, ou uma aba.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) enum TabSlot {
@@ -94,7 +114,7 @@ pub(in crate::windows_app) enum TabSlot {
 }
 
 /// A fila visivel de uma coluna, ja cortada ao que cabe na barra.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::windows_app) struct TabRow {
     pub(in crate::windows_app) slots: [TabSlot; MAX_VISIBLE_TAB_SLOTS],
     /// Para cada `TabSlot::Tab`, o indice do grupo a que a aba pertence. A
@@ -214,17 +234,17 @@ pub(in crate::windows_app) fn plan_tab_row_with_active(
 /// alcancada pela pilula --, nem quando o corte pelo fim a deixaria de fora.
 /// Se as duas nao couberem juntas, ganha `focus`: e para ela que se olha.
 pub(in crate::windows_app) fn plan_tab_row_focused(
-    tabs: &[ContextTab],
+    tabs: &[impl GroupTab],
     groups: &[ContextGroup],
     active: Option<u64>,
     focus: Option<u64>,
 ) -> TabRow {
     let group_of = |index: usize| -> Option<usize> {
         tabs.get(index)
-            .and_then(|tab| tab.group)
+            .and_then(GroupTab::group)
             .and_then(|id| groups.iter().position(|group| group.id == id))
     };
-    let active_index = active.and_then(|id| tabs.iter().position(|tab| tab.id == id));
+    let active_index = active.and_then(|id| tabs.iter().position(|tab| tab.id() == id));
 
     let mut full: Vec<TabSlot> = Vec::new();
     let mut billed: Vec<usize> = Vec::new();
@@ -246,7 +266,7 @@ pub(in crate::windows_app) fn plan_tab_row_focused(
     // Onde esta cada ancora na fila completa. Uma aba escondida num grupo
     // recolhido e alcancada pela pilula dele.
     let place = |id: u64| -> Option<usize> {
-        let index = tabs.iter().position(|tab| tab.id == id)?;
+        let index = tabs.iter().position(|tab| tab.id() == id)?;
         full.iter()
             .position(|slot| *slot == TabSlot::Tab(index))
             .or_else(|| {
@@ -317,7 +337,7 @@ pub(in crate::windows_app) fn plan_tab_row_focused(
     let pinned: Vec<usize> = [focus, active]
         .into_iter()
         .flatten()
-        .filter_map(|id| tabs.iter().position(|tab| tab.id == id))
+        .filter_map(|id| tabs.iter().position(|tab| tab.id() == id))
         .collect();
     for position in 0..row.len {
         match row.slots[position] {
@@ -393,6 +413,20 @@ pub(in crate::windows_app) fn create_context_group(
     tab_index: usize,
 ) -> Option<usize> {
     let name = context_tab_label(&tabs.get(tab_index)?.url);
+    Some(create_tab_group(
+        &mut tabs[tab_index],
+        groups,
+        next_id,
+        name,
+    ))
+}
+
+pub(in crate::windows_app) fn create_tab_group(
+    tab: &mut impl GroupTab,
+    groups: &mut Vec<ContextGroup>,
+    next_id: &mut u64,
+    name: String,
+) -> usize {
     let used: Vec<GroupColor> = groups.iter().map(|group| group.color).collect();
     let id = *next_id;
     *next_id += 1;
@@ -402,15 +436,15 @@ pub(in crate::windows_app) fn create_context_group(
         color: GroupColor::next(&used),
         collapsed: false,
     });
-    tabs[tab_index].group = Some(id);
-    Some(groups.len() - 1)
+    tab.set_group(Some(id));
+    groups.len() - 1
 }
 
 /// Poe a aba no grupo e encosta-a ao ultimo membro: os membros de um grupo tem
 /// de ficar juntos na barra, senao a pilula fica a rotular abas que nao sao
 /// dela.
 pub(in crate::windows_app) fn join_context_group(
-    tabs: &mut Vec<ContextTab>,
+    tabs: &mut Vec<impl GroupTab>,
     group_id: u64,
     tab_index: usize,
 ) {
@@ -418,10 +452,10 @@ pub(in crate::windows_app) fn join_context_group(
         return;
     }
     let mut tab = tabs.remove(tab_index);
-    tab.group = Some(group_id);
+    tab.set_group(Some(group_id));
     let target = tabs
         .iter()
-        .rposition(|other| other.group == Some(group_id))
+        .rposition(|other| other.group() == Some(group_id))
         .map(|last| last + 1)
         .unwrap_or(tabs.len());
     tabs.insert(target, tab);
@@ -434,7 +468,7 @@ pub(in crate::windows_app) fn join_context_group(
 /// sitio onde estava partia o grupo em dois quando ela estava no meio: a
 /// pilula ficava a rotular metade e a outra metade parecia de ninguem.
 pub(in crate::windows_app) fn leave_context_group(
-    tabs: &mut Vec<ContextTab>,
+    tabs: &mut Vec<impl GroupTab>,
     groups: &mut Vec<ContextGroup>,
     tab_index: usize,
 ) {
@@ -445,17 +479,17 @@ pub(in crate::windows_app) fn leave_context_group(
 /// Solta a aba do seu grupo e poe-na logo depois do ultimo membro que fica.
 /// Devolve onde a aba ficou. Uma aba solta fica onde esta.
 pub(in crate::windows_app) fn detach_from_group(
-    tabs: &mut Vec<ContextTab>,
+    tabs: &mut Vec<impl GroupTab>,
     tab_index: usize,
 ) -> usize {
-    let Some(group) = tabs.get(tab_index).and_then(|tab| tab.group) else {
+    let Some(group) = tabs.get(tab_index).and_then(GroupTab::group) else {
         return tab_index;
     };
     let mut tab = tabs.remove(tab_index);
-    tab.group = None;
+    tab.set_group(None);
     let target = tabs
         .iter()
-        .rposition(|other| other.group == Some(group))
+        .rposition(|other| other.group() == Some(group))
         .map_or(tab_index.min(tabs.len()), |last| last + 1);
     tabs.insert(target, tab);
     target
@@ -582,10 +616,10 @@ pub(in crate::windows_app) fn move_context_group(
 }
 
 pub(in crate::windows_app) fn prune_empty_groups(
-    tabs: &[ContextTab],
+    tabs: &[impl GroupTab],
     groups: &mut Vec<ContextGroup>,
 ) {
-    groups.retain(|group| tabs.iter().any(|tab| tab.group == Some(group.id)));
+    groups.retain(|group| tabs.iter().any(|tab| tab.group() == Some(group.id)));
 }
 
 /// Guarda uma nova aba de contexto e devolve a sua identidade estavel. Se a
@@ -931,7 +965,7 @@ pub(in crate::windows_app) fn group_menu_command(id: usize) -> Option<GroupMenuC
 /// das abas que fecharam: se a que esta aberta ao lado estiver entre elas, o
 /// App fecha o Split.
 pub(in crate::windows_app) fn apply_group_command(
-    tabs: &mut Vec<ContextTab>,
+    tabs: &mut Vec<impl GroupTab>,
     groups: &mut Vec<ContextGroup>,
     group_id: u64,
     command: GroupMenuCommand,
@@ -951,8 +985,8 @@ pub(in crate::windows_app) fn apply_group_command(
         GroupMenuCommand::Rename => Vec::new(),
         // As abas ficam onde estao, soltas: o troco era seguido, continua.
         GroupMenuCommand::Ungroup => {
-            for tab in tabs.iter_mut().filter(|tab| tab.group == Some(group_id)) {
-                tab.group = None;
+            for tab in tabs.iter_mut().filter(|tab| tab.group() == Some(group_id)) {
+                tab.set_group(None);
             }
             prune_empty_groups(tabs, groups);
             Vec::new()
@@ -960,10 +994,10 @@ pub(in crate::windows_app) fn apply_group_command(
         GroupMenuCommand::Close => {
             let closed: Vec<u64> = tabs
                 .iter()
-                .filter(|tab| tab.group == Some(group_id))
-                .map(|tab| tab.id)
+                .filter(|tab| tab.group() == Some(group_id))
+                .map(GroupTab::id)
                 .collect();
-            tabs.retain(|tab| tab.group != Some(group_id));
+            tabs.retain(|tab| tab.group() != Some(group_id));
             prune_empty_groups(tabs, groups);
             closed
         }
@@ -1012,7 +1046,7 @@ pub(in crate::windows_app) fn chip_click(collapsed: bool, members_drawn: bool) -
 /// do grupo como ancora da coluna (`focus`): a barra corta a fila a volta
 /// dela, pilula incluida.
 pub(in crate::windows_app) fn apply_chip_click(
-    tabs: &[ContextTab],
+    tabs: &[impl GroupTab],
     groups: &mut [ContextGroup],
     focus: &mut Option<u64>,
     group_index: usize,
@@ -1022,8 +1056,8 @@ pub(in crate::windows_app) fn apply_chip_click(
     let click = chip_click(group.collapsed, members_drawn);
     let first = tabs
         .iter()
-        .find(|tab| tab.group == Some(group.id))
-        .map(|tab| tab.id);
+        .find(|tab| tab.group() == Some(group.id))
+        .map(GroupTab::id);
     match click {
         ChipClick::Expand => {
             group.collapsed = false;

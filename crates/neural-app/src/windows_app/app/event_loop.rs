@@ -518,12 +518,26 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::GroupRenameSubmit {
-                source_index,
-                group_id,
+                target,
+                generation,
                 name,
             } => {
-                self.rename_context_group(source_index, group_id, name);
-                self.close_group_rename();
+                if generation == self.group_rename_host.generation.get()
+                    && self.group_rename_host.target.get() == Some(target)
+                {
+                    match target {
+                        GroupRenameTarget::Context { source, group_id } => {
+                            self.rename_context_group(source, group_id, name);
+                        }
+                        GroupRenameTarget::Web(group_id) => {
+                            if rename_context_group(&mut self.left_browser_groups, group_id, &name)
+                            {
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                    self.close_group_rename();
+                }
             }
             UserEvent::CloseGroupRename(generation) => {
                 if generation == self.group_rename_host.generation.get() {
@@ -745,6 +759,7 @@ impl ApplicationHandler<UserEvent> for App {
                                     state,
                                     &self.live_panel,
                                     &self.left_browser_tabs,
+                                    &self.left_browser_groups,
                                 );
                             }
                             for panel in &self.background_services {
