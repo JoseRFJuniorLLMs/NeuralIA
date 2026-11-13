@@ -2,7 +2,7 @@
 
 All notable changes to NeuralIA are documented here.
 
-## [Unreleased]
+## [3.2.7] - 2026-11-13
 
 ### Fixed
 - **Grupos de abas** ([58d144f](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/58d144f233541b84d1706d79875a43972f358bb9)). Crie grupos com nome e cor pelo botão direito, inclusive nas abas Web abertas pelo botão +. A lista de abas ocultas dá acesso às opções de grupo em janelas estreitas. Os grupos das abas Web duram pela sessão atual.
