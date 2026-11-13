@@ -769,11 +769,7 @@ impl ApplicationHandler<UserEvent> for App {
                     "resized {}x{} surface={:?}",
                     size.width, size.height, self.surface
                 ));
-                self.fit_comparator_to_panel();
-                self.position_side_panel();
-                self.position_service_panel();
-                self.position_live_panel();
-                self.after_panel_change();
+                self.update_comparator_layout();
                 self.position_search_card();
                 self.position_translate_card();
                 self.position_download_card();
@@ -788,13 +784,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     Surface::Comparator => {
                         self.needs_clear = true;
-                        self.update_comparator_layout();
                         self.sync_comparator_splitters();
                         self.sync_exit_button();
                         self.sync_home_button();
                         self.sync_caption_buttons();
                         self.position_omnibox();
-                        self.position_palette();
                         self.request_redraw();
                     }
                     _ => {}

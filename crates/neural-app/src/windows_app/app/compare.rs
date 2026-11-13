@@ -256,7 +256,6 @@ impl App {
         let (restored, notice) = self.privacy.restore_tabs();
         self.comparator = Some(Self::new_comparator_state(Vec::new(), restored));
         self.activate_comparator(false);
-        self.apply_panel_layout();
         if let Some(notice) = notice {
             self.show_splash(notice, 5);
         }
@@ -762,11 +761,17 @@ impl App {
 
     pub(in crate::windows_app) fn comparator_has_no_panels(&self) -> bool {
         self.comparator.as_ref().is_some_and(|comp| {
-            all_pages_minimized(
-                &comp.minimized,
-                comp.views.len(),
-                comp.split.as_ref().is_some_and(|split| !split.minimized),
-            )
+            let browser_layout = self.left_browser_owns_layout();
+            if browser_layout && !self.left_browser_minimized {
+                return false;
+            }
+            let split_visible =
+                !browser_layout && comp.split.as_ref().is_some_and(|split| !split.minimized);
+            if comp.views.is_empty() {
+                !split_visible
+            } else {
+                all_pages_minimized(&comp.minimized, comp.views.len(), split_visible)
+            }
         })
     }
 
@@ -860,7 +865,19 @@ impl App {
         }
     }
 
-    pub(in crate::windows_app) fn update_comparator_layout(&self) {
+    pub(in crate::windows_app) fn update_comparator_layout(&mut self) {
+        // Abertura, minimização e restauração de páginas também mudam o
+        // espaço disponível para os dois painéis laterais.
+        self.fit_comparator_to_panel();
+        self.position_side_panel();
+        self.position_service_panel();
+        self.position_live_panel();
+        self.position_comparator_content();
+        self.after_panel_change();
+        self.position_palette();
+    }
+
+    fn position_comparator_content(&self) {
         let (Some(window), Some(comp)) = (&self.window, &self.comparator) else {
             return;
         };
@@ -876,12 +893,7 @@ impl App {
 
         // A aba Web ativa divide o conteúdo apenas com as colunas de IA
         // efetivamente visíveis. Não se reserva um terço fantasma no meio.
-        let show_left_browser = !self.left_browser_tabs.is_empty()
-            && left_browser_visible(
-                self.surface,
-                comp.expanded,
-                comp.split.as_ref().is_some_and(|split| split.fullscreen),
-            );
+        let show_left_browser = self.left_browser_owns_layout();
         if !show_left_browser {
             for tab in &self.left_browser_tabs {
                 let _ = tab.view.set_visible(false);
