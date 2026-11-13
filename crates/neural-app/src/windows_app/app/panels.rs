@@ -20,7 +20,8 @@ use crate::gemini_live::{
 use crate::panel_chrome::{
     Area, EXIT_PAGE_FULLSCREEN_SCRIPT, PANEL_HANDLE_WIDTH, PANEL_WIDTHS_FILE, PanelKind,
     SERVICE_STRIP_HEIGHT, ScreenRect, ServiceBadge, ServiceEffect, ServiceFrame, ServiceInput,
-    ServicePanelState, panel_area, panel_handle_area, panel_width, panel_width_from_drag,
+    ServicePanelState, clamp_panel_split, panel_area, panel_handle_area, panel_split_widths,
+    panel_width, panel_width_from_drag,
 };
 use crate::windows_app::*;
 use crate::windows_app::{
@@ -173,15 +174,28 @@ impl PanelDock {
     }
 }
 
-fn paired_panel_width(width: f64, window_width: f64, paired: bool) -> f64 {
-    if paired {
-        width.min(window_width * 0.42)
-    } else {
-        width
+fn docked_panel_width(
+    dock: PanelDock,
+    preferred: f64,
+    window_width: f64,
+    scale: f64,
+    paired: bool,
+    split_right: Option<f64>,
+) -> f64 {
+    if !paired {
+        return preferred;
     }
+    if let Some(right_fraction) = split_right {
+        let (left, right) = panel_split_widths(window_width, scale, right_fraction);
+        return match dock {
+            PanelDock::Left => left,
+            PanelDock::Right => right,
+        };
+    }
+    // Deixa espaço no meio para as páginas do comparador.
+    preferred.min(window_width * 0.42)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn docked_service_frame(
     dock: PanelDock,
     state: ServicePanelState,
@@ -190,9 +204,7 @@ fn docked_service_frame(
     window_height: f64,
     top: f64,
     strip: f64,
-    paired: bool,
 ) -> ServiceFrame {
-    let width = paired_panel_width(width, window_width, paired);
     let mut frame = state.frame(width, window_width, window_height, top, strip);
     if dock == PanelDock::Left && state.docked() {
         if let Some(panel) = &mut frame.panel {
@@ -500,9 +512,34 @@ impl App {
         panel_width(kind, self.panel_widths.get(kind), logical_w)
     }
 
+    fn panels_share_window(&self) -> bool {
+        self.surface == Surface::Home
+            || (self.surface == Surface::Comparator && self.comparator_has_no_panels())
+    }
+
+    fn panel_width_at(
+        &self,
+        dock: PanelDock,
+        kind: PanelKind,
+        logical_w: f64,
+        scale: f64,
+        docked: bool,
+    ) -> f64 {
+        let paired = docked && self.docked_panel_at(dock.opposite()).is_some();
+        docked_panel_width(
+            dock,
+            self.chosen_panel_width(kind, logical_w),
+            logical_w,
+            scale,
+            paired,
+            self.panels_share_window()
+                .then_some(self.panel_widths.split_right.unwrap_or(0.5)),
+        )
+    }
+
     /// O que o painel de servicos, no modo `state`, pede a janela agora.
     fn service_frame_for(&self, dock: PanelDock, state: ServicePanelState) -> Option<ServiceFrame> {
-        let (logical_w, logical_h, top, _) = self.panel_space()?;
+        let (logical_w, logical_h, top, scale) = self.panel_space()?;
         // A faixa de controlos so existe no comparador, que e onde ha barra.
         // Minimizado, ela sobe para essa barra. Se outro painel ou a gaveta
         // ja ocupam o canto, a faixa sai: o icone do servico e que restaura.
@@ -523,10 +560,9 @@ impl App {
         } else {
             0.0
         };
-        let width = self.chosen_panel_width(PanelKind::Service, logical_w);
-        let paired = state.docked() && self.docked_panel_at(dock.opposite()).is_some();
+        let width = self.panel_width_at(dock, PanelKind::Service, logical_w, scale, state.docked());
         Some(docked_service_frame(
-            dock, state, width, logical_w, logical_h, top, strip, paired,
+            dock, state, width, logical_w, logical_h, top, strip,
         ))
     }
 
@@ -662,9 +698,7 @@ impl App {
         }
         // Em tela cheia o teclado vai para o painel: o Esc (e as teclas do
         // proprio video) chegam a ele e nao a uma coluna escondida.
-        self.position_service_panel();
-        self.position_side_panel();
-        self.position_live_panel();
+        self.update_comparator_layout();
         if entering
             && let Some(panel) = self
                 .fullscreen_service_dock()
@@ -672,15 +706,12 @@ impl App {
         {
             let _ = panel.webview.focus();
         }
-        self.fit_comparator_to_panel();
-        self.update_comparator_layout();
         self.sync_comparator_splitters();
         self.sync_exit_button();
         // Os botoes da janela saem da frente do painel em tela cheia e voltam
         // ao sair -- tambem quando a janela ja estava em tela cheia e nao ha
         // Resized nenhum a sincroniza-los.
         self.sync_caption_buttons();
-        self.after_panel_change();
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -740,9 +771,8 @@ impl App {
         kind: PanelKind,
         reserve_strip: bool,
     ) -> Option<Area> {
-        let (w, h, top, _) = self.panel_space()?;
-        let width = self.chosen_panel_width(kind, w);
-        let width = paired_panel_width(width, w, self.docked_panel_at(dock.opposite()).is_some());
+        let (w, h, top, scale) = self.panel_space()?;
+        let width = self.panel_width_at(dock, kind, w, scale, true);
         let strip = if reserve_strip && self.dock_strips_available() {
             SERVICE_STRIP_HEIGHT
         } else {
@@ -962,8 +992,7 @@ impl App {
         position_panel_handle(handle, area, scale);
     }
 
-    /// A pega foi arrastada: a borda do painel segue o rato, presa a
-    /// [300 px, 60% da janela], e as colunas refluem para o lado.
+    /// A borda acompanha o cursor e redistribui o espaço ao lado do painel.
     pub(in crate::windows_app) fn resize_panel(&mut self) {
         // Limpar a marca ANTES de ler, como no divisor das colunas.
         PANEL_RESIZE_PENDING.store(false, Ordering::Release);
@@ -984,18 +1013,19 @@ impl App {
         unsafe {
             ScreenToClient(owner, &mut point);
         }
-        let width = panel_width_from_drag(point.x as f64 / scale, logical_w);
-        self.panel_widths.set(kind, width);
-        self.relayout_right_panels();
-    }
-
-    /// Recoloca os paineis da direita e as colunas depois de mudar a largura.
-    pub(in crate::windows_app) fn relayout_right_panels(&mut self) {
-        self.position_side_panel();
-        self.position_service_panel();
-        self.position_live_panel();
-        self.fit_comparator_to_panel();
-        self.after_panel_change();
+        let cursor_x = point.x as f64 / scale;
+        if logical_w > 0.0
+            && self.panels_share_window()
+            && self.docked_panel_at(PanelDock::Left).is_some()
+        {
+            let right_fraction = 1.0 - cursor_x / logical_w;
+            self.panel_widths.split_right = Some(clamp_panel_split(right_fraction, logical_w));
+        } else {
+            let width = panel_width_from_drag(cursor_x, logical_w);
+            self.panel_widths.set(kind, width);
+        }
+        self.update_comparator_layout();
+        self.sync_comparator_splitters();
         self.needs_clear = true;
         self.request_redraw();
     }
@@ -2036,9 +2066,7 @@ impl App {
             .map_or(0.0, |(_, area)| area.width)
     }
 
-    /// O comparador encolhe para o lado do painel, como no Chrome. Antes o
-    /// painel ficava POR CIMA das colunas, e os divisores e a paleta (popups)
-    /// apareciam por cima dele.
+    /// Atualiza o espaço reservado na barra e no conteúdo do comparador.
     pub(in crate::windows_app) fn fit_comparator_to_panel(&mut self) {
         let width = self.open_panel_width();
         // Minimizado, a faixa fica na barra e as colunas ocupam a janela.
@@ -2056,20 +2084,8 @@ impl App {
         let Some(comp) = &mut self.comparator else {
             return;
         };
-        let width_same = (comp.panel_width - width).abs() < 0.5;
-        let strip_same = (comp.restore_strip - restore_strip).abs() < 0.5;
         comp.restore_strip = restore_strip;
-        if width_same {
-            if !strip_same {
-                self.request_redraw();
-            }
-            return;
-        }
         comp.panel_width = width;
-        self.update_comparator_layout();
-        self.sync_comparator_splitters();
-        self.position_palette();
-        self.request_redraw();
     }
 
     /// Ctrl+H: abre o historico inteligente ao lado; de novo (ou Esc), fecha.
@@ -2566,32 +2582,54 @@ mod youtube_transition_tests {
     #[test]
     fn two_service_panels_leave_room_for_the_comparator() {
         let state = ServicePanelState::default();
-        let left = docked_service_frame(
-            PanelDock::Left,
-            state,
-            800.0,
-            1000.0,
-            750.0,
-            100.0,
-            34.0,
-            true,
-        );
-        let right = docked_service_frame(
-            PanelDock::Right,
-            state,
-            800.0,
-            1000.0,
-            750.0,
-            100.0,
-            34.0,
-            true,
-        );
+        let frame = |dock| {
+            let width = docked_panel_width(dock, 800.0, 1000.0, 1.0, true, None);
+            docked_service_frame(dock, state, width, 1000.0, 750.0, 100.0, 34.0)
+        };
+        let left = frame(PanelDock::Left);
+        let right = frame(PanelDock::Right);
         let left_area = left.panel.unwrap();
         let right_area = right.panel.unwrap();
         assert_eq!((left_area.x, left.strip.unwrap().x), (0.0, 0.0));
         assert_eq!((right_area.x, right.strip.unwrap().x), (580.0, 580.0));
         assert_eq!(right_area.x - left_area.width, 160.0);
         assert_eq!(right_area.x + right_area.width, 1000.0);
+    }
+
+    #[test]
+    fn two_docked_panels_share_the_full_width_when_the_center_is_empty() {
+        let state = ServicePanelState::default();
+        for (physical_w, scale, fraction) in [
+            (2880.0, 2.0, 0.5),
+            (1919.0, 1.25, 0.5),
+            (1439.0, 1.5, 0.63),
+            (375.0, 1.25, 1.0),
+        ] {
+            let width = physical_w / scale;
+            let frame = |dock, preferred| {
+                let panel_width =
+                    docked_panel_width(dock, preferred, width, scale, true, Some(fraction));
+                docked_service_frame(dock, state, panel_width, width, 850.0, 76.0, 34.0)
+            };
+            let left = frame(PanelDock::Left, 640.0);
+            let right = frame(PanelDock::Right, 440.0);
+            let left_area = left.panel.unwrap();
+            let right_area = right.panel.unwrap();
+            let boundary = (right_area.x * scale).round();
+            assert_eq!(left_area.x, 0.0);
+            assert_eq!((left_area.width * scale).round(), boundary);
+            assert_eq!(boundary + (right_area.width * scale).round(), physical_w);
+            assert_eq!(left.strip.unwrap().width, left_area.width);
+            assert_eq!(right.strip.unwrap().x, right_area.x);
+            assert!(left_area.width > 0.0 && right_area.width > 0.0);
+            if fraction == 0.5 {
+                assert_eq!(boundary, (physical_w / 2.0).round());
+            } else if fraction == 0.63 {
+                assert_eq!(boundary, (physical_w * (1.0 - fraction)).round());
+            }
+        }
+        let single = docked_panel_width(PanelDock::Right, 500.0, 1440.0, 2.0, false, Some(0.63));
+        assert_eq!(single, 500.0);
     }
 
     #[test]

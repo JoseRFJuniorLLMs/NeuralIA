@@ -2,6 +2,11 @@
 
 All notable changes to NeuralIA are documented here.
 
+## [3.2.6] - 2026-11-13
+
+### Fixed
+- **Painéis laterais** ([530c3f8](https://github.com/JoseRFJuniorLLMs/NeuralIA/commit/530c3f832097cf0fe4a0122974e1efd9df9ad1cf)). Quando o centro está vazio, dois painéis ocupam toda a largura da janela. Arraste o divisor para ajustar a proporção, que fica salva para a próxima abertura.
+
 ## [3.2.5] - 2026-11-11
 
 ### Fixed

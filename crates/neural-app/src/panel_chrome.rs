@@ -176,6 +176,19 @@ pub fn panel_width_from_drag(cursor_x: f64, logical_w: f64) -> f64 {
     clamp_panel_width(logical_w - cursor_x, logical_w)
 }
 
+/// Mantém os dois painéis utilizáveis mesmo em janelas estreitas.
+pub fn clamp_panel_split(right_fraction: f64, logical_w: f64) -> f64 {
+    let min_fraction = (PANEL_MIN_WIDTH / logical_w).min(0.4);
+    right_fraction.clamp(min_fraction, 1.0 - min_fraction)
+}
+
+/// Alinha a borda comum ao pixel físico que as duas WebViews compartilham.
+pub fn panel_split_widths(logical_w: f64, scale: f64, right_fraction: f64) -> (f64, f64) {
+    let right_fraction = clamp_panel_split(right_fraction, logical_w);
+    let left = ((logical_w * (1.0 - right_fraction) * scale).round() / scale).min(logical_w);
+    (left, logical_w - left)
+}
+
 /// Onde fica o painel encostado a direita, abaixo de `top`.
 pub fn panel_area(width: f64, logical_w: f64, logical_h: f64, top: f64) -> Area {
     let top = top.clamp(0.0, logical_h.max(0.0));
@@ -206,6 +219,7 @@ pub fn panel_handle_area(panel: Area, handle_width: f64) -> Area {
 pub struct PanelWidths {
     pub history: Option<f64>,
     pub service: Option<f64>,
+    pub split_right: Option<f64>,
 }
 
 impl PanelWidths {
@@ -224,7 +238,7 @@ impl PanelWidths {
         *slot = width.is_finite().then_some(width.round());
     }
 
-    /// `{"historico":380,"servicos":560}`; o que nao for um numero plausivel
+    /// `{"historico":380,"servicos":560,"divisor":0.5}`; o que nao for um numero plausivel
     /// fica de fora e vale a largura de sempre.
     pub fn to_json(self) -> String {
         let mut map = serde_json::Map::new();
@@ -233,6 +247,9 @@ impl PanelWidths {
         }
         if let Some(width) = self.service {
             map.insert("servicos".into(), serde_json::json!(width));
+        }
+        if let Some(fraction) = self.split_right {
+            map.insert("divisor".into(), serde_json::json!(fraction));
         }
         serde_json::Value::Object(map).to_string()
     }
@@ -250,6 +267,10 @@ impl PanelWidths {
         Self {
             history: read("historico"),
             service: read("servicos"),
+            split_right: value
+                .get("divisor")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|fraction| (0.0..=1.0).contains(fraction)),
         }
     }
 
@@ -846,11 +867,17 @@ mod tests {
         let mut widths = PanelWidths::default();
         widths.set(PanelKind::History, 377.4);
         widths.set(PanelKind::Service, 612.0);
+        widths.split_right = Some(0.63);
         widths.save(&path).expect("gravar");
         assert!(!path.with_extension("tmp").exists(), "o temporario ficou");
         let loaded = PanelWidths::load(&path);
         assert_eq!(loaded.get(PanelKind::History), Some(377.0));
         assert_eq!(loaded.get(PanelKind::Service), Some(612.0));
+        assert_eq!(loaded.split_right, Some(0.63));
+        let old = PanelWidths::from_json(r#"{"historico":377,"servicos":612}"#);
+        assert_eq!(old.service, Some(612.0));
+        assert_eq!(old.split_right, None);
+        assert_eq!(PanelWidths::from_json(r#"{"divisor":2}"#).split_right, None);
 
         // Gravar outra vez por cima: ganha a ultima.
         widths.set(PanelKind::Service, 700.0);
